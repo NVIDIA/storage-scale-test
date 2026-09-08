@@ -1,0 +1,93 @@
+#
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+version: "1.0"
+project: storage-scale-test
+last_updated: "2026-08-03T19:29:30Z"
+repository_exposure_classification:
+  visibility: Public
+  basis: >-
+    Intended for publication as a public open source repository. SECURITY.md is
+    written for public consumption.
+  confirmed_by: "Darrell Bishop <dbishop@nvidia.com>"
+  date: "2026-08-03"
+service_exposure_classification:
+  tier: External / Regulated
+  confidence: high
+  basis: >-
+    Publicly distributed source-only CLI; no hosted service or compiled-artifact
+    distribution. Benchmark runs can create temporary listeners and use
+    operator-provided credentials on operator-managed test infrastructure.
+  confirmed_by: "Darrell Bishop <dbishop@nvidia.com>"
+  date: "2026-08-03"
+false_positives: []
+accepted_risks:
+  - slug: "threat-user-built-warp-supply-chain"
+    threat: >-
+      build_warp_from_source.sh builds Warp from an operator-selected upstream
+      repository and source ref using an operator-selected Go toolchain and
+      build environment.
+    severity: "medium"
+    reason: >-
+      storage-scale-test does not build, release, or distribute Warp binaries
+      and intentionally does not pin one Go archive checksum because users may
+      select newer patched Go releases to avoid toolchain CVEs. The helper may
+      use an installed Go version at or above its minimum, a tagged Docker image,
+      or a user-local temporary download of the minimum release. Users are
+      responsible for trusted Warp source and dependency resolution, a currently
+      supported and patched Go distribution or image, environment-appropriate
+      checksum, signature, digest, or provenance verification, reproducible
+      builds, and recording hashes for their own artifacts.
+    triaged_by: "Darrell Bishop <dbishop@nvidia.com>"
+    date: "2026-08-03"
+
+  - slug: assumption-operator-controlled-s3-credential-lengths
+    assumption: >-
+      Object connectivity uses operator-controlled, provider-issued S3
+      credentials of conventional length.
+    severity: medium
+    reason: >-
+      Credential files and environment variables are trusted operator
+      configuration. Users with nonstandard credentials must validate their
+      length and protect the configuration before use.
+    triaged_by: "Project maintainers"
+    date: "2026-08-03"
+
+  - slug: assumption-ssh-mode-trusted-host-network
+    assumption: >-
+      SSH mode targets operator-selected ephemeral nodes on a trusted,
+      isolated benchmark network using a least-privilege account.
+    severity: medium
+    reason: >-
+      Unattended fan-out intentionally avoids persistent host-key state. Users
+      enabling SSH mode accept the residual host-impersonation risk; deployments
+      that cannot meet the network assumptions must use Slurm mode or enforce
+      host verification outside the tool.
+    triaged_by: "Project maintainers"
+    date: "2026-08-03"
+
+  - slug: assumption-resume-directories-trusted-executable-state
+    assumption: >-
+      Resume directories and their generated shell state are executable
+      configuration controlled solely by the operator.
+    severity: low
+    reason: >-
+      The resume workflow intentionally sources tool-generated state. Users must
+      resume only from trusted, self-generated result directories that are not
+      writable by other users.
+    triaged_by: "Project maintainers"
+    date: "2026-08-03"

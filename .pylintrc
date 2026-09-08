@@ -1,0 +1,119 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Canonical Pylint configuration for storage-scale-test.
+
+[MASTER]
+# Use multiple processes to speed up Pylint
+jobs=0
+
+# Pickle collected data for later comparisons
+persistent=yes
+
+# Allow loading of arbitrary C extensions
+unsafe-load-any-extension=no
+
+# A comma-separated list of package or module names from where C extensions may be loaded
+extension-pkg-allow-list=
+
+[MESSAGES CONTROL]
+# Gate enabled errors and warnings plus the explicit C/R checks below. Disable
+# C/R categories first so a Pylint upgrade cannot silently add new C/R gates.
+# Optional extension checks E0106 and W1502 remain at Pylint's disabled default.
+disable=
+    C,
+    R,
+    # Warnings that can be noisy
+    fixme,                            # W0511 - allow TODO/FIXME comments
+    # Information messages
+    locally-disabled,                 # I0011
+    file-ignored,                     # I0013
+    suppressed-message,               # I0020
+    useless-suppression,              # I0021
+    # Environment-specific errors
+    import-error,                     # E0401 - dependencies may not be installed
+
+# These convention/refactoring checks are intentional score-affecting gates.
+enable=
+    consider-using-enumerate,         # C0200
+    wrong-import-order,               # C0411
+    duplicate-code,                   # R0801
+    redefined-argument-from-local,    # R1704
+
+[REPORTS]
+# Set the output format
+output-format=text
+
+# Display full report or only messages
+reports=no
+
+# Activate the evaluation score
+score=yes
+
+[BASIC]
+# Good variable names which should always be accepted
+good-names=i,j,k,ex,Run,_,x,y,z,fd,fp,df
+
+# Bad variable names which should always be refused
+bad-names=foo,bar,baz,toto,tutu,tata
+
+# Include a hint for the correct naming format with invalid-name
+include-naming-hint=yes
+
+[FORMAT]
+# Maximum number of characters on a single line (handled by Black)
+max-line-length=100
+
+# Maximum number of lines in a module (very permissive)
+max-module-lines=2000
+
+# String used as indentation unit (handled by Black)
+indent-string='    '
+
+[DESIGN]
+# Informational thresholds for checks outside the explicit gate set.
+max-args=10
+max-attributes=15
+max-bool-expr=7
+max-branches=20
+max-locals=25
+max-parents=10
+max-public-methods=25
+max-returns=10
+max-statements=100
+
+[SIMILARITIES]
+# Minimum lines number of a similarity
+min-similarity-lines=10
+
+# Ignore comments when computing similarities
+ignore-comments=yes
+
+# Ignore docstrings when computing similarities
+ignore-docstrings=yes
+
+# Ignore imports when computing similarities
+ignore-imports=yes
+
+[VARIABLES]
+# Tells whether we should check for unused import in __init__ files
+init-import=no
+
+# A regular expression matching the name of dummy variables
+dummy-variables-rgx=_$|dummy|unused
+
+[EXCEPTIONS]
+# Exceptions that will emit a warning when caught
+overgeneral-exceptions=builtins.BaseException,builtins.Exception

@@ -1,0 +1,123 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Bug report
+description: Report reproducible incorrect behavior in NVIDIA Storage Scale Test
+title: "[Bug]: "
+labels: ["bug"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve NVIDIA Storage Scale Test.
+
+        Do not report security vulnerabilities here. Follow `SECURITY.md` and
+        report them privately to NVIDIA PSIRT. Before submitting logs or
+        configuration, remove credentials, hostnames, addresses, account names,
+        bucket names, filesystem paths, and other sensitive information.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Provide the release, branch, or full commit SHA you used.
+      placeholder: "Example: main at 0123456789abcdef..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Filesystem tests (elbencho or mdtest-elbencho)
+        - Object-storage tests (Warp)
+        - Network tests (elbencho netbench)
+        - Result extraction or reporting
+        - Environment validation or setup
+        - Tarball or benchmark build helpers
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: execution-mode
+    attributes:
+      label: Execution mode
+      options:
+        - Slurm
+        - Passwordless SSH
+        - Local analysis or reporting only
+        - Not applicable
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Explain what happened and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: |
+        List the smallest sequence of commands and sanitized configuration that
+        reliably demonstrates the problem. State whether it reproduces every
+        time.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        Include relevant controller and client OS/architecture, Python version,
+        client count and topology, storage type, benchmark binary versions, and
+        Slurm version or SSH details. Do not include secrets or internal system
+        identifiers.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or output
+      description: Paste the smallest relevant excerpt after removing sensitive data.
+      render: shell
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add anything else that may help diagnose the problem.
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Submission checklist
+      options:
+        - label: I have removed credentials and other sensitive information.
+          required: true
+        - label: I have searched existing issues and found no duplicate.
+          required: true
+        - label: I agree to follow this repository's `CODE_OF_CONDUCT.md`.
+          required: true

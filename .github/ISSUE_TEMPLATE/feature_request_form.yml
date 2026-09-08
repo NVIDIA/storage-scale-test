@@ -1,0 +1,81 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Feature or enhancement suggestion
+description: Suggest useful new or improved NVIDIA Storage Scale Test behavior
+title: "[Enhancement]: "
+labels: ["enhancement"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Suggestions are welcome. The project is not currently accepting
+        external code contributions, so please focus on the use case and desired
+        behavior rather than offering a pull request.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Filesystem tests
+        - Object-storage tests
+        - Network tests
+        - Result extraction or reporting
+        - Environment validation or setup
+        - Tarball or benchmark build helpers
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Use case or problem
+      description: Describe the storage-testing need and why current behavior is insufficient.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Desired behavior
+      description: Explain what outcome or workflow would address the need.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe any workarounds or alternative tools you have tried.
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Include non-sensitive examples, scale, constraints, or references.
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Submission checklist
+      options:
+        - label: I have searched existing issues and found no duplicate.
+          required: true
+        - label: I agree to follow this repository's `CODE_OF_CONDUCT.md`.
+          required: true

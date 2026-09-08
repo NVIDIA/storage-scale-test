@@ -1,0 +1,487 @@
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+================================================================================
+IMPORTANT
+================================================================================
+
+This project will download and install additional third-party open source
+software projects. Review the license terms of these open source projects
+before use.
+
+================================================================================
+About This File
+================================================================================
+
+This NOTICE file identifies third-party open source software that
+storage-scale-test may download, build, or invoke at runtime. The
+storage-scale-test
+source repository itself is distributed under the Apache License 2.0 (see the
+LICENSE file in this repository).
+
+Third-party benchmark binaries (elbencho, Warp) are not bundled in this
+repository. Helper scripts may download or build them on the machine where you
+prepare a deployment tarball. Python packages listed below are installed into a
+local virtual environment by setup scripts. Alpine Linux libraries listed below
+are used when building static helper binaries (for example, s3test) inside an
+Alpine Linux container.
+
+Nothing in this file grants rights beyond those provided by the applicable
+third-party license for each component. Full license texts are available at the
+source URLs cited for each component.
+
+================================================================================
+Third-Party Components
+================================================================================
+
+The sections below are organized alphabetically by component name. Each section
+includes the copyright and attribution notices required by the applicable
+license when you use, reproduce, or distribute that component (including in
+binary form).
+
+--------------------------------------------------------------------------------
+1. elbencho
+--------------------------------------------------------------------------------
+
+Description: Distributed storage benchmark for file systems, object stores, and
+             block devices.
+Used by:     Filesystem and network benchmark tests; may be downloaded as a
+             static release binary by utils/build_tarball.sh.
+License:     GPL-3.0-only
+Source:      https://github.com/breuner/elbencho
+License text: https://github.com/breuner/elbencho/blob/master/LICENSE
+
+Copyright (c) 2020-2025 Sven Breuner and elbencho contributors.
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program. If not, see https://www.gnu.org/licenses/.
+
+GPL-3.0 is a copyleft license. If you distribute elbencho or a derivative work,
+you must comply with GPL-3.0 source-offer and license-conveyance requirements.
+Obtain corresponding source from the URL above.
+
+--------------------------------------------------------------------------------
+2. matplotlib
+--------------------------------------------------------------------------------
+
+Description: Python plotting library used by benchmark extraction and summary
+             utilities.
+Used by:     Installed from requirements.txt into the repository .venv/ by
+             setup_python_venv().
+License:     LicenseRef-PSF-2.0 (Python Software Foundation License)
+Source:      https://github.com/matplotlib/matplotlib
+License text: https://github.com/matplotlib/matplotlib/blob/main/LICENSE/LICENSE
+
+For matplotlib versions 1.3.0 and later, the Matplotlib Development Team
+requires retention of the following copyright notice in matplotlib alone or in
+any derivative version:
+
+    Copyright (c) 2012- Matplotlib Development Team; All Rights Reserved
+
+For matplotlib versions prior to 1.3.0, the following copyright notice applies
+to those portions of the codebase:
+
+    Copyright (c) 2002-2011 John D. Hunter; All Rights Reserved
+
+See the upstream LICENSE file for the complete Python Software Foundation
+License agreement text.
+
+--------------------------------------------------------------------------------
+3. musl (Alpine Linux package)
+--------------------------------------------------------------------------------
+
+Description: C standard library implementation; provided as part of the Alpine
+             Linux base image used to build static helper binaries.
+Used by:     Alpine Linux container builds (for example, utils/build/
+             build_s3test_from_source.sh).
+License:     MIT
+Source:      https://musl.libc.org/
+             https://git.musl-libc.org/cgit/musl/
+License text: https://git.musl-libc.org/cgit/musl/tree/COPYRIGHT
+
+musl as a whole is licensed under the following standard MIT license:
+
+    Copyright (c) 2005-2020 Rich Felker, et al.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to
+    deal in the Software without restriction, including without limitation the
+    rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+    sell copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+musl also incorporates portions of third-party works under compatible licenses
+(for example, BSD-licensed regular expression and math library code). See the
+upstream COPYRIGHT file for the complete list of incorporated works and their
+notices.
+
+--------------------------------------------------------------------------------
+4. numpy
+--------------------------------------------------------------------------------
+
+Description: Python numerical computing library used by benchmark extraction and
+             summary utilities.
+Used by:     Installed from requirements.txt into the repository .venv/ by
+             setup_python_venv().
+License:     BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0
+Source:      https://github.com/numpy/numpy
+License text: https://github.com/numpy/numpy/blob/main/LICENSE.txt
+
+NumPy primary license (BSD-3-Clause):
+
+    Copyright (c) 2005-2025, NumPy Developers.
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met:
+
+     * Redistributions of source code must retain the above copyright notice,
+       this list of conditions and the following disclaimer.
+
+     * Redistributions in binary form must reproduce the above copyright notice,
+       this list of conditions and the following disclaimer in the documentation
+       and/or other materials provided with the distribution.
+
+     * Neither the name of the NumPy Developers nor the names of any
+       contributors may be used to endorse or promote products derived from this
+       software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+    LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
+
+NumPy source distributions and installed packages may additionally include the
+following bundled components (SPDX license identifiers shown):
+
+  Component: libdivide
+  License:   Zlib
+  Files:     numpy/_core/include/numpy/libdivide/*
+  Notice:
+
+      Copyright (C) 2010 - 2019 ridiculous_fish,
+      Copyright (C) 2016 - 2019 Kim Walisch,
+
+      This software is provided 'as-is', without any express or implied
+      warranty. In no event will the authors be held liable for any damages
+      arising from the use of this software.
+
+      Permission is granted to anyone to use this software for any purpose,
+      including commercial applications, and to alter it and redistribute it
+      freely, subject to the following restrictions:
+
+      1. The origin of this software must not be misrepresented; you must not
+         claim that you wrote the original software. If you use this software
+         in a product, an acknowledgment in the product documentation would be
+         appreciated but is not required.
+      2. Altered source versions must be plainly marked as such, and must not
+         be misrepresented as being the original software.
+      3. This notice may not be removed or altered from any source
+         distribution.
+
+  Component: dragon4 (floating-point printing)
+  License:   MIT
+  Files:     numpy/_core/src/multiarray/dragon4*
+  Notice:
+
+      Copyright (c) 2014 Ryan Juckett
+
+      Permission is hereby granted, free of charge, to any person obtaining a
+      copy of this software and associated documentation files (the "Software"),
+      to deal in the Software without restriction, including without limitation
+      the rights to use, copy, modify, merge, publish, distribute, sublicense,
+      and/or sell copies of the Software, and to permit persons to whom the
+      Software is furnished to do so, subject to the following conditions:
+
+      The above copyright notice and this permission notice shall be included in
+      all copies or substantial portions of the Software.
+
+      THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+      OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+      FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+      AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+      LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+      FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+      DEALINGS IN THE SOFTWARE.
+
+  Component: pythoncapi-compat
+  License:   0BSD
+  Files:     numpy/_core/src/common/pythoncapi-compat/*
+  Notice:
+
+      Copyright (c) Victor Stinner and contributors.
+
+      Permission to use, copy, modify, and/or distribute this software for any
+      purpose with or without fee is hereby granted.
+
+      THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+      WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+      MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+      ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+      WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+      ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+      OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+  Component: splitmix64 (random number generation)
+  License:   CC0-1.0
+  Files:     numpy/random/src/splitmix64/*
+  Notice:
+
+      Written in 2015 by Sebastiano Vigna (vigna@acm.org)
+
+      To the extent possible under law, the author has dedicated all copyright
+      and related and neighboring rights to this software to the public domain
+      worldwide. This software is distributed without any warranty.
+
+      See http://creativecommons.org/publicdomain/zero/1.0/.
+
+Additional bundled components in NumPy wheels or platform-specific binaries (for
+example, OpenBLAS) may carry separate licenses. Consult the LICENSE.txt file
+shipped with your NumPy installation for the authoritative list.
+
+--------------------------------------------------------------------------------
+5. OpenSSL (Alpine Linux package)
+--------------------------------------------------------------------------------
+
+Description: Cryptographic and TLS library; used when building static s3test
+             helper binaries that link against OpenSSL.
+Used by:     Alpine Linux container builds (apk packages openssl-dev and
+             openssl-libs-static).
+License:     Apache-2.0
+Source:      https://www.openssl.org/
+             https://github.com/openssl/openssl
+License text: https://github.com/openssl/openssl/blob/master/LICENSE.txt
+
+Copyright (c) 1998-2026 The OpenSSL Project Authors
+
+Copyright (c) 1995-1998 Eric A. Young, Tim J. Hudson
+
+All rights reserved.
+
+OpenSSL is licensed under the Apache License 2.0. When redistributing OpenSSL
+binaries or linking them into your own binaries, retain the copyright notices
+above and provide a copy of the Apache License 2.0. See the upstream LICENSE.txt
+file for the complete license text.
+
+--------------------------------------------------------------------------------
+6. PyYAML
+--------------------------------------------------------------------------------
+
+Description: YAML parser and emitter for Python; used by benchmark extraction
+             utilities.
+Used by:     Installed from requirements.txt (listed as PyYAML) into the
+             repository .venv/ by setup_python_venv().
+License:     MIT
+Source:      https://github.com/yaml/pyyaml
+License text: https://github.com/yaml/pyyaml/blob/master/LICENSE
+
+    Copyright (c) 2017-2021 Ingy döt Net
+    Copyright (c) 2006-2016 Kirill Simonov
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to
+    deal in the Software without restriction, including without limitation the
+    rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+    sell copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+--------------------------------------------------------------------------------
+7. Warp (MinIO Warp)
+--------------------------------------------------------------------------------
+
+Description: S3-compatible object storage benchmark.
+Used by:     Object storage benchmark tests; may be built from upstream source
+             by utils/build/build_warp_from_source.sh (not downloaded
+             automatically by utils/build_tarball.sh).
+License:     AGPL-3.0-only
+Source:      https://github.com/NVIDIA/warp-minio
+License text: https://github.com/NVIDIA/warp-minio/blob/HEAD/LICENSE
+
+MinIO Warp benchmark (C) 2019-2020 MinIO, Inc.
+
+This product includes software developed at MinIO, Inc.
+(https://min.io/).
+
+The MinIO project contains unmodified/modified subcomponents too with separate
+copyright notices and license terms. Your use of the source code for these
+subcomponents is subject to the terms and conditions of the following licenses.
+See the upstream CREDITS file for dependency license details:
+
+    https://github.com/NVIDIA/warp-minio/blob/HEAD/CREDITS
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program. If not, see https://www.gnu.org/licenses/.
+
+AGPL-3.0 is a strong copyleft license. Network use of a modified version may
+trigger source-offer obligations. Obtain corresponding source from the URL
+above.
+
+--------------------------------------------------------------------------------
+8. zlib (Alpine Linux package)
+--------------------------------------------------------------------------------
+
+Description: Compression library; used when building static s3test helper
+             binaries.
+Used by:     Alpine Linux container builds (apk package zlib-static).
+License:     Zlib
+Source:      https://zlib.net/
+             https://github.com/madler/zlib
+License text: https://github.com/madler/zlib/blob/master/LICENSE
+
+    (C) 1995-2026 Jean-loup Gailly and Mark Adler
+
+    This software is provided 'as-is', without any express or implied
+    warranty. In no event will the authors be held liable for any damages
+    arising from the use of this software.
+
+    Permission is granted to anyone to use this software for any purpose,
+    including commercial applications, and to alter it and redistribute it
+    freely, subject to the following restrictions:
+
+    1. The origin of this software must not be misrepresented; you must not
+       claim that you wrote the original software. If you use this software
+       in a product, an acknowledgment in the product documentation would be
+       appreciated but is not required.
+    2. Altered source versions must be plainly marked as such, and must not be
+       misrepresented as being the original software.
+    3. This notice may not be removed or altered from any source distribution.
+
+--------------------------------------------------------------------------------
+9. zstandard (python-zstandard)
+--------------------------------------------------------------------------------
+
+Description: Python bindings to the Zstandard compression library; used by
+             benchmark extraction utilities.
+Used by:     Installed from requirements.txt into the repository .venv/ by
+             setup_python_venv().
+License:     BSD-3-Clause
+Source:      https://github.com/indygreg/python-zstandard
+             (bundles https://github.com/facebook/zstd)
+License text: https://github.com/indygreg/python-zstandard/blob/master/LICENSE
+             https://github.com/facebook/zstd/blob/dev/LICENSE
+
+python-zstandard (Python bindings):
+
+    Copyright (c) 2016, Gregory Szorc
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+
+    1. Redistributions of source code must retain the above copyright notice,
+       this list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright notice,
+       this list of conditions and the following disclaimer in the documentation
+       and/or other materials provided with the distribution.
+
+    3. Neither the name of the copyright holder nor the names of its
+       contributors may be used to endorse or promote products derived from
+       this software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+    LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
+
+Bundled Zstandard C library (libzstd):
+
+    Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+
+     * Redistributions of source code must retain the above copyright notice,
+       this list of conditions and the following disclaimer.
+
+     * Redistributions in binary form must reproduce the above copyright notice,
+       this list of conditions and the following disclaimer in the documentation
+       and/or other materials provided with the distribution.
+
+     * Neither the name Facebook, nor Meta, nor the names of its contributors
+       may be used to endorse or promote products derived from this software
+       without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+    LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
+
+================================================================================
+End of NOTICE
+================================================================================
