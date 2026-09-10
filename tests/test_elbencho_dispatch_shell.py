@@ -31,11 +31,12 @@ _SLURM_COORDINATOR = (
     _REPO_ROOT / "storage-tests" / "fs" / "sbatch" / "_nv-elbencho-coordinator.sh"
 )
 _ENV_FUNCTIONS = _REPO_ROOT / "lib" / "env_functions.sh"
+_BASH = shutil.which("bash") or "bash"
 
 
 def _run_bash(script: str) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["bash", "-c", script],
+        [_BASH, "-c", script],
         check=False,
         cwd=_REPO_ROOT,
         text=True,
@@ -171,7 +172,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         trap 'rm -rf "$tmp"' EXIT
         mkdir -p "$tmp/bin"
         cat > "$tmp/bin/srun" <<'EOF'
-        #!/bin/bash
+        #!{_BASH}
         echo '[OK] host-a'
         echo '[OK] host-b'
         EOF
@@ -294,7 +295,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         trap 'rm -rf "$tmp"' EXIT
         mkdir -p "$tmp/bin"
         cat > "$tmp/bin/srun" <<'EOF'
-        #!/bin/bash
+        #!{_BASH}
         exec sleep 10
         EOF
         chmod +x "$tmp/bin/srun"
@@ -306,9 +307,12 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         rc=$?
         set -e
         elapsed=$((SECONDS - started))
-        [[ "$rc" -eq 1 ]]
-        [[ "$elapsed" -ge 1 && "$elapsed" -le 4 ]]
-        grep -q 'reached its 1s deadline' "$tmp/output"
+        if [[ "$rc" -ne 1 || "$elapsed" -lt 1 || "$elapsed" -gt 4 ]] ||
+                ! grep -q 'reached its 1s deadline' "$tmp/output"; then
+            printf 'health-check rc=%s elapsed=%ss output:\\n' "$rc" "$elapsed" >&2
+            cat "$tmp/output" >&2
+            exit 1
+        fi
         """
         result = _run_bash(textwrap.dedent(script))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -774,7 +778,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         trap 'rm -rf "$tmp"' EXIT
         cd "$tmp"
         cat > elbencho <<'EOF'
-        #!/bin/bash
+        #!{_BASH}
         printf 'ran-cwd=%s\\n' "$PWD" > "$ELBENCHO_RAN_FILE"
         EOF
         chmod +x elbencho
@@ -1392,7 +1396,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 textwrap.dedent(saved_text), encoding="utf-8"
             )
             env = os.environ.copy()
-            env["SHELL"] = "/bin/bash"
+            env["SHELL"] = _BASH
             result = subprocess.run(
                 [str(sweep_script), "--resume", str(resume_dir)],
                 check=False,
@@ -1466,7 +1470,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 textwrap.dedent(saved_text), encoding="utf-8"
             )
             env = os.environ.copy()
-            env["SHELL"] = "/bin/bash"
+            env["SHELL"] = _BASH
             result = subprocess.run(
                 [str(sweep_script), "--resume", str(resume_dir)],
                 check=False,
@@ -1518,7 +1522,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 textwrap.dedent(env_text), encoding="utf-8"
             )
             env = os.environ.copy()
-            env["SHELL"] = "/bin/bash"
+            env["SHELL"] = _BASH
             result = subprocess.run(
                 [str(sweep_script), "--nodes", "1024,820,616,412,208"],
                 check=False,

@@ -56,8 +56,8 @@ and are responsible for every binary they place in it.
 
 Slurm is the default execution substrate. Setting `SSH_HOST_LIST` selects
 passwordless SSH instead. Kubernetes execution is not implemented.
-The repository has no GitHub CI/CD workflow; validation is run locally, and
-GitHub CI configuration is outside the present repository scope.
+GitHub Actions runs compliance, ShellCheck, Black, Pylint, and pytest for pull
+requests and pushes to `main`.
 
 ## Repository map
 
@@ -68,6 +68,7 @@ GitHub CI configuration is outside the present repository scope.
 | `storage-tests/network/` | Elbencho netbench entry point and substrate-specific dispatchers |
 | `lib/env_base.sh` | Derived configuration, substrate selection, executable paths, and Slurm option construction |
 | `lib/env_functions.sh` | Shared orchestration, validation, SSH, Slurm, resume, and environment-snapshot helpers |
+| `lib/_platform_functions.sh` | GNU/Linux and Homebrew coreutils command adapters shared by shell libraries |
 | `lib/_elbencho_functions.sh` | Filesystem IO, metadata, execution reification, and workload-completion logic |
 | `lib/_warp_functions.sh` | Warp client lifecycle and object benchmark logic |
 | `lib/_netbench_functions.sh` | Netbench service, grouping, and traffic logic |
@@ -480,6 +481,10 @@ Public accepted-risk records live in `.security-triage.yaml` and cover:
 - Every text file carries the NVIDIA Apache-2.0 header except `LICENSE`; the
   README header is intentionally at the bottom. See `AGENTS.md` for the exact
   rule.
+- Shell tests use the adapters in `lib/_platform_functions.sh` to select
+  unprefixed GNU coreutils on Linux and Homebrew's `g`-prefixed coreutils on
+  macOS. Scale-test execution remains shell-only and does not acquire a Python
+  dependency.
 
 ## Required validation
 
@@ -489,8 +494,7 @@ under `tmp/`.
 Run the repository checks from the root:
 
 ```bash
-pytest
-shellcheck $(find . -name '*.sh' -not -path '*/tmp/*')
+./utils/run_ci_checks.sh
 ```
 
 After Python changes, run Black 25.9.0 or newer and Pylint. `.pylintrc` is the

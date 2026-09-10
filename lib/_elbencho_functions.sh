@@ -16,6 +16,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+# shellcheck source=lib/_platform_functions.sh
+# shellcheck disable=SC1091  # Resolved beside this library locally and over SSH
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_platform_functions.sh"
+#
 # This library provides elbencho-related functions for benchmarking.
 #
 # =============================================================================
@@ -75,10 +79,10 @@
 #   - scriptlet run by ssh on one client node
 #   - does NOT have access to env.sh, lib/env_functions.sh, etc.
 #
-# Because of the ssh case constraints, this script cannot itself source
-# env.sh, lib/env_functions.sh, etc. Instead, the call sites must source
-# the appropriate files, set required environment variables, source this
-# file, and then call the desired function.
+# Because of the SSH case constraints, this script cannot depend on env.sh or
+# lib/env_functions.sh. Its only sibling dependency is
+# lib/_platform_functions.sh, which is deployed alongside it. Call sites must
+# set the required environment variables before calling the desired function.
 #
 # =============================================================================
 # run_elbencho_io_sweep_iteration() required environment variables:
@@ -1240,8 +1244,8 @@ _elbencho_treefile_cache_prepare() {
 
     local parent_dev
     local data_dev
-    parent_dev=$(stat -c %d "$parent") || return 1
-    data_dev=$(stat -c %d "$read_from") || return 1
+    parent_dev=$(_portable_stat_device_id "$parent") || return 1
+    data_dev=$(_portable_stat_device_id "$read_from") || return 1
     if [[ "$parent_dev" != "$data_dev" ]]; then
         ELBENCHO_TREEFILE_CACHE_STATE=unavailable
         echo "Note: dataset parent is on a different filesystem; scanning without a treefile cache: $read_from" >&2
@@ -1965,8 +1969,8 @@ _elbencho_resolve_shared_cleanup_target() {
     local root="${ELBENCHO_RUN_GENERATED_TEST_ROOT:-${ELBENCHO_RUN_TEST_ROOT:-}}"
     local suffix="$ELBENCHO_RUN_TEST_DIR_SUFFIX"
     local resolved_target resolved_root
-    resolved_target=$(realpath -m -- "$target") || return 1
-    resolved_root=$(realpath -m -- "$root") || return 1
+    resolved_target=$(_portable_realpath_m "$target") || return 1
+    resolved_root=$(_portable_realpath_m "$root") || return 1
     if [[ "$resolved_target" == "$resolved_root" \
             || "$resolved_target" != "$resolved_root"/* \
             || ${#resolved_target} -lt ${#suffix} \
@@ -2846,7 +2850,7 @@ _elbencho_shared_run_delete() {
     local resolved_target
     resolved_target=$(_elbencho_resolve_shared_cleanup_target) \
         || { _elbencho_shared_fail 1; return $?; }
-    [[ "$resolved_target" == "$(realpath -m -- "$target")" ]] \
+    [[ "$resolved_target" == "$(_portable_realpath_m "$target")" ]] \
         || { _elbencho_shared_fail 1; return $?; }
     rm -f -- "$delete_json" || { _elbencho_shared_fail 1; return $?; }
     local phase_rc=0 check_rc=0 lifecycle_finished_ms

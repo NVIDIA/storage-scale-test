@@ -711,25 +711,28 @@ iterative report refinement.
 
 ## 10. Validation and Release
 
-Changes are validated by running the following checks locally before committing:
+Changes are validated locally before committing. GitHub Actions runs the same
+checks for pull requests and pushes to `main`:
 
 | Check | Command |
 |-------|---------|
-| Python unit tests | `pytest` |
-| Shell static analysis | `shellcheck $(find . -name '*.sh' -not -path '*/tmp/*')` |
-| Python formatting | `black <changed files>` |
-| Python lint | `pylint -j 1 <changed files>` |
+| All local gates | `./utils/run_ci_checks.sh` |
+| License compliance | `./utils/run_ci_checks.sh compliance` |
+| Python unit tests | `./utils/run_ci_checks.sh pytest` (Python 3.12–3.14 in CI) |
+| Shell static analysis | `./utils/run_ci_checks.sh shellcheck` |
+| Python formatting | `./utils/run_ci_checks.sh black` |
+| Python lint | `./utils/run_ci_checks.sh pylint` |
 
-This repository does not currently define a GitHub CI pipeline, so those checks
-are not enforced automatically. It also does not publish benchmark binaries or
-deployment tarballs; packaging is performed by users with
+The independent gates run concurrently and use dependency caches keyed by the
+pinned requirements files. CI does not publish benchmark binaries or deployment
+tarballs; packaging is performed by users with
 `utils/build_tarball.sh` after they have provided, helper-downloaded, or
 helper-built the binaries needed for their tests.
 
 ### 10.1 Recommended Validation Stages
 
 ```
-shell/static analysis ──► Python tests ──► optional binary-helper scale tests ──► user packaging
+parallel static checks and unit tests ──► optional binary-helper scale tests ──► user packaging
 ```
 
 | Stage | Purpose |
