@@ -16,6 +16,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+# shellcheck source=lib/_platform_functions.sh
+# shellcheck disable=SC1091  # Resolved beside this library locally and over SSH
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_platform_functions.sh"
+#
 # This library provides netbench-related functions for network benchmarking.
 # It is intended to be sourced (with no side effects) in two environments:
 # 1. SLURM
@@ -25,10 +29,10 @@
 #   - scriptlet run by ssh on one client node
 #   - does NOT have access to env.sh, lib/env_functions.sh, etc.
 #
-# Because of the ssh case constraints, this script cannot itself source
-# env.sh, lib/env_functions.sh, etc. Instead, the call sites must source
-# the appropriate files, set required environment variables, source this
-# file, and then call the desired function.
+# Because of the SSH case constraints, this script cannot depend on env.sh or
+# lib/env_functions.sh. Its only sibling dependency is
+# lib/_platform_functions.sh, which is deployed alongside it. Call sites must
+# set the required environment variables before calling the desired function.
 #
 # Available functions:
 #   run_netbench_half_half   - Half clients, half servers (unidirectional or bidirectional)
@@ -167,7 +171,8 @@ _check_tcp_connectivity() {
             host="${hp%:*}"
             port="${hp##*:}"
             # shellcheck disable=SC2016  # Single quotes intentional for inline bash
-            timeout 2 bash -c 'echo >/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null &
+            _run_command_with_timeout 2 \
+                bash -c 'echo >/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null &
             pids+=($!)
             targets+=("$hp")
         done

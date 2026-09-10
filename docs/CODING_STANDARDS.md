@@ -22,6 +22,24 @@ Detailed coding standards for `storage-scale-test`. Referenced from
 work. `AGENTS.md` carries the lean, always-on summary; this file holds the
 depth.
 
+## Running repository checks
+
+Run the same validation commands used by CI from the repository root:
+
+```bash
+./utils/run_ci_checks.sh
+```
+
+The script works on Linux and macOS, creates and reuses `.venv-ci`, and installs
+the exact versions in `requirements.txt` and `requirements-ci.txt`. Pass
+`compliance`, `shellcheck`, `black`, `pylint`, or `pytest` to run one check.
+It uses `uv` when already installed and otherwise uses Python's standard
+`venv`. For a sandbox with preinstalled tools but no package-index access, set
+`CI_BOOTSTRAP=0`; `CI_PYTHON` and `CI_SHELLCHECK` can select the executables.
+On macOS, unit tests require Bash 4.3 or newer and GNU coreutils; install both
+with `brew install bash coreutils` and put Homebrew's bin directory first on
+`PATH`.
+
 ## Python
 
 Python 3.12 or newer is required for repository Python tools and their pinned
@@ -88,12 +106,17 @@ literal duplicates an existing one.
 After modifying ANY `.sh` file:
 
 ```bash
-shellcheck $(find <repo-root> -name '*.sh' -not -path '*/tmp/*')
+./utils/run_ci_checks.sh shellcheck
 ```
 
 Fix all errors and warnings. For intentional exceptions, add
 `# shellcheck disable=SCXXXX` with an explanatory comment. This command is safe
 to run in the sandbox without requesting permissions.
+
+Shell unit tests that do not require benchmark binaries run on Linux and
+macOS; binary-dependent tests skip when elbencho is unavailable. GNU coreutils
+commands use their unprefixed names on Linux and Homebrew's `g`-prefixed names
+on macOS.
 
 ### Best practices
 - **Quoting**: always quote variables (`"$var"`); the only exception is

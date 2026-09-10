@@ -13,23 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-/utils/warp*
-/utils/elbencho*
-/utils/s3test*
-/utils/mdtest*
-/*.png
-/env.sh
-/.venv
-/.venv-ci
-/.obj_auth
-/.vscode
-__pycache__/
-/tmp/
-/utils/build/*.log
-*.tar.gz
-*.tar.xz
-.agents
-.cursor
-.claude
-.DS_Store
-.pytest_cache/
+# Keep CI tooling reproducible. Runtime dependencies remain in requirements.txt.
+black==26.5.1
+pylint==4.0.8
+pytest==9.1.1
+shellcheck-py==0.11.0.1

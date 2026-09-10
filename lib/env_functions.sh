@@ -15,6 +15,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# shellcheck source=lib/_platform_functions.sh
+# shellcheck disable=SC1091  # Resolved beside this library in the repository
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_platform_functions.sh"
+
 # Parse SSH host file into an array of hostnames/IPs
 # Usage:
 #   mapfile -t my_hosts < <(parse_ssh_host_file "/path/to/hostfile")
@@ -872,6 +876,12 @@ ensure_all_ssh_nodes_can_elbencho() {
 
     if ! copy_a_file_over_ssh "$status_dir" "$ELBENCHO" "$cmd"; then
         echo "Error: Failed to copy elbencho to all nodes" >&2
+        rm -rf "$status_dir"
+        return 1
+    fi
+
+    if ! copy_a_file_over_ssh "$status_dir" "${SCALE_TEST_BASE}/lib/_platform_functions.sh" "cp /dev/stdin _platform_functions.sh"; then
+        echo "Error: Failed to copy platform functions library to all nodes" >&2
         rm -rf "$status_dir"
         return 1
     fi
@@ -3382,8 +3392,8 @@ _elbencho_path_under_or_equal_test_root() {
     local user_path="$1"
     local base_path="$2"
     local rp_user rp_base
-    rp_user=$(realpath -m "$user_path") || return 1
-    rp_base=$(realpath -m "$base_path") || return 1
+    rp_user=$(_portable_realpath_m "$user_path") || return 1
+    rp_base=$(_portable_realpath_m "$base_path") || return 1
     [[ "$rp_user" == "$rp_base" ]] || [[ "$rp_user" == "$rp_base"/* ]]
 }
 
@@ -3393,8 +3403,8 @@ _elbencho_path_strict_subdir_of_test_root() {
     local user_path="$1"
     local base_path="$2"
     local rp_user rp_base
-    rp_user=$(realpath -m "$user_path") || return 1
-    rp_base=$(realpath -m "$base_path") || return 1
+    rp_user=$(_portable_realpath_m "$user_path") || return 1
+    rp_base=$(_portable_realpath_m "$base_path") || return 1
     [[ "$rp_user" == "$rp_base"/* ]]
 }
 
@@ -3596,7 +3606,7 @@ start_elbencho_services_srun() {
 
 # Check elbencho services are responding on all SLURM nodes via HTTP /status.
 # The first probe is immediate. Failed probes retry within one overall deadline;
-# timeout bounds each srun to the remaining time so one stuck step cannot hang.
+# GNU timeout bounds each srun to the remaining time so one stuck step cannot hang.
 # Usage: check_elbencho_services_srun [port [max_wait]]
 #   port     - Port number to check (default: 1611)
 #   max_wait - Overall probe deadline in seconds (default: 60)
@@ -3612,12 +3622,15 @@ check_elbencho_services_srun() {
     local srun_rc=0
     local ok_count=0
     local fail_count=0
+    local check_output_file
 
     if [[ ! "$max_wait" =~ ^[1-9][0-9]*$ ]]; then
         echo "Error: elbencho service max_wait must be a positive integer: $max_wait" >&2
         return 2
     fi
     deadline=$((started + max_wait))
+    check_output_file=$(mktemp "${TMPDIR:-/tmp}/storage-scale-test-health.XXXXXX") \
+        || return 1
 
     while [[ $SECONDS -lt $deadline ]]; do
         attempt=$((attempt + 1))
@@ -3626,25 +3639,29 @@ check_elbencho_services_srun() {
         # Run HTTP /status check on each node
         # Only capture our [OK]/[FAIL] messages, suppress bash errors and srun noise
         # shellcheck disable=SC2016  # Single quotes intentional for remote execution
-        check_output=$(timeout --signal=TERM --kill-after=2s "${remaining}s" \
-            srun --overlap --ntasks="$SLURM_JOB_NUM_NODES" --ntasks-per-node=1 \
-                bash -c '
-                    port="$1"
-                    response=$(
-                        exec 3<>/dev/tcp/127.0.0.1/"$port" 2>/dev/null && \
-                        echo -e "GET /status HTTP/1.0\r\nHost: 127.0.0.1:$port\r\n\r\n" >&3 && \
-                        cat <&3 2>/dev/null
-                        exec 3>&- 2>/dev/null
-                    ) 2>/dev/null
-                    if [[ "$response" == *"200"* ]]; then
-                        echo "[OK] $(hostname)"
-                        exit 0
-                    else
-                        echo "[FAIL] $(hostname)"
-                        exit 1
-                    fi
-                ' bash "$port" </dev/null 2>/dev/null)
-        srun_rc=$?
+        if _run_command_with_timeout "$remaining" \
+                srun --overlap --ntasks="$SLURM_JOB_NUM_NODES" \
+                    --ntasks-per-node=1 bash -c '
+                        port="$1"
+                        response=$(
+                            exec 3<>/dev/tcp/127.0.0.1/"$port" 2>/dev/null && \
+                            echo -e "GET /status HTTP/1.0\r\nHost: 127.0.0.1:$port\r\n\r\n" >&3 && \
+                            cat <&3 2>/dev/null
+                            exec 3>&- 2>/dev/null
+                        ) 2>/dev/null
+                        if [[ "$response" == *"200"* ]]; then
+                            echo "[OK] $(hostname)"
+                            exit 0
+                        else
+                            echo "[FAIL] $(hostname)"
+                            exit 1
+                        fi
+                    ' bash "$port" </dev/null >"$check_output_file" 2>/dev/null; then
+            srun_rc=0
+        else
+            srun_rc=$?
+        fi
+        check_output=$(<"$check_output_file")
 
         ok_count=$(echo "$check_output" | grep -c '^\[OK\]' || true)
         fail_count=$(echo "$check_output" | grep -c '^\[FAIL\]' || true)
@@ -3652,11 +3669,14 @@ check_elbencho_services_srun() {
             if [[ "$ok_count" -ge "$SLURM_JOB_NUM_NODES" ]]; then
                 local elapsed=$((SECONDS - started))
                 _echo_ts "elbencho services ready on port $port after ${elapsed}s ($ok_count/$SLURM_JOB_NUM_NODES nodes)"
+                rm -f -- "$check_output_file"
                 return 0
             fi
             echo "Warning: srun OK but only $ok_count/$SLURM_JOB_NUM_NODES nodes responded (port $port, attempt $attempt, ${max_wait}s deadline)"
-        # GNU timeout returns 124; some implementations return 125 with --kill-after.
-        elif [[ $srun_rc -eq 124 || $srun_rc -eq 125 || $srun_rc -eq 137 ]]; then
+        # GNU timeout returns 124; retain the defensive handling for a process
+        # killed while enforcing the deadline.
+        elif [[ $srun_rc -eq 124 || $srun_rc -eq 125 || $srun_rc -eq 137 ]] \
+             || [[ $SECONDS -ge $deadline ]]; then
             echo "Warning: elbencho service probe reached its ${max_wait}s deadline (port $port, attempt $attempt)" >&2
         fi
 
@@ -3678,6 +3698,7 @@ check_elbencho_services_srun() {
         echo "Port $port: $ok_count OK, $fail_count FAILED (final attempt $attempt): $failed_nodes"
     fi
     echo "Error: elbencho services not responding on port $port after ${max_wait}s" >&2
+    rm -f -- "$check_output_file"
     return 1
 }
 

@@ -60,14 +60,17 @@ See the README "Getting Started" section for the full quickstart and
 ## Checks (run before committing)
 
 ```bash
-pytest                                                   # Python unit tests
-shellcheck $(find . -name '*.sh' -not -path '*/tmp/*')   # all shell scripts
-black file1.py file2.py && pylint -j 1 file1.py file2.py # changed Python files
+./utils/run_ci_checks.sh
 ```
 
 If any required check tool is missing from the sandbox, install it into the
 repo's local environment and rerun the check. Do not skip required tooling just
 because it is not preinstalled.
+
+The script creates and reuses `.venv-ci` with the pinned tools. Pass
+`compliance`, `shellcheck`, `black`, `pylint`, or `pytest` to run one check. In
+a pre-provisioned, network-restricted sandbox, set `CI_BOOTSTRAP=0` and use
+`CI_PYTHON` or `CI_SHELLCHECK` to select installed tools.
 
 `black` must be 25.9.0+; `pylint` must score 10.00/10. Details and rationale:
 [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md).

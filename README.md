@@ -30,10 +30,13 @@ recommended.
 
 ## Global Prerequisites
 
-* Linux on the orchestration host and on every client. The tooling relies on
-  bash 4.3 or newer (for associative-array features) and on GNU coreutils —
-  specifically `realpath -m` and `stat -c`, which the BSD userland on macOS does
-  not provide. macOS is not a supported platform for running tests.
+* Linux on the orchestration host and on every client. Benchmark execution
+  relies on bash 4.3 or newer and a Linux userland. macOS can run static checks
+  and unit tests that do not require benchmark binaries, but it cannot run the
+  storage benchmarks. In particular, elbencho is not available for Apple
+  silicon; binary-dependent tests are skipped when it is unavailable. Running
+  the developer unit tests on macOS requires a newer Bash and GNU coreutils,
+  which can be installed with `brew install bash coreutils`.
 * Python 3.12 or newer is required on the host that runs the analysis and
   reporting wrappers. The pinned current NumPy release establishes this minimum.
 * Clients must be available through Slurm or passwordless SSH. For Slurm,
