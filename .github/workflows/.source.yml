@@ -17,6 +17,17 @@ name: Source checks
 
 on:
   workflow_call:
+    inputs:
+      python-version:
+        description: Python version used for unit tests
+        required: false
+        type: string
+        default: "3.12"
+      run-lint:
+        description: Run the repository lint checks
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -29,10 +40,11 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  compliance:
-    name: License headers
+  lint:
+    name: Lint
+    if: ${{ inputs.run-lint }}
     runs-on: linux-amd64-cpu4
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -42,105 +54,50 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
-      - name: Check license headers
+      - name: Configure the package proxy
+        uses: nv-gha-runners/setup-proxy-cache@eadc57871cde0c92a223d0f486ab669a2360f978 # main
+        with:
+          enable-pip: "true"
+          enable-conda: "false"
+          enable-pypi-anaconda: "false"
+      - name: Install lint dependencies
+        run: >-
+          python -m pip install --no-compile
+          -c requirements-ci.txt
+          black pylint shellcheck-py
+      - name: Run lint checks
         env:
           CI_BOOTSTRAP: "0"
-        run: ./utils/run_ci_checks.sh compliance
-
-  shellcheck:
-    name: ShellCheck
-    runs-on: linux-amd64-cpu4
-    timeout-minutes: 10
-    steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-      - name: Set up Python and restore the pip cache
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: requirements-ci.txt
-      - name: Install ShellCheck
-        run: python -m pip install --no-compile -c requirements-ci.txt shellcheck-py
-      - name: Check shell scripts
-        env:
-          CI_BOOTSTRAP: "0"
-        run: ./utils/run_ci_checks.sh shellcheck
-
-  black:
-    name: Black
-    runs-on: linux-amd64-cpu4
-    timeout-minutes: 10
-    steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-      - name: Set up Python and restore the pip cache
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: requirements-ci.txt
-      - name: Install Black
-        run: python -m pip install --no-compile -c requirements-ci.txt black
-      - name: Check Python formatting
-        env:
-          CI_BOOTSTRAP: "0"
-        run: ./utils/run_ci_checks.sh black
-
-  pylint:
-    name: Pylint
-    runs-on: linux-amd64-cpu4
-    timeout-minutes: 10
-    steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-      - name: Set up Python and restore the pip cache
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: requirements-ci.txt
-      - name: Install Pylint
-        run: python -m pip install --no-compile -c requirements-ci.txt pylint
-      - name: Lint Python
-        env:
-          CI_BOOTSTRAP: "0"
-        run: ./utils/run_ci_checks.sh pylint
+          CI_CHECK_JOBS: "4"
+        run: ./utils/run_ci_checks.sh lint
 
   pytest:
-    name: Pytest (Python ${{ matrix.python-version }})
+    name: Pytest (Python ${{ inputs.python-version }})
     runs-on: linux-amd64-cpu4
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.12", "3.13", "3.14"]
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - name: Set up Python and restore the pip cache
+      - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-ci.txt
+          python-version: ${{ inputs.python-version }}
+      - name: Configure the package proxy
+        uses: nv-gha-runners/setup-proxy-cache@eadc57871cde0c92a223d0f486ab669a2360f978 # main
+        with:
+          enable-pip: "true"
+          enable-conda: "false"
+          enable-pypi-anaconda: "false"
       - name: Install test dependencies
         run: >-
           python -m pip install --no-compile
           -c requirements-ci.txt
           -r requirements.txt
-          pytest
+          pytest pytest-xdist
       - name: Run unit tests
         env:
           CI_BOOTSTRAP: "0"
+          CI_CHECK_JOBS: "4"
         run: ./utils/run_ci_checks.sh pytest

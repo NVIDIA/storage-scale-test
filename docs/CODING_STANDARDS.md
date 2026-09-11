@@ -32,9 +32,15 @@ Run the same validation commands used by CI from the repository root:
 
 The script works on Linux and macOS, creates and reuses `.venv-ci`, and installs
 the exact versions in `requirements.txt` and `requirements-ci.txt`. Pass
-`compliance`, `shellcheck`, `black`, `pylint`, or `pytest` to run one check.
-It uses `uv` when already installed and otherwise uses Python's standard
-`venv`. For a sandbox with preinstalled tools but no package-index access, set
+`lint` to run all static checks, or pass `compliance`, `shellcheck`, `black`,
+`pylint`, or `pytest` to run one check. The lint target runs its four checks
+concurrently, buffers each check's diagnostics, and reports every result. Set
+`CI_CHECK_JOBS` to control total concurrency; local runs default to the host's
+logical CPU count. The default `all` target runs lint and pytest concurrently,
+buffers their output separately, and splits that CPU budget between them.
+Pytest uses `pytest-xdist` to distribute tests across its assigned workers. The
+script uses `uv` when already installed and otherwise uses Python's standard `venv`.
+For a sandbox with preinstalled tools but no package-index access, set
 `CI_BOOTSTRAP=0`; `CI_PYTHON` and `CI_SHELLCHECK` can select the executables.
 On macOS, unit tests require Bash 4.3 or newer and GNU coreutils; install both
 with `brew install bash coreutils` and put Homebrew's bin directory first on
@@ -93,8 +99,8 @@ literal duplicates an existing one.
    exactly `C0200`, `C0411`, `R0801`, and `R1704`; all other C/R checks are
    disabled by category. For `R0801`, move reusable production helpers into
    `lib/` and repeated test infrastructure into a shared test helper.
-4. Run combined: `black file1.py file2.py && pylint -j 1 file1.py file2.py`
-   (`-j 1` avoids parallel pylint, which often fails in sandboxes).
+4. Run combined checks with `./utils/run_ci_checks.sh lint`. In a constrained
+   sandbox, set `CI_CHECK_JOBS=1` to disable parallel execution.
 5. Prefer the alternate quote character inside f-string expressions when it
    improves readability; Python 3.12 supports either form.
 6. Run analysis scripts via their shell wrappers (e.g. `utils/extract-elbencho.sh`),

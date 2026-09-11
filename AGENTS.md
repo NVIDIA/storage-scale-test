@@ -68,9 +68,10 @@ repo's local environment and rerun the check. Do not skip required tooling just
 because it is not preinstalled.
 
 The script creates and reuses `.venv-ci` with the pinned tools. Pass
-`compliance`, `shellcheck`, `black`, `pylint`, or `pytest` to run one check. In
-a pre-provisioned, network-restricted sandbox, set `CI_BOOTSTRAP=0` and use
-`CI_PYTHON` or `CI_SHELLCHECK` to select installed tools.
+`lint` to run all static checks, or pass `compliance`, `shellcheck`, `black`,
+`pylint`, or `pytest` to run one check. Set `CI_CHECK_JOBS=1` in a constrained
+sandbox. In a pre-provisioned, network-restricted sandbox, set `CI_BOOTSTRAP=0`
+and use `CI_PYTHON` or `CI_SHELLCHECK` to select installed tools.
 
 `black` must be 25.9.0+; `pylint` must score 10.00/10. Details and rationale:
 [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md).
