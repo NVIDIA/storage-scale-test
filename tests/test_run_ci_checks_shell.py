@@ -98,6 +98,7 @@ class TestRunCiChecksShell(unittest.TestCase):
                     "CI_PYTHON": str(fake_python),
                     "CI_SHELLCHECK": str(fake_shellcheck),
                     "FAIL_CHECK": fail_check,
+                    "GITHUB_ACTIONS": "false",
                     "GITHUB_STEP_SUMMARY": str(summary),
                 }
             )
