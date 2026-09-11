@@ -717,15 +717,19 @@ checks for pull requests and pushes to `main`:
 | Check | Command |
 |-------|---------|
 | All local gates | `./utils/run_ci_checks.sh` |
+| Concurrent static checks | `./utils/run_ci_checks.sh lint` |
 | License compliance | `./utils/run_ci_checks.sh compliance` |
-| Python unit tests | `./utils/run_ci_checks.sh pytest` (Python 3.12–3.14 in CI) |
+| Python unit tests | `./utils/run_ci_checks.sh pytest` |
 | Shell static analysis | `./utils/run_ci_checks.sh shellcheck` |
 | Python formatting | `./utils/run_ci_checks.sh black` |
 | Python lint | `./utils/run_ci_checks.sh pylint` |
 
-The independent gates run concurrently and use dependency caches keyed by the
-pinned requirements files. CI does not publish benchmark binaries or deployment
-tarballs; packaging is performed by users with
+For pull requests and `main`, CI runs the static checks concurrently in one job
+and runs `pytest-xdist` unit tests on the minimum supported Python version
+(3.12) in another. Local full checks run those two phases concurrently and
+buffer their output separately. A weekly and manually dispatchable workflow
+tests Python 3.14 compatibility. CI does not publish benchmark binaries or
+deployment tarballs; packaging is performed by users with
 `utils/build_tarball.sh` after they have provided, helper-downloaded, or
 helper-built the binaries needed for their tests.
 

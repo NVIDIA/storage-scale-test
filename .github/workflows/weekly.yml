@@ -13,9 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Keep CI tooling reproducible. Runtime dependencies remain in requirements.txt.
-black==26.5.1
-pylint==4.0.8
-pytest==9.1.1
-pytest-xdist==3.8.0
-shellcheck-py==0.11.0.1
+name: Weekly compatibility
+
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  source:
+    name: Python 3.14
+    permissions:
+      contents: read
+    uses: ./.github/workflows/.source.yml
+    with:
+      python-version: "3.14"
+      run-lint: false

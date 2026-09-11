@@ -56,8 +56,9 @@ and are responsible for every binary they place in it.
 
 Slurm is the default execution substrate. Setting `SSH_HOST_LIST` selects
 passwordless SSH instead. Kubernetes execution is not implemented.
-GitHub Actions runs compliance, ShellCheck, Black, Pylint, and pytest for pull
-requests and pushes to `main`.
+GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
+alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
+3.14 unit tests run weekly and on manual request.
 
 ## Repository map
 
@@ -496,6 +497,13 @@ Run the repository checks from the root:
 ```bash
 ./utils/run_ci_checks.sh
 ```
+
+The `lint` target runs the four static checks concurrently by default, buffers
+their output, and reports all failures. `CI_CHECK_JOBS` controls the shared
+concurrency budget. Local `all` runs divide the host's logical CPUs between the
+lint checks and pytest, with pytest distributing tests through `pytest-xdist`.
+Pull-request and `main` CI explicitly use four workers to match the runner CPU
+count.
 
 After Python changes, run Black 25.9.0 or newer and Pylint. `.pylintrc` is the
 canonical configuration and the required score is 10.00/10. It gates Pylint's
