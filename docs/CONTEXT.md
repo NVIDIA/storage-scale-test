@@ -94,6 +94,9 @@ sizing, scheduler boundaries, failure contracts, and reporting. CI runs the full
 NFS-backed catalog concurrently on amd64 and arm64 with repeatable-teardown
 headroom; SBX is a supported local backend.
 
+The proposed kubectl addition to filesystem-sweep design is documented in
+[plans/kubernetes-elbencho-filesystem-sweep.md](plans/kubernetes-elbencho-filesystem-sweep.md).
+
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 3.14 unit tests run weekly and on manual request.
