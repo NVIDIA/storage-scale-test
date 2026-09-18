@@ -76,6 +76,24 @@ state directory's `test-runs/` directory. The test also requires successful
 execution records, nonempty benchmark output, environment snapshots, and
 cleanup of its generated data directories.
 
+## On-demand CI
+
+The `Filesystem integration` GitHub Actions workflow runs setup followed by
+`test all` and always attempts a disposable stop. It is deliberately absent
+from ordinary pull-request and default-branch events.
+
+For a pull request, use the repository's existing PR authorization control—the
+same control used to start the regular PR checks. Authorization copies the
+reviewed PR commit to the trusted `pull-request/<PR-number>` branch. A push to
+that narrowly matched branch starts the integration workflow. Updating a PR
+requires authorizing its new head before a new integration run can start. An
+existing run can instead be repeated with **Re-run jobs** in GitHub Actions.
+
+Before this workflow file is present on the default branch, that authorized PR
+branch is the way to run it. After the workflow is merged, a maintainer can also
+open **Actions**, choose **Filesystem integration**, select **Run workflow**,
+and choose an authorized branch or the default branch.
+
 Delete the disposable kind cluster and, when owned exclusively by the harness,
 stop NFS with:
 
