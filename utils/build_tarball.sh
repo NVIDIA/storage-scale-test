@@ -288,20 +288,48 @@ check_s3test_binaries() {
 # Command-line argument processing
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--force-download] [--help | -h]
+Usage: $(basename "$0") [--force-download] [--arch ARCH] [--skip-object-tools]
+       $(basename "$0") [--help | -h]
 
 Options:
   --force-download   Force (re-)download of the elbencho binaries, even if present.
+  --arch ARCH        Include elbencho for x86_64, aarch64, or all (default: all).
+  --skip-object-tools
+                     Skip Warp checks and s3test builds for filesystem-only use.
   -h, --help         Display this help message and exit.
 EOF
 }
 
 force_download=false
+selected_arch=all
+skip_object_tools=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --force-download)
             force_download=true
+            shift
+            ;;
+        --arch)
+            if [[ $# -lt 2 ]]; then
+                echo "Missing value for --arch" >&2
+                usage >&2
+                exit 1
+            fi
+            case "$2" in
+                x86_64|aarch64|all)
+                    selected_arch="$2"
+                    ;;
+                *)
+                    echo "Unsupported architecture: $2" >&2
+                    usage >&2
+                    exit 1
+                    ;;
+            esac
+            shift 2
+            ;;
+        --skip-object-tools)
+            skip_object_tools=true
             shift
             ;;
         -h|--help)
@@ -320,24 +348,31 @@ echo "Creating deployment tarball..."
 
 # Build list of elbencho binaries to download/extract. Format per entry:
 #   arch|output_path|display_name
-declare -a binaries_to_download=(
-    "x86_64|${UTILS_DIR}/elbencho|elbencho amd64"
-    "aarch64|${UTILS_DIR}/elbencho.aarch64|elbencho arm64"
-)
+declare -a binaries_to_download=()
+if [[ "${selected_arch}" == x86_64 || "${selected_arch}" == all ]]; then
+    binaries_to_download+=("x86_64|${UTILS_DIR}/elbencho|elbencho amd64")
+fi
+if [[ "${selected_arch}" == aarch64 || "${selected_arch}" == all ]]; then
+    binaries_to_download+=("aarch64|${UTILS_DIR}/elbencho.aarch64|elbencho arm64")
+fi
 
 # Refuse to produce a deployment tarball until the pinned upstream checksums have
 # been filled in. This prevents placeholder values from degrading into the
 # historical warn-and-continue download behavior below.
 validate_elbencho_checksum_configuration || exit 1
 
-# Warp binaries are user-built from OSS source when object storage testing is needed.
-# Warn if either architecture is missing, but keep building the tarball.
-check_warp_binaries
+if [[ "${skip_object_tools}" == false ]]; then
+    # Warp binaries are user-built from OSS source when object storage testing is needed.
+    # Warn if either architecture is missing, but keep building the tarball.
+    check_warp_binaries
 
-# Build s3test from in-tree source when the binaries are missing or stale.
-# If one architecture cannot be built, keep creating the tarball but warn that
-# object storage testing will not work for that architecture.
-check_s3test_binaries ||:
+    # Build s3test from in-tree source when the binaries are missing or stale.
+    # If one architecture cannot be built, keep creating the tarball but warn that
+    # object storage testing will not work for that architecture.
+    check_s3test_binaries ||:
+else
+    echo "Skipping object-storage tool checks for filesystem-only packaging."
+fi
 
 # Download all selected files concurrently.
 echo "Downloading required files..."
