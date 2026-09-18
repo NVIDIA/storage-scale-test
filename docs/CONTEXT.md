@@ -56,6 +56,10 @@ and are responsible for every binary they place in it.
 
 Slurm is the default execution substrate. Setting `SSH_HOST_LIST` selects
 passwordless SSH instead. Kubernetes execution is not implemented.
+The separate `integration-tests/` fixture provisions a three-node kind cluster,
+NFS CSI storage, two passwordless-SSH workers, and a Slinky Slurm environment
+on one Linux host. It validates infrastructure for future regression tests; it
+does not add Kubernetes dispatch to the benchmark entry points.
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 3.14 unit tests run weekly and on manual request.
@@ -79,6 +83,8 @@ alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 | `utils/build_tarball.sh` | User-local deployment-tarball builder |
 | `utils/build/` | Helpers for building Warp and the in-tree s3test program |
 | `tests/` | Python and shell-behavior regression tests collected by `pytest` |
+| `integration-tests/` | Single-host kind, NFS CSI, SSH, and Slinky fixture provisioner and manifests |
+| `docs/research/` | Feasibility studies and implementation handoffs for future integration work |
 
 The checked-in benchmark entry points are:
 
