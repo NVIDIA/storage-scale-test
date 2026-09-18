@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shlex
 import shutil
 import tarfile
@@ -72,6 +73,7 @@ class Fixture:
     login_container: str
     ssh_addresses: tuple[str, str]
     slurm_nodes: tuple[str, str]
+    slurm_addresses: tuple[str, str]
     architecture: str
     ssh_home_mode: str
 
@@ -153,6 +155,9 @@ def _load_state(config: Any) -> dict[str, Any]:
         "cluster_name": config.cluster_name,
         "namespace": config.namespace,
         "export_dir": str(config.export_dir),
+        "test_user": config.test_user,
+        "test_uid": config.test_uid,
+        "test_gid": config.test_gid,
     }
     mismatches = [
         f"{name}={state.get(name)!r} (expected {value!r})"
@@ -334,11 +339,26 @@ def _require_fixture(runner: Any, config: Any) -> Fixture:
         raise IntegrationTestError(
             f"expected two Slurm compute nodes; found {slurm_nodes}"
         )
+    slurm_address_output = _probe_pod(
+        runner,
+        config,
+        login_name,
+        "login",
+        "for node in "
+        + " ".join(shlex.quote(node) for node in slurm_nodes)
+        + "; do getent ahostsv4 \"$node\" | awk 'NR == 1 {print $1}'; done",
+    )
+    slurm_addresses = tuple(line for line in slurm_address_output.splitlines() if line)
+    if len(slurm_addresses) != 2 or len(set(slurm_addresses)) != 2:
+        raise IntegrationTestError(
+            f"Slurm workers lack distinct IPv4 addresses: {slurm_addresses}"
+        )
     return Fixture(
         login_pod=login_name,
         login_container="login",
         ssh_addresses=(addresses[0], addresses[1]),
         slurm_nodes=(slurm_nodes[0], slurm_nodes[1]),
+        slurm_addresses=(slurm_addresses[0], slurm_addresses[1]),
         architecture=host_arch,
         ssh_home_mode=str(state["ssh_home_mode"]),
     )
@@ -877,7 +897,7 @@ def _assert_results(
     selector: str,
     remote_root: str,
     log_dir: Path,
-) -> None:
+) -> str:
     """Assert the two execution records and bounded-data cleanup."""
     results = f"{remote_root}/results"
     discover = (
@@ -933,6 +953,14 @@ for id in 0001 0002; do
     test -s "$result/executions/$id.log"
     test -s "$result/executions/$id.workload.tsv"
 done
+grep -qx $'nodes\t1' "$result/executions/0001.workload.tsv"
+grep -qx $'nodes\t2' "$result/executions/0002.workload.tsv"
+grep -qx $'dataset_files_total\t1' "$result/executions/0001.workload.tsv"
+grep -qx $'dataset_files_total\t2' "$result/executions/0002.workload.tsv"
+grep -qx $'dataset_bytes_total\t4096' "$result/executions/0001.workload.tsv"
+grep -qx $'dataset_bytes_total\t8192' "$result/executions/0002.workload.tsv"
+grep -qx $'completion_state\tcompleted' "$result/executions/0001.workload.tsv"
+grep -qx $'completion_state\tcompleted' "$result/executions/0002.workload.tsv"
 test "$(find "$result" -type f -name '*.csv' -size +0c | wc -l)" -ge 2
 test "$(find "$result" -type f -name '*.out' -size +0c | wc -l)" -ge 2
 {cleanup_probe}
@@ -947,6 +975,92 @@ test "$(find "$result" -type f -name '*.out' -size +0c | wc -l)" -ge 2
         log_dir,
         60,
     )
+    return result_dir
+
+
+def _assert_ordered_workers(fixture: Fixture, selector: str, sweep_output: str) -> None:
+    """Prove increasing cells use the configured workers in prefix order."""
+    workers = fixture.ssh_addresses if selector == "ssh" else fixture.slurm_addresses
+    expected = {
+        "1": workers[0],
+        "2": ",".join(workers),
+    }
+    selected: dict[str, str] = {}
+    for line in sweep_output.splitlines():
+        match = re.search(r"starting execution \d+:.*nodes=(\d+).*hosts=([^ ]+)", line)
+        if match:
+            selected[match.group(1)] = match.group(2)
+    if selected != expected:
+        raise IntegrationTestError(
+            f"{selector} ordered worker selection was {selected!r}; "
+            f"expected {expected!r}"
+        )
+
+
+def _copy_result_for_reporting(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    selector: str,
+    result_dir: str,
+    destination: Path,
+) -> Path:
+    """Bring one completed result tree to the host for report validation."""
+    destination.mkdir(parents=True)
+    if selector == "ssh":
+        shutil.copytree(result_dir, destination / Path(result_dir).name)
+    else:
+        runner.run(
+            [
+                *_kubectl(config, "-n", config.namespace, "cp"),
+                "-c",
+                fixture.login_container,
+                f"{fixture.login_pod}:{result_dir}",
+                destination / Path(result_dir).name,
+            ],
+            timeout=120,
+        )
+    return destination / Path(result_dir).name
+
+
+def _assert_report(
+    runner: Any,
+    report_workspace: Path,
+    result_dir: Path,
+    selector: str,
+    log_dir: Path,
+) -> None:
+    """Run the supported report wrapper and verify both sweep sizes appear."""
+    result = runner.run(
+        [
+            report_workspace / "utils" / "extract-elbencho.sh",
+            "--markdown",
+            result_dir,
+        ],
+        cwd=report_workspace,
+        timeout=600,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    report_log = log_dir / f"{selector}-extract-elbencho.log"
+    report_log.write_text(output, encoding="utf-8")
+    report_log.chmod(0o640)
+    if result.returncode:
+        raise IntegrationTestError(
+            f"{selector} result reporting failed with exit code {result.returncode}; "
+            f"full output: {report_log}\n{output.strip()[-8000:]}"
+        )
+    missing = []
+    if "| Nodes" not in output:
+        missing.append("Nodes header")
+    for node_count in (1, 2):
+        if not re.search(rf"^\|\s*{node_count}\s*\|", output, re.MULTILINE):
+            missing.append(f"{node_count}-node row")
+    if missing:
+        raise IntegrationTestError(
+            f"{selector} report omitted expected node-count rows {missing}; "
+            f"full output: {report_log}"
+        )
 
 
 def _run_substrate(
@@ -957,6 +1071,7 @@ def _run_substrate(
     archive: Path,
     extracted: Path,
     build_root: Path,
+    report_workspace: Path,
     log_dir: Path,
 ) -> None:
     """Stage, validate, run, and inspect one filesystem substrate."""
@@ -985,7 +1100,7 @@ def _run_substrate(
             f"{selector} validate_env.sh omitted its success marker"
         )
     sweep = prefix + "./storage-tests/fs/nv-elbencho-sweep.sh -b --nodes 1,2"
-    _run_step(
+    sweep_output = _run_step(
         runner,
         config,
         fixture,
@@ -995,7 +1110,19 @@ def _run_substrate(
         log_dir,
         600,
     )
-    _assert_results(runner, config, fixture, selector, remote_root, log_dir)
+    _assert_ordered_workers(fixture, selector, sweep_output)
+    result_dir = _assert_results(
+        runner, config, fixture, selector, remote_root, log_dir
+    )
+    local_result = _copy_result_for_reporting(
+        runner,
+        config,
+        fixture,
+        selector,
+        result_dir,
+        build_root / f"{selector}-report-input",
+    )
+    _assert_report(runner, report_workspace, local_result, selector, log_dir)
 
 
 def _selected_tests(selectors: list[str]) -> tuple[str, ...]:
@@ -1045,6 +1172,15 @@ def run_filesystem_tests(
             fixture.architecture,
         )
         shutil.copy2(build_root / "build-tarball.log", log_dir / "build-tarball.log")
+        report_workspace = build_root / "report-workspace"
+        shutil.copytree(extracted, report_workspace)
+        _write_runtime_files(
+            report_workspace,
+            "ssh",
+            str(report_workspace),
+            fixture,
+            template=extracted / "env.sh.template",
+        )
         for selector in selected:
             _run_substrate(
                 runner,
@@ -1054,6 +1190,7 @@ def run_filesystem_tests(
                 archive,
                 extracted,
                 build_root,
+                report_workspace,
                 log_dir,
             )
     LOG.info("Filesystem integration tests passed: %s", ", ".join(selected))

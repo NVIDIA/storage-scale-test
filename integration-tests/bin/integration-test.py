@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import platform
+import pwd
 import secrets
 import shlex
 import shutil
@@ -75,6 +76,11 @@ NFS_IMAGE_BYTES = 128 * 1024 * 1024
 GIB = 1024**3
 DEFAULT_STATE_DIR = Path("/var/lib/storage-scale-test-integration")
 DEFAULT_EXPORT_DIR = Path("/srv/storage-scale-test-integration")
+NFS_EXPORT_CONFIG = Path("/etc/exports.d/storage-scale-test-integration.exports")
+NFS_DAEMON_CONFIG = Path("/etc/nfs.conf.d/storage-scale-test-integration.conf")
+EXPORT_MARKER = ".storage-scale-test-integration.json"
+STATE_MARKER = "state-owner.json"
+UFW_COMMENT = "storage-scale-test integration NFSv4"
 LOG = logging.getLogger("storage-scale-integration")
 
 CSI_IMAGES = (
@@ -99,6 +105,9 @@ class Config:
     state_dir: Path
     export_dir: Path
     ssh_home_mode: str
+    test_user: str
+    test_uid: int
+    test_gid: int
     verbose: bool
 
     @property
@@ -201,6 +210,7 @@ def _sudo_prefix() -> list[str]:
 
 def _bootstrap_state_dir(config: Config) -> None:
     """Create the operator-owned state directory before file logging."""
+    create_marker = not config.state_dir.exists()
     command = [
         *_sudo_prefix(),
         "install",
@@ -208,9 +218,9 @@ def _bootstrap_state_dir(config: Config) -> None:
         "-m",
         "0750",
         "-o",
-        f"+{os.getuid()}",
+        f"+{config.test_uid}",
         "-g",
-        f"+{os.getgid()}",
+        f"+{config.test_gid}",
         config.state_dir,
         config.manifests_dir,
         config.keys_dir,
@@ -220,6 +230,15 @@ def _bootstrap_state_dir(config: Config) -> None:
     if result.returncode:
         raise ProvisionError(
             f"cannot create state directory {config.state_dir}: {result.stderr.strip()}"
+        )
+    if create_marker:
+        _write_text(
+            config.state_dir / STATE_MARKER,
+            json.dumps(
+                {"schema": STATE_SCHEMA, "cluster_name": config.cluster_name},
+                sort_keys=True,
+            )
+            + "\n",
         )
 
 
@@ -707,7 +726,7 @@ def _kind_ipv4_network(runner: Runner) -> tuple[str, str]:
 
 def _ensure_export_marker(runner: Runner, config: Config) -> None:
     """Create or validate ownership of the dedicated host export."""
-    marker_path = config.export_dir / ".storage-scale-test-integration.json"
+    marker_path = config.export_dir / EXPORT_MARKER
     expected = json.dumps(
         {"schema": STATE_SCHEMA, "cluster_name": config.cluster_name}, sort_keys=True
     )
@@ -849,7 +868,7 @@ def _configure_nfs(runner: Runner, config: Config, subnet: str, gateway: str) ->
             "-m",
             "0644",
             export_source,
-            "/etc/exports.d/storage-scale-test-integration.exports",
+            NFS_EXPORT_CONFIG,
         ]
     )
     runner.run(
@@ -859,10 +878,10 @@ def _configure_nfs(runner: Runner, config: Config, subnet: str, gateway: str) ->
             "-m",
             "0644",
             nfs_source,
-            "/etc/nfs.conf.d/storage-scale-test-integration.conf",
+            NFS_DAEMON_CONFIG,
         ]
     )
-    _ensure_nfs_firewall(runner, subnet)
+    _ensure_nfs_firewall(runner, config, subnet)
     runner.run([*_sudo_prefix(), "exportfs", "-rav"])
     runner.run([*_sudo_prefix(), "systemctl", "enable", "--now", "nfs-server"])
     state = {"subnet": subnet, "gateway": gateway}
@@ -883,19 +902,68 @@ def _record_nfs_service_state(runner: Runner, config: Config) -> None:
     _write_text(path, json.dumps({"started_by_harness": not active}) + "\n")
 
 
-def _ensure_nfs_firewall(runner: Runner, subnet: str) -> None:
+def _ensure_nfs_firewall(runner: Runner, config: Config, subnet: str) -> None:
     """Allow NFS only from kind when UFW is active."""
+    state_path = config.state_dir / "ufw-rule.json"
+    previous: dict[str, object] = {}
+    if state_path.exists():
+        previous = json.loads(state_path.read_text(encoding="utf-8"))
     if not shutil.which("ufw"):
         LOG.warning("ufw is absent; verify an equivalent TCP-2049 restriction")
         return
     status = runner.run([*_sudo_prefix(), "ufw", "status"], check=False)
     if not status.stdout.startswith("Status: active"):
         LOG.info("ufw is inactive; exportfs remains restricted to %s", subnet)
+        if not state_path.exists():
+            _write_text(
+                state_path,
+                json.dumps({"added_by_harness": False, "subnet": subnet}) + "\n",
+            )
         return
+    if previous.get("added_by_harness") and previous.get("subnet") != subnet:
+        _delete_nfs_firewall_rule(runner, str(previous["subnet"]))
+        previous = {}
+        status = runner.run([*_sudo_prefix(), "ufw", "status"], check=False)
+    rule_exists = any(
+        subnet in line and UFW_COMMENT in line for line in status.stdout.splitlines()
+    )
+    added_by_harness = bool(previous.get("added_by_harness"))
+    if rule_exists:
+        LOG.info("The dedicated UFW NFS rule is already present")
+    else:
+        runner.run(
+            [
+                *_sudo_prefix(),
+                "ufw",
+                "allow",
+                "from",
+                subnet,
+                "to",
+                "any",
+                "port",
+                "2049",
+                "proto",
+                "tcp",
+                "comment",
+                UFW_COMMENT,
+            ]
+        )
+        added_by_harness = True
+    _write_text(
+        state_path,
+        json.dumps({"added_by_harness": added_by_harness, "subnet": subnet}) + "\n",
+    )
+
+
+def _delete_nfs_firewall_rule(
+    runner: Runner, subnet: str, *, check: bool = False
+) -> None:
+    """Delete the exact UFW rule installed by this harness."""
     runner.run(
         [
             *_sudo_prefix(),
             "ufw",
+            "delete",
             "allow",
             "from",
             subnet,
@@ -906,8 +974,9 @@ def _ensure_nfs_firewall(runner: Runner, subnet: str) -> None:
             "proto",
             "tcp",
             "comment",
-            "storage-scale-test integration NFSv4",
-        ]
+            UFW_COMMENT,
+        ],
+        check=check,
     )
 
 
@@ -929,6 +998,36 @@ def _image_exists(runner: Runner, image: str) -> bool:
     return (
         runner.run(["docker", "image", "inspect", image], check=False).returncode == 0
     )
+
+
+def _image_id(runner: Runner, image: str) -> str | None:
+    """Return a local Docker image ID, or None when its tag is absent."""
+    result = runner.run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", image], check=False
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _record_image_build_start(runner: Runner, config: Config, image: str) -> None:
+    """Remember a fixed tag's original owner before the first local build."""
+    state_path = config.state_dir / "built-images.json"
+    state: dict[str, dict[str, str | None]] = {}
+    if state_path.exists():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    if image not in state:
+        state[image] = {"previous_id": _image_id(runner, image), "built_id": None}
+        _write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+def _record_image_build_complete(runner: Runner, config: Config, image: str) -> None:
+    """Record the exact image ID produced by a successful local build."""
+    state_path = config.state_dir / "built-images.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    built_id = _image_id(runner, image)
+    if built_id is None:
+        raise ProvisionError(f"Docker build did not produce expected image tag {image}")
+    state[image]["built_id"] = built_id
+    _write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
 def _prepare_csi_images(runner: Runner, config: Config) -> None:
@@ -1116,6 +1215,7 @@ def _ensure_file_secret(
 def _install_ssh_workers(runner: Runner, config: Config) -> None:
     """Build, deploy, and validate the two SSH workers."""
     private_key, public_key = _ensure_ssh_key(runner, config)
+    _record_image_build_start(runner, config, SSH_IMAGE)
     runner.run(
         [
             "docker",
@@ -1128,6 +1228,7 @@ def _install_ssh_workers(runner: Runner, config: Config) -> None:
         ],
         timeout=600,
     )
+    _record_image_build_complete(runner, config, SSH_IMAGE)
     nodes = _kind_containers(runner, config, running_only=True)
     _load_image_into_nodes(runner, SSH_IMAGE, nodes)
     _ensure_file_secret(
@@ -1374,6 +1475,7 @@ def _install_slurm(runner: Runner, config: Config) -> None:
 
 def _prepare_slinky_login_image(runner: Runner, config: Config) -> None:
     """Build and preload the login image with declared test prerequisites."""
+    _record_image_build_start(runner, config, SLINKY_LOGIN_IMAGE)
     runner.run(
         [
             "docker",
@@ -1388,6 +1490,7 @@ def _prepare_slinky_login_image(runner: Runner, config: Config) -> None:
         ],
         timeout=600,
     )
+    _record_image_build_complete(runner, config, SLINKY_LOGIN_IMAGE)
     _load_image_into_nodes(
         runner,
         SLINKY_LOGIN_IMAGE,
@@ -1686,6 +1789,9 @@ def _write_state_summary(config: Config, subnet: str, gateway: str) -> None:
         "namespace": config.namespace,
         "export_dir": str(config.export_dir),
         "ssh_home_mode": config.ssh_home_mode,
+        "test_user": config.test_user,
+        "test_uid": config.test_uid,
+        "test_gid": config.test_gid,
         "kind_version": KIND_VERSION,
         "kubernetes_version": KUBECTL_VERSION,
         "nfs_csi_version": NFS_CSI_VERSION,
@@ -1742,6 +1848,55 @@ def setup_environment(runner: Runner, config: Config) -> None:
     LOG.info("Integration environment is provisioned and running")
 
 
+def _grant_test_user_access(runner: Runner, config: Config) -> None:
+    """Give the non-root test identity access to its private setup state."""
+    marker = config.state_dir / STATE_MARKER
+    if not marker.is_file() or json.loads(marker.read_text(encoding="utf-8")) != (
+        _owner_document(config)
+    ):
+        raise ProvisionError(
+            f"refusing to change ownership of unverified setup state: {config.state_dir}"
+        )
+    runner.run(
+        [
+            *_sudo_prefix(),
+            "chown",
+            "-R",
+            f"{config.test_uid}:{config.test_gid}",
+            config.state_dir,
+        ]
+    )
+
+
+def _test_user_command(config: Config, *command: str | Path) -> list[str | Path]:
+    """Build a command that executes as the configured non-root test user."""
+    if os.geteuid() != 0:
+        return list(command)
+    return ["runuser", "-u", config.test_user, "--", *command]
+
+
+def _verify_test_user_access(runner: Runner, config: Config) -> None:
+    """Verify the test identity can use the provisioned cluster and state."""
+    probe = config.state_dir / "test-runs" / ".access-probe"
+    runner.run(_test_user_command(config, "mkdir", "-p", probe.parent))
+    runner.run(_test_user_command(config, "touch", probe))
+    runner.run(_test_user_command(config, "rm", "--", probe))
+    runner.run(_test_user_command(config, "docker", "info"), timeout=60)
+    runner.run(_test_user_command(config, "kind", "get", "clusters"), timeout=30)
+    runner.run(
+        _test_user_command(
+            config,
+            "kubectl",
+            "--kubeconfig",
+            config.kubeconfig,
+            "get",
+            "nodes",
+        ),
+        timeout=30,
+    )
+    LOG.info("Verified integration test access for non-root user %s", config.test_user)
+
+
 def _scale_ssh(runner: Runner, config: Config, replicas: int) -> None:
     """Scale SSH workers to conserve host capacity between checks."""
     runner.run(
@@ -1789,6 +1944,351 @@ def stop_environment(runner: Runner, config: Config) -> None:
     )
 
 
+def teardown_environment(runner: Runner, config: Config) -> None:
+    """Stop the fixture and remove all harness-owned data and host config."""
+    state_owned, setup_owned, export_owned, nfs_configured = (
+        _validate_teardown_ownership(runner, config)
+    )
+    stop_environment(runner, config)
+    if nfs_configured:
+        _remove_nfs_configuration(runner, config)
+    if export_owned:
+        _unmount_export_filesystem(runner, config)
+    if setup_owned:
+        _remove_harness_images(runner, config)
+    _remove_owned_directories(
+        runner, config, remove_state=state_owned, remove_export=export_owned
+    )
+    LOG.info(
+        "Integration environment torn down; installed host packages and client "
+        "tools were preserved"
+    )
+
+
+def _owner_document(config: Config) -> dict[str, object]:
+    """Return the exact ownership document used by persistent markers."""
+    return {"schema": STATE_SCHEMA, "cluster_name": config.cluster_name}
+
+
+def _read_system_file(runner: Runner, path: Path) -> str | None:
+    """Read a root-owned file, returning None when it is absent."""
+    result = runner.run([*_sudo_prefix(), "cat", path], check=False, timeout=30)
+    return result.stdout if result.returncode == 0 else None
+
+
+def _validate_teardown_ownership(
+    runner: Runner, config: Config
+) -> tuple[bool, bool, bool, bool]:
+    """Validate every persistent artifact before destructive cleanup."""
+    _validate_cleanup_paths(config)
+    expected_owner = _owner_document(config)
+    state_marker = config.state_dir / STATE_MARKER
+    state_owned = False
+    if state_marker.exists():
+        if json.loads(state_marker.read_text(encoding="utf-8")) != expected_owner:
+            raise ProvisionError(
+                f"refusing teardown with mismatched ownership marker: {state_marker}"
+            )
+        state_owned = True
+    cluster_marker = config.state_dir / "cluster-owner.json"
+    cluster_owned = False
+    if cluster_marker.exists():
+        if json.loads(cluster_marker.read_text(encoding="utf-8")) != expected_owner:
+            raise ProvisionError(
+                f"refusing teardown with mismatched ownership marker: {cluster_marker}"
+            )
+        cluster_owned = True
+        state_owned = True
+    elif config.state_dir.exists() and not state_owned:
+        raise ProvisionError(
+            f"refusing to remove unowned setup state: {config.state_dir}"
+        )
+
+    export_marker = config.export_dir / EXPORT_MARKER
+    marker_text = _read_system_file(runner, export_marker)
+    export_owned = False
+    if marker_text is not None:
+        try:
+            marker = json.loads(marker_text)
+        except json.JSONDecodeError as error:
+            raise ProvisionError(
+                f"refusing teardown with invalid export marker: {export_marker}"
+            ) from error
+        if marker != expected_owner:
+            raise ProvisionError(
+                f"refusing teardown with mismatched export marker: {export_marker}"
+            )
+        export_owned = True
+    elif (
+        runner.run(
+            [*_sudo_prefix(), "test", "-d", config.export_dir], check=False
+        ).returncode
+        == 0
+    ):
+        contents = runner.run(
+            [
+                *_sudo_prefix(),
+                "find",
+                config.export_dir,
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-print",
+            ]
+        ).stdout.strip()
+        if contents:
+            raise ProvisionError(
+                f"refusing to remove nonempty unowned export: {config.export_dir}"
+            )
+
+    export_config = _read_system_file(runner, NFS_EXPORT_CONFIG)
+    daemon_config = _read_system_file(runner, NFS_DAEMON_CONFIG)
+    _validate_installed_config(
+        export_config,
+        config.manifests_dir / "storage-scale-test.exports",
+        NFS_EXPORT_CONFIG,
+    )
+    _validate_installed_config(
+        daemon_config,
+        config.manifests_dir / "storage-scale-test-nfs.conf",
+        NFS_DAEMON_CONFIG,
+    )
+    service_state = config.state_dir / "nfs-service.json"
+    nfs_configured = (
+        export_config is not None or daemon_config is not None or service_state.exists()
+    )
+    if (export_owned or nfs_configured) and not cluster_owned:
+        raise ProvisionError(
+            "refusing to remove NFS artifacts without the matching setup state marker"
+        )
+    if (export_config is not None or daemon_config is not None) and not export_owned:
+        raise ProvisionError(
+            "refusing to remove NFS configuration without the matching export marker"
+        )
+    if _export_mount_type(runner, config):
+        if not export_owned:
+            raise ProvisionError(
+                f"refusing to unmount unowned export directory: {config.export_dir}"
+            )
+        _verified_export_loop(runner, config)
+    _validate_loop_associations(runner, config)
+    if cluster_owned:
+        _validate_image_ownership(runner, config)
+
+    if nfs_configured:
+        unrelated = [
+            path for path in _export_paths(runner) if path != str(config.export_dir)
+        ]
+        if unrelated:
+            raise ProvisionError(
+                "refusing to stop and disable nfs-server while unrelated exports "
+                "exist: " + ", ".join(unrelated)
+            )
+    return state_owned, cluster_owned, export_owned, nfs_configured
+
+
+def _validate_cleanup_paths(config: Config) -> None:
+    """Reject broad or overlapping destructive cleanup targets."""
+    forbidden = {Path("/"), Path("/var"), Path("/srv"), Path("/etc")}
+    if config.state_dir in forbidden or config.export_dir in forbidden:
+        raise ProvisionError("refusing teardown with a broad state or export path")
+    if config.state_dir == config.export_dir:
+        raise ProvisionError("state and export directories must be different")
+    if config.state_dir in config.export_dir.parents:
+        raise ProvisionError("export directory must not be inside the state directory")
+    if config.export_dir in config.state_dir.parents:
+        raise ProvisionError("state directory must not be inside the export directory")
+
+
+def _validate_installed_config(
+    installed: str | None, source: Path, destination: Path
+) -> None:
+    """Require a host config file to match its harness-rendered source."""
+    if installed is None:
+        return
+    if not source.exists() or installed != source.read_text(encoding="utf-8"):
+        raise ProvisionError(
+            f"refusing to remove modified or unowned host configuration: {destination}"
+        )
+
+
+def _export_paths(runner: Runner) -> list[str]:
+    """Return currently exported local paths."""
+    exports = runner.run([*_sudo_prefix(), "exportfs", "-v"], check=False).stdout
+    return [line.split()[0] for line in exports.splitlines() if line.startswith("/")]
+
+
+def _verified_export_loop(runner: Runner, config: Config) -> str:
+    """Return the export loop device after verifying its exact backing image."""
+    mounted = runner.run(
+        [
+            "findmnt",
+            "--noheadings",
+            "--output",
+            "SOURCE,FSTYPE",
+            "--mountpoint",
+            config.export_dir,
+        ]
+    ).stdout.split()
+    if (
+        len(mounted) != 2
+        or mounted[1] != "ext4"
+        or not mounted[0].startswith("/dev/loop")
+    ):
+        raise ProvisionError(
+            f"refusing unexpected mount at dedicated export {config.export_dir}"
+        )
+    backing = runner.run(
+        [
+            *_sudo_prefix(),
+            "losetup",
+            "--noheadings",
+            "--output",
+            "BACK-FILE",
+            mounted[0],
+        ]
+    ).stdout.strip()
+    if Path(backing).resolve() != config.nfs_image.resolve():
+        raise ProvisionError(
+            f"refusing loop device {mounted[0]} backed by unexpected file {backing}"
+        )
+    return mounted[0]
+
+
+def _associated_loop_devices(runner: Runner, config: Config) -> list[str]:
+    """Return loop devices associated with the exact NFS backing image."""
+    if not config.nfs_image.exists():
+        return []
+    result = runner.run(
+        [*_sudo_prefix(), "losetup", "--associated", config.nfs_image], check=False
+    )
+    return [line.split(":", maxsplit=1)[0] for line in result.stdout.splitlines()]
+
+
+def _validate_loop_associations(runner: Runner, config: Config) -> None:
+    """Reject an owned loop device mounted anywhere except the export path."""
+    for device in _associated_loop_devices(runner, config):
+        mounts = runner.run(
+            ["findmnt", "--noheadings", "--output", "TARGET", "--source", device],
+            check=False,
+        ).stdout.splitlines()
+        unexpected = [
+            target for target in mounts if Path(target).resolve() != config.export_dir
+        ]
+        if unexpected:
+            raise ProvisionError(
+                f"refusing loop device {device} mounted outside the fixture: "
+                + ", ".join(unexpected)
+            )
+
+
+def _validate_image_ownership(runner: Runner, config: Config) -> None:
+    """Reject fixture tags that no longer identify images built by setup."""
+    state_path = config.state_dir / "built-images.json"
+    if not state_path.exists():
+        return
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    for image, ownership in state.items():
+        previous_id = ownership.get("previous_id")
+        if previous_id and _image_id(runner, previous_id) != previous_id:
+            raise ProvisionError(
+                f"cannot restore prior Docker image for fixture tag {image}: "
+                f"{previous_id} is absent"
+            )
+        current = _image_id(runner, image)
+        allowed = {previous_id, ownership.get("built_id"), None}
+        if current not in allowed:
+            raise ProvisionError(
+                f"refusing to alter Docker tag changed outside the fixture: {image}"
+            )
+
+
+def _remove_nfs_configuration(runner: Runner, config: Config) -> None:
+    """Unexport storage, disable NFS, and remove exact host configuration."""
+    LOG.info("Removing the dedicated NFS export and host configuration")
+    export_source = config.manifests_dir / "storage-scale-test.exports"
+    if export_source.exists():
+        client = export_source.read_text(encoding="utf-8").split()[1].split("(", 1)[0]
+        runner.run(
+            [
+                *_sudo_prefix(),
+                "exportfs",
+                "-u",
+                f"{client}:{config.export_dir}",
+            ],
+            check=False,
+        )
+    for path in (NFS_EXPORT_CONFIG, NFS_DAEMON_CONFIG):
+        runner.run([*_sudo_prefix(), "rm", "--force", "--", path])
+    runner.run([*_sudo_prefix(), "exportfs", "-ra"])
+    if str(config.export_dir) in _export_paths(runner):
+        raise ProvisionError(f"NFS export is still active: {config.export_dir}")
+    runner.run([*_sudo_prefix(), "systemctl", "disable", "--now", "nfs-server"])
+    firewall_state = config.state_dir / "ufw-rule.json"
+    if firewall_state.exists():
+        state = json.loads(firewall_state.read_text(encoding="utf-8"))
+        if state.get("added_by_harness"):
+            _delete_nfs_firewall_rule(runner, str(state["subnet"]), check=True)
+
+
+def _unmount_export_filesystem(runner: Runner, config: Config) -> None:
+    """Unmount and detach only the verified fixture backing filesystem."""
+    if _export_mount_type(runner, config):
+        _verified_export_loop(runner, config)
+        runner.run([*_sudo_prefix(), "umount", config.export_dir])
+    _validate_loop_associations(runner, config)
+    for device in _associated_loop_devices(runner, config):
+        runner.run([*_sudo_prefix(), "losetup", "--detach", device])
+    if _export_mount_type(runner, config):
+        raise ProvisionError(f"export remains mounted: {config.export_dir}")
+    if _associated_loop_devices(runner, config):
+        raise ProvisionError(f"loop devices remain attached to {config.nfs_image}")
+
+
+def _remove_harness_images(runner: Runner, config: Config) -> None:
+    """Remove owned image tags or restore the tags that setup replaced."""
+    state_path = config.state_dir / "built-images.json"
+    if not state_path.exists():
+        return
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    for image, ownership in state.items():
+        built_id = ownership.get("built_id")
+        previous_id = ownership.get("previous_id")
+        if built_id is None or _image_id(runner, image) != built_id:
+            continue
+        if previous_id:
+            runner.run(["docker", "image", "tag", previous_id, image])
+        else:
+            runner.run(["docker", "image", "rm", image])
+
+
+def _remove_owned_directories(
+    runner: Runner,
+    config: Config,
+    *,
+    remove_state: bool,
+    remove_export: bool,
+) -> None:
+    """Remove the validated export and state directories without crossing mounts."""
+    paths = [config.state_dir] if remove_state else []
+    if remove_export:
+        paths.insert(0, config.export_dir)
+    for path in paths:
+        probe = runner.run([*_sudo_prefix(), "test", "-e", path], check=False)
+        if probe.returncode:
+            continue
+        runner.run(
+            [*_sudo_prefix(), "find", path, "-xdev", "-depth", "-delete"],
+            timeout=120,
+        )
+        if (
+            runner.run([*_sudo_prefix(), "test", "-e", path], check=False).returncode
+            == 0
+        ):
+            raise ProvisionError(f"cleanup did not remove {path}")
+
+
 def _stop_owned_nfs(runner: Runner, config: Config) -> None:
     """Stop NFS only when this harness started the otherwise-dedicated service."""
     state_path = config.state_dir / "nfs-service.json"
@@ -1799,10 +2299,7 @@ def _stop_owned_nfs(runner: Runner, config: Config) -> None:
     if not state.get("started_by_harness", False):
         LOG.info("nfs-server predated this fixture; leaving it running")
         return
-    exports = runner.run([*_sudo_prefix(), "exportfs", "-v"], check=False).stdout
-    export_paths = [
-        line.split()[0] for line in exports.splitlines() if line.startswith("/")
-    ]
+    export_paths = _export_paths(runner)
     unrelated = [path for path in export_paths if path != str(config.export_dir)]
     if unrelated:
         LOG.warning(
@@ -1831,6 +2328,9 @@ def _collect_diagnostics(runner: Runner, config: Config) -> None:
         (*_sudo_prefix(), "exportfs", "-v"),
     )
     for command in commands:
+        if not shutil.which(str(command[0])):
+            LOG.error("diagnostic command is unavailable: %s", command[0])
+            continue
         result = runner.run(command, check=False, timeout=30)
         output = (result.stdout + result.stderr).strip()
         if output:
@@ -1855,10 +2355,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     parser.add_argument("--export-dir", type=Path, default=DEFAULT_EXPORT_DIR)
     parser.add_argument(
+        "--test-user",
+        help=(
+            "non-root account that runs tests; required for root setup unless "
+            "SUDO_USER identifies it"
+        ),
+    )
+    parser.add_argument(
         "--ssh-home-mode", choices=("separate", "shared"), default="separate"
     )
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("action", choices=("setup", "start", "stop", "test"))
+    parser.add_argument(
+        "action", choices=("setup", "start", "stop", "teardown", "test")
+    )
     parser.add_argument(
         "tests",
         nargs="*",
@@ -1870,22 +2379,61 @@ def _parser() -> argparse.ArgumentParser:
 
 def _config(arguments: argparse.Namespace) -> Config:
     """Convert parsed arguments into immutable configuration."""
+    account = _test_account(arguments.test_user)
     return Config(
         cluster_name=arguments.cluster_name,
         namespace=arguments.namespace,
         state_dir=arguments.state_dir.resolve(),
         export_dir=arguments.export_dir.resolve(),
         ssh_home_mode=arguments.ssh_home_mode,
+        test_user=account.pw_name,
+        test_uid=account.pw_uid,
+        test_gid=account.pw_gid,
         verbose=arguments.verbose,
     )
+
+
+def _test_account(explicit_user: str | None) -> pwd.struct_passwd:
+    """Resolve the non-root account that owns and runs integration tests."""
+    requested = explicit_user
+    if os.geteuid() == 0 and requested is None:
+        requested = os.environ.get("SUDO_USER")
+    if requested is None:
+        try:
+            requested = pwd.getpwuid(os.getuid()).pw_name
+        except KeyError as error:
+            raise ProvisionError(
+                f"current uid has no password-database entry: {os.getuid()}"
+            ) from error
+    try:
+        account = pwd.getpwnam(requested)
+    except KeyError as error:
+        raise ProvisionError(
+            f"integration test user does not exist: {requested}"
+        ) from error
+    if account.pw_uid == 0:
+        raise ProvisionError(
+            "integration tests require a non-root account; use sudo from that "
+            "account or pass --test-user"
+        )
+    if os.geteuid() != 0 and account.pw_uid != os.getuid():
+        raise ProvisionError(
+            f"non-root caller cannot provision tests for another user: {requested}"
+        )
+    return account
 
 
 def main() -> int:
     """Run one integration environment lifecycle action."""
     _require_python()
     arguments = _parser().parse_args()
-    config = _config(arguments)
     try:
+        if arguments.action == "test" and os.geteuid() == 0:
+            raise ProvisionError(
+                "refusing to run integration sweeps as root; rerun the test "
+                "action as the account provisioned by setup"
+            )
+        config = _config(arguments)
         if arguments.action != "test" and arguments.tests:
             raise ProvisionError("test selectors are valid only with the test action")
         if arguments.action == "test" and not config.state_dir.is_dir():
@@ -1899,12 +2447,16 @@ def main() -> int:
             runner = Runner()
             if arguments.action == "stop":
                 stop_environment(runner, config)
+            elif arguments.action == "teardown":
+                teardown_environment(runner, config)
             elif arguments.action == "test":
                 run_filesystem_tests(
                     runner, config, _repository_root(), arguments.tests
                 )
             else:
                 setup_environment(runner, config)
+                _grant_test_user_access(runner, config)
+                _verify_test_user_access(runner, config)
         return 0
     except (
         ProvisionError,
@@ -1914,7 +2466,11 @@ def main() -> int:
         json.JSONDecodeError,
     ) as error:
         LOG.error("%s", error)
-        if "runner" in locals() and arguments.action != "stop":
+        if (
+            "runner" in locals()
+            and "config" in locals()
+            and arguments.action not in ("stop", "teardown")
+        ):
             _collect_diagnostics(runner, config)
         return 1
     except KeyboardInterrupt:

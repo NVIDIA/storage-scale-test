@@ -40,7 +40,7 @@ scaling, failure-domain, or network-isolation measurements.
 ## Implemented lifecycle
 
 The executable driver is `integration-tests/bin/integration-test.py` and
-supports four actions:
+supports five actions:
 
 - `setup` installs missing host dependencies, creates or reconciles the
   environment, and validates every substrate.
@@ -48,6 +48,8 @@ supports four actions:
 - `stop` is disposable: it deletes only the marker-owned kind cluster and then
   stops the NFS service only when the harness started it and no unrelated
   exports exist.
+- `teardown` performs stop and then removes all marker-owned fixture data and
+  host configuration while leaving installed packages and client tools.
 - `test` requires an already-running setup and runs selected bounded filesystem
   regression cases without reconciling the environment.
 
@@ -57,7 +59,10 @@ NFS data. It intentionally discards Kubernetes objects, kind containers, and
 MariaDB's node-local storage. A later start creates and validates a fresh
 cluster, so it takes longer than setup against an already-running cluster.
 The disposable stop and subsequent fresh start were exercised end to end, as
-was a repeated stop with the cluster already absent.
+was a repeated stop with the cluster already absent. Full teardown was also
+exercised after both filesystem substrate tests, its absence/disabled-state
+postconditions were verified, and a second teardown succeeded with all fixture
+state already absent.
 
 Deleting the cluster avoids relying on resumed kind container addresses.
 Kubernetes Service DNS stabilizes application endpoints inside the cluster but
@@ -240,6 +245,16 @@ Stop is idempotent. Repeated stop calls succeed when the cluster and owned NFS
 service are already absent or inactive. It never stops Docker globally and
 leaves a pre-existing or shared NFS service running.
 
+Teardown is also idempotent and is intended for CI workers and other disposable
+fixtures. It first performs stop, then removes only marker-owned NFS data and
+host configuration, stops and disables the dedicated NFS service, removes an
+owned UFW rule, unmounts the verified loop device, and deletes generated state
+and locally built image tags. It refuses cleanup if ownership, configuration,
+mount-backing, or unrelated-export checks fail. Installed packages, client
+tools, and reusable upstream image layers remain available. Image IDs are
+recorded before and after local builds so teardown can remove only owned tags
+and restore any prior tag target.
+
 ## Provisioning sequence
 
 An implementation or future refactor should preserve this ordering:
@@ -267,11 +282,23 @@ For disposable stop:
 5. Stop NFS only when it is harness-owned and has no unrelated exports.
 6. Preserve all host packages, caches, keys, rendered state, and NFS data.
 
+For full teardown:
+
+1. Validate all ownership markers, installed configuration content, the ext4
+   loop backing file, and the absence of unrelated NFS exports.
+2. Perform the idempotent disposable stop.
+3. Unexport the dedicated path and remove the two dedicated host config files.
+4. Stop and disable NFS and remove only a UFW rule recorded as harness-created.
+5. Unmount the export, detach its verified loop device, and remove the two
+   locally built fixture image tags.
+6. Delete the dedicated export and state directories while retaining installed
+   packages, client tools, and reusable upstream container layers.
+
 ## Checked-in implementation artifacts
 
 | Path | Purpose |
 |---|---|
-| `integration-tests/bin/integration-test.py` | Setup/start/stop driver, validation, logging, and diagnostics |
+| `integration-tests/bin/integration-test.py` | Setup/start/stop/teardown driver, validation, logging, and diagnostics |
 | `integration-tests/lib/filesystem_integration.py` | Filesystem test selection, staging, execution, and result assertions |
 | `integration-tests/manifests/kind.yaml.tmpl` | Three-node kind topology and neutral role labels |
 | `integration-tests/manifests/nfs-csi-values.yaml` | Low-footprint NFS CSI deployment values |

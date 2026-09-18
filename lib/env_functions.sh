@@ -1825,7 +1825,7 @@ coordinator_run_one_execution() {
         test_dirs_csv=$(_compute_test_dirs_csv_for_execution) || exit 1
 
         # shellcheck disable=SC2154  # nodes, io_size, thread_count, io_depth come from sourcing NNNN.sh
-        _echo_ts "[coordinator] starting execution ${id}: nodes=${nodes} io_size=${io_size} threads=${thread_count} iodepth=${io_depth}"
+        _echo_ts "[coordinator] starting execution ${id}: nodes=${nodes} hosts=${first_n_hosts_csv} io_size=${io_size} threads=${thread_count} iodepth=${io_depth}"
         run_elbencho_io_sweep_iteration
     ) 2>&1 | tee "$log_file"
     execution_pipe_status=("${PIPESTATUS[@]}")

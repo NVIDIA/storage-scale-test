@@ -60,10 +60,13 @@ The separate `integration-tests/` fixture provisions a three-node kind cluster,
 NFS CSI storage, two passwordless-SSH workers, and a Slinky Slurm environment
 on one Linux host. Its test action builds and validates a deployment tarball,
 derives environments from the packaged `env.sh.template`, and runs bounded
-one-node and two-node filesystem sweeps through SSH and Slurm. The SSH entry
-point runs on the host; the Slurm entry point runs from the archive extracted by
-the LoginSet on shared storage. It does not add Kubernetes dispatch to the
-benchmark entry points.
+one-node and two-node filesystem sweeps through SSH and Slurm as the non-root
+account recorded by setup. It verifies ordered worker selection, exact workload
+totals, cleanup, and report extraction for both node counts. The SSH entry point
+runs on the host; the Slurm entry point runs from the archive extracted by the
+LoginSet on shared storage. The on-demand integration workflow runs the full
+lifecycle concurrently on amd64 and arm64. It does not add Kubernetes dispatch
+to the benchmark entry points.
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 3.14 unit tests run weekly and on manual request.
