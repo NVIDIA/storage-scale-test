@@ -69,6 +69,10 @@ loginsets:
   test:
     replicas: 1
     login:
+      image:
+        repository: storage-scale-integration-login
+        tag: slinky-26.05-file
+        digest: null
       resources:
         requests:
           cpu: 25m

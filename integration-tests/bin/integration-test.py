@@ -39,6 +39,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
+INTEGRATION_LIB = Path(__file__).resolve().parents[1] / "lib"
+sys.path.insert(0, str(INTEGRATION_LIB))
+
+from filesystem_integration import (  # pylint: disable=wrong-import-position
+    IntegrationTestError,
+    TEST_SELECTORS,
+    run_filesystem_tests,
+)
+
 KIND_VERSION = "v0.33.0"
 KUBECTL_VERSION = "v1.37.0"
 HELM_VERSION = "v3.22.0"
@@ -54,12 +63,15 @@ NFS_CSI_CHART_SHA256 = (
     "815ac441a2dd0e48c82fa92d043e96caac4dd8ac422fbba91ed76892ed32da54"
 )
 SLINKY_VERSION = "1.2.0"
+SLINKY_LOGIN_BASE_IMAGE = "ghcr.io/slinkyproject/login:26.05-ubuntu26.04"
+SLINKY_LOGIN_IMAGE = "storage-scale-integration-login:slinky-26.05-file"
 SSH_IMAGE = "storage-scale-integration-ssh:ubuntu-24.04"
 STATE_SCHEMA = 1
 TARGET_LABEL = "storage-scale-test/target=true"
 LOGIN_LABEL = "storage-scale-test/login=true"
 NFS_UID = 2000
 NFS_GID = 2000
+NFS_IMAGE_BYTES = 128 * 1024 * 1024
 GIB = 1024**3
 DEFAULT_STATE_DIR = Path("/var/lib/storage-scale-test-integration")
 DEFAULT_EXPORT_DIR = Path("/srv/storage-scale-test-integration")
@@ -104,6 +116,11 @@ class Config:
         """Return the persistent test-key directory."""
         return self.state_dir / "keys"
 
+    @property
+    def nfs_image(self) -> Path:
+        """Return the sparse backing image for the dedicated NFS export."""
+        return self.state_dir / "nfs-export.ext4"
+
 
 class Runner:
     """Run commands with bounded execution and consistent diagnostics."""
@@ -116,6 +133,7 @@ class Runner:
         check: bool = True,
         sensitive: bool = False,
         stdin: IO[bytes] | None = None,
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run *args* and return its completed process."""
         command = [str(item) for item in args]
@@ -131,6 +149,7 @@ class Runner:
             stderr=subprocess.PIPE,
             text=stdin is None,
             timeout=timeout,
+            cwd=cwd,
         )
         stdout = _output_text(result.stdout)
         stderr = _output_text(result.stderr)
@@ -333,6 +352,8 @@ def _ensure_apt_packages(runner: Runner) -> None:
     packages = (
         "ca-certificates",
         "curl",
+        "e2fsprogs",
+        "file",
         "jq",
         "nfs-common",
         "nfs-kernel-server",
@@ -730,10 +751,87 @@ def _ensure_export_marker(runner: Runner, config: Config) -> None:
     )
 
 
+def _export_mount_type(runner: Runner, config: Config) -> str:
+    """Return the export mount filesystem type, or an empty string."""
+    result = runner.run(
+        [
+            "findmnt",
+            "--noheadings",
+            "--output",
+            "FSTYPE",
+            "--mountpoint",
+            config.export_dir,
+        ],
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _ensure_export_filesystem(runner: Runner, config: Config) -> None:
+    """Mount a small persistent filesystem for realistic mount validation."""
+    runner.run([*_sudo_prefix(), "install", "-d", "-m", "0770", config.export_dir])
+    mounted_type = _export_mount_type(runner, config)
+    if mounted_type:
+        if mounted_type != "ext4":
+            raise ProvisionError(
+                f"refusing non-ext4 mount at dedicated export {config.export_dir}: "
+                f"{mounted_type}"
+            )
+        loops = runner.run(
+            [*_sudo_prefix(), "losetup", "--associated", config.nfs_image],
+            check=False,
+        ).stdout
+        if not loops.strip():
+            raise ProvisionError(
+                f"mounted export {config.export_dir} is not backed by "
+                f"{config.nfs_image}"
+            )
+        return
+
+    _ensure_export_marker(runner, config)
+    if not config.nfs_image.exists():
+        LOG.info("Creating sparse %s-byte NFS backing filesystem", NFS_IMAGE_BYTES)
+        temporary_image = config.nfs_image.with_suffix(".ext4.new")
+        temporary_image.unlink(missing_ok=True)
+        runner.run(["truncate", "--size", str(NFS_IMAGE_BYTES), temporary_image])
+        runner.run(["/usr/sbin/mkfs.ext4", "-F", "-q", "-m", "0", temporary_image])
+        temporary_image.replace(config.nfs_image)
+        with tempfile.TemporaryDirectory(dir=config.state_dir) as directory:
+            migration_mount = Path(directory)
+            runner.run(
+                [
+                    *_sudo_prefix(),
+                    "mount",
+                    "-o",
+                    "loop",
+                    config.nfs_image,
+                    migration_mount,
+                ]
+            )
+            try:
+                runner.run(
+                    [
+                        *_sudo_prefix(),
+                        "cp",
+                        "-a",
+                        f"{config.export_dir}/.",
+                        f"{migration_mount}/",
+                    ]
+                )
+            finally:
+                runner.run([*_sudo_prefix(), "umount", migration_mount], check=False)
+    runner.run([*_sudo_prefix(), "exportfs", "-u", config.export_dir], check=False)
+    runner.run(
+        [*_sudo_prefix(), "mount", "-o", "loop", config.nfs_image, config.export_dir]
+    )
+    _ensure_export_marker(runner, config)
+
+
 def _configure_nfs(runner: Runner, config: Config, subnet: str, gateway: str) -> None:
     """Reconcile the narrow NFSv4 export and firewall rule."""
     LOG.info("Configuring NFSv4 export for kind subnet %s", subnet)
     _record_nfs_service_state(runner, config)
+    _ensure_export_filesystem(runner, config)
     _ensure_export_marker(runner, config)
     export_line = (
         f"{config.export_dir} {subnet}(rw,sync,no_subtree_check,fsid=0,"
@@ -1041,7 +1139,7 @@ def _install_ssh_workers(runner: Runner, config: Config) -> None:
     home_volume = (
         "persistentVolumeClaim:\n            claimName: ssh-home-rwx"
         if config.ssh_home_mode == "shared"
-        else "emptyDir:\n            sizeLimit: 16Mi"
+        else "emptyDir:\n            sizeLimit: 64Mi"
     )
     manifest = _render_resource(
         config,
@@ -1249,6 +1347,7 @@ def _ensure_mariadb_secret(runner: Runner, config: Config) -> None:
 
 def _install_slurm(runner: Runner, config: Config) -> None:
     """Install MariaDB, Slinky, and the two-node Slurm fixture."""
+    _prepare_slinky_login_image(runner, config)
     _ensure_mariadb_secret(runner, config)
     mariadb = _render_resource(
         config,
@@ -1273,6 +1372,52 @@ def _install_slurm(runner: Runner, config: Config) -> None:
     _validate_slurm(runner, config)
 
 
+def _prepare_slinky_login_image(runner: Runner, config: Config) -> None:
+    """Build and preload the login image with declared test prerequisites."""
+    runner.run(
+        [
+            "docker",
+            "build",
+            "--tag",
+            SLINKY_LOGIN_IMAGE,
+            "--build-arg",
+            f"BASE_IMAGE={SLINKY_LOGIN_BASE_IMAGE}",
+            "--file",
+            _resource_path("slinky-login-image.Dockerfile"),
+            _resource_path("."),
+        ],
+        timeout=600,
+    )
+    _load_image_into_nodes(
+        runner,
+        SLINKY_LOGIN_IMAGE,
+        [f"{config.cluster_name}-control-plane"],
+    )
+
+
+def _slinky_login_image_current(runner: Runner, config: Config) -> bool:
+    """Return whether the live LoginSet selects the prepared image."""
+    result = runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "get",
+            "loginsets",
+            "-o",
+            "json",
+        ),
+        check=False,
+        timeout=30,
+    )
+    if result.returncode:
+        return False
+    return any(
+        item.get("spec", {}).get("login", {}).get("image") == SLINKY_LOGIN_IMAGE
+        for item in json.loads(result.stdout).get("items", [])
+    )
+
+
 def _helm_slinky(runner: Runner, config: Config) -> None:
     """Reconcile the three pinned Slinky releases."""
     releases = (
@@ -1293,7 +1438,10 @@ def _helm_slinky(runner: Runner, config: Config) -> None:
         ),
     )
     for release, chart, values in releases:
-        if _helm_release_current(runner, config, release, chart):
+        current = _helm_release_current(runner, config, release, chart)
+        if current and (
+            release != "slurm" or _slinky_login_image_current(runner, config)
+        ):
             LOG.info("Slinky release %s is already at %s", release, SLINKY_VERSION)
             continue
         arguments: list[str | Path] = [
@@ -1560,6 +1708,16 @@ def setup_environment(runner: Runner, config: Config) -> None:
     running_containers = _kind_containers(runner, config, running_only=True)
     cluster_exists = config.cluster_name in running_clusters or bool(containers)
     _ensure_cluster_ownership(config, cluster_exists)
+    if cluster_exists and not _export_mount_type(runner, config):
+        LOG.warning(
+            "Replacing the disposable cluster before initializing the NFS "
+            "backing filesystem"
+        )
+        _delete_cluster(runner, config)
+        running_clusters = set()
+        running_containers = set()
+        cluster_exists = False
+    _ensure_export_filesystem(runner, config)
     if config.cluster_name in running_clusters and len(running_containers) == 3:
         _export_kubeconfig(runner, config)
     elif cluster_exists:
@@ -1700,7 +1858,13 @@ def _parser() -> argparse.ArgumentParser:
         "--ssh-home-mode", choices=("separate", "shared"), default="separate"
     )
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("action", choices=("setup", "start", "stop"))
+    parser.add_argument("action", choices=("setup", "start", "stop", "test"))
+    parser.add_argument(
+        "tests",
+        nargs="*",
+        metavar="TEST",
+        help="test selectors for the test action: " + ", ".join(TEST_SELECTORS),
+    )
     return parser
 
 
@@ -1722,6 +1886,12 @@ def main() -> int:
     arguments = _parser().parse_args()
     config = _config(arguments)
     try:
+        if arguments.action != "test" and arguments.tests:
+            raise ProvisionError("test selectors are valid only with the test action")
+        if arguments.action == "test" and not config.state_dir.is_dir():
+            raise ProvisionError(
+                f"setup state directory is absent at {config.state_dir}; run setup first"
+            )
         _bootstrap_state_dir(config)
         log_path = _configure_logging(config, arguments.action)
         LOG.info("Detailed log: %s", log_path)
@@ -1729,11 +1899,16 @@ def main() -> int:
             runner = Runner()
             if arguments.action == "stop":
                 stop_environment(runner, config)
+            elif arguments.action == "test":
+                run_filesystem_tests(
+                    runner, config, _repository_root(), arguments.tests
+                )
             else:
                 setup_environment(runner, config)
         return 0
     except (
         ProvisionError,
+        IntegrationTestError,
         OSError,
         subprocess.TimeoutExpired,
         json.JSONDecodeError,

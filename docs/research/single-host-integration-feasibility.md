@@ -40,7 +40,7 @@ scaling, failure-domain, or network-isolation measurements.
 ## Implemented lifecycle
 
 The executable driver is `integration-tests/bin/integration-test.py` and
-supports three actions:
+supports four actions:
 
 - `setup` installs missing host dependencies, creates or reconciles the
   environment, and validates every substrate.
@@ -48,6 +48,8 @@ supports three actions:
 - `stop` is disposable: it deletes only the marker-owned kind cluster and then
   stops the NFS service only when the harness started it and no unrelated
   exports exist.
+- `test` requires an already-running setup and runs selected bounded filesystem
+  regression cases without reconciling the environment.
 
 Stop preserves installed packages and tools, downloaded charts, Docker image
 caches, generated SSH and database credentials, rendered state, and external
@@ -92,6 +94,9 @@ the fixture, not a benchmark sizing recommendation.
 ## Shared storage
 
 The host runs a narrowly configured NFSv4.1 server with two server threads.
+Its export is backed by a persistent 128 MiB sparse ext4 image. This gives the
+project's mount validation a filesystem distinct from the host root while
+keeping disk consumption bounded and retaining data across disposable stops.
 Provisioning discovers the kind Docker network's IPv4 subnet and gateway; it
 does not assume a fixed bridge address. The export:
 
@@ -177,6 +182,43 @@ than relying on generic labels that the operator does not publish. It verifies:
 Commands are submitted from the LoginSet, matching the intended login/submit
 execution point.
 
+## Filesystem regression cases
+
+The `test` action accepts `all`, `filesystem`, `ssh`, and `slurm` selectors.
+`all` and `filesystem` run both substrate cases; `ssh` and `slurm` can run
+individually or together. Test execution deliberately refuses to run without a
+matching saved setup and a healthy live three-node fixture.
+
+The harness first copies only tracked working-tree files to an isolated staging
+tree and invokes `utils/build_tarball.sh` there. It validates the resulting
+archive's paths, types, size, required files, and packaged benchmark executable
+before extraction. Each case renders `env.sh` from the packaged user-facing
+`env.sh.template`, injects only bounded fixture overrides, and executes
+`validate_env.sh` before the benchmark.
+
+The SSH case runs both validation and `nv-elbencho-sweep.sh` on the test host;
+the checked-in SSH implementation copies and launches its worker payloads in
+the two pods. The Slurm case streams the same deployment archive to the
+LoginSet, extracts it in the shared NFS filesystem, and runs both commands from
+that extracted tree. The sweep uses one 4 KiB file, one thread, queue depth one,
+buffered I/O, and one-node and two-node dimensions. Substrates run sequentially.
+This covers deployment packaging, environment validation, sweep reification,
+SSH and Slurm dispatch, service startup, write/read/delete phases, result
+recording, and cleanup while writing only a few KiB per execution.
+
+The pinned elbencho release archive is architecture-selected, capped during
+download, checksum-verified, and cached in protected state. Its verified native
+binary is supplied to the isolated tree as the deployment builder's documented
+local cache, so the integration test does not vendor a benchmark binary. A
+minimal derived Slinky login image installs the standard `file` package required
+by `validate_env.sh`; the test does not replace that prerequisite with a
+test-specific implementation.
+
+Every run retains host-side logs beneath `test-runs/`. Success requires two
+successful execution records, zero exit codes, workload manifests, environment
+snapshots, nonempty CSV and text output, and no remaining generated benchmark
+directory at the NFS root. Performance values are not asserted.
+
 ## Idempotency and failure behavior
 
 Setup reuses generated credentials, existing claims, cached downloads, and
@@ -208,7 +250,8 @@ An implementation or future refactor should preserve this ordering:
 4. Install checksum-verified kind, kubectl, and Helm clients as needed.
 5. Validate cluster ownership, replacing only an owned partial cluster.
 6. Create and validate the three-node kind topology and labels.
-7. Configure and probe the subnet-scoped NFSv4.1 export.
+7. Create or mount the bounded sparse ext4 backing image, then configure and
+   probe the subnet-scoped NFSv4.1 export.
 8. Preload pinned CSI images, install NFS CSI, and bind both RWX claims.
 9. Build, preload, deploy, and validate the two SSH workers.
 10. Scale SSH down, reconcile MariaDB and Slinky, and validate Slurm.
@@ -229,10 +272,12 @@ For disposable stop:
 | Path | Purpose |
 |---|---|
 | `integration-tests/bin/integration-test.py` | Setup/start/stop driver, validation, logging, and diagnostics |
+| `integration-tests/lib/filesystem_integration.py` | Filesystem test selection, staging, execution, and result assertions |
 | `integration-tests/manifests/kind.yaml.tmpl` | Three-node kind topology and neutral role labels |
 | `integration-tests/manifests/nfs-csi-values.yaml` | Low-footprint NFS CSI deployment values |
 | `integration-tests/manifests/nfs-storage.yaml.tmpl` | StorageClass and two RWX claims |
 | `integration-tests/ssh-image.Dockerfile` | Ubuntu/OpenSSH worker image with non-root fixture user |
+| `integration-tests/slinky-login-image.Dockerfile` | Slinky login image with the standard `file` prerequisite |
 | `integration-tests/manifests/ssh-workers.yaml.tmpl` | Two host-networked SSH workers and selectable home volume |
 | `integration-tests/manifests/mariadb-accounting.yaml.tmpl` | Disposable local accounting database |
 | `integration-tests/manifests/slinky-operator-values.yaml` | Low-footprint operator and webhook configuration |
@@ -244,8 +289,7 @@ resource policy, or lifecycle semantics change.
 
 ## Remaining work
 
-This initial harness provisions and validates the substrate only. Follow-up
-work should add tiny one-node and two-node benchmark cases for both SSH and
-Slurm, stage the required benchmark executable in the shared path, retain
-bounded result artifacts, and keep performance assertions out of this
-single-host functional fixture.
+The implemented first pass covers the basic filesystem sweep through SSH and
+Slurm. Future cases can add metadata, write-only/read-from/resume, failure
+recovery, shared-home mode, and Kubernetes dispatch coverage while preserving
+the same bounded-data and no-performance-assertion policy.

@@ -13,34 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM ubuntu:24.04
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
 
+USER root
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates \
-        coreutils \
         file \
-        findutils \
-        gawk \
-        gzip \
-        iproute2 \
-        openssh-client \
-        openssh-server \
-        procps \
-        psmisc \
-        tar \
-        util-linux \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 2000 storage-test \
-    && useradd --uid 2000 --gid 2000 --create-home --shell /bin/bash tester \
-    && install -d -m 0755 /run/sshd \
-    && printf '%s\n' \
-        'PasswordAuthentication no' \
-        'PermitRootLogin no' \
-        'PubkeyAuthentication yes' \
-        'AllowUsers tester' \
-        >> /etc/ssh/sshd_config \
-    && rm -f /etc/ssh/ssh_host_*
-
-EXPOSE 22
-CMD ["bash", "-c", "ssh-keygen -A && exec /usr/sbin/sshd -D -e"]
+    && rm -rf /var/lib/apt/lists/*

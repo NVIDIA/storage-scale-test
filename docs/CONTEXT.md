@@ -58,8 +58,12 @@ Slurm is the default execution substrate. Setting `SSH_HOST_LIST` selects
 passwordless SSH instead. Kubernetes execution is not implemented.
 The separate `integration-tests/` fixture provisions a three-node kind cluster,
 NFS CSI storage, two passwordless-SSH workers, and a Slinky Slurm environment
-on one Linux host. It validates infrastructure for future regression tests; it
-does not add Kubernetes dispatch to the benchmark entry points.
+on one Linux host. Its test action builds and validates a deployment tarball,
+derives environments from the packaged `env.sh.template`, and runs bounded
+one-node and two-node filesystem sweeps through SSH and Slurm. The SSH entry
+point runs on the host; the Slurm entry point runs from the archive extracted by
+the LoginSet on shared storage. It does not add Kubernetes dispatch to the
+benchmark entry points.
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 3.14 unit tests run weekly and on manual request.
@@ -412,6 +416,10 @@ into a benchmark environment. It:
   missing or stale; and
 - includes existing Warp binaries but does not download or automatically build
   them, warning when an architecture is missing.
+
+By default the helper retains that full behavior. `--arch` can select only the
+native elbencho architecture, and `--skip-object-tools` omits Warp checks and
+s3test builds when creating a filesystem-only deployment archive.
 
 `utils/build/build_s3test_from_source.sh` tries suitable local compilers, Docker,
 and Docker Buildx. Failure to produce one architecture warns and permits tarball
