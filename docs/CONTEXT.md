@@ -57,8 +57,21 @@ and are responsible for every binary they place in it.
 Slurm is the default execution substrate. Setting `SSH_HOST_LIST` selects
 passwordless SSH instead. Kubernetes execution is not implemented.
 The separate `integration-tests/` fixture provisions a three-node kind cluster,
-NFS CSI storage, two passwordless-SSH workers, and a Slinky Slurm environment
-on one Linux host. Its test action builds and validates a deployment tarball,
+a shared RWX storage backend, two passwordless-SSH workers, and a Slinky Slurm
+environment on one Linux host. The `nfs` backend uses a loop-backed NFSv4
+export and NFS CSI. The Docker-SBX-specific `sbx-shared` backend mounts a
+repository-backed directory into every kind node and uses static RWX volumes;
+both backends validate the repository's same shared-storage contract. Backend
+selection is explicit or capability-based and persists until teardown. The
+harness's state and export directories are dedicated leaves: an existing path
+must carry the exact harness ownership marker before setup changes it or teardown
+removes it. A completed setup also locks its namespace and, for NFS, export
+directory until teardown. The SBX compatibility profile pairs kind/Kubernetes
+1.34 with kubectl 1.34 and rebuilds cached container-derived Elbencho bundles
+when their pinned image or bundle recipe changes. Slurm coordinators restore
+configured `ORDER_NODES` include-list order after Slurm canonicalizes an
+allocation's node list.
+The test action builds and validates a deployment tarball,
 derives environments from the packaged `env.sh.template`, and runs bounded
 one-node and two-node filesystem sweeps through SSH and Slurm as the non-root
 account recorded by setup. It verifies ordered worker selection, exact workload
@@ -90,7 +103,7 @@ alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 | `utils/build_tarball.sh` | User-local deployment-tarball builder |
 | `utils/build/` | Helpers for building Warp and the in-tree s3test program |
 | `tests/` | Python and shell-behavior regression tests collected by `pytest` |
-| `integration-tests/` | Single-host kind, NFS CSI, SSH, and Slinky fixture provisioner and manifests |
+| `integration-tests/` | Single-host kind, RWX storage, SSH, and Slinky fixture provisioner and manifests |
 | `docs/research/` | Feasibility studies and implementation handoffs for future integration work |
 
 The checked-in benchmark entry points are:

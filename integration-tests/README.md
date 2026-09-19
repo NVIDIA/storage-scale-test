@@ -23,11 +23,11 @@ server. The control-plane node is also the Slinky login node and negative
 control for the storage-worker label. The two worker nodes run storage clients.
 
 The current setup target is Ubuntu 24.04 on x86-64 or ARM64 with at least two
-CPUs, 8 GiB total RAM, 6 GiB available RAM, and 20 GiB free on `/`. Python
-3.12 and an accessible rootful Docker daemon are prerequisites. The driver
-installs its other host packages and pinned client tools when needed. It also
-builds a small derived Slinky login image containing the standard `file`
-package required by `validate_env.sh`.
+CPUs, 8 GiB total RAM, 6 GiB available RAM, and 20 GiB free on the selected
+backend's filesystem. Python 3.12 and an accessible rootful Docker daemon are
+prerequisites. The driver installs its other host packages and pinned client
+tools when needed. It also builds a small derived Slinky login image containing
+the standard `file` package required by `validate_env.sh`.
 
 Run setup (or its exact synonym, start) with:
 
@@ -36,13 +36,46 @@ sudo -v
 sudo integration-tests/bin/integration-test.py setup
 ```
 
+`--storage-backend auto` is the default. It selects `nfs` when the host has the
+required loop, mount, systemd, and kernel NFS facilities. It selects
+`sbx-shared` only when a recognized capability needed by that profile is
+absent. An explicit backend never falls back, and setup records the selection;
+changing it requires teardown first. Arbitrary download, image, Kubernetes,
+manifest, storage-visibility, SSH, and Slurm failures remain fatal.
+
+The `nfs` backend uses a loop-backed NFSv4 export and NFS CSI. The
+`sbx-shared` backend is specifically for Docker SBX: it mounts one
+repository-backed directory into every kind node and binds static RWX claims to
+separate test-data and shared-home subdirectories. Both implement the same
+in-scope integration contract: cross-node and host read/write visibility,
+shared-home behavior, and successful SSH and Slurm filesystem sweeps. NFS and
+CSI provisioning themselves are infrastructure details outside this
+repository's test scope; the backend difference is environmental fidelity, not
+repository feature coverage.
+
+Select Docker SBX explicitly with:
+
+```bash
+sudo integration-tests/bin/integration-test.py \
+  --storage-backend sbx-shared setup
+```
+
+The SBX profile requires Docker's private engine to bind-mount the checked-out
+repository path. It uses the tested kind v0.30.0/Kubernetes v1.34.0 profile and
+maps `/dev/null` to `/dev/kmsg` in kind nodes only when the SBX environment
+lacks that device. When Docker SBX exposes its proxy CA, setup installs that CA
+in the disposable kind nodes so containerd can pull the fixture images. The
+default shared root is `tmp/integration-sbx-shared`; an alternate path may be
+set with `--sbx-shared-root`, but must remain below the repository's `tmp/`
+directory.
+
 Setup records the invoking pre-sudo account, gives that non-root account
 access to the private kubeconfig, key, and test-run workspace, and verifies it
 can use Docker, kind, and kubectl. A root shell without `SUDO_USER` must name
 the account explicitly with `--test-user USER`.
 
 The default SSH homes are separate `emptyDir` volumes. To mount the dedicated
-RWX NFS claim at `/home/tester` in both workers instead, use:
+RWX shared-home claim at `/home/tester` in both workers instead, use:
 
 ```bash
 integration-tests/bin/integration-test.py --ssh-home-mode shared setup
@@ -51,7 +84,7 @@ integration-tests/bin/integration-test.py --ssh-home-mode shared setup
 The generated host SSH key, strict known-hosts file, and two worker addresses
 are kept under `/var/lib/storage-scale-test-integration/`. Re-running setup
 reconciles and validates the environment without replacing those credentials
-or retained NFS data.
+or retained backend data.
 
 After setup succeeds, run the bounded filesystem regression cases with:
 
@@ -72,18 +105,19 @@ deployment archive from a tracked-files-only snapshot with
 `utils/build_tarball.sh`, validates its contents, and runs from the extracted
 archive. The SSH case launches `validate_env.sh` and `nv-elbencho-sweep.sh` on
 the host and reaches the two worker pods over SSH. The Slurm case streams the
-same archive to the LoginSet, extracts it in the shared NFS filesystem, and
+same archive to the LoginSet, extracts it in the shared storage filesystem, and
 launches both commands there.
 
-The pinned benchmark archive is size-limited, checksum-verified, and cached
-outside the repository before the binary is included in the user-built
-deployment archive. Timestamped build and step logs are retained below the
-state directory's `test-runs/` directory. The test also requires successful
-execution records, exact one- and two-node workload totals, ordered worker
-selection, nonempty benchmark output, environment snapshots, and cleanup of
-its generated data directories. It then runs `utils/extract-elbencho.sh` on a
-host-side copy of each result and requires the report to contain both node
-counts.
+The NFS profile uses a size-limited, checksum-verified upstream benchmark
+archive. Docker SBX, where GitHub release assets may be unavailable, extracts
+the binary and runtime libraries from the digest-pinned upstream
+`breuner/elbencho:v3.1-11` image and includes them only in the generated test
+deployment. Timestamped build and step logs are retained below the state
+directory's `test-runs/` directory. The test also requires successful execution
+records, exact one- and two-node workload totals, ordered worker selection,
+nonempty benchmark output, environment snapshots, and cleanup of its generated
+data directories. It then runs `utils/extract-elbencho.sh` on a host-side copy
+of each result and requires the report to contain both node counts.
 
 ## On-demand CI
 
@@ -106,22 +140,22 @@ branch is the way to run it. After the workflow is merged, a maintainer can also
 open **Actions**, choose **Filesystem integration**, select **Run workflow**,
 and choose an authorized branch or the default branch.
 
-Delete the disposable kind cluster and, when owned exclusively by the harness,
-stop NFS with:
+Delete the disposable kind cluster and, for the NFS backend when owned
+exclusively by the harness, stop NFS with:
 
 ```bash
 integration-tests/bin/integration-test.py stop
 ```
 
 Stop preserves packages, downloaded charts, Docker images, generated keys and
-passwords, rendered state, and external NFS data. Kind containers, Kubernetes
+passwords, rendered state, and backend data. Kind containers, Kubernetes
 objects, and MariaDB's node-local volume are disposable and are deleted. A
 subsequent start therefore creates and validates a fresh cluster and takes
 longer than an idempotent setup against an already-running cluster. Timestamped
 logs and rendered manifests are retained in the state directory. Add
 `--verbose` for command-level logging. The failure path captures host, Docker,
-NFS, Kubernetes node, pod, and event diagnostics without printing Kubernetes
-Secrets.
+backend, Kubernetes node, pod, and event diagnostics without printing
+Kubernetes Secrets.
 
 For CI workers or any host where retained fixture data is not wanted, run:
 
@@ -129,12 +163,14 @@ For CI workers or any host where retained fixture data is not wanted, run:
 integration-tests/bin/integration-test.py teardown
 ```
 
-Teardown is idempotent. It performs the disposable stop, removes the dedicated
-NFS export and configuration, disables and stops `nfs-server`, removes any UFW
-rule that the harness added, unmounts the verified loop-backed filesystem, and
-deletes the fixture's generated data, keys, logs, and locally built image tags.
-It refuses destructive cleanup when ownership markers, rendered host
-configuration, mount backing, or unrelated NFS exports do not match the
-fixture. Operating-system packages, kind, kubectl, Helm, and reusable upstream
-Docker image layers are not uninstalled. If a locally built tag existed before
-setup, teardown restores that exact prior image ID instead of deleting it.
+Teardown is idempotent. It performs the disposable stop and deletes the
+fixture's generated data, keys, logs, and locally built image tags. For NFS it
+also removes the dedicated export and configuration, disables and stops
+`nfs-server`, removes any harness-owned UFW rule, and unmounts the verified
+loop-backed filesystem. For Docker SBX it removes only the marker-owned shared
+root and never invokes NFS, systemd, firewall, loop, or mount operations. It
+refuses destructive cleanup when the applicable ownership and path checks do
+not match the fixture. Operating-system packages, kind, kubectl, Helm, and
+reusable upstream Docker image layers are not uninstalled. If a locally built
+tag existed before setup, teardown restores that exact prior image ID instead
+of deleting it.

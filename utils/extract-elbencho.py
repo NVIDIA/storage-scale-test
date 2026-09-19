@@ -2330,6 +2330,14 @@ def plot_performance_metrics(
         )
 
 
+def _scale_efficiency(throughput_per_unit: List[float]) -> List[float]:
+    """Return relative efficiency, including a defined all-zero result."""
+    maximum = max(throughput_per_unit)
+    if maximum <= 0:
+        return [0.0] * len(throughput_per_unit)
+    return [value / maximum * 100 for value in throughput_per_unit]
+
+
 def plot_throughput_scale_efficiency(
     annotated_size_group: AnnotatedSizeGroup,
     output_dir: str,
@@ -2434,15 +2442,9 @@ def plot_throughput_scale_efficiency(
         # Calculate throughput per unit (node/thread) for each data point
         bw_per_unit = [bw_val / x_val for bw_val, x_val in zip(bw, x_data)]
 
-        # Find the maximum throughput per unit to use as the reference (100%)
-        max_bw_per_unit = max(bw_per_unit)
-
         # Calculate efficiency values relative to the maximum throughput per unit
         # Formula: (bw_per_unit / max_bw_per_unit) * 100
-        efficiency = [
-            (bw_val / x_val) / max_bw_per_unit * 100
-            for bw_val, x_val in zip(bw, x_data)
-        ]
+        efficiency = _scale_efficiency(bw_per_unit)
 
         # Select color and marker using the pre-computed mapping
         color_index = color_key_to_index[color_key]

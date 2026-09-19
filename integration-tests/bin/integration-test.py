@@ -50,11 +50,17 @@ from filesystem_integration import (  # pylint: disable=wrong-import-position
 )
 
 KIND_VERSION = "v0.33.0"
+SBX_KIND_VERSION = "v0.30.0"
 KUBECTL_VERSION = "v1.37.0"
+SBX_KUBECTL_VERSION = "v1.34.0"
 HELM_VERSION = "v3.22.0"
 KIND_NODE_IMAGE = (
     "kindest/node:v1.37.0@"
     "sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5"
+)
+SBX_KIND_NODE_IMAGE = (
+    "kindest/node:v1.34.0@"
+    "sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8ec94d976dc5a"
 )
 NFS_CSI_VERSION = "4.13.4"
 NFS_CSI_SOURCE_SHA256 = (
@@ -76,6 +82,9 @@ NFS_IMAGE_BYTES = 128 * 1024 * 1024
 GIB = 1024**3
 DEFAULT_STATE_DIR = Path("/var/lib/storage-scale-test-integration")
 DEFAULT_EXPORT_DIR = Path("/srv/storage-scale-test-integration")
+DEFAULT_SBX_SHARED_ROOT = (
+    Path(__file__).resolve().parents[2] / "tmp" / "integration-sbx-shared"
+)
 NFS_EXPORT_CONFIG = Path("/etc/exports.d/storage-scale-test-integration.exports")
 NFS_DAEMON_CONFIG = Path("/etc/nfs.conf.d/storage-scale-test-integration.conf")
 EXPORT_MARKER = ".storage-scale-test-integration.json"
@@ -104,6 +113,8 @@ class Config:
     namespace: str
     state_dir: Path
     export_dir: Path
+    storage_backend: str
+    sbx_shared_root: Path
     ssh_home_mode: str
     test_user: str
     test_uid: int
@@ -318,11 +329,11 @@ def _require_python() -> None:
         raise ProvisionError("integration-test.py requires Python 3.12 or newer")
 
 
-def _check_host_capacity() -> None:
+def _check_host_capacity(disk_path: Path) -> None:
     """Fail before provisioning an undersized host."""
     cpu_count = os.cpu_count() or 0
     memory = _meminfo()
-    disk = shutil.disk_usage("/")
+    disk = shutil.disk_usage(disk_path)
     failures: list[str] = []
     if cpu_count < 2:
         failures.append(f"need at least 2 CPUs; found {cpu_count}")
@@ -331,15 +342,108 @@ def _check_host_capacity() -> None:
     if memory.get("MemAvailable", 0) < 6 * GIB:
         failures.append("need at least 6 GiB available memory")
     if disk.free < 20 * GIB:
-        failures.append("need at least 20 GiB free on /")
+        failures.append(f"need at least 20 GiB free on {disk_path}")
     if failures:
         raise ProvisionError("host capacity check failed: " + "; ".join(failures))
     LOG.info(
-        "Host capacity accepted: %s CPUs, %.1f GiB available RAM, %.1f GiB free disk",
+        "Host capacity accepted: %s CPUs, %.1f GiB available RAM, %.1f GiB "
+        "free on %s",
         cpu_count,
         memory["MemAvailable"] / GIB,
         disk.free / GIB,
+        disk_path,
     )
+
+
+def _nfs_capability_failures() -> list[str]:
+    """Return recognized reasons that the full NFS backend cannot run."""
+    failures = []
+    for path in (Path("/dev/kmsg"), Path("/dev/loop-control")):
+        if not path.exists():
+            failures.append(f"{path} is absent")
+    # exportfs is supplied by nfs-kernel-server, which setup installs after
+    # selection; its pre-setup absence is not a host capability failure.
+    for command in ("losetup", "mount", "systemctl"):
+        if not shutil.which(command):
+            failures.append(f"{command} is unavailable")
+    return failures
+
+
+def _storage_backend_document(config: Config, backend: str) -> dict[str, object]:
+    """Return the persistent storage-backend selection document."""
+    document: dict[str, object] = {
+        "schema": STATE_SCHEMA,
+        "cluster_name": config.cluster_name,
+        "backend": backend,
+    }
+    if backend == "sbx-shared":
+        document["shared_root"] = str(config.sbx_shared_root)
+    return document
+
+
+def _validate_retained_state_summary(config: Config) -> None:
+    """Reject immutable option changes after a setup has completed."""
+    path = config.state_dir / "state.json"
+    if not path.exists():
+        return
+    state = json.loads(path.read_text(encoding="utf-8"))
+    backend = state.get("storage_backend")
+    if backend not in {"nfs", "sbx-shared"}:
+        raise ProvisionError(f"invalid retained setup state: {path}")
+    expected: dict[str, object] = {
+        "schema": STATE_SCHEMA,
+        "cluster_name": config.cluster_name,
+        "namespace": config.namespace,
+    }
+    if backend == "nfs":
+        expected["export_dir"] = str(config.export_dir)
+    mismatches = [name for name, value in expected.items() if state.get(name) != value]
+    backend_changed = config.storage_backend not in {"auto", backend}
+    if mismatches or backend_changed:
+        changed = ", ".join(mismatches or ["storage_backend"])
+        raise ProvisionError(
+            f"retained setup differs in immutable fields ({changed}); "
+            "use the original options to teardown first"
+        )
+
+
+def _select_storage_backend(config: Config) -> str:
+    """Select once, persist, and validate the integration storage backend."""
+    _validate_retained_state_summary(config)
+    path = config.state_dir / "storage-backend.json"
+    if path.exists():
+        document = json.loads(path.read_text(encoding="utf-8"))
+        backend = str(document.get("backend", ""))
+        expected = _storage_backend_document(config, backend)
+        if backend not in {"nfs", "sbx-shared"} or document != expected:
+            raise ProvisionError(f"invalid retained storage backend state: {path}")
+        if config.storage_backend not in {"auto", backend}:
+            raise ProvisionError(
+                f"retained setup uses storage backend {backend}; teardown is "
+                f"required before selecting {config.storage_backend}"
+            )
+        return backend
+
+    failures = _nfs_capability_failures()
+    backend = config.storage_backend
+    if backend == "auto":
+        backend = "sbx-shared" if failures else "nfs"
+    if backend == "nfs" and failures:
+        raise ProvisionError(
+            "NFS storage backend requirements are unavailable: " + "; ".join(failures)
+        )
+    _write_text(
+        path,
+        json.dumps(_storage_backend_document(config, backend), sort_keys=True) + "\n",
+    )
+    if backend == "sbx-shared":
+        LOG.info(
+            "Using the Docker SBX shared-path backend for the required RWX "
+            "storage contract"
+        )
+    else:
+        LOG.info("Using full-fidelity NFS CSI storage backend")
+    return backend
 
 
 def _meminfo() -> dict[str, int]:
@@ -366,19 +470,21 @@ def _check_platform() -> str:
         ) from error
 
 
-def _ensure_apt_packages(runner: Runner) -> None:
+def _ensure_apt_packages(runner: Runner, backend: str) -> None:
     """Install the narrow tested Ubuntu/Debian package set when absent."""
-    packages = (
+    packages = [
         "ca-certificates",
         "curl",
-        "e2fsprogs",
         "file",
         "jq",
-        "nfs-common",
-        "nfs-kernel-server",
         "openssh-client",
         "openssl",
-    )
+        "python3-venv",
+    ]
+    if backend == "nfs":
+        packages.extend(("e2fsprogs", "nfs-common", "nfs-kernel-server"))
+    elif not shutil.which("kind"):
+        packages.append("kind")
     missing = [
         package
         for package in packages
@@ -437,14 +543,29 @@ def _command_version(runner: Runner, command: str) -> str:
     return runner.run(arguments, check=False, timeout=30).stdout
 
 
-def _ensure_client_tools(runner: Runner, architecture: str) -> None:
+def _ensure_client_tools(
+    runner: Runner, architecture: str, storage_backend: str
+) -> None:
     """Install checksum-verified kind, kubectl, and Helm when versions differ."""
     expected = {
         "kind": KIND_VERSION,
-        "kubectl": KUBECTL_VERSION,
+        "kubectl": (
+            SBX_KUBECTL_VERSION if storage_backend == "sbx-shared" else KUBECTL_VERSION
+        ),
         "helm": HELM_VERSION,
     }
     for command, version in expected.items():
+        if command == "kind" and storage_backend == "sbx-shared":
+            installed = _command_version(runner, command)
+            if SBX_KIND_VERSION not in installed:
+                raise ProvisionError(
+                    "sbx-shared compatibility profile requires kind "
+                    f"{SBX_KIND_VERSION}; found {installed.strip() or 'nothing'}"
+                )
+            LOG.info(
+                "Using Docker SBX compatibility profile with %s", installed.strip()
+            )
+            continue
         if version in _command_version(runner, command):
             LOG.info("Using %s %s", command, version)
             continue
@@ -573,8 +694,23 @@ def _kind_containers(runner: Runner, config: Config, running_only: bool) -> list
     return [line for line in output.splitlines() if line]
 
 
-def _render_kind_config(config: Config) -> Path:
+def _render_kind_config(config: Config, backend: str) -> Path:
     """Render the immutable three-node topology."""
+    if backend == "sbx-shared":
+        kmsg_mount = ""
+        if not Path("/dev/kmsg").exists():
+            kmsg_mount = "\n".join(
+                ("      - hostPath: /dev/null", "        containerPath: /dev/kmsg")
+            )
+        return _render_resource(
+            config,
+            "manifests/kind-sbx-shared.yaml.tmpl",
+            {
+                "CLUSTER_NAME": config.cluster_name,
+                "SHARED_ROOT": str(config.sbx_shared_root),
+                "KMSG_MOUNT": kmsg_mount,
+            },
+        )
     return _render_resource(
         config,
         "manifests/kind.yaml.tmpl",
@@ -582,9 +718,10 @@ def _render_kind_config(config: Config) -> Path:
     )
 
 
-def _create_cluster(runner: Runner, config: Config) -> None:
+def _create_cluster(runner: Runner, config: Config, backend: str) -> None:
     """Create a new owned kind cluster."""
-    manifest = _render_kind_config(config)
+    manifest = _render_kind_config(config, backend)
+    node_image = SBX_KIND_NODE_IMAGE if backend == "sbx-shared" else KIND_NODE_IMAGE
     LOG.info("Creating three-node kind cluster %s", config.cluster_name)
     runner.run(
         [
@@ -594,7 +731,7 @@ def _create_cluster(runner: Runner, config: Config) -> None:
             "--name",
             config.cluster_name,
             "--image",
-            KIND_NODE_IMAGE,
+            node_image,
             "--config",
             manifest,
             "--kubeconfig",
@@ -604,6 +741,100 @@ def _create_cluster(runner: Runner, config: Config) -> None:
         ],
         timeout=600,
     )
+
+
+def _validate_sbx_shared_root(config: Config) -> None:
+    """Require the Docker SBX root to be a narrow path inside repository tmp."""
+    allowed_parent = (_repository_root() / "tmp").resolve()
+    root = config.sbx_shared_root
+    if root == allowed_parent or allowed_parent not in root.parents:
+        raise ProvisionError(
+            f"Docker SBX shared root must be below {allowed_parent}: {root}"
+        )
+
+
+def _sbx_shared_marker(config: Config) -> dict[str, object]:
+    """Return the exact marker for the repository-backed shared root."""
+    return {
+        **_owner_document(config),
+        "backend": "sbx-shared",
+        "shared_root": str(config.sbx_shared_root),
+    }
+
+
+def _prepare_sbx_shared(runner: Runner, config: Config) -> None:
+    """Create and prove the repository-backed Docker-shared directory."""
+    _validate_sbx_shared_root(config)
+    root = config.sbx_shared_root
+    marker = root / EXPORT_MARKER
+    if root.exists() and not marker.exists() and any(root.iterdir()):
+        raise ProvisionError(f"refusing nonempty unowned SBX shared root: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    if marker.exists():
+        document = json.loads(marker.read_text(encoding="utf-8"))
+        if document != _sbx_shared_marker(config):
+            raise ProvisionError(f"SBX shared marker does not match: {marker}")
+    else:
+        _write_text(
+            marker,
+            json.dumps(_sbx_shared_marker(config), sort_keys=True) + "\n",
+        )
+    for directory in (root / "storage-test", root / "ssh-home"):
+        directory.mkdir(exist_ok=True)
+        directory.chmod(0o777)
+    token = secrets.token_hex(16)
+    source = root / "agent-probe"
+    source.write_text(token + "\n", encoding="utf-8")
+    try:
+        runner.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "sh",
+                "--mount",
+                f"type=bind,src={root},dst=/probe",
+                SBX_KIND_NODE_IMAGE,
+                "-ec",
+                'test "$(cat /probe/agent-probe)" = "$1"; '
+                'printf "%s\\n" "$1" >/probe/engine-probe',
+                "sbx-shared-probe",
+                token,
+            ],
+            timeout=300,
+        )
+        if (root / "engine-probe").read_text(encoding="utf-8").strip() != token:
+            raise ProvisionError("Docker shared-path probe returned the wrong token")
+    finally:
+        source.unlink(missing_ok=True)
+        (root / "engine-probe").unlink(missing_ok=True)
+
+
+def _configure_sbx_node_trust(runner: Runner, config: Config) -> None:
+    """Install Docker SBX's proxy CA in kind nodes when it is present."""
+    source = Path("/usr/local/share/ca-certificates/proxy-ca.crt")
+    if not source.is_file():
+        LOG.info("Docker SBX proxy CA is absent; leaving kind trust unchanged")
+        return
+    expected = hashlib.sha256(source.read_bytes()).hexdigest()
+    destination = "/usr/local/share/ca-certificates/docker-sbx-proxy-ca.crt"
+    nodes = _kind_containers(runner, config, running_only=True)
+    if len(nodes) != 3:
+        raise ProvisionError(
+            f"cannot configure Docker SBX trust: expected 3 nodes, found {len(nodes)}"
+        )
+    for node in nodes:
+        current = runner.run(
+            ["docker", "exec", node, "sha256sum", destination], check=False
+        )
+        if current.returncode == 0 and current.stdout.split()[0] == expected:
+            continue
+        runner.run(["docker", "cp", source, f"{node}:{destination}"])
+        runner.run(["docker", "exec", node, "update-ca-certificates"])
+        runner.run(["docker", "exec", node, "systemctl", "restart", "containerd"])
+        runner.run(["docker", "exec", node, "systemctl", "restart", "kubelet"])
+    LOG.info("Configured kind nodes to trust the Docker SBX proxy CA")
 
 
 def _ensure_cluster_ownership(config: Config, cluster_exists: bool) -> None:
@@ -730,30 +961,36 @@ def _ensure_export_marker(runner: Runner, config: Config) -> None:
     expected = json.dumps(
         {"schema": STATE_SCHEMA, "cluster_name": config.cluster_name}, sort_keys=True
     )
+    export_exists = (
+        runner.run(
+            [*_sudo_prefix(), "test", "-e", config.export_dir],
+            check=False,
+            timeout=30,
+        ).returncode
+        == 0
+    )
     existing = runner.run(
         [*_sudo_prefix(), "cat", marker_path], check=False, timeout=30
     )
+    if export_exists and existing.returncode != 0:
+        raise ProvisionError(
+            f"refusing to modify unowned export directory: {config.export_dir}"
+        )
+    if not export_exists:
+        parent_exists = runner.run(
+            [*_sudo_prefix(), "test", "-d", config.export_dir.parent],
+            check=False,
+            timeout=30,
+        )
+        if parent_exists.returncode:
+            raise ProvisionError(
+                "export directory must be a leaf below an existing directory: "
+                f"{config.export_dir}"
+            )
     if existing.returncode == 0 and existing.stdout.strip() != expected:
         raise ProvisionError(
             f"refusing export with mismatched ownership marker: {marker_path}"
         )
-    if existing.returncode != 0:
-        probe = runner.run(
-            [
-                *_sudo_prefix(),
-                "find",
-                config.export_dir,
-                "-mindepth",
-                "1",
-                "-maxdepth",
-                "1",
-            ],
-            check=False,
-        )
-        if probe.returncode == 0 and probe.stdout.strip():
-            raise ProvisionError(
-                f"refusing nonempty unowned export directory: {config.export_dir}"
-            )
     runner.run([*_sudo_prefix(), "install", "-d", "-m", "0770", config.export_dir])
     runner.run([*_sudo_prefix(), "chown", f"+{NFS_UID}:+{NFS_GID}", config.export_dir])
     marker_source = config.state_dir / "export-marker.json"
@@ -788,7 +1025,7 @@ def _export_mount_type(runner: Runner, config: Config) -> str:
 
 def _ensure_export_filesystem(runner: Runner, config: Config) -> None:
     """Mount a small persistent filesystem for realistic mount validation."""
-    runner.run([*_sudo_prefix(), "install", "-d", "-m", "0770", config.export_dir])
+    _ensure_export_marker(runner, config)
     mounted_type = _export_mount_type(runner, config)
     if mounted_type:
         if mounted_type != "ext4":
@@ -807,7 +1044,6 @@ def _ensure_export_filesystem(runner: Runner, config: Config) -> None:
             )
         return
 
-    _ensure_export_marker(runner, config)
     if not config.nfs_image.exists():
         LOG.info("Creating sparse %s-byte NFS backing filesystem", NFS_IMAGE_BYTES)
         temporary_image = config.nfs_image.with_suffix(".ext4.new")
@@ -1127,6 +1363,30 @@ def _install_nfs_csi(runner: Runner, config: Config, gateway: str) -> None:
     )
 
 
+def _install_sbx_shared_storage(runner: Runner, config: Config) -> None:
+    """Bind the shared kind-node paths to the fixture's stable RWX claims."""
+    _ensure_namespace(runner, config)
+    storage = _render_resource(
+        config,
+        "manifests/sbx-storage.yaml.tmpl",
+        {"NAMESPACE": config.namespace},
+    )
+    runner.run(_kubectl(config, "apply", "-f", storage))
+    runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "wait",
+            "--for=jsonpath={.status.phase}=Bound",
+            "pvc/storage-test-rwx",
+            "pvc/ssh-home-rwx",
+            "--timeout=60s",
+        ),
+        timeout=90,
+    )
+
+
 def _ensure_nfs_csi_chart(runner: Runner, config: Config) -> Path:
     """Cache the pinned NFS CSI chart from a checksum-verified source archive."""
     chart = config.state_dir / "charts" / f"csi-driver-nfs-{NFS_CSI_VERSION}.tgz"
@@ -1309,6 +1569,8 @@ def _validate_ssh_workers(runner: Runner, config: Config, private_key: Path) -> 
                 "-o",
                 "BatchMode=yes",
                 "-o",
+                "IdentitiesOnly=yes",
+                "-o",
                 f"UserKnownHostsFile={known_hosts}",
                 f"tester@{address}",
                 "test $(id -u) -eq 2000 && test $(stat -f -c %T /root) = overlayfs",
@@ -1322,6 +1584,8 @@ def _validate_ssh_workers(runner: Runner, config: Config, private_key: Path) -> 
             private_key,
             "-o",
             "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
             "-o",
             f"UserKnownHostsFile={known_hosts}",
             f"root@{addresses[0]}",
@@ -1377,11 +1641,14 @@ def _validate_ssh_storage(
 ) -> None:
     """Validate the selected home mode and shared storage claim."""
     names = [str(pod["metadata"]["name"]) for pod in pods]
+    token = secrets.token_hex(16)
     _pod_exec(
         runner,
         config,
         names[0],
-        "touch /home/tester/.integration-home-probe /mnt/storage-test/.integration-rwx-probe",
+        "touch /home/tester/.integration-home-probe; "
+        f"printf '%s\\n' {shlex.quote(token)} "
+        ">/mnt/storage-test/.integration-rwx-probe",
     )
     home_probe = _pod_exec(
         runner,
@@ -1390,14 +1657,29 @@ def _validate_ssh_storage(
         "test -e /home/tester/.integration-home-probe",
         check=False,
     )
+    storage_check = (
+        f'test "$(cat /mnt/storage-test/.integration-rwx-probe)" = '
+        f"{shlex.quote(token)}"
+    )
+    if _select_storage_backend(config) == "nfs":
+        storage_check += (
+            " && case $(stat -f -c %T /mnt/storage-test) in "
+            "nfs|nfs4) true;; *) false;; esac"
+        )
     rwx_probe = _pod_exec(
         runner,
         config,
         names[1],
-        "test -e /mnt/storage-test/.integration-rwx-probe && "
-        "case $(stat -f -c %T /mnt/storage-test) in nfs|nfs4) true;; *) false;; esac",
+        storage_check,
         check=False,
     )
+    if _select_storage_backend(config) == "sbx-shared":
+        host_probe = config.sbx_shared_root / "storage-test" / ".integration-rwx-probe"
+        if (
+            not host_probe.is_file()
+            or host_probe.read_text(encoding="utf-8").strip() != token
+        ):
+            raise ProvisionError("SBX shared data is not visible from the agent")
     expected_home_rc = 0 if config.ssh_home_mode == "shared" else 1
     if home_probe.returncode != expected_home_rc or rwx_probe.returncode:
         raise ProvisionError("SSH home or RWX visibility validation failed")
@@ -1470,6 +1752,7 @@ def _install_slurm(runner: Runner, config: Config) -> None:
     )
     _helm_slinky(runner, config)
     _wait_for_slurm(runner, config)
+    _restart_slinky_login(runner, config)
     _validate_slurm(runner, config)
 
 
@@ -1498,29 +1781,6 @@ def _prepare_slinky_login_image(runner: Runner, config: Config) -> None:
     )
 
 
-def _slinky_login_image_current(runner: Runner, config: Config) -> bool:
-    """Return whether the live LoginSet selects the prepared image."""
-    result = runner.run(
-        _kubectl(
-            config,
-            "-n",
-            config.namespace,
-            "get",
-            "loginsets",
-            "-o",
-            "json",
-        ),
-        check=False,
-        timeout=30,
-    )
-    if result.returncode:
-        return False
-    return any(
-        item.get("spec", {}).get("login", {}).get("image") == SLINKY_LOGIN_IMAGE
-        for item in json.loads(result.stdout).get("items", [])
-    )
-
-
 def _helm_slinky(runner: Runner, config: Config) -> None:
     """Reconcile the three pinned Slinky releases."""
     releases = (
@@ -1541,12 +1801,6 @@ def _helm_slinky(runner: Runner, config: Config) -> None:
         ),
     )
     for release, chart, values in releases:
-        current = _helm_release_current(runner, config, release, chart)
-        if current and (
-            release != "slurm" or _slinky_login_image_current(runner, config)
-        ):
-            LOG.info("Slinky release %s is already at %s", release, SLINKY_VERSION)
-            continue
         arguments: list[str | Path] = [
             "helm",
             "upgrade",
@@ -1565,7 +1819,7 @@ def _helm_slinky(runner: Runner, config: Config) -> None:
         ]
         if values:
             arguments.extend(["--values", values])
-        runner.run(arguments, timeout=600)
+        _install_slinky_release(runner, arguments, release)
         if release == "slurm-operator":
             runner.run(
                 _kubectl(
@@ -1591,34 +1845,28 @@ def _helm_slinky(runner: Runner, config: Config) -> None:
             )
 
 
-def _helm_release_current(
-    runner: Runner, config: Config, release: str, chart: str
-) -> bool:
-    """Return whether a healthy release already has the pinned chart version."""
-    result = runner.run(
-        [
-            "helm",
-            "list",
-            "--namespace",
-            config.namespace,
-            "--all",
-            "--output",
-            "json",
-            "--kubeconfig",
-            config.kubeconfig,
-        ],
-        check=False,
-        timeout=60,
-    )
-    if result.returncode:
-        return False
-    expected_chart = f"{chart}-{SLINKY_VERSION}"
-    return any(
-        item.get("name") == release
-        and item.get("chart") == expected_chart
-        and item.get("status") == "deployed"
-        for item in json.loads(result.stdout)
-    )
+def _install_slinky_release(
+    runner: Runner, arguments: list[str | Path], release: str
+) -> None:
+    """Install a release, retrying the operator webhook startup race once."""
+    for attempt in range(2):
+        result = runner.run(arguments, check=False, timeout=600)
+        if result.returncode == 0:
+            return
+        detail = result.stdout + result.stderr
+        webhook_race = "failed calling webhook" in detail
+        if attempt == 0 and webhook_race:
+            LOG.warning(
+                "Slinky release %s reached its webhook before it was responsive; "
+                "retrying once",
+                release,
+            )
+            time.sleep(10)
+            continue
+        raise ProvisionError(
+            f"Helm failed to install Slinky release {release!r}"
+            f"{_failure_detail(result.stdout, result.stderr, False)}"
+        )
 
 
 def _wait_for_slurm(runner: Runner, config: Config) -> None:
@@ -1672,15 +1920,54 @@ def _pod_is_ready(pod: dict[str, object]) -> bool:
 
 
 def _login_pod(runner: Runner, config: Config) -> str:
-    """Return the single Slinky LoginSet pod name."""
-    pods = _pods_with_container(_namespace_pods(runner, config), "login")
-    if len(pods) != 1:
-        raise ProvisionError(f"expected one LoginSet pod; found {len(pods)}")
-    return str(pods[0]["metadata"]["name"])  # type: ignore[index]
+    """Wait for and return the single ready, nonterminating LoginSet pod."""
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        pods = [
+            pod
+            for pod in _pods_with_container(_namespace_pods(runner, config), "login")
+            if not pod["metadata"].get("deletionTimestamp")  # type: ignore[index]
+            and _pod_is_ready(pod)
+        ]
+        if len(pods) == 1:
+            return str(pods[0]["metadata"]["name"])  # type: ignore[index]
+        LOG.info(
+            "Waiting for one ready, nonterminating LoginSet pod; found %s", len(pods)
+        )
+        time.sleep(3)
+    raise ProvisionError(
+        "LoginSet did not converge to one ready pod within 180 seconds"
+    )
+
+
+def _restart_slinky_login(runner: Runner, config: Config) -> None:
+    """Restart the configless login client after accounting is available."""
+    runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "rollout",
+            "restart",
+            "deployment/slurm-login-test",
+        )
+    )
+    runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "rollout",
+            "status",
+            "deployment/slurm-login-test",
+            "--timeout=180s",
+        ),
+        timeout=210,
+    )
 
 
 def _validate_slurm(runner: Runner, config: Config) -> None:
-    """Validate LoginSet placement, NFS, two-node fan-out, and accounting."""
+    """Validate LoginSet placement, storage, two-node fan-out, and accounting."""
     login = _login_pod(runner, config)
     login_node = runner.run(
         _kubectl(
@@ -1721,15 +2008,25 @@ def _validate_slurm(runner: Runner, config: Config) -> None:
             f"targets={sorted(target_nodes)}"
         )
     prefix = _kubectl(config, "-n", config.namespace, "exec", login, "--")
-    runner.run(
-        [
-            *prefix,
-            "bash",
-            "-c",
-            "case $(stat -f -c %T /mnt/storage-test) in "
-            "nfs|nfs4) true;; *) false;; esac",
-        ]
+    backend = _select_storage_backend(config)
+    token = secrets.token_hex(16)
+    storage_probe = (
+        f"printf '%s\\n' {shlex.quote(token)} >/mnt/storage-test/.login-probe"
     )
+    if backend == "nfs":
+        storage_probe += (
+            "; case $(stat -f -c %T /mnt/storage-test) in "
+            "nfs|nfs4) true;; *) false;; esac"
+        )
+    runner.run([*prefix, "bash", "-c", storage_probe])
+    if backend == "sbx-shared":
+        host_probe = config.sbx_shared_root / "storage-test" / ".login-probe"
+        if (
+            not host_probe.is_file()
+            or host_probe.read_text(encoding="utf-8").strip() != token
+        ):
+            raise ProvisionError("LoginSet SBX data is not visible from the agent")
+    runner.run([*prefix, "rm", "-f", "/mnt/storage-test/.login-probe"])
     fanout = runner.run(
         [
             *prefix,
@@ -1781,7 +2078,9 @@ def _validate_slurm(runner: Runner, config: Config) -> None:
         )
 
 
-def _write_state_summary(config: Config, subnet: str, gateway: str) -> None:
+def _write_state_summary(
+    config: Config, backend: str, subnet: str = "", gateway: str = ""
+) -> None:
     """Persist non-secret desired state for later diagnostics."""
     state = {
         "schema": STATE_SCHEMA,
@@ -1789,12 +2088,18 @@ def _write_state_summary(config: Config, subnet: str, gateway: str) -> None:
         "namespace": config.namespace,
         "export_dir": str(config.export_dir),
         "ssh_home_mode": config.ssh_home_mode,
+        "storage_backend": backend,
         "test_user": config.test_user,
         "test_uid": config.test_uid,
         "test_gid": config.test_gid,
-        "kind_version": KIND_VERSION,
-        "kubernetes_version": KUBECTL_VERSION,
-        "nfs_csi_version": NFS_CSI_VERSION,
+        "kind_version": (SBX_KIND_VERSION if backend == "sbx-shared" else KIND_VERSION),
+        "kubectl_version": (
+            SBX_KUBECTL_VERSION if backend == "sbx-shared" else KUBECTL_VERSION
+        ),
+        "kubernetes_version": (
+            SBX_KUBECTL_VERSION if backend == "sbx-shared" else KUBECTL_VERSION
+        ),
+        "nfs_csi_version": NFS_CSI_VERSION if backend == "nfs" else None,
         "slinky_version": SLINKY_VERSION,
         "kind_subnet": subnet,
         "kind_gateway": gateway,
@@ -1805,16 +2110,18 @@ def _write_state_summary(config: Config, subnet: str, gateway: str) -> None:
 def setup_environment(runner: Runner, config: Config) -> None:
     """Idempotently provision and validate the complete fixture."""
     architecture = _check_platform()
-    _check_host_capacity()
-    _ensure_apt_packages(runner)
+    backend = _select_storage_backend(config)
+    capacity_path = _repository_root() if backend == "sbx-shared" else Path("/")
+    _check_host_capacity(capacity_path)
+    _ensure_apt_packages(runner, backend)
     _ensure_docker(runner)
-    _ensure_client_tools(runner, architecture)
+    _ensure_client_tools(runner, architecture, backend)
     running_clusters = _kind_clusters(runner)
     containers = _kind_containers(runner, config, running_only=False)
     running_containers = _kind_containers(runner, config, running_only=True)
     cluster_exists = config.cluster_name in running_clusters or bool(containers)
     _ensure_cluster_ownership(config, cluster_exists)
-    if cluster_exists and not _export_mount_type(runner, config):
+    if backend == "nfs" and cluster_exists and not _export_mount_type(runner, config):
         LOG.warning(
             "Replacing the disposable cluster before initializing the NFS "
             "backing filesystem"
@@ -1823,20 +2130,30 @@ def setup_environment(runner: Runner, config: Config) -> None:
         running_clusters = set()
         running_containers = set()
         cluster_exists = False
-    _ensure_export_filesystem(runner, config)
+    if backend == "nfs":
+        _ensure_export_filesystem(runner, config)
+    else:
+        _prepare_sbx_shared(runner, config)
     if config.cluster_name in running_clusters and len(running_containers) == 3:
         _export_kubeconfig(runner, config)
     elif cluster_exists:
         LOG.warning("Replacing incomplete or stopped disposable kind cluster")
         _delete_cluster(runner, config)
-        _create_cluster(runner, config)
+        _create_cluster(runner, config, backend)
     else:
-        _create_cluster(runner, config)
+        _create_cluster(runner, config, backend)
+    if backend == "sbx-shared":
+        _configure_sbx_node_trust(runner, config)
     _wait_for_cluster(runner, config)
-    subnet, gateway = _kind_ipv4_network(runner)
-    _configure_nfs(runner, config, subnet, gateway)
-    _probe_nfs(runner, config, gateway)
-    _install_nfs_csi(runner, config, gateway)
+    subnet = ""
+    gateway = ""
+    if backend == "nfs":
+        subnet, gateway = _kind_ipv4_network(runner)
+        _configure_nfs(runner, config, subnet, gateway)
+        _probe_nfs(runner, config, gateway)
+        _install_nfs_csi(runner, config, gateway)
+    else:
+        _install_sbx_shared_storage(runner, config)
     _install_ssh_workers(runner, config)
     _scale_ssh(runner, config, replicas=0)
     _install_slurm(runner, config)
@@ -1844,7 +2161,7 @@ def setup_environment(runner: Runner, config: Config) -> None:
     _wait_for_ssh(runner, config)
     private_key = config.keys_dir / "id_ed25519"
     _validate_ssh_workers(runner, config, private_key)
-    _write_state_summary(config, subnet, gateway)
+    _write_state_summary(config, backend, subnet, gateway)
     LOG.info("Integration environment is provisioned and running")
 
 
@@ -1937,15 +2254,35 @@ def stop_environment(runner: Runner, config: Config) -> None:
         _delete_cluster(runner, config)
     else:
         LOG.info("Disposable kind cluster %s is already absent", config.cluster_name)
-    _stop_owned_nfs(runner, config)
+    backend = _select_storage_backend(config)
+    if backend == "nfs":
+        _stop_owned_nfs(runner, config)
     LOG.info(
-        "Integration environment stopped; host packages, caches, keys, and NFS data "
-        "were preserved"
+        "Integration environment stopped; host packages, caches, keys, and %s "
+        "data were preserved",
+        "NFS" if backend == "nfs" else "SBX shared",
     )
 
 
 def teardown_environment(runner: Runner, config: Config) -> None:
     """Stop the fixture and remove all harness-owned data and host config."""
+    if _select_storage_backend(config) == "sbx-shared":
+        state_owned, setup_owned, shared_owned = _validate_sbx_teardown_ownership(
+            runner, config
+        )
+        stop_environment(runner, config)
+        if setup_owned:
+            _remove_harness_images(runner, config)
+        if shared_owned:
+            _remove_sbx_shared(runner, config)
+        _remove_owned_directories(
+            runner, config, remove_state=state_owned, remove_export=False
+        )
+        LOG.info(
+            "Docker SBX integration environment torn down; installed host "
+            "packages and client tools were preserved"
+        )
+        return
     state_owned, setup_owned, export_owned, nfs_configured = (
         _validate_teardown_ownership(runner, config)
     )
@@ -1963,6 +2300,68 @@ def teardown_environment(runner: Runner, config: Config) -> None:
         "Integration environment torn down; installed host packages and client "
         "tools were preserved"
     )
+
+
+def _validate_sbx_teardown_ownership(
+    runner: Runner, config: Config
+) -> tuple[bool, bool, bool]:
+    """Validate owned state and shared paths before Docker SBX cleanup."""
+    _validate_cleanup_paths(config)
+    _validate_sbx_shared_root(config)
+    expected_owner = _owner_document(config)
+    state_marker = config.state_dir / STATE_MARKER
+    state_owned = state_marker.is_file()
+    if (
+        state_owned
+        and json.loads(state_marker.read_text(encoding="utf-8")) != expected_owner
+    ):
+        raise ProvisionError(
+            f"refusing teardown with mismatched ownership marker: {state_marker}"
+        )
+    if config.state_dir.exists() and not state_owned:
+        raise ProvisionError(
+            f"refusing to remove unowned setup state: {config.state_dir}"
+        )
+
+    cluster_marker = config.state_dir / "cluster-owner.json"
+    setup_owned = cluster_marker.is_file()
+    if (
+        setup_owned
+        and json.loads(cluster_marker.read_text(encoding="utf-8")) != expected_owner
+    ):
+        raise ProvisionError(
+            f"refusing teardown with mismatched ownership marker: {cluster_marker}"
+        )
+
+    root = config.sbx_shared_root
+    shared_owned = root.exists()
+    if shared_owned:
+        marker = root / EXPORT_MARKER
+        if not marker.is_file() or json.loads(marker.read_text(encoding="utf-8")) != (
+            _sbx_shared_marker(config)
+        ):
+            raise ProvisionError(
+                f"refusing teardown of unowned SBX shared root: {root}"
+            )
+        allowed = {EXPORT_MARKER, "storage-test", "ssh-home"}
+        unexpected = sorted(
+            path.name for path in root.iterdir() if path.name not in allowed
+        )
+        if unexpected:
+            raise ProvisionError(
+                f"refusing unexpected entries in SBX shared root: {unexpected}"
+            )
+    if setup_owned:
+        _validate_image_ownership(runner, config)
+    return state_owned, setup_owned, shared_owned
+
+
+def _remove_sbx_shared(runner: Runner, config: Config) -> None:
+    """Remove only the validated marker-owned Docker SBX shared root."""
+    root = config.sbx_shared_root
+    runner.run(["find", root, "-xdev", "-depth", "-delete"], timeout=120)
+    if root.exists():
+        raise ProvisionError(f"cleanup did not remove SBX shared root: {root}")
 
 
 def _owner_document(config: Config) -> dict[str, object]:
@@ -2089,16 +2488,43 @@ def _validate_teardown_ownership(
 
 
 def _validate_cleanup_paths(config: Config) -> None:
-    """Reject broad or overlapping destructive cleanup targets."""
+    """Reject broad or overlapping lifecycle paths."""
     forbidden = {Path("/"), Path("/var"), Path("/srv"), Path("/etc")}
     if config.state_dir in forbidden or config.export_dir in forbidden:
-        raise ProvisionError("refusing teardown with a broad state or export path")
+        raise ProvisionError(
+            "refusing lifecycle action with a broad state or export path"
+        )
     if config.state_dir == config.export_dir:
         raise ProvisionError("state and export directories must be different")
     if config.state_dir in config.export_dir.parents:
         raise ProvisionError("export directory must not be inside the state directory")
     if config.export_dir in config.state_dir.parents:
         raise ProvisionError("state directory must not be inside the export directory")
+
+
+def _validate_lifecycle_paths(config: Config) -> None:
+    """Validate state ownership before bootstrap can mutate its path."""
+    _validate_cleanup_paths(config)
+    state_dir = config.state_dir
+    if not state_dir.exists():
+        if not state_dir.parent.is_dir():
+            raise ProvisionError(
+                f"state directory must be a leaf below an existing directory: {state_dir}"
+            )
+        return
+    if not state_dir.is_dir():
+        raise ProvisionError(f"state path is not a directory: {state_dir}")
+    marker = state_dir / STATE_MARKER
+    if not marker.is_file():
+        raise ProvisionError(f"refusing to modify unowned setup state: {state_dir}")
+    try:
+        owner = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ProvisionError(
+            f"invalid setup state ownership marker: {marker}"
+        ) from error
+    if owner != _owner_document(config):
+        raise ProvisionError(f"setup state ownership marker does not match: {marker}")
 
 
 def _validate_installed_config(
@@ -2355,6 +2781,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     parser.add_argument("--export-dir", type=Path, default=DEFAULT_EXPORT_DIR)
     parser.add_argument(
+        "--storage-backend",
+        choices=("auto", "nfs", "sbx-shared"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--sbx-shared-root",
+        type=Path,
+        default=DEFAULT_SBX_SHARED_ROOT,
+    )
+    parser.add_argument(
         "--test-user",
         help=(
             "non-root account that runs tests; required for root setup unless "
@@ -2385,6 +2821,8 @@ def _config(arguments: argparse.Namespace) -> Config:
         namespace=arguments.namespace,
         state_dir=arguments.state_dir.resolve(),
         export_dir=arguments.export_dir.resolve(),
+        storage_backend=arguments.storage_backend,
+        sbx_shared_root=arguments.sbx_shared_root.resolve(),
         ssh_home_mode=arguments.ssh_home_mode,
         test_user=account.pw_name,
         test_uid=account.pw_uid,
@@ -2434,6 +2872,7 @@ def main() -> int:
                 "action as the account provisioned by setup"
             )
         config = _config(arguments)
+        _validate_lifecycle_paths(config)
         if arguments.action != "test" and arguments.tests:
             raise ProvisionError("test selectors are valid only with the test action")
         if arguments.action == "test" and not config.state_dir.is_dir():

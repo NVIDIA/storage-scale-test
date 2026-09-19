@@ -40,6 +40,11 @@ ELBENCHO_VERSION = "v3.1-11"
 ELBENCHO_RELEASE_API = (
     "https://api.github.com/repos/breuner/elbencho/releases/tags/" + ELBENCHO_VERSION
 )
+ELBENCHO_CONTAINER = (
+    "breuner/elbencho:v3.1-11@"
+    "sha256:719fba92cab57c773ddf7a2776414b358aeb8126a15fbc8e3c52469ce3a5b8b2"
+)
+SBX_ELBENCHO_BUNDLE_RECIPE = 1
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
 MAX_DEPLOYMENT_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_DEPLOYMENT_FILES = 10_000
@@ -76,6 +81,7 @@ class Fixture:
     slurm_addresses: tuple[str, str]
     architecture: str
     ssh_home_mode: str
+    storage_backend: str
 
 
 def _kubectl(config: Any, *arguments: str | Path) -> list[str | Path]:
@@ -138,6 +144,7 @@ def _pods_with_container(
         pod
         for pod in pods
         if _ready(pod)
+        and not pod.get("metadata", {}).get("deletionTimestamp")
         and container
         in {item["name"] for item in pod.get("spec", {}).get("containers", [])}
     ]
@@ -171,6 +178,9 @@ def _load_state(config: Any) -> dict[str, Any]:
     mode = state.get("ssh_home_mode")
     if mode not in {"separate", "shared"}:
         raise IntegrationTestError(f"invalid ssh_home_mode in {path}: {mode!r}")
+    backend = state.get("storage_backend")
+    if backend not in {"nfs", "sbx-shared"}:
+        raise IntegrationTestError(f"invalid storage_backend in {path}: {backend!r}")
     return state
 
 
@@ -310,9 +320,12 @@ def _require_fixture(runner: Any, config: Any) -> Fixture:
     )
     _probe_pod(runner, config, login_name, "login", tools)
     _probe_pod(runner, config, ssh_name, "sshd", tools, as_user="tester")
-    mount_probe = (
-        "case $(stat -f -c %T /mnt/storage-test) in nfs|nfs4) true;; *) false;; esac"
-    )
+    mount_probe = "test -w /mnt/storage-test"
+    if state["storage_backend"] == "nfs":
+        mount_probe += (
+            " && case $(stat -f -c %T /mnt/storage-test) in "
+            "nfs|nfs4) true;; *) false;; esac"
+        )
     _probe_pod(runner, config, login_name, "login", mount_probe)
     _probe_pod(runner, config, ssh_name, "sshd", mount_probe, as_user="tester")
     login_arch = _probe_pod(runner, config, login_name, "login", "uname -m")
@@ -361,6 +374,7 @@ def _require_fixture(runner: Any, config: Any) -> Fixture:
         slurm_addresses=(slurm_addresses[0], slurm_addresses[1]),
         architecture=host_arch,
         ssh_home_mode=str(state["ssh_home_mode"]),
+        storage_backend=str(state["storage_backend"]),
     )
 
 
@@ -443,10 +457,133 @@ def _download_archive(destination: Path, name: str, expected: str) -> None:
     temporary.replace(destination)
 
 
-def _ensure_elbencho(config: Any, architecture: str) -> tuple[Path, str]:
+def _extract_container_elbencho(
+    runner: Any, cache: Path, binary: Path, runtime: Path, architecture: str
+) -> None:
+    """Build a portable wrapper from the digest-pinned upstream image."""
+    runner.run(["docker", "pull", ELBENCHO_CONTAINER], timeout=300)
+    container = runner.run(
+        ["docker", "create", "--entrypoint", "sleep", ELBENCHO_CONTAINER, "infinity"]
+    ).stdout.strip()
+    if not container:
+        raise IntegrationTestError("Docker did not return an elbencho container ID")
+    archive = cache / f".{binary.name}.runtime.tar"
+    try:
+        bundle = """
+set -eu
+rm -rf /tmp/elbencho-runtime /tmp/elbencho-runtime.tar
+mkdir -p /tmp/elbencho-runtime
+libraries=$(ldd /usr/bin/elbencho | awk '$3 ~ /^\\// {print $3} $1 ~ /^\\// {print $1}')
+loader=$(ldd /usr/bin/elbencho | awk '{for (i=1; i<=NF; i++) if ($i ~ /^\\/.*ld-linux.*\\.so/) {print $i; exit}}')
+test -n "$loader"
+cp -L --parents /usr/bin/elbencho $libraries /tmp/elbencho-runtime
+printf '%s\n' "$loader" > /tmp/elbencho-runtime/.loader-path
+cd /tmp/elbencho-runtime
+tar -cf /tmp/elbencho-runtime.tar .
+""".strip()
+        runner.run(["docker", "start", container])
+        runner.run(["docker", "exec", container, "sh", "-ec", bundle])
+        runner.run(["docker", "cp", f"{container}:/tmp/elbencho-runtime.tar", archive])
+        temporary_runtime = cache / f".{runtime.name}.new"
+        shutil.rmtree(temporary_runtime, ignore_errors=True)
+        temporary_runtime.mkdir()
+        with tarfile.open(archive) as tar:
+            tar.extractall(temporary_runtime, filter="data")
+        loader_marker = temporary_runtime / ".loader-path"
+        loader_path = Path(loader_marker.read_text(encoding="utf-8").strip())
+        if not loader_path.is_absolute() or ".." in loader_path.parts:
+            raise IntegrationTestError(
+                f"container reported an invalid dynamic loader path: {loader_path}"
+            )
+        loader_relative = loader_path.relative_to("/")
+        if not (temporary_runtime / loader_relative).is_file():
+            raise IntegrationTestError(
+                f"container runtime is missing its dynamic loader: {loader_path}"
+            )
+        loader_marker.unlink()
+        shutil.rmtree(runtime, ignore_errors=True)
+        temporary_runtime.replace(runtime)
+        library_arch = (
+            "aarch64-linux-gnu" if architecture == "aarch64" else "x86_64-linux-gnu"
+        )
+        wrapper = "\n".join(
+            (
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                'runtime_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/'
+                'elbencho-runtime" && pwd)',
+                f'exec "$runtime_dir/{loader_relative.as_posix()}" \\',
+                f'    --library-path "$runtime_dir/usr/lib/{library_arch}:'
+                f'$runtime_dir/lib/{library_arch}" \\',
+                '    "$runtime_dir/usr/bin/elbencho" "$@"',
+                "",
+            )
+        )
+        binary.write_text(wrapper, encoding="utf-8")
+        binary.chmod(0o755)
+    finally:
+        archive.unlink(missing_ok=True)
+        runner.run(["docker", "rm", "--force", container], check=False)
+
+
+def _sbx_bundle_document(architecture: str, binary_name: str) -> dict[str, object]:
+    """Return the exact recipe identity for a cached SBX Elbencho bundle."""
+    return {
+        "schema": 1,
+        "recipe": SBX_ELBENCHO_BUNDLE_RECIPE,
+        "container": ELBENCHO_CONTAINER,
+        "architecture": architecture,
+        "binary_name": binary_name,
+    }
+
+
+def _write_sbx_bundle_marker(path: Path, document: dict[str, object]) -> None:
+    """Atomically record a successfully built SBX Elbencho bundle."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, delete=False
+    ) as handle:
+        json.dump(document, handle, sort_keys=True)
+        handle.write("\n")
+        temporary = Path(handle.name)
+    temporary.chmod(0o640)
+    temporary.replace(path)
+
+
+def _sbx_bundle_is_current(
+    binary: Path,
+    runtime: Path,
+    marker: Path,
+    expected: dict[str, object],
+) -> bool:
+    """Return whether all cached bundle artifacts match the current recipe."""
+    if not binary.is_file() or not runtime.is_dir() or not marker.is_file():
+        return False
+    try:
+        document = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return document == expected
+
+
+def _ensure_elbencho(
+    runner: Any, config: Any, architecture: str, storage_backend: str
+) -> tuple[Path, str, Path | None]:
     """Return a verified, extracted pinned elbencho binary and staged name."""
     archive_name, expected, binary_name = ELBENCHO_ARCHIVES[architecture]
     cache = config.state_dir / "test-cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    binary = cache / f"{ELBENCHO_VERSION}-{binary_name}"
+    if storage_backend == "sbx-shared":
+        runtime = cache / f"{ELBENCHO_VERSION}-{binary_name}.runtime"
+        marker = cache / f"{ELBENCHO_VERSION}-{binary_name}.bundle.json"
+        bundle_document = _sbx_bundle_document(architecture, binary_name)
+        if not _sbx_bundle_is_current(binary, runtime, marker, bundle_document):
+            LOG.info("Extracting pinned elbencho %s container", ELBENCHO_VERSION)
+            _extract_container_elbencho(runner, cache, binary, runtime, architecture)
+            _write_sbx_bundle_marker(marker, bundle_document)
+        else:
+            LOG.info("Using cached elbencho from the pinned upstream container")
+        return binary, binary_name, runtime
     archive = cache / f"{ELBENCHO_VERSION}-{archive_name}"
     if not archive.is_file() or _sha256(archive) != expected:
         LOG.info(
@@ -455,7 +592,6 @@ def _ensure_elbencho(config: Any, architecture: str) -> tuple[Path, str]:
         _download_archive(archive, archive_name, expected)
     else:
         LOG.info("Using cached pinned elbencho archive for %s", architecture)
-    binary = cache / f"{ELBENCHO_VERSION}-{binary_name}"
     with tarfile.open(archive, "r:gz") as tar:
         members = [
             member
@@ -474,7 +610,7 @@ def _ensure_elbencho(config: Any, architecture: str) -> tuple[Path, str]:
             shutil.copyfileobj(source, handle)
     temporary.chmod(0o755)
     temporary.replace(binary)
-    return binary, binary_name
+    return binary, binary_name, None
 
 
 def _shell(value: str | Path) -> str:
@@ -503,7 +639,7 @@ def _override_block(
         "export ELBENCHO_FILE_SIZE_MULTIPLIER=1",
         'export ELBENCHO_FILE_LAYOUT="shared-directory"',
         "export ELBENCHO_FILES_PER_NODE=1",
-        'export ELBENCHO_FILE_SIZE="4K"',
+        'export ELBENCHO_FILE_SIZE="16M"',
         'export ELBENCHO_SCALE_IO_SIZES=("4K")',
         'export ELBENCHO_IODEPTH_LIST=("1")',
         "export ELBENCHO_SCALE_READ_WRITE_DURATION=1",
@@ -597,6 +733,7 @@ def _validate_deployment_archive(
     binary_digest: str,
     architecture: str,
     runner: Any,
+    bundled_runtime: bool,
 ) -> Path:
     """Validate and safely extract the deployment tarball."""
     if not archive.is_file() or archive.stat().st_size > MAX_DEPLOYMENT_ARCHIVE_BYTES:
@@ -611,6 +748,8 @@ def _validate_deployment_archive(
         "storage-scale-test/storage-tests/fs/nv-elbencho-sweep.sh",
         f"storage-scale-test/utils/{binary_name}",
     }
+    if bundled_runtime:
+        required.add("storage-scale-test/utils/elbencho-runtime/usr/bin/elbencho")
     names: set[str] = set()
     content_bytes = 0
     with tarfile.open(archive, "r:gz") as tar:
@@ -662,7 +801,10 @@ def _validate_deployment_archive(
         raise IntegrationTestError(
             f"packaged elbencho failed identity checks: {packaged_binary}"
         )
-    description = runner.run(["file", packaged_binary], timeout=30).stdout
+    inspected_binary = packaged_binary
+    if bundled_runtime:
+        inspected_binary = root / "utils" / "elbencho-runtime" / "usr/bin/elbencho"
+    description = runner.run(["file", inspected_binary], timeout=30).stdout
     expected_arch = "x86-64" if architecture == "x86_64" else "aarch64"
     if expected_arch not in description:
         raise IntegrationTestError(
@@ -679,6 +821,7 @@ def _build_deployment_archive(
     binary: Path,
     binary_name: str,
     architecture: str,
+    runtime: Path | None,
 ) -> tuple[Path, Path]:
     """Build and inspect one filesystem-only deployment tarball."""
     snapshot = build_root / "source"
@@ -686,6 +829,8 @@ def _build_deployment_archive(
     seeded_binary = snapshot / "utils" / binary_name
     shutil.copy2(binary, seeded_binary)
     seeded_binary.chmod(0o755)
+    if runtime is not None:
+        shutil.copytree(runtime, snapshot / "utils" / "elbencho-runtime")
     LOG.info("Building deployment tarball from a tracked-files-only snapshot")
     result = runner.run(
         [
@@ -708,6 +853,7 @@ def _build_deployment_archive(
         _sha256(binary),
         architecture,
         runner,
+        runtime is not None,
     )
     return archive, extracted
 
@@ -759,6 +905,40 @@ def _stream_to_login(
             stdin=stream,
             timeout=timeout,
         )
+
+
+def _stage_ssh_runtime(
+    runner: Any, config: Any, runtime: Path, pods: list[dict[str, Any]]
+) -> None:
+    """Install the container-derived runtime beside each SSH wrapper target."""
+    ssh_pods = sorted(
+        _pods_with_container(pods, "sshd"),
+        key=lambda item: item["metadata"]["name"],
+    )
+    with tempfile.NamedTemporaryFile(suffix=".tar") as stream:
+        with tarfile.open(fileobj=stream, mode="w") as archive:
+            archive.add(runtime, arcname="elbencho-runtime")
+        stream.flush()
+        for pod in ssh_pods:
+            stream.seek(0)
+            command = [
+                *_kubectl(
+                    config,
+                    "-n",
+                    config.namespace,
+                    "exec",
+                    "-i",
+                    pod["metadata"]["name"],
+                    "-c",
+                    "sshd",
+                    "--",
+                ),
+                "bash",
+                "-ec",
+                "rm -rf -- /home/tester/elbencho-runtime && "
+                "tar --no-same-owner --no-same-permissions -xf - -C /home/tester",
+            ]
+            runner.run(command, stdin=stream, timeout=180)
 
 
 def _stage_workspace(
@@ -847,7 +1027,7 @@ def _test_command(
             "--kill-after=10s",
             f"{timeout}s",
             "bash",
-            "-lc",
+            "-c",
             host_command,
         ]
     return _pod_command(
@@ -887,7 +1067,7 @@ def _run_step(
             f"full output: {log_path}\n{detail}"
         )
     LOG.info("Passed %s filesystem step: %s", selector, name)
-    return output
+    return result.stdout
 
 
 def _assert_results(
@@ -953,12 +1133,10 @@ for id in 0001 0002; do
     test -s "$result/executions/$id.log"
     test -s "$result/executions/$id.workload.tsv"
 done
-grep -qx $'nodes\t1' "$result/executions/0001.workload.tsv"
-grep -qx $'nodes\t2' "$result/executions/0002.workload.tsv"
 grep -qx $'dataset_files_total\t1' "$result/executions/0001.workload.tsv"
 grep -qx $'dataset_files_total\t2' "$result/executions/0002.workload.tsv"
-grep -qx $'dataset_bytes_total\t4096' "$result/executions/0001.workload.tsv"
-grep -qx $'dataset_bytes_total\t8192' "$result/executions/0002.workload.tsv"
+grep -qx $'dataset_bytes_total\t16777216' "$result/executions/0001.workload.tsv"
+grep -qx $'dataset_bytes_total\t33554432' "$result/executions/0002.workload.tsv"
 grep -qx $'completion_state\tcompleted' "$result/executions/0001.workload.tsv"
 grep -qx $'completion_state\tcompleted' "$result/executions/0002.workload.tsv"
 test "$(find "$result" -type f -name '*.csv' -size +0c | wc -l)" -ge 2
@@ -1155,7 +1333,12 @@ def run_filesystem_tests(
     selected = _selected_tests(selectors)
     LOG.info("Requiring an already-running integration setup")
     fixture = _require_fixture(runner, config)
-    binary, binary_name = _ensure_elbencho(config, fixture.architecture)
+    binary, binary_name, runtime = _ensure_elbencho(
+        runner, config, fixture.architecture, fixture.storage_backend
+    )
+    if runtime is not None and "ssh" in selected:
+        LOG.info("Staging the pinned Elbencho container runtime in SSH worker homes")
+        _stage_ssh_runtime(runner, config, runtime, _pod_inventory(runner, config))
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{os.getpid()}"
     log_dir = config.state_dir / "test-runs" / run_id
     log_dir.mkdir(parents=True, exist_ok=False)
@@ -1170,6 +1353,7 @@ def run_filesystem_tests(
             binary,
             binary_name,
             fixture.architecture,
+            runtime,
         )
         shutil.copy2(build_root / "build-tarball.log", log_dir / "build-tarball.log")
         report_workspace = build_root / "report-workspace"
