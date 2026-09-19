@@ -2223,7 +2223,7 @@ dispatch_ssh_executions() {
 # The nameref lets the entry point stop services before releasing the lock.
 _dispatch_ssh_executions_owned() {
     local output_dir="$1"
-    local -n ssh_services_started="$2"
+    local -n ssh_services_started_ref="$2"
     local executions_dir="${output_dir}/executions"
     _elbencho_sweep_running_to_pending "$executions_dir" || return 1
 
@@ -2248,7 +2248,8 @@ _dispatch_ssh_executions_owned() {
         echo "Error: failed to start elbencho services on any reachable SSH host" >&2
         return 1
     fi
-    ssh_services_started=1
+    # shellcheck disable=SC2034  # Nameref assignment updates the caller's flag.
+    ssh_services_started_ref=1
 
     local max_nodes
     if ! max_nodes=$(max_nodes_remaining_executions "$executions_dir"); then
@@ -2323,7 +2324,7 @@ _ssh_fan_out_to_each_host() {
     }
 
     local rc=0
-    local -a successful_hosts=()
+    local -a completed_hosts=()
     local spawn_output
     if ! spawn_output=$(spawn_N_ssh "$status_dir" true "$scriptlet"); then
         rc=1
@@ -2341,7 +2342,7 @@ _ssh_fan_out_to_each_host() {
                     echo "Warning: SSH command failed on $hostname (rc=$ssh_rc)" >&2
                     rc=1
                 else
-                    successful_hosts+=("$hostname")
+                    completed_hosts+=("$hostname")
                 fi
             done
         fi
@@ -2354,7 +2355,7 @@ _ssh_fan_out_to_each_host() {
     if [[ -n "$successful_hosts_array_name" ]]; then
         local -n successful_hosts_ref="$successful_hosts_array_name"
         # shellcheck disable=SC2034  # Assignment intentionally updates the caller's named array
-        successful_hosts_ref=("${successful_hosts[@]}")
+        successful_hosts_ref=("${completed_hosts[@]}")
     fi
     return "$rc"
 }

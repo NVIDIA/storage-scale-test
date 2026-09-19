@@ -56,6 +56,14 @@ and are responsible for every binary they place in it.
 
 Slurm is the default execution substrate. Setting `SSH_HOST_LIST` selects
 passwordless SSH instead. Kubernetes execution is not implemented.
+The separate `integration-tests/` fixture provisions a three-node kind cluster,
+NFS CSI storage, two passwordless-SSH workers, and a Slinky Slurm environment
+on one Linux host. Its test action builds and validates a deployment tarball,
+derives environments from the packaged `env.sh.template`, and runs bounded
+one-node and two-node filesystem sweeps through SSH and Slurm. The SSH entry
+point runs on the host; the Slurm entry point runs from the archive extracted by
+the LoginSet on shared storage. It does not add Kubernetes dispatch to the
+benchmark entry points.
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 3.14 unit tests run weekly and on manual request.
@@ -79,6 +87,8 @@ alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 | `utils/build_tarball.sh` | User-local deployment-tarball builder |
 | `utils/build/` | Helpers for building Warp and the in-tree s3test program |
 | `tests/` | Python and shell-behavior regression tests collected by `pytest` |
+| `integration-tests/` | Single-host kind, NFS CSI, SSH, and Slinky fixture provisioner and manifests |
+| `docs/research/` | Feasibility studies and implementation handoffs for future integration work |
 
 The checked-in benchmark entry points are:
 
@@ -406,6 +416,10 @@ into a benchmark environment. It:
   missing or stale; and
 - includes existing Warp binaries but does not download or automatically build
   them, warning when an architecture is missing.
+
+By default the helper retains that full behavior. `--arch` can select only the
+native elbencho architecture, and `--skip-object-tools` omits Warp checks and
+s3test builds when creating a filesystem-only deployment archive.
 
 `utils/build/build_s3test_from_source.sh` tries suitable local compilers, Docker,
 and Docker Buildx. Failure to produce one architecture warns and permits tarball
