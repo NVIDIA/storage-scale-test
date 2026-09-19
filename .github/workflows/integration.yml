@@ -58,6 +58,6 @@ jobs:
         run: sudo "$(command -v python)" integration-tests/bin/integration-test.py setup
       - name: Run all integration tests
         run: sudo "$(command -v python)" integration-tests/bin/integration-test.py test all
-      - name: Stop the integration environment
+      - name: Tear down the integration environment
         if: ${{ always() }}
-        run: sudo "$(command -v python)" integration-tests/bin/integration-test.py stop
+        run: sudo "$(command -v python)" integration-tests/bin/integration-test.py teardown

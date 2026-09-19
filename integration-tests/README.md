@@ -79,8 +79,8 @@ cleanup of its generated data directories.
 ## On-demand CI
 
 The `Filesystem integration` GitHub Actions workflow runs setup followed by
-`test all` and always attempts a disposable stop. It is deliberately absent
-from ordinary pull-request and default-branch events.
+`test all` and always attempts a full teardown. It is deliberately absent from
+ordinary pull-request and default-branch events.
 
 For a pull request, use the repository's existing PR authorization control—the
 same control used to start the regular PR checks. Authorization copies the
@@ -110,3 +110,19 @@ logs and rendered manifests are retained in the state directory. Add
 `--verbose` for command-level logging. The failure path captures host, Docker,
 NFS, Kubernetes node, pod, and event diagnostics without printing Kubernetes
 Secrets.
+
+For CI workers or any host where retained fixture data is not wanted, run:
+
+```bash
+integration-tests/bin/integration-test.py teardown
+```
+
+Teardown is idempotent. It performs the disposable stop, removes the dedicated
+NFS export and configuration, disables and stops `nfs-server`, removes any UFW
+rule that the harness added, unmounts the verified loop-backed filesystem, and
+deletes the fixture's generated data, keys, logs, and locally built image tags.
+It refuses destructive cleanup when ownership markers, rendered host
+configuration, mount backing, or unrelated NFS exports do not match the
+fixture. Operating-system packages, kind, kubectl, Helm, and reusable upstream
+Docker image layers are not uninstalled. If a locally built tag existed before
+setup, teardown restores that exact prior image ID instead of deleting it.
