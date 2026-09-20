@@ -110,6 +110,46 @@ def test_valid_filter_matching_no_metrics_is_an_error(monkeypatch, tmp_path):
     assert raised.value.code == 1
 
 
+def _mixed_report_input(tmp_path, live_nodes):
+    """Create recognizable aggregate and live filenames for CLI tests."""
+    stem = "elbencho-4K-c_001-s_001-d_001_20260101Z000000"
+    (tmp_path / f"{stem}.csv").write_text("aggregate\n", encoding="utf-8")
+    (tmp_path / f"{stem}.out").write_text("aggregate\n", encoding="utf-8")
+    live_stem = f"elbencho-4K-c_{live_nodes:03d}-s_001-d_001_20260101Z000000"
+    (tmp_path / f"{live_stem}.live.csv").write_text("live\n", encoding="utf-8")
+
+
+def test_live_match_cannot_hide_empty_filtered_aggregate(monkeypatch, tmp_path):
+    """Each discovered report family must independently survive filtering."""
+    _mixed_report_input(tmp_path, live_nodes=2)
+    monkeypatch.setattr(_EXTRACT, "parse_elbencho_files", lambda _base: [_metric()])
+
+    with pytest.raises(SystemExit) as raised:
+        _run_main(
+            monkeypatch,
+            str(tmp_path),
+            "--only-nodes",
+            "2",
+            "--markdown",
+        )
+
+    assert raised.value.code == 1
+
+
+def test_failed_live_reports_cannot_hide_behind_aggregate(monkeypatch, tmp_path):
+    """Aggregate output does not turn a failed live report into success."""
+    _mixed_report_input(tmp_path, live_nodes=1)
+    monkeypatch.setattr(_EXTRACT, "parse_elbencho_files", lambda _base: [_metric()])
+    monkeypatch.setattr(_EXTRACT, "print_markdown_table", lambda *_args: None)
+    monkeypatch.setattr(_EXTRACT, "plot_metrics", lambda *_args: None)
+    monkeypatch.setattr(_EXTRACT, "_report_one_live_file", lambda *_args: False)
+
+    with pytest.raises(SystemExit) as raised:
+        _run_main(monkeypatch, str(tmp_path), "--markdown")
+
+    assert raised.value.code == 1
+
+
 def test_csv_round_trip_preserves_report_dimensions(tmp_path):
     """Persisted metrics retain the dimensions needed by later filtering."""
     metrics = [

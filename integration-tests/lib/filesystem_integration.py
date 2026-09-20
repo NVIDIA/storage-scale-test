@@ -30,7 +30,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -89,9 +89,11 @@ ELBENCHO_ARCHIVES = {
     ),
 }
 REMOTE_BASE = "/mnt/storage-test/integration-regression"
+SSH_FAILURE_STAGING_BASE = "/tmp/storage-scale-test-integration-failure"
 VALIDATION_SUCCESS = "All validation checks passed successfully"
-POD_TEST_UID = 2000
-POD_TEST_GID = 2000
+WORKLOAD_USER = "tester"
+WORKLOAD_UID = 2000
+WORKLOAD_GID = 2000
 
 
 class IntegrationTestError(RuntimeError):
@@ -104,9 +106,9 @@ class Fixture:
 
     login_pod: str
     login_container: str
-    ssh_addresses: tuple[str, str]
-    slurm_nodes: tuple[str, str]
-    slurm_addresses: tuple[str, str]
+    ssh_addresses: tuple[str, ...]
+    slurm_nodes: tuple[str, ...]
+    slurm_addresses: tuple[str, ...]
     architecture: str
     ssh_home_mode: str
     storage_backend: str
@@ -294,17 +296,22 @@ def _pod_inventory(runner: Any, config: Any) -> list[dict[str, Any]]:
 
 def _require_pods(
     pods: list[dict[str, Any]],
+    substrates: set[str],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Require one LoginSet and two SSH worker pods."""
+    """Require only the live workloads needed by selected substrates."""
     login = _pods_with_container(pods, "login")
     ssh = sorted(
         _pods_with_container(pods, "sshd"), key=lambda item: item["metadata"]["name"]
     )
     slurmd = _pods_with_container(pods, "slurmd")
-    if len(login) != 1 or len(ssh) != 2 or len(slurmd) != 2:
+    invalid = len(login) != 1
+    invalid = invalid or ("ssh" in substrates and len(ssh) != 2)
+    invalid = invalid or ("slurm" in substrates and len(slurmd) != 2)
+    if invalid:
         raise IntegrationTestError(
             "fixture workloads are incomplete: "
-            f"login={len(login)}, ssh={len(ssh)}, slurmd={len(slurmd)}; run setup"
+            f"required={sorted(substrates)}, login={len(login)}, ssh={len(ssh)}, "
+            f"slurmd={len(slurmd)}; run setup"
         )
     return login[0], ssh
 
@@ -334,22 +341,25 @@ def _probe_pod(
 
 
 def _require_fixture(
-    runner: Any, config: Any, ssh_home_mode: str = "separate"
+    runner: Any,
+    config: Any,
+    substrates: set[str],
+    ssh_home_mode: str = "separate",
 ) -> Fixture:
     """Validate setup without reconciling or installing anything."""
     state = _load_state(config)
-    required_host_tools = (
+    required_host_tools = {
         "bash",
         "file",
         "find",
         "git",
-        "ssh-add",
-        "ssh-agent",
         "tar",
         "timeout",
-    )
+    }
+    if "ssh" in substrates:
+        required_host_tools.update(("ssh-add", "ssh-agent"))
     missing_host_tools = [
-        tool for tool in required_host_tools if shutil.which(tool) is None
+        tool for tool in sorted(required_host_tools) if shutil.which(tool) is None
     ]
     if missing_host_tools:
         raise IntegrationTestError(
@@ -361,70 +371,127 @@ def _require_fixture(
         )
     _require_nodes(runner, config)
     _require_storage(runner, config)
-    login, ssh = _require_pods(_pod_inventory(runner, config))
+    login, ssh = _require_pods(_pod_inventory(runner, config), substrates)
     login_name = str(login["metadata"]["name"])
-    ssh_name = str(ssh[0]["metadata"]["name"])
-    addresses = tuple(str(item["status"]["podIP"]) for item in ssh)
-    if len(set(addresses)) != 2:
-        raise IntegrationTestError(f"SSH workers lack distinct addresses: {addresses}")
+    addresses: tuple[str, ...] = ()
+    if "ssh" in substrates:
+        addresses = tuple(str(item["status"]["podIP"]) for item in ssh)
+        if len(set(addresses)) != 2:
+            raise IntegrationTestError(
+                f"SSH workers lack distinct addresses: {addresses}"
+            )
     tools = (
         "for tool in bash file find tar timeout; do "
         'command -v "$tool" >/dev/null || exit 1; done'
     )
-    _probe_pod(runner, config, login_name, "login", tools)
-    _probe_pod(runner, config, ssh_name, "sshd", tools, as_user="tester")
+    _probe_pod(
+        runner,
+        config,
+        login_name,
+        "login",
+        tools,
+        as_user=WORKLOAD_USER,
+    )
+    if "ssh" in substrates:
+        _probe_pod(
+            runner,
+            config,
+            str(ssh[0]["metadata"]["name"]),
+            "sshd",
+            tools,
+            as_user="tester",
+        )
     mount_probe = "test -w /mnt/storage-test"
     if state["storage_backend"] == "nfs":
         mount_probe += (
             " && case $(stat -f -c %T /mnt/storage-test) in "
             "nfs|nfs4) true;; *) false;; esac"
         )
-    _probe_pod(runner, config, login_name, "login", mount_probe)
-    _probe_pod(runner, config, ssh_name, "sshd", mount_probe, as_user="tester")
-    login_arch = _probe_pod(runner, config, login_name, "login", "uname -m")
-    ssh_arch = _probe_pod(
-        runner, config, ssh_name, "sshd", "uname -m", as_user="tester"
+    _probe_pod(
+        runner,
+        config,
+        login_name,
+        "login",
+        mount_probe,
+        as_user=WORKLOAD_USER,
+    )
+    if "ssh" in substrates:
+        _probe_pod(
+            runner,
+            config,
+            str(ssh[0]["metadata"]["name"]),
+            "sshd",
+            mount_probe,
+            as_user="tester",
+        )
+    login_arch = _probe_pod(
+        runner,
+        config,
+        login_name,
+        "login",
+        "uname -m",
+        as_user=WORKLOAD_USER,
     )
     host_arch = platform.machine()
-    if login_arch != ssh_arch or login_arch != host_arch:
+    fixture_architectures = {"host": host_arch, "login": login_arch}
+    if "ssh" in substrates:
+        fixture_architectures["ssh"] = _probe_pod(
+            runner,
+            config,
+            str(ssh[0]["metadata"]["name"]),
+            "sshd",
+            "uname -m",
+            as_user="tester",
+        )
+    if len(set(fixture_architectures.values())) != 1:
         raise IntegrationTestError(
             "fixture architecture mismatch: "
-            f"host={host_arch}, login={login_arch}, ssh={ssh_arch}"
+            + ", ".join(
+                f"{name}={architecture}"
+                for name, architecture in fixture_architectures.items()
+            )
         )
     if host_arch not in ELBENCHO_ARCHIVES:
         raise IntegrationTestError(f"unsupported fixture architecture: {host_arch}")
-    slurm_output = _probe_pod(
-        runner,
-        config,
-        login_name,
-        "login",
-        "sinfo -N -h -o %N | sort -u",
-    )
-    slurm_nodes = tuple(line for line in slurm_output.splitlines() if line)
-    if len(slurm_nodes) != 2:
-        raise IntegrationTestError(
-            f"expected two Slurm compute nodes; found {slurm_nodes}"
+    slurm_nodes: tuple[str, ...] = ()
+    slurm_addresses: tuple[str, ...] = ()
+    if "slurm" in substrates:
+        slurm_output = _probe_pod(
+            runner,
+            config,
+            login_name,
+            "login",
+            "sinfo -N -h -o %N | sort -u",
+            as_user=WORKLOAD_USER,
         )
-    slurm_address_output = _probe_pod(
-        runner,
-        config,
-        login_name,
-        "login",
-        "for node in "
-        + " ".join(shlex.quote(node) for node in slurm_nodes)
-        + "; do getent ahostsv4 \"$node\" | awk 'NR == 1 {print $1}'; done",
-    )
-    slurm_addresses = tuple(line for line in slurm_address_output.splitlines() if line)
-    if len(slurm_addresses) != 2 or len(set(slurm_addresses)) != 2:
-        raise IntegrationTestError(
-            f"Slurm workers lack distinct IPv4 addresses: {slurm_addresses}"
+        slurm_nodes = tuple(line for line in slurm_output.splitlines() if line)
+        if len(slurm_nodes) != 2:
+            raise IntegrationTestError(
+                f"expected two Slurm compute nodes; found {slurm_nodes}"
+            )
+        slurm_address_output = _probe_pod(
+            runner,
+            config,
+            login_name,
+            "login",
+            "for node in "
+            + " ".join(shlex.quote(node) for node in slurm_nodes)
+            + "; do getent ahostsv4 \"$node\" | awk 'NR == 1 {print $1}'; done",
+            as_user=WORKLOAD_USER,
         )
+        slurm_addresses = tuple(
+            line for line in slurm_address_output.splitlines() if line
+        )
+        if len(slurm_addresses) != 2 or len(set(slurm_addresses)) != 2:
+            raise IntegrationTestError(
+                f"Slurm workers lack distinct IPv4 addresses: {slurm_addresses}"
+            )
     return Fixture(
         login_pod=login_name,
         login_container="login",
-        ssh_addresses=(addresses[0], addresses[1]),
-        slurm_nodes=(slurm_nodes[0], slurm_nodes[1]),
-        slurm_addresses=(slurm_addresses[0], slurm_addresses[1]),
+        ssh_addresses=addresses,
+        slurm_nodes=slurm_nodes,
+        slurm_addresses=slurm_addresses,
         architecture=host_arch,
         ssh_home_mode=ssh_home_mode,
         storage_backend=str(state["storage_backend"]),
@@ -728,7 +795,7 @@ def _override_block(
         lines.extend(
             (
                 "unset SSH_HOST_LIST SSH_USER SSH_HOMEDIR_SHARED",
-                'account=""',
+                'account="storage-test"',
                 'reservation=""',
                 'partition="all"',
                 'run_time="00:05:00"',
@@ -943,28 +1010,27 @@ def _stream_to_login(
     fixture: Fixture,
     source: Path,
     command: list[str | Path],
+    *,
+    as_user: str | None = None,
     timeout: int = 180,
 ) -> None:
     """Stream one local archive to a command in the Slinky LoginSet."""
     with source.open("rb") as stream:
-        runner.run(
-            [
-                *_kubectl(
-                    config,
-                    "-n",
-                    config.namespace,
-                    "exec",
-                    "-i",
-                    fixture.login_pod,
-                    "-c",
-                    fixture.login_container,
-                    "--",
-                ),
-                *command,
-            ],
-            stdin=stream,
-            timeout=timeout,
+        pod_command: list[str | Path] = _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "exec",
+            "-i",
+            fixture.login_pod,
+            "-c",
+            fixture.login_container,
+            "--",
         )
+        if as_user:
+            pod_command.extend(("runuser", "-u", as_user, "--"))
+        pod_command.extend(command)
+        runner.run(pod_command, stdin=stream, timeout=timeout)
 
 
 def _stage_ssh_runtime(
@@ -993,9 +1059,13 @@ def _stage_ssh_runtime(
                     "sshd",
                     "--",
                 ),
+                "runuser",
+                "-u",
+                WORKLOAD_USER,
+                "--",
                 "bash",
                 "-ec",
-                "rm -rf -- /home/tester/elbencho-runtime && "
+                "umask 0007; rm -rf -- /home/tester/elbencho-runtime && "
                 "tar --no-same-owner --no-same-permissions -xf - -C /home/tester",
             ]
             runner.run(command, stdin=stream, timeout=180)
@@ -1020,27 +1090,35 @@ def _stage_workspace(
 
     remote_base = f"{REMOTE_BASE}/workspaces/{workspace_id}"
     remote_root = f"{remote_base}/storage-scale-test"
-    reset = f"rm -rf -- {_shell(remote_base)} && mkdir -p -- {_shell(remote_base)}"
+    reset = (
+        f"umask 0007; rm -rf -- {_shell(remote_base)} && "
+        f"mkdir -p -- {_shell(remote_base)}"
+    )
     runner.run(
         _pod_command(
             config,
             fixture.login_pod,
             fixture.login_container,
             reset,
+            as_user=WORKLOAD_USER,
             timeout=60,
         ),
         timeout=75,
     )
     extract_command = [
-        "tar",
-        "--no-same-owner",
-        "--no-same-permissions",
-        "-xzf",
-        "-",
-        "-C",
-        remote_base,
+        "bash",
+        "-ec",
+        "umask 0007; tar --no-same-owner --no-same-permissions "
+        f"-xzf - -C {_shell(remote_base)}",
     ]
-    _stream_to_login(runner, config, fixture, archive, extract_command)
+    _stream_to_login(
+        runner,
+        config,
+        fixture,
+        archive,
+        extract_command,
+        as_user=WORKLOAD_USER,
+    )
     support_stage = build_root / "slurm-runtime"
     support_stage.mkdir()
     _write_runtime_files(
@@ -1055,15 +1133,19 @@ def _stage_workspace(
         for child in sorted(support_stage.iterdir()):
             tar.add(child, arcname=child.name)
     support_command = [
-        "tar",
-        "--no-same-owner",
-        "--no-same-permissions",
-        "-xf",
-        "-",
-        "-C",
-        remote_root,
+        "bash",
+        "-ec",
+        "umask 0007; tar --no-same-owner --no-same-permissions "
+        f"-xf - -C {_shell(remote_root)}",
     ]
-    _stream_to_login(runner, config, fixture, support_archive, support_command)
+    _stream_to_login(
+        runner,
+        config,
+        fixture,
+        support_archive,
+        support_command,
+        as_user=WORKLOAD_USER,
+    )
     return remote_root
 
 
@@ -1096,6 +1178,7 @@ def _test_command(
         fixture.login_pod,
         fixture.login_container,
         command,
+        as_user=WORKLOAD_USER,
         timeout=timeout,
     )
 
@@ -1219,7 +1302,20 @@ test "$(find "$result" -type f -name '*.out' -size +0c | wc -l)" -ge 2
     return result_dir
 
 
-def _assert_ordered_workers(fixture: Fixture, selector: str, sweep_output: str) -> None:
+def _ordered_worker_evidence(selector: str, sweep_output: str, result: Path) -> str:
+    """Return substrate-appropriate durable worker-selection evidence."""
+    if selector == "ssh":
+        return sweep_output
+    logs = sorted((result / "executions").glob("*.log"))
+    logs.extend(sorted(result.glob("coordinator-*.log")))
+    return "\n".join(
+        path.read_text(encoding="utf-8", errors="replace") for path in logs
+    )
+
+
+def _assert_ordered_workers(
+    fixture: Fixture, selector: str, sweep_output: str, result: Path
+) -> None:
     """Prove increasing cells use the configured workers in prefix order."""
     workers = fixture.ssh_addresses if selector == "ssh" else fixture.slurm_addresses
     expected = {
@@ -1227,7 +1323,8 @@ def _assert_ordered_workers(fixture: Fixture, selector: str, sweep_output: str) 
         "2": ",".join(workers),
     }
     selected: dict[str, str] = {}
-    for line in sweep_output.splitlines():
+    evidence = _ordered_worker_evidence(selector, sweep_output, result)
+    for line in evidence.splitlines():
         match = re.search(r"starting execution \d+:.*nodes=(\d+).*hosts=([^ ]+)", line)
         if match:
             selected[match.group(1)] = match.group(2)
@@ -1319,6 +1416,7 @@ def _login_shell(
             fixture.login_pod,
             fixture.login_container,
             command,
+            as_user=WORKLOAD_USER,
             timeout=timeout,
         ),
         timeout=timeout + 15,
@@ -1334,11 +1432,11 @@ def _prepare_scenario_data(
     """Reset one marker-owned scenario subtree on the shared test storage."""
     command = f"""
 set -euo pipefail
+umask 0007
 rm -rf -- {_shell(data_root)}
 mkdir -p -- {_shell(data_root + '/primary')} {_shell(data_root + '/secondary')}
 printf 'scenario-owned\n' > {_shell(data_root + '/primary/.integration-sentinel')}
 printf 'scenario-owned\n' > {_shell(data_root + '/secondary/.integration-sentinel')}
-chown -R {config.test_uid}:{config.test_gid} -- {_shell(data_root)}
 """.strip()
     _login_shell(runner, config, fixture, command)
 
@@ -1396,14 +1494,12 @@ def _sync_step_runtime(
         fixture,
         archive_path,
         [
-            "tar",
-            "--no-same-owner",
-            "--no-same-permissions",
-            "-xf",
-            "-",
-            "-C",
-            runtime.workspace,
+            "bash",
+            "-ec",
+            "umask 0007; tar --no-same-owner --no-same-permissions "
+            f"-xf - -C {_shell(runtime.workspace)}",
         ],
+        as_user=WORKLOAD_USER,
     )
 
 
@@ -1419,10 +1515,9 @@ def _create_generated_inputs(
         path = f"{runtime.values['test_root']}/{generated.relative_path}"
         command = f"""
 set -euo pipefail
+umask 0007
 mkdir -p -- {_shell(str(PurePosixPath(path).parent))}
 truncate -s {generated.size_bytes} -- {_shell(path)}
-chown -R {config.test_uid}:{config.test_gid} -- \
-    {_shell(str(PurePosixPath(path).parent))}
 test "$(stat -c %s -- {_shell(path)})" -eq {generated.size_bytes}
 """.strip()
         _login_shell(runner, config, fixture, command)
@@ -1624,7 +1719,12 @@ def _assert_execution_contract(
         totals = _expected_dataset_totals(
             scenario.name, step, expected.coordinate.nodes
         )
-        if totals is not None and workload_path.is_file():
+        if totals is not None:
+            if not workload_path.is_file():
+                raise IntegrationTestError(
+                    f"{scenario.name}/{step.name}/{execution_id}: missing "
+                    f"required workload metadata {workload_path}"
+                )
             workload = _workload_values(workload_path)
             if workload.get("dataset_files_total") != str(totals[0]) or workload.get(
                 "dataset_bytes_total"
@@ -1805,8 +1905,8 @@ def _reset_result_base(
         runner,
         config,
         fixture,
-        f"rm -rf -- {_shell(result_base)} && mkdir -p -- {_shell(result_base)} "
-        f"&& chown {config.test_uid}:{config.test_gid} -- {_shell(result_base)}",
+        f"umask 0007; rm -rf -- {_shell(result_base)} && "
+        f"mkdir -p -- {_shell(result_base)}",
     )
 
 
@@ -2031,7 +2131,7 @@ def _run_regular_step(
         log_dir,
     )
     if {item.coordinate.nodes for item in step.executions} == {1, 2}:
-        _assert_ordered_workers(fixture, runtime.selector, output)
+        _assert_ordered_workers(fixture, runtime.selector, output, local_result)
     return StepOutcome(output, remote_result, local_result)
 
 
@@ -2065,8 +2165,8 @@ def _make_scenario_runtime(
         "workspace": workspace,
         "test_root": f"{data_root}/primary",
         "test_root_secondary": f"{data_root}/secondary",
-        "slurm_node_1": fixture.slurm_nodes[0],
-        "slurm_node_2": fixture.slurm_nodes[1],
+        "slurm_node_1": fixture.slurm_nodes[0] if fixture.slurm_nodes else "",
+        "slurm_node_2": fixture.slurm_nodes[1] if fixture.slurm_nodes else "",
     }
     return ScenarioRuntime(
         scenario,
@@ -2118,6 +2218,10 @@ def _cleanup_ssh_remote_results(runner: Any, config: Any) -> None:
                     "sshd",
                     "--",
                 ),
+                "runuser",
+                "-u",
+                WORKLOAD_USER,
+                "--",
                 "bash",
                 "-c",
                 "rm -rf -- /home/tester/elbencho-[0-9]*",
@@ -2156,6 +2260,7 @@ def _cleanup_scenario_storage(
             fixture.login_pod,
             fixture.login_container,
             command,
+            as_user=WORKLOAD_USER,
             timeout=120,
         ),
         check=False,
@@ -2199,25 +2304,35 @@ def _remote_staging_operations(
                     _container(endpoint),
                     "--",
                 ),
+                "runuser",
+                "-u",
+                WORKLOAD_USER,
+                "--",
                 "bash",
                 "-ec",
-                command,
+                f"umask 0007; {command}",
             ],
             stdin=stdin,
             timeout=180,
         )
 
     def make_directory(endpoint: str, path: PurePosixPath) -> None:
+        if endpoint == "local":
+            Path(path).mkdir(parents=True, exist_ok=True)
+            return
         _command(
             endpoint,
-            f"mkdir -p -- {_shell(path)} && chown {POD_TEST_UID}:{POD_TEST_GID} "
-            f"-- {_shell(path)}",
+            f"mkdir -p -- {_shell(path)}",
         )
 
     def copy_file(
         source: Path, endpoint: str, destination: PurePosixPath, mode: int
     ) -> None:
         if endpoint == "local":
+            local_destination = Path(destination)
+            local_destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, local_destination)
+            local_destination.chmod(mode)
             return
         with tempfile.TemporaryFile() as stream:
             stream.write(source.read_bytes())
@@ -2225,13 +2340,16 @@ def _remote_staging_operations(
             _command(
                 endpoint,
                 f"cat > {_shell(destination)} && chmod {mode:o} -- "
-                f"{_shell(destination)} && chown {POD_TEST_UID}:{POD_TEST_GID} "
-                f"-- {_shell(destination)}",
+                f"{_shell(destination)}",
                 stdin=stream,
             )
 
     def copy_tree(source: Path, endpoint: str, destination: PurePosixPath) -> None:
         if endpoint == "local":
+            local_destination = Path(destination)
+            if local_destination.exists():
+                shutil.rmtree(local_destination)
+            shutil.copytree(source, local_destination)
             return
         if selector == "ssh":
             _command(
@@ -2249,8 +2367,7 @@ def _remote_staging_operations(
                 endpoint,
                 f"rm -rf -- {_shell(destination)} && mkdir -p -- "
                 f"{_shell(destination)} && tar -xf - -C {_shell(destination)} "
-                f"&& chown -R {POD_TEST_UID}:{POD_TEST_GID} -- "
-                f"{_shell(destination)}",
+                f"&& chmod -R u+rwX,g+rX,o-rwx -- {_shell(destination)}",
                 stdin=stream,
             )
 
@@ -2271,8 +2388,7 @@ def _remote_staging_operations(
             _command(
                 endpoint,
                 f"cat > {_shell(destination)} && chmod {mode:o} -- "
-                f"{_shell(destination)} && chown {POD_TEST_UID}:{POD_TEST_GID} "
-                f"-- {_shell(destination)}",
+                f"{_shell(destination)}",
                 stdin=stream,
             )
 
@@ -2280,6 +2396,7 @@ def _remote_staging_operations(
         if endpoint == "local":
             if local_wrapper is not None and restore_binary is not None:
                 shutil.copy2(restore_binary, local_wrapper)
+            shutil.rmtree(Path(path), ignore_errors=True)
             return
         if remote_wrapper is not None:
             _command(
@@ -2317,7 +2434,7 @@ def _failure_plan(
     )
     plan = build_ssh_failure_injection_plan(
         scenario_id=f"{runtime.scenario.name}-{os.getpid()}",
-        staging_root="/home/tester/.storage-scale-test-failure",
+        staging_root=SSH_FAILURE_STAGING_BASE,
         source_binary=source_binary,
         source_runtime=bundled_runtime,
         target_argument="executions/0002.write.json",
@@ -2451,20 +2568,20 @@ def _run_failure_resume(
         )
         injected_first = first
     result_base = f"{runtime.workspace}/results/{first.name}"
+    _reset_result_base(runner, config, fixture, runtime, result_base)
+    _sync_step_runtime(
+        runner,
+        config,
+        fixture,
+        runtime,
+        injected_first,
+        template,
+        result_base,
+    )
+    _validate_step_environment(
+        runner, config, fixture, runtime, injected_first, log_dir
+    )
     with staged_failure_injection(plan, operations):
-        _reset_result_base(runner, config, fixture, runtime, result_base)
-        _sync_step_runtime(
-            runner,
-            config,
-            fixture,
-            runtime,
-            injected_first,
-            template,
-            result_base,
-        )
-        _validate_step_environment(
-            runner, config, fixture, runtime, injected_first, log_dir
-        )
         arguments = shlex.join(first.render_arguments(runtime.values))
         command = (
             f"cd -- {_shell(runtime.workspace)} && "
@@ -2580,7 +2697,6 @@ def _run_substrate(
         log_dir,
         600,
     )
-    _assert_ordered_workers(fixture, selector, sweep_output)
     result_dir = _assert_results(
         runner, config, fixture, selector, remote_root, log_dir
     )
@@ -2592,6 +2708,7 @@ def _run_substrate(
         result_dir,
         build_root / f"{selector}-report-input",
     )
+    _assert_ordered_workers(fixture, selector, sweep_output, local_result)
     _assert_report(runner, report_workspace, local_result, selector, log_dir)
 
 
@@ -2615,7 +2732,7 @@ def run_filesystem_tests(
             raise IntegrationTestError("SSH scenarios require a home transition hook")
         transition_ssh_home("separate", "preflight")
     LOG.info("Requiring an already-running integration setup")
-    fixture = _require_fixture(runner, config)
+    fixture = _require_fixture(runner, config, selected)
     binary, binary_name, runtime = _ensure_elbencho(
         runner, config, fixture.architecture, fixture.storage_backend
     )
@@ -2642,11 +2759,16 @@ def run_filesystem_tests(
         shutil.copy2(build_root / "build-tarball.log", log_dir / "build-tarball.log")
         report_workspace = build_root / "report-workspace"
         shutil.copytree(extracted, report_workspace)
+        report_fixture = fixture
+        if not report_fixture.ssh_addresses:
+            report_fixture = replace(
+                report_fixture, ssh_addresses=report_fixture.slurm_addresses
+            )
         _write_runtime_files(
             report_workspace,
             "ssh",
             str(report_workspace),
-            fixture,
+            report_fixture,
             template=extracted / "env.sh.template",
         )
         home_mode = "separate"
@@ -2655,7 +2777,9 @@ def run_filesystem_tests(
                 if isinstance(step, SshHomeTransition):
                     transition_ssh_home(step.target.value, "ssh-shared-home")
                     home_mode = step.target.value
-                    fixture = _require_fixture(runner, config, home_mode)
+                    fixture = _require_fixture(
+                        runner, config, selected, ssh_home_mode=home_mode
+                    )
                     if runtime is not None:
                         _stage_ssh_runtime(
                             runner,

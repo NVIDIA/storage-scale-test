@@ -17,9 +17,5 @@ ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 USER root
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        file \
-    && groupadd --gid 2000 storage-test \
-    && useradd --uid 2000 --gid 2000 --create-home --shell /bin/bash tester \
-    && rm -rf /var/lib/apt/lists/*
+RUN groupadd --gid 2000 storage-test \
+    && useradd --uid 2000 --gid 2000 --create-home --shell /bin/bash tester

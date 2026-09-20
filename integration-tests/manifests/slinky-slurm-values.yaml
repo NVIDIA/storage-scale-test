@@ -71,7 +71,7 @@ loginsets:
     login:
       image:
         repository: storage-scale-integration-login
-        tag: slinky-26.05-file
+        tag: slinky-26.05-user
         digest: null
       resources:
         requests:
@@ -107,6 +107,10 @@ nodesets:
     scalingMode: DaemonSet
     workloadDisruptionProtection: false
     slurmd:
+      image:
+        repository: storage-scale-integration-slurmd
+        tag: slinky-26.05-user
+        digest: null
       resources:
         requests:
           cpu: 100m

@@ -4626,6 +4626,7 @@ def main() -> None:
         )
 
     had_aggregate_metrics = bool(metrics)
+    had_live_files = bool(live_files)
 
     # Verify that all metrics have a datestamp
     if metrics:
@@ -4688,8 +4689,11 @@ def main() -> None:
         ]
         eprint(f"After filtering, {len(live_files)} live CSV files remain")
 
-        if not metrics and not live_files:
-            eprint("ERROR: Filters matched no report metrics")
+        if had_aggregate_metrics and not metrics:
+            eprint("ERROR: Filters matched no aggregate metrics")
+            sys.exit(1)
+        if had_live_files and not live_files:
+            eprint("ERROR: Filters matched no live CSV files")
             sys.exit(1)
 
     # Write to CSV if requested
@@ -4711,8 +4715,7 @@ def main() -> None:
     elif args.from_csv:
         output_dir = os.path.dirname(os.path.abspath(args.from_csv))
 
-    # Preserve the pre-live behavior when filters remove all aggregate metrics.
-    if had_aggregate_metrics:
+    if metrics:
         if args.markdown:
             print_markdown_table(metrics, args.no_dual_y_axis)
         else:
@@ -4747,7 +4750,7 @@ def main() -> None:
         except Exception as exc:  # pylint: disable=broad-exception-caught
             eprint(f"Error reporting live CSV {metadata.path}: {exc}")
             traceback.print_exc()
-    if live_files and not successful_live_reports and not had_aggregate_metrics:
+    if live_files and not successful_live_reports:
         eprint("ERROR: No live CSV reports were generated")
         sys.exit(1)
 

@@ -21,6 +21,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,6 +37,7 @@ from failure_injection import (  # pylint: disable=wrong-import-position
     stage_failure_injection,
     staged_failure_injection,
 )
+import filesystem_integration as _INTEGRATION  # pylint: disable=wrong-import-position
 
 TARGET_ARGUMENT = "/mnt/storage-test/results-e0002"
 
@@ -229,6 +231,52 @@ def test_ssh_staging_places_delegate_runtime_on_every_worker(tmp_path):
     assert f"readonly delegate={plan.layout.delegate}" in writes[0][3]
 
 
+def test_ssh_coordinator_adapter_stages_local_delegate_and_runtime(tmp_path):
+    """The concrete SSH adapter supplies every path referenced by its wrapper."""
+    source = tmp_path / "source-elbencho"
+    _write_delegate(source, 'printf "delegate:%s\\n" "$*"')
+    runtime = tmp_path / "source-runtime"
+    runtime.mkdir()
+    (runtime / "library.so").write_text("runtime\n", encoding="utf-8")
+    packaged = tmp_path / "workspace" / "utils" / "elbencho"
+    packaged.parent.mkdir(parents=True)
+    shutil.copy2(source, packaged)
+    plan = build_ssh_failure_injection_plan(
+        scenario_id="failure-resume",
+        staging_root=tmp_path / "scenario-staging",
+        source_binary=source,
+        source_runtime=runtime,
+        target_argument=TARGET_ARGUMENT,
+        coordinator_endpoint="local",
+        worker_endpoints=(),
+    )
+    operations = (
+        _INTEGRATION._remote_staging_operations(  # pylint: disable=protected-access
+            object(),
+            SimpleNamespace(namespace="unused"),
+            SimpleNamespace(login_container="login"),
+            "ssh",
+            packaged,
+            source,
+        )
+    )
+
+    stage_failure_injection(plan, operations)
+
+    assert Path(plan.layout.delegate).is_file()
+    assert (Path(plan.layout.runtime) / "library.so").is_file()
+    injected = subprocess.run(
+        [str(packaged), TARGET_ARGUMENT], text=True, capture_output=True, check=False
+    )
+    assert injected.returncode == 97
+    assert injected.stdout == f"delegate:{TARGET_ARGUMENT}\n"
+
+    cleanup_failure_injection(plan, operations)
+
+    assert packaged.read_bytes() == source.read_bytes()
+    assert not Path(plan.layout.root).exists()
+
+
 def test_outer_context_retains_artifacts_through_resume_then_cleans(tmp_path):
     """No per-attempt cleanup removes the marker needed by resume."""
     source = tmp_path / "source-elbencho"
@@ -299,4 +347,71 @@ def test_cleanup_runs_in_reverse_target_order(tmp_path):
         "worker-2",
         "worker-1",
         "coordinator",
+    ]
+
+
+def test_real_binary_validation_precedes_wrapper_staging(tmp_path, monkeypatch):
+    """The validator observes Elbencho before the failure wrapper replaces it."""
+    events = []
+    first = SimpleNamespace(name="inject-one-failure")
+    resume = SimpleNamespace(name="resume")
+    runtime = SimpleNamespace(
+        selector="ssh",
+        scenario=SimpleNamespace(steps=(first, resume)),
+        workspace=tmp_path.as_posix(),
+    )
+
+    class _StopAfterStaging:
+        def __enter__(self):
+            events.append("stage-wrapper")
+            raise RuntimeError("stop after staging")
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        _INTEGRATION,
+        "_failure_plan",
+        lambda *_args: (object(), object()),
+    )
+    monkeypatch.setattr(
+        _INTEGRATION,
+        "_reset_result_base",
+        lambda *_args: events.append("reset"),
+    )
+    monkeypatch.setattr(
+        _INTEGRATION,
+        "_sync_step_runtime",
+        lambda *_args: events.append("render-real-env"),
+    )
+    monkeypatch.setattr(
+        _INTEGRATION,
+        "_validate_step_environment",
+        lambda *_args: events.append("validate-real-binary"),
+    )
+    monkeypatch.setattr(
+        _INTEGRATION,
+        "staged_failure_injection",
+        lambda *_args: _StopAfterStaging(),
+    )
+
+    with pytest.raises(RuntimeError, match="stop after staging"):
+        _INTEGRATION._run_failure_resume(  # pylint: disable=protected-access
+            object(),
+            object(),
+            object(),
+            runtime,
+            tmp_path / "env.sh.template",
+            tmp_path,
+            tmp_path,
+            "elbencho",
+            tmp_path / "elbencho",
+            None,
+        )
+
+    assert events == [
+        "reset",
+        "render-real-env",
+        "validate-real-binary",
+        "stage-wrapper",
     ]

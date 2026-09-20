@@ -210,7 +210,7 @@ edit-validate loop:
    | Slurm connectivity | `sinfo`, `sbatch` a test job, wait for completion |
    | SSH connectivity | `ssh` command execution + scriptlet execution on each host |
    | Binary architecture match | `file` on binary vs. `uname -m` on remote |
-   | Filesystem paths are mountpoints | `mountpoint` on compute nodes (via Slurm/SSH) |
+   | Filesystem paths use storage distinct from `/` | Compare `stat -c %d` device IDs on compute nodes (via Slurm/SSH) |
    | Filesystem paths are writable | Touch test on compute nodes |
    | S3 credentials and bucket access | `s3test` binary |
    | S3 bucket emptiness | Object count check (warning if non-empty) |

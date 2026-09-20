@@ -578,14 +578,17 @@ check_fs() {
     local slurm_rc="$1"  # 0 if we can run slurm
     local fs_path="$2"   # filesystem path to test
 
-    # This scriptlet is used to test if the filesystem is a mountpoint.
-    # It is used for both SLURM and SSH-based testing.
+    # This scriptlet verifies that the test path is a directory on a different
+    # filesystem device than /. It does not prove that the path itself is the
+    # exact mountpoint. It is used for both Slurm and SSH-based testing.
     local scriptlet
     scriptlet=$(cat << 'EOF'
 TEST_DIR="$1"
-test_dir_inode=$(stat -f -c %d "$TEST_DIR")
-root_inode=$(stat -f -c %d "/")
-test -d "$TEST_DIR" && [ "$test_dir_inode" != "$root_inode" ] || (echo "failed_$(hostname -s)" && exit 1)
+fs_device_failure() { echo "failed_$(hostname -s)"; exit 1; }
+test -d "$TEST_DIR" || fs_device_failure
+test_dir_device=$(stat -c %d -- "$TEST_DIR") || fs_device_failure
+root_device=$(stat -c %d -- "/") || fs_device_failure
+[ "$test_dir_device" != "$root_device" ] || fs_device_failure
 test -w "$TEST_DIR" || (echo "nowrite_$(hostname -s)" && exit 1)
 EOF
 )
@@ -614,23 +617,25 @@ check_fs_ssh() {
     ssh_rc=$?
     if [[ "$ssh_output" =~ failed_([[:alnum:]_-]+) ]]; then
         nodename="${BASH_REMATCH[1]}"
-        register_error "ssh: ${fs_path} is not a mountpoint on compute node ${nodename}"
+        register_error "ssh: ${fs_path} is not on a filesystem distinct from / on compute node ${nodename}"
     elif [[ "$ssh_output" =~ nowrite_([[:alnum:]_-]+) ]]; then
         nodename="${BASH_REMATCH[1]}"
         register_error "ssh: ${fs_path} is not writable on compute node ${nodename}"
     elif [[ $ssh_rc != 0 ]]; then
-        register_error "ssh: $fs_path is not a mountpoint on some node"
+        register_error "ssh: $fs_path is not on a filesystem distinct from / on some node"
         register_error "ssh: output: $ssh_output"
     fi
 
+    local fs_path_quoted
+    printf -v fs_path_quoted '%q' "$fs_path"
     # shellcheck disable=SC2016
-    local fs_check_cmd='test -d '"$fs_path"' && [ $(stat -f -c %d '"$fs_path"') != $(stat -f -c %d /) ] || echo "failed_$(hostname -s)"'
+    local fs_check_cmd='TEST_DIR='"$fs_path_quoted"'; test -d "$TEST_DIR" && test_dir_device=$(stat -c %d -- "$TEST_DIR") && root_device=$(stat -c %d -- /) && [ "$test_dir_device" != "$root_device" ] || echo "failed_$(hostname -s)"'
     ssh_output=$(check_ssh_with "" "$fs_check_cmd")
 
-    # Check for mountpoint failure regardless of ssh exit status
+    # Check for filesystem-device failure regardless of ssh exit status
     if [[ "$ssh_output" =~ failed_([[:alnum:]_-]+) ]]; then
         nodename="${BASH_REMATCH[1]}"
-        register_error "ssh: ${fs_path} is not a mountpoint on compute node ${nodename}"
+        register_error "ssh: ${fs_path} is not on a filesystem distinct from / on compute node ${nodename}"
     fi
 }
 
@@ -641,17 +646,17 @@ check_fs_slurm() {
     sbatch_output=$(check_sbatch_with "$scriptlet" "$fs_path")
     sbatch_rc=$?
     if [[ $sbatch_rc != 0 ]]; then
-        register_error "sbatch: $fs_path is not a mountpoint on some node"
+        register_error "sbatch: $fs_path is not on a filesystem distinct from / on some node"
         register_error "sbatch: output: $sbatch_output"
     fi
 
     # shellcheck disable=SC2016
-    srun_output=$(check_srun_with 'TEST_DIR="$1"; h=$(hostname -s); test -d ${TEST_DIR} && [ $(stat -f -c %d "$TEST_DIR") != $(stat -f -c %d /) ] || echo "failed_${h}"' _ "$fs_path")
+    srun_output=$(check_srun_with 'TEST_DIR="$1"; h=$(hostname -s); test -d "$TEST_DIR" && test_dir_device=$(stat -c %d -- "$TEST_DIR") && root_device=$(stat -c %d -- /) && [ "$test_dir_device" != "$root_device" ] || echo "failed_${h}"' _ "$fs_path")
 
-    # Check for mountpoint failure regardless of srun exit status
+    # Check for filesystem-device failure regardless of srun exit status
     if [[ "$srun_output" =~ failed_([[:alnum:]_-]+) ]]; then
         nodename="${BASH_REMATCH[1]}"
-        register_error "srun: ${fs_path} is not a mountpoint on compute node ${nodename}"
+        register_error "srun: ${fs_path} is not on a filesystem distinct from / on compute node ${nodename}"
     fi
 }
 

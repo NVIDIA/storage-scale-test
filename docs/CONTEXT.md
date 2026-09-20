@@ -63,10 +63,25 @@ export and NFS CSI. The Docker-SBX-specific `sbx-shared` backend mounts a
 repository-backed directory into every kind node and uses static RWX volumes;
 both backends validate the repository's same shared-storage contract. Backend
 selection is explicit or capability-based and persists until teardown. The
+SBX shared directories are non-sticky writable fixture paths because SBX can
+remap bind-mounted file ownership between replacement pods.
 harness's state and export directories are dedicated leaves: an existing path
-must carry the exact harness ownership marker before setup changes it or teardown
-removes it. A completed setup also locks its namespace and, for NFS, export
-directory until teardown. The SBX compatibility profile pairs kind/Kubernetes
+must carry the exact harness ownership marker before setup changes it or
+teardown removes it. Every lifecycle action runs as an ordinary user. Its
+kubeconfig, keys, client tools, caches, manifests, logs, and runs are user-owned
+under `tmp/integration-state`; the driver invokes `sudo` only for the NFS
+profile's narrow host-system operations, while `sbx-shared` never invokes it.
+The driver adds standard `sbin` locations to its ordinary-user tool search
+path. It records NFS service ownership before package installation can start
+the service, and repeated teardown remains valid after its private clients are
+removed. Partial bootstrap teardown also tolerates `exportfs` not having been
+installed yet.
+Bootstrap creates the known default `tmp/` parent in a clean checkout, while a
+custom state path must remain a leaf below an existing directory.
+A completed setup also locks its namespace and, for NFS, export directory until
+teardown. NFS teardown removes only the harness export and configuration; a
+server or unrelated exports that predated the fixture remain active. The SBX
+compatibility profile pairs kind/Kubernetes
 1.34 with kubectl 1.34 and rebuilds cached container-derived Elbencho bundles
 when their pinned image or bundle recipe changes. Slurm coordinators restore
 configured `ORDER_NODES` include-list order after Slurm canonicalizes an
@@ -74,6 +89,18 @@ allocation's node list.
 The test action selects execution substrate and named scenario independently.
 Its deterministic planner batches the one shared-home SSH scenario behind a
 crash-recoverable StatefulSet transition; separate SSH homes are canonical.
+Transitions require the StatefulSet rollout to finish before accepting two
+ready nonterminating pods. Cross-pod storage checks use unique probe paths,
+bounded visibility retries, and unconditional cleanup.
+Fixture preflight requires only the workloads selected by the plan, so Slurm
+diagnosis remains available while SSH workers are unhealthy. Host operator
+UIDs own local state only. LoginSet coordination, Slurm tasks, SSH workers, and
+pod-side staging use the fixed `tester` UID/GID 2000 contract. Setup provisions
+the matching Slurm account, verifies the coordinator and both real `srun`
+tasks, and all-squashed NFS paths retain their server-assigned ownership.
+Slurm worker-order assertions use the copied execution logs rather than the
+asynchronous submission stream. Failure scenarios validate the real Elbencho
+binary before replacing it with their scenario-owned wrapper.
 Deployment archives remain products of `utils/build_tarball.sh`, but the
 harness caches them by the exact immutable tracked-source snapshot, build
 options, architecture, and seeded Elbencho/runtime identity. Each scenario
@@ -92,7 +119,7 @@ path safety, sizing limits, and Slurm argument boundaries without a live
 fixture. Elbencho CSV reload resolves postponed dataclass annotations before
 coercing types, so cached metrics remain filterable. Its reporting CLI treats
 `--from-csv` as exclusive with raw directories and rejects malformed or
-no-match filters.
+no-match filters independently for aggregate metrics and live CSV reports.
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 3.14 unit tests run weekly and on manual request.
@@ -158,6 +185,9 @@ Important configuration relationships:
   inclusive ranges, and `+step` increments. Entry points validate the complete
   expanded list before dispatch.
 - `TEST_DIRS` is an associative array of filesystem test roots and weights.
+  `validate_env.sh` compares each path's `stat -c %d` device number with `/`
+  through both dispatch interfaces; this establishes distinct backing storage,
+  not that the configured path is itself the exact mountpoint.
   Object tests use a dedicated `OBJ_BUCKET`, endpoint settings, and credentials
   sourced from `OBJ_AUTH_FILE`.
 

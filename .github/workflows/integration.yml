@@ -63,27 +63,33 @@ jobs:
           sudo -n true
           docker info >/dev/null
       - name: Set up the integration environment
-        run: sudo "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs setup
-      - name: Verify repeated setup
-        run: sudo "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs setup
-      - name: Stop the integration environment
-        run: sudo "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs stop
-      - name: Restart the integration environment
-        run: sudo "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs start
-      - name: Verify root test execution is rejected
         run: |
-          if sudo "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs test; then
-            echo "integration test action unexpectedly accepted root" >&2
-            exit 1
-          fi
+          "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs setup
+      - name: Verify repeated setup
+        run: |
+          "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs setup
+      - name: Stop the integration environment
+        run: |
+          "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs stop
+      - name: Restart the integration environment
+        run: |
+          "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs start
+      - name: Verify root lifecycle execution is rejected
+        run: |
+          for action in setup test; do
+            if sudo "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs "$action"; then
+              echo "integration $action action unexpectedly accepted root" >&2
+              exit 1
+            fi
+          done
       - name: Run all integration tests
         run: |
           "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs test
       - name: Tear down the integration environment
         if: ${{ always() }}
         run: |
-          sudo "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs teardown
-          sudo "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs teardown
+          "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs teardown
+          "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs teardown
 
   integration-status:
     name: Filesystem integration status

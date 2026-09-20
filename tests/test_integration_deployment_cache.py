@@ -215,6 +215,7 @@ def test_runtime_directory_mode_participates_in_cache_identity(tmp_path):
     repository, binary = _repository(tmp_path)
     runtime = tmp_path / "runtime"
     (runtime / "empty").mkdir(parents=True)
+    (runtime / "empty").chmod(0o755)
     runner = _Runner()
     request = replace(_request(tmp_path, repository, binary), runtime=runtime)
     first = _CACHE.get_or_build_deployment(runner, request)

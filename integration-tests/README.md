@@ -26,14 +26,17 @@ The current setup target is Ubuntu 24.04 on x86-64 or ARM64 with at least two
 CPUs, 8 GiB total RAM, 6 GiB available RAM, and 20 GiB free on the selected
 backend's filesystem. Python 3.12 and an accessible rootful Docker daemon are
 prerequisites. The driver installs its other host packages and pinned client
-tools when needed. It also builds a small derived Slinky login image containing
-the standard `file` package required by `validate_env.sh`.
+tools when needed. It also builds small derived Slinky login and compute images
+containing the fixed integration workload account; the login image additionally
+provides the standard `file` package required by `validate_env.sh`.
 
-Run setup (or its exact synonym, start) with:
+Run setup (or its exact synonym, start) as the ordinary test user. The NFS
+profile invokes passwordless `sudo` itself only for package installation and
+the dedicated export, loop-device, firewall, and systemd operations:
 
 ```bash
 sudo -v
-sudo integration-tests/bin/integration-test.py setup
+integration-tests/bin/integration-test.py setup
 ```
 
 `--storage-backend auto` is the default. It selects `nfs` when the host has the
@@ -56,7 +59,7 @@ repository feature coverage.
 Select Docker SBX explicitly with:
 
 ```bash
-sudo integration-tests/bin/integration-test.py \
+integration-tests/bin/integration-test.py \
   --storage-backend sbx-shared setup
 ```
 
@@ -67,12 +70,24 @@ lacks that device. When Docker SBX exposes its proxy CA, setup installs that CA
 in the disposable kind nodes so containerd can pull the fixture images. The
 default shared root is `tmp/integration-sbx-shared`; an alternate path may be
 set with `--sbx-shared-root`, but must remain below the repository's `tmp/`
-directory.
+directory. This profile never invokes `sudo`; required host packages and an
+accessible Docker engine must already be present. Its two disposable backing
+directories use sticky shared-directory permissions so UID 2000 workloads can
+create their own restricted scenario trees without host-side ownership changes.
 
-Setup records the invoking pre-sudo account, gives that non-root account
-access to the private kubeconfig, key, and test-run workspace, and verifies it
-can use Docker, kind, and kubectl. A root shell without `SUDO_USER` must name
-the account explicitly with `--test-user USER`.
+Every lifecycle action runs as the ordinary test account and refuses root.
+Kubeconfig, keys, downloaded clients, cached deployments, rendered manifests,
+logs, and test runs remain user-owned from creation under the default
+`tmp/integration-state` directory. Setup never recursively changes that
+tree's ownership. It verifies that the caller can use Docker, kind, kubectl,
+and the state directory after provisioning.
+
+The host account and in-cluster workload account are deliberately independent.
+LoginSet coordination, Slurm jobs, SSH workers, and shared-storage staging run
+as `tester` with UID/GID 2000; setup verifies that identity on the coordinator
+and on both real `srun` tasks. This matches the NFS export's anonymous mapping,
+so clients create scenario data directly with a restrictive umask and never
+attempt to change ownership through an all-squashed mount.
 
 SSH workers normally use separate `emptyDir` homes. A scenario that requires
 the RWX shared-home claim owns a bounded StatefulSet transition and restores
@@ -81,7 +96,7 @@ transition before allowing more SSH work; the kind and Slurm fixtures remain
 running throughout.
 
 The generated host SSH key, strict known-hosts file, and two worker addresses
-are kept under `/var/lib/storage-scale-test-integration/`. Re-running setup
+are kept under `tmp/integration-state/`. Re-running setup
 reconciles and validates the environment without replacing those credentials
 or retained backend data.
 
@@ -138,7 +153,7 @@ copies and checks the semantic report content applicable to each scenario.
 
 The `Filesystem integration` GitHub Actions workflow runs independent amd64
 and arm64 jobs concurrently. Each job runs setup twice, stops and restarts the
-fixture, proves that root test execution is rejected, runs `test` as the
+fixture, proves that root lifecycle execution is rejected, runs `test` as the
 ordinary runner account, and tears down twice. A final status job requires both
 architectures to pass. The workflow is deliberately absent from ordinary
 pull-request and default-branch events.
@@ -180,12 +195,15 @@ integration-tests/bin/integration-test.py teardown
 
 Teardown is idempotent. It performs the disposable stop and deletes the
 fixture's generated data, keys, logs, and locally built image tags. For NFS it
-also removes the dedicated export and configuration, disables and stops
-`nfs-server`, removes any harness-owned UFW rule, and unmounts the verified
-loop-backed filesystem. For Docker SBX it removes only the marker-owned shared
-root and never invokes NFS, systemd, firewall, loop, or mount operations. It
-refuses destructive cleanup when the applicable ownership and path checks do
-not match the fixture. Operating-system packages, kind, kubectl, Helm, and
-reusable upstream Docker image layers are not uninstalled. If a locally built
-tag existed before setup, teardown restores that exact prior image ID instead
-of deleting it.
+also removes the dedicated export and configuration, removes any harness-owned
+UFW rule, and unmounts the verified loop-backed filesystem. It disables and
+stops `nfs-server` only when setup started it and no unrelated exports remain;
+a pre-existing service is left running. For Docker SBX it removes only the
+marker-owned shared root and never invokes NFS, systemd, firewall, loop, or
+mount operations. It refuses destructive cleanup when the applicable ownership
+and path checks do not match the fixture. Operating-system packages,
+pre-existing client tools, and reusable upstream Docker image layers are not
+uninstalled. Checksum-verified client copies that the harness downloaded into
+its own state tree are removed with that tree. If a locally built tag existed
+before setup, teardown restores that exact prior image ID instead of deleting
+it.
