@@ -692,7 +692,10 @@ All analysis scripts support filtering to reduce clutter:
 
 Intermediate data can be cached (`--to-csv`, `--to-json`) and reloaded
 (`--from-csv`, `--from-json`) to avoid re-parsing raw files, enabling fast
-iterative report refinement.
+iterative report refinement. For Elbencho, `--from-csv` is an alternative input
+source and cannot be combined with raw result directories. Malformed filters
+and filters that match neither aggregate nor live metrics fail instead of
+silently producing an unfiltered or empty report.
 
 ### 9.5 Plot Design Principles
 

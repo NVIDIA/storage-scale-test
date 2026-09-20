@@ -53,6 +53,7 @@ from typing import (
     Tuple,
     TypedDict,
     cast,
+    get_type_hints,
 )
 
 import matplotlib.pyplot as plt
@@ -81,7 +82,6 @@ from lib.elbencho_live_report import (
     write_client_summaries,
 )
 from lib.join_datestamps import join_datestamps, join_datestamps_for_filename
-from lib.parse_only_sizes import parse_only_sizes_arg
 from lib.reporting_common import histogram_axis_ranges
 from lib.stdout_report_file import (  # pylint: disable=wrong-import-position
     REPORT_TXT_FILENAME,
@@ -265,6 +265,9 @@ class ElbenchoMetrics:
     # Histogram data (optional, for visualization); latency histogram data
     # as {time_sec: count}
     histogram: Dict[float, int] = field(default_factory=dict)
+
+
+_ELBENCHO_METRIC_FIELD_TYPES = get_type_hints(ElbenchoMetrics)
 
 
 @dataclass(frozen=True)
@@ -2683,13 +2686,14 @@ def _elbencho_csv_coerce_field_types(row: Dict[str, Any]) -> None:
     for a_field in fields(ElbenchoMetrics):
         field_name = a_field.name
         field_value = row[field_name]
+        field_type = _ELBENCHO_METRIC_FIELD_TYPES[field_name]
 
-        if a_field.type == bool:
+        if field_type is bool:
             if isinstance(field_value, str):
                 row[field_name] = field_value.lower() == "true"
-        elif a_field.type == int:
+        elif field_type is int:
             row[field_name] = int(float(field_value)) if field_value else 0
-        elif a_field.type == float:
+        elif field_type is float:
             row[field_name] = float(field_value) if field_value else 0.0
 
 
@@ -3533,38 +3537,62 @@ def test_parse(base_filename: str) -> None:
 
 
 # Helper function to parse value lists with ranges
-def parse_int_values_with_ranges(value_str):
-    """Parse a comma-separated list of integers or ranges.
+def parse_int_values_with_ranges(value_str: str) -> Set[int]:
+    """Parse a strict comma-separated list of integers or inclusive ranges.
 
-    Ranges are specified as 'start-end'. Returns a set of integer values.
-    Example: '1,2,5-10,15' would return {1, 2, 5, 6, 7, 8, 9, 10, 15}
+    A report filter is an operator request, not a best-effort hint.  Silently
+    dropping a malformed token can turn a narrow report into an unfiltered
+    report, so invalid syntax raises ``ValueError`` for the CLI to report.
     """
-    result = set()
-    if not value_str:
-        return result
+    if not value_str or not value_str.strip():
+        raise ValueError("filter must not be empty")
 
-    for part in value_str.split(","):
-        part = part.strip()
-        if "-" in part:
-            # Handle range (e.g., "1-10")
-            try:
-                start, end = map(int, part.split("-", 1))
-                # Add all integers in the range (inclusive)
-                result.update(range(start, end + 1))
-            except ValueError:
-                eprint(
-                    f"Warning: Invalid range format: {part}. Using individual values only."
-                )
-                continue
-        else:
-            # Handle individual value
-            try:
-                result.add(int(part))
-            except ValueError:
-                eprint(f"Warning: Invalid integer value: {part}. Skipping.")
-                continue
-
+    result: Set[int] = set()
+    for raw_part in value_str.split(","):
+        part = raw_part.strip()
+        if not part:
+            raise ValueError("empty filter item")
+        pieces = part.split("-")
+        if len(pieces) > 2 or not all(piece.isdigit() for piece in pieces):
+            raise ValueError(f"invalid integer or range: {part}")
+        start = int(pieces[0])
+        end = int(pieces[-1])
+        if len(pieces) == 2 and start > end:
+            raise ValueError(f"range start exceeds end: {part}")
+        result.update(range(start, end + 1))
     return result
+
+
+_REPORT_SIZE_FILTER_RE = re.compile(r"^r?[0-9]+[KMG](,r?[0-9]+[KMG])?$")
+
+
+def parse_only_sizes_filter(values: Optional[List[str]]) -> Optional[Set[str]]:
+    """Parse and validate repeated ``--only-sizes`` filter arguments."""
+    if not values:
+        return None
+
+    result: Set[str] = set()
+    for raw_value in values:
+        parts = raw_value.split(";")
+        if any(not part.strip() for part in parts):
+            raise ValueError("size filter contains an empty item")
+        for part in parts:
+            size = part.strip()
+            if not _REPORT_SIZE_FILTER_RE.fullmatch(size):
+                raise ValueError(f"invalid IO size: {size}")
+            result.add(size)
+    return result
+
+
+def _parse_report_integer_filter(
+    parser: argparse.ArgumentParser, option_name: str, value: str
+) -> Set[int]:
+    """Parse one integer filter and convert syntax errors to CLI errors."""
+    try:
+        return parse_int_values_with_ranges(value)
+    except ValueError as exc:
+        parser.error(f"invalid {option_name} filter: {exc}")
+    return set()  # ``parser.error`` raises; keeps static type checkers happy.
 
 
 def parse_benchmark_filename(filename: str) -> Optional[Dict[str, Any]]:
@@ -4509,6 +4537,9 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    if args.from_csv and args.input_dirs:
+        parser.error("--from-csv cannot be combined with input directories")
+
     positive_live_options = (
         ("--client-outlier-threshold", args.client_outlier_threshold),
         (
@@ -4612,20 +4643,32 @@ def main() -> None:
     node_filter = None
     size_filter = None
     iodepth_filter = None
-    if args.only_threads or args.only_sizes or args.only_nodes or args.only_iodepths:
+    filter_requested = bool(
+        args.only_threads or args.only_sizes or args.only_nodes or args.only_iodepths
+    )
+    if filter_requested:
         thread_filter = (
-            parse_int_values_with_ranges(args.only_threads)
-            if args.only_threads
-            else None
+            None
+            if not args.only_threads
+            else _parse_report_integer_filter(
+                parser, "--only-threads", args.only_threads
+            )
         )
         node_filter = (
-            parse_int_values_with_ranges(args.only_nodes) if args.only_nodes else None
+            None
+            if not args.only_nodes
+            else _parse_report_integer_filter(parser, "--only-nodes", args.only_nodes)
         )
-        size_filter = parse_only_sizes_arg(args.only_sizes)
+        try:
+            size_filter = parse_only_sizes_filter(args.only_sizes)
+        except ValueError as exc:
+            parser.error(f"invalid --only-sizes filter: {exc}")
         iodepth_filter = (
-            parse_int_values_with_ranges(args.only_iodepths)
-            if args.only_iodepths
-            else None
+            None
+            if not args.only_iodepths
+            else _parse_report_integer_filter(
+                parser, "--only-iodepths", args.only_iodepths
+            )
         )
 
         metrics = filter_metrics(
@@ -4644,6 +4687,10 @@ def main() -> None:
             )
         ]
         eprint(f"After filtering, {len(live_files)} live CSV files remain")
+
+        if not metrics and not live_files:
+            eprint("ERROR: Filters matched no report metrics")
+            sys.exit(1)
 
     # Write to CSV if requested
     if args.to_csv:

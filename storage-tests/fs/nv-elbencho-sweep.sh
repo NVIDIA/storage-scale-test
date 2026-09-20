@@ -445,10 +445,12 @@ if [[ "${ELBENCHO_SINGLE_BIG_FILE:-0}" == "1" && "$rand_option" == "1" ]]; then
 fi
 
 # Parse --nodes specification into array
-if ! mapfile -t node_counts < <(parse_range_specification "$nodes_spec"); then
+node_counts_output=""
+if ! node_counts_output=$(parse_range_specification "$nodes_spec"); then
     echo "Error: Invalid node specification: $nodes_spec" >&2
     exit 1
 fi
+mapfile -t node_counts <<<"$node_counts_output"
 if [[ ${#node_counts[@]} -eq 0 ]]; then
     echo "Error: Node specification produced no node counts" >&2
     exit 1

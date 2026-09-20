@@ -3494,11 +3494,13 @@ reify_all_elbencho_executions() {
     local sweep_write_no_read="$7"
     local sweep_read_from="$8"
 
-    local -a node_counts
-    if ! mapfile -t node_counts < <(parse_range_specification "$nodes_spec"); then
+    local node_counts_output=""
+    if ! node_counts_output=$(parse_range_specification "$nodes_spec"); then
         echo "Error: Invalid node specification: $nodes_spec" >&2
         return 1
     fi
+    local -a node_counts
+    mapfile -t node_counts <<<"$node_counts_output"
     if [[ ${#node_counts[@]} -eq 0 ]]; then
         echo "Error: Node specification produced no node counts" >&2
         return 1

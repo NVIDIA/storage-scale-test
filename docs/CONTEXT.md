@@ -86,6 +86,13 @@ storage is isolated and removed after host-side evidence is retained. The
 on-demand integration workflow explicitly selects NFS and runs the complete
 catalog concurrently on amd64 and arm64; Kubernetes remains fixture
 infrastructure and is not a benchmark execution substrate.
+Fast shell contract tests cover node-range parsing and Cartesian order,
+configuration precedence, SSH host parsing and selection, workload-mode and
+path safety, sizing limits, and Slurm argument boundaries without a live
+fixture. Elbencho CSV reload resolves postponed dataclass annotations before
+coercing types, so cached metrics remain filterable. Its reporting CLI treats
+`--from-csv` as exclusive with raw directories and rejects malformed or
+no-match filters.
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 3.14 unit tests run weekly and on manual request.
