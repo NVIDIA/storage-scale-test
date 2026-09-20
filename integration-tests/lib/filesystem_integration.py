@@ -39,6 +39,21 @@ from deployment_cache import (
     DeploymentCacheRequest,
     get_or_build_deployment,
 )
+from failure_injection import (
+    FailureInjectionOperations,
+    build_slurm_failure_injection_plan,
+    build_ssh_failure_injection_plan,
+    staged_failure_injection,
+)
+from filesystem_scenario_specs import (
+    SCENARIO_SPECS_BY_NAME,
+    CommandKind,
+    DatasetExpectation,
+    ExecutionStatus,
+    FilesystemScenarioSpec,
+    ScenarioStep,
+    WorkloadPhase,
+)
 from scenario_planner import (
     ScenarioPlanningError,
     SshHomeTransition,
@@ -75,6 +90,8 @@ ELBENCHO_ARCHIVES = {
 }
 REMOTE_BASE = "/mnt/storage-test/integration-regression"
 VALIDATION_SUCCESS = "All validation checks passed successfully"
+POD_TEST_UID = 2000
+POD_TEST_GID = 2000
 
 
 class IntegrationTestError(RuntimeError):
@@ -93,6 +110,29 @@ class Fixture:
     architecture: str
     ssh_home_mode: str
     storage_backend: str
+
+
+@dataclass
+class ScenarioRuntime:
+    """Mutable state shared by a scenario's ordered command steps."""
+
+    scenario: FilesystemScenarioSpec
+    selector: str
+    workspace: str
+    local_workspace: Path
+    artifact_root: Path
+    data_root: str
+    values: dict[str, str]
+    copied_results: list[Path]
+
+
+@dataclass(frozen=True)
+class StepOutcome:
+    """Result locations and output for one scenario command."""
+
+    output: str
+    remote_result: str | None
+    local_result: Path | None
 
 
 def _kubectl(config: Any, *arguments: str | Path) -> list[str | Path]:
@@ -632,14 +672,20 @@ def _shell(value: str | Path) -> str:
 
 
 def _override_block(
-    selector: str, remote_root: str, fixture: Fixture
+    selector: str,
+    remote_root: str,
+    fixture: Fixture,
+    *,
+    results_dir: str | None = None,
+    logs_dir: str | None = None,
+    extra_env: str = "",
 ) -> tuple[str, dict[str, str]]:
     """Return template overrides and small support-file contents."""
     data = "/mnt/storage-test"
     lines = [
         "# Bounded integration regression overrides.",
-        f"export RESULTS_DIR={_shell(remote_root + '/results')}",
-        f"export LOGS_DIR={_shell(remote_root + '/logs')}",
+        f"export RESULTS_DIR={_shell(results_dir or remote_root + '/results')}",
+        f"export LOGS_DIR={_shell(logs_dir or remote_root + '/logs')}",
         "ORDER_NODES=1",
         'client_type="cpu"',
         f"client_arch={_shell(fixture.architecture)}",
@@ -693,11 +739,20 @@ def _override_block(
         )
         support["slurm-nodes"] = "\n".join(fixture.slurm_nodes) + "\n"
         support["slurm-ignore"] = ""
+    if extra_env:
+        lines.extend(("# Scenario-specific integration overrides.", extra_env.rstrip()))
     return "\n".join(lines) + "\n", support
 
 
 def _render_env(
-    template: Path, selector: str, remote_root: str, fixture: Fixture
+    template: Path,
+    selector: str,
+    remote_root: str,
+    fixture: Fixture,
+    *,
+    results_dir: str | None = None,
+    logs_dir: str | None = None,
+    extra_env: str = "",
 ) -> tuple[str, dict[str, str]]:
     """Render one runtime env from the repository's real user template."""
     text = template.read_text(encoding="utf-8")
@@ -706,7 +761,14 @@ def _render_env(
         raise IntegrationTestError(
             f"expected exactly one env_base source anchor in {template}"
         )
-    overrides, support = _override_block(selector, remote_root, fixture)
+    overrides, support = _override_block(
+        selector,
+        remote_root,
+        fixture,
+        results_dir=results_dir,
+        logs_dir=logs_dir,
+        extra_env=extra_env,
+    )
     rendered = text.replace(anchor, overrides + "\n" + anchor)
     return rendered, support
 
@@ -848,16 +910,31 @@ def _write_runtime_files(
     fixture: Fixture,
     *,
     template: Path | None = None,
+    results_dir: str | None = None,
+    logs_dir: str | None = None,
+    extra_env: str = "",
+    extra_support: dict[str, str] | None = None,
 ) -> None:
     """Add the generated environment and support files to a deployment."""
     rendered, support = _render_env(
-        template or workspace / "env.sh.template", selector, runtime_root, fixture
+        template or workspace / "env.sh.template",
+        selector,
+        runtime_root,
+        fixture,
+        results_dir=results_dir,
+        logs_dir=logs_dir,
+        extra_env=extra_env,
     )
     (workspace / "env.sh").write_text(rendered, encoding="utf-8")
     (workspace / "env.sh").chmod(0o640)
     for name, content in support.items():
         (workspace / name).write_text(content, encoding="utf-8")
         (workspace / name).chmod(0o640)
+    for name, content in (extra_support or {}).items():
+        path = workspace / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o640)
 
 
 def _stream_to_login(
@@ -932,6 +1009,7 @@ def _stage_workspace(
     archive: Path,
     extracted: Path,
     build_root: Path,
+    workspace_id: str,
 ) -> str:
     """Stage a packaged deployment for host SSH or LoginSet Slurm execution."""
     if selector == "ssh":
@@ -940,7 +1018,7 @@ def _stage_workspace(
         _write_runtime_files(workspace, selector, str(workspace), fixture)
         return str(workspace)
 
-    remote_base = f"{REMOTE_BASE}/{selector}"
+    remote_base = f"{REMOTE_BASE}/workspaces/{workspace_id}"
     remote_root = f"{remote_base}/storage-scale-test"
     reset = f"rm -rf -- {_shell(remote_base)} && mkdir -p -- {_shell(remote_base)}"
     runner.run(
@@ -1031,6 +1109,8 @@ def _run_step(
     command: str,
     log_dir: Path,
     timeout: int,
+    *,
+    expected_failure: bool = False,
 ) -> str:
     """Run one bounded substrate step and preserve diagnostic output."""
     LOG.info("Running %s filesystem step: %s", selector, name)
@@ -1043,14 +1123,14 @@ def _run_step(
     log_path = log_dir / f"{selector}-{name}.log"
     log_path.write_text(output, encoding="utf-8")
     log_path.chmod(0o640)
-    if result.returncode:
+    if result.returncode and not expected_failure:
         detail = output.strip()[-8000:]
         raise IntegrationTestError(
             f"{selector} {name} failed with exit code {result.returncode}; "
             f"full output: {log_path}\n{detail}"
         )
     LOG.info("Passed %s filesystem step: %s", selector, name)
-    return result.stdout
+    return output
 
 
 def _assert_results(
@@ -1167,7 +1247,7 @@ def _copy_result_for_reporting(
     destination: Path,
 ) -> Path:
     """Bring one completed result tree to the host for report validation."""
-    destination.mkdir(parents=True)
+    destination.mkdir(parents=True, exist_ok=True)
     if selector == "ssh":
         shutil.copytree(result_dir, destination / Path(result_dir).name)
     else:
@@ -1224,6 +1304,1234 @@ def _assert_report(
         )
 
 
+def _login_shell(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    command: str,
+    *,
+    timeout: int = 60,
+) -> str:
+    """Run a storage-inspection command in the PVC-mounted login pod."""
+    return runner.run(
+        _pod_command(
+            config,
+            fixture.login_pod,
+            fixture.login_container,
+            command,
+            timeout=timeout,
+        ),
+        timeout=timeout + 15,
+    ).stdout
+
+
+def _prepare_scenario_data(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    data_root: str,
+) -> None:
+    """Reset one marker-owned scenario subtree on the shared test storage."""
+    command = f"""
+set -euo pipefail
+rm -rf -- {_shell(data_root)}
+mkdir -p -- {_shell(data_root + '/primary')} {_shell(data_root + '/secondary')}
+printf 'scenario-owned\n' > {_shell(data_root + '/primary/.integration-sentinel')}
+printf 'scenario-owned\n' > {_shell(data_root + '/secondary/.integration-sentinel')}
+chown -R {config.test_uid}:{config.test_gid} -- {_shell(data_root)}
+""".strip()
+    _login_shell(runner, config, fixture, command)
+
+
+def _sync_step_runtime(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    step: ScenarioStep,
+    template: Path,
+    result_base: str,
+) -> None:
+    """Render and install one step's env and support files."""
+    extra_env = step.render_env(runtime.values)
+    extra_support = {
+        item.relative_path: item.content
+        for item in step.render_support_files(runtime.values)
+    }
+    if runtime.selector == "ssh":
+        _write_runtime_files(
+            Path(runtime.workspace),
+            runtime.selector,
+            runtime.workspace,
+            fixture,
+            template=template,
+            results_dir=result_base,
+            logs_dir=f"{runtime.workspace}/logs/{step.name}",
+            extra_env=extra_env,
+            extra_support=extra_support,
+        )
+        return
+    stage = runtime.local_workspace / f"runtime-{step.name}"
+    if stage.exists():
+        shutil.rmtree(stage)
+    stage.mkdir()
+    _write_runtime_files(
+        stage,
+        runtime.selector,
+        runtime.workspace,
+        fixture,
+        template=template,
+        results_dir=result_base,
+        logs_dir=f"{runtime.workspace}/logs/{step.name}",
+        extra_env=extra_env,
+        extra_support=extra_support,
+    )
+    archive_path = runtime.local_workspace / f"runtime-{step.name}.tar"
+    with tarfile.open(archive_path, "w") as archive:
+        for child in sorted(stage.rglob("*")):
+            archive.add(child, arcname=child.relative_to(stage))
+    _stream_to_login(
+        runner,
+        config,
+        fixture,
+        archive_path,
+        [
+            "tar",
+            "--no-same-owner",
+            "--no-same-permissions",
+            "-xf",
+            "-",
+            "-C",
+            runtime.workspace,
+        ],
+    )
+
+
+def _create_generated_inputs(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    step: ScenarioStep,
+) -> None:
+    """Create bounded scenario inputs through the shared PVC mount."""
+    for generated in step.generated_inputs:
+        path = f"{runtime.values['test_root']}/{generated.relative_path}"
+        command = f"""
+set -euo pipefail
+mkdir -p -- {_shell(str(PurePosixPath(path).parent))}
+truncate -s {generated.size_bytes} -- {_shell(path)}
+chown -R {config.test_uid}:{config.test_gid} -- \
+    {_shell(str(PurePosixPath(path).parent))}
+test "$(stat -c %s -- {_shell(path)})" -eq {generated.size_bytes}
+""".strip()
+        _login_shell(runner, config, fixture, command)
+
+
+def _discover_result(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    step: ScenarioStep,
+    result_base: str,
+    log_dir: Path,
+) -> str:
+    """Find the single normal sweep result below an invocation-owned base."""
+    output = _run_step(
+        runner,
+        config,
+        fixture,
+        runtime.selector,
+        f"{step.name}-discover",
+        f"find {_shell(result_base)} -mindepth 1 -maxdepth 1 -type d "
+        "-name 'elbencho-*' -printf '%p\\n'",
+        log_dir,
+        30,
+    )
+    directories = [line for line in output.splitlines() if line.strip()]
+    if len(directories) != 1:
+        raise IntegrationTestError(
+            f"{runtime.selector} {step.name} produced {len(directories)} "
+            f"normal result directories under {result_base}: {directories}"
+        )
+    return directories[0]
+
+
+def _copy_scenario_result(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    step: ScenarioStep,
+    remote_result: str,
+) -> Path:
+    """Copy one immutable result snapshot into the retained test-run log."""
+    destination = runtime.artifact_root / "copied-results" / step.name
+    destination.mkdir(parents=True, exist_ok=True)
+    if runtime.selector == "ssh":
+        target = destination / Path(remote_result).name
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(remote_result, target)
+    else:
+        target = _copy_result_for_reporting(
+            runner,
+            config,
+            fixture,
+            runtime.selector,
+            remote_result,
+            destination,
+        )
+    runtime.copied_results.append(target)
+    return target
+
+
+def _shell_assignments(path: Path) -> dict[str, str]:
+    """Read simple exported scalar assignments from a reified execution."""
+    assignments: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = re.fullmatch(r"export ([A-Za-z_][A-Za-z0-9_]*)=(.*)", line)
+        if not match:
+            continue
+        values = shlex.split(match.group(2), posix=True)
+        assignments[match.group(1)] = values[0] if values else ""
+    return assignments
+
+
+def _coordinate_from_execution(path: Path) -> tuple[int, str, int, int]:
+    """Return a reified execution's stable sweep coordinate."""
+    values = _shell_assignments(path)
+    try:
+        return (
+            int(values["nodes"]),
+            values["io_size"],
+            int(values["thread_count"]),
+            int(values["io_depth"]),
+        )
+    except (KeyError, ValueError) as error:
+        raise IntegrationTestError(f"invalid execution metadata in {path}") from error
+
+
+def _workload_values(path: Path) -> dict[str, str]:
+    """Load a workload TSV while rejecting duplicate or malformed keys."""
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        fields = line.split("\t")
+        if len(fields) != 2 or fields[0] in values:
+            raise IntegrationTestError(f"malformed workload metadata: {path}")
+        values[fields[0]] = fields[1]
+    return values
+
+
+def _expected_dataset_totals(
+    scenario: str, step: ScenarioStep, nodes: int
+) -> tuple[int, int] | None:
+    """Return exact bounded totals for workloads with a metadata contract."""
+    if scenario in {"baseline", "ssh-shared-home", "failure-resume"}:
+        return nodes, nodes * 16 * 1024 * 1024
+    if scenario == "live-capture":
+        return nodes * 2, nodes * 2 * 16 * 1024 * 1024
+    if scenario == "slurm-cartesian":
+        return nodes * 2, nodes * 2 * 1024 * 1024
+    if scenario == "retained-lifecycle" and step.kind is not CommandKind.DELETE:
+        return 1, 16 * 1024 * 1024
+    return None
+
+
+def _assert_phase_artifacts(
+    execution_root: Path,
+    execution_id: str,
+    step: ScenarioStep,
+    status: ExecutionStatus,
+) -> None:
+    """Require phase evidence without freezing complete native arguments."""
+    phase_files = {
+        WorkloadPhase.WRITE: "write.json",
+        WorkloadPhase.READ: "read.json",
+        WorkloadPhase.REMOVE_FILES: "delete.json",
+    }
+    for phase, suffix in phase_files.items():
+        if phase not in step.required_phases:
+            continue
+        if status is ExecutionStatus.FAILED and phase is WorkloadPhase.REMOVE_FILES:
+            continue
+        path = execution_root / f"{execution_id}.{suffix}"
+        if not path.is_file() or path.stat().st_size == 0:
+            raise IntegrationTestError(f"missing {phase.value} evidence: {path}")
+
+
+def _assert_execution_contract(
+    scenario: FilesystemScenarioSpec,
+    step: ScenarioStep,
+    result: Path,
+) -> None:
+    """Validate exact coordinates, states, totals, and required phases."""
+    execution_root = result / "executions"
+    scripts = sorted(execution_root.glob("[0-9][0-9][0-9][0-9].sh"))
+    if len(scripts) != len(step.executions):
+        raise IntegrationTestError(
+            f"{scenario.name}/{step.name}: expected {len(step.executions)} "
+            f"executions, found {len(scripts)}"
+        )
+    actual_coordinates = [_coordinate_from_execution(path) for path in scripts]
+    expected_coordinates = [
+        (
+            item.coordinate.nodes,
+            item.coordinate.io_size,
+            item.coordinate.threads,
+            item.coordinate.io_depth,
+        )
+        for item in step.executions
+    ]
+    if actual_coordinates != expected_coordinates:
+        raise IntegrationTestError(
+            f"{scenario.name}/{step.name}: coordinates {actual_coordinates!r} "
+            f"do not match {expected_coordinates!r}"
+        )
+    for index, expected in enumerate(step.executions, start=1):
+        execution_id = f"{index:04d}"
+        status_path = execution_root / f"{execution_id}.status"
+        status = status_path.read_text(encoding="utf-8").strip()
+        if status != expected.status.value:
+            raise IntegrationTestError(
+                f"{scenario.name}/{step.name}/{execution_id}: expected "
+                f"{expected.status.value}, found {status}"
+            )
+        if expected.status is ExecutionStatus.PENDING:
+            continue
+        exitcode = (
+            (execution_root / f"{execution_id}.exitcode")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+        expected_exit = "97" if expected.status is ExecutionStatus.FAILED else "0"
+        if exitcode != expected_exit:
+            raise IntegrationTestError(
+                f"{scenario.name}/{step.name}/{execution_id}: expected exit "
+                f"{expected_exit}, found {exitcode}"
+            )
+        if scenario.name not in {
+            "default-dio",
+            "ssh-single-big-file",
+            "ssh-weighted-roots",
+        } and not (
+            scenario.name == "retained-lifecycle"
+            and step.name.startswith("read-cache-")
+        ):
+            _assert_phase_artifacts(execution_root, execution_id, step, expected.status)
+        workload_path = execution_root / f"{execution_id}.workload.tsv"
+        totals = _expected_dataset_totals(
+            scenario.name, step, expected.coordinate.nodes
+        )
+        if totals is not None and workload_path.is_file():
+            workload = _workload_values(workload_path)
+            if workload.get("dataset_files_total") != str(totals[0]) or workload.get(
+                "dataset_bytes_total"
+            ) != str(totals[1]):
+                raise IntegrationTestError(
+                    f"{scenario.name}/{step.name}/{execution_id}: invalid "
+                    f"dataset totals in {workload_path}"
+                )
+            valid_completion = {"completed"}
+            if scenario.name == "retained-lifecycle" and step.name.startswith(
+                "read-cache-"
+            ):
+                valid_completion.add("not_applicable_time_based")
+            if (
+                expected.status is ExecutionStatus.SUCCESS
+                and workload.get("completion_state") not in valid_completion
+            ):
+                raise IntegrationTestError(
+                    f"{scenario.name}/{step.name}/{execution_id}: workload did "
+                    "not complete"
+                )
+
+
+def _execution_targets(result: Path) -> tuple[str, ...]:
+    """Return every exact generated target recorded by a result tree."""
+    targets: list[str] = []
+    for script in sorted((result / "executions").glob("[0-9][0-9][0-9][0-9].sh")):
+        value = _shell_assignments(script).get(
+            "ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV", ""
+        )
+        targets.extend(item for item in value.split(",") if item)
+    return tuple(targets)
+
+
+def _assert_dataset_state(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    step: ScenarioStep,
+    result: Path | None,
+    retained_path: str | None,
+) -> None:
+    """Validate cleanup or retention only within scenario-owned paths."""
+    if step.dataset is DatasetExpectation.PRESERVED:
+        if retained_path:
+            _login_shell(runner, config, fixture, f"test -e {_shell(retained_path)}")
+        return
+    paths = list(_execution_targets(result)) if result is not None else []
+    if step.dataset is DatasetExpectation.REMOVED and retained_path:
+        paths.append(retained_path)
+    if not paths:
+        return
+    probes = "\n".join(f"test ! -e {_shell(path)}" for path in paths)
+    _login_shell(runner, config, fixture, f"set -euo pipefail\n{probes}")
+
+
+def _assert_semantic_flags(scenario: str, step: ScenarioStep, result: Path) -> None:
+    """Check required command semantics while allowing future optional flags."""
+    command_lines: list[str] = []
+    for path in result.glob("executions/*.log"):
+        command_lines.extend(
+            line
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if line.startswith("# elbencho ")
+        )
+    evidence = "\n".join(command_lines)
+    if not evidence:
+        raise IntegrationTestError(
+            f"{scenario}/{step.name}: execution logs omitted native commands"
+        )
+    required: tuple[str, ...] = ()
+    forbidden: tuple[str, ...] = ()
+    if scenario == "baseline" or scenario == "ssh-shared-home":
+        required = ("--norandalign",)
+    elif scenario == "default-dio":
+        required, forbidden = ("--direct",), ("--norandalign",)
+    elif scenario == "live-capture":
+        required = ("--livecsv", "--livecsvex", "--liveint=10")
+    elif scenario == "ssh-single-big-file" and step.name == "inferred-extent-read":
+        required, forbidden = ("--nosvcshare", "--read"), (
+            "--size",
+            "--treescan",
+            "--treefile",
+        )
+    elif scenario == "ssh-weighted-roots":
+        required = ("--files=1",)
+    missing = [flag for flag in required if flag not in evidence]
+    present = [
+        flag
+        for flag in forbidden
+        if re.search(rf"(?<![A-Za-z0-9_-]){re.escape(flag)}(?:=|\b)", evidence)
+    ]
+    if missing or present:
+        raise IntegrationTestError(
+            f"{scenario}/{step.name}: native command flag mismatch; "
+            f"missing={missing}, forbidden-present={present}"
+        )
+
+
+def _assert_scenario_report(
+    runner: Any,
+    report_workspace: Path,
+    result: Path,
+    runtime: ScenarioRuntime,
+    step: ScenarioStep,
+    log_dir: Path,
+) -> None:
+    """Exercise reporting and require semantic rows and plot families."""
+    report_dir = log_dir / f"report-{step.name}"
+    report_dir.mkdir()
+    command: list[str | Path] = [
+        report_workspace / "utils" / "extract-elbencho.sh",
+        "--markdown",
+    ]
+    if runtime.scenario.name == "live-capture":
+        command.extend(
+            (
+                "--per-client-plots",
+                "--client-min-underperform-segments",
+                "2",
+                "--client-max-timeseries-lines",
+                "2",
+                "--client-max-heatmap-rows",
+                "2",
+            )
+        )
+    command.append(result)
+    completed = runner.run(
+        command, cwd=report_dir, timeout=step.timeout_seconds, check=False
+    )
+    output = completed.stdout + completed.stderr
+    log_path = report_dir / "extract-elbencho.log"
+    log_path.write_text(output, encoding="utf-8")
+    if completed.returncode:
+        raise IntegrationTestError(
+            f"{runtime.scenario.name}/{runtime.selector}/{step.name}: reporting "
+            f"failed; full output: {log_path}\n{output[-8000:]}"
+        )
+    node_counts = sorted({item.coordinate.nodes for item in step.executions})
+    missing_rows = [
+        nodes
+        for nodes in node_counts
+        if not re.search(rf"^\|\s*{nodes}\s*\|", output, re.MULTILINE)
+    ]
+    required_operations = []
+    if WorkloadPhase.WRITE in step.required_phases:
+        required_operations.append("WRITE Operation")
+    if WorkloadPhase.READ in step.required_phases:
+        required_operations.append("READ Operation")
+    missing_operations = [item for item in required_operations if item not in output]
+    if missing_rows or missing_operations:
+        raise IntegrationTestError(
+            f"{runtime.scenario.name}/{runtime.selector}/{step.name}: report "
+            f"missing node rows {missing_rows} or operations {missing_operations}"
+        )
+    if not any(path.stat().st_size for path in result.glob("*.png")):
+        raise IntegrationTestError(
+            f"{runtime.scenario.name}/{runtime.selector}/{step.name}: no "
+            "nonempty report plot was generated"
+        )
+
+
+def _reset_result_base(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    result_base: str,
+) -> None:
+    """Create an empty invocation-owned result base."""
+    if runtime.selector == "ssh":
+        path = Path(result_base)
+        if path.exists():
+            shutil.rmtree(path)
+        path.mkdir(parents=True)
+        return
+    _login_shell(
+        runner,
+        config,
+        fixture,
+        f"rm -rf -- {_shell(result_base)} && mkdir -p -- {_shell(result_base)} "
+        f"&& chown {config.test_uid}:{config.test_gid} -- {_shell(result_base)}",
+    )
+
+
+def _validate_step_environment(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    step: ScenarioStep,
+    log_dir: Path,
+) -> None:
+    """Run the repository's validator for a rendered scenario environment."""
+    output = _run_step(
+        runner,
+        config,
+        fixture,
+        runtime.selector,
+        f"{step.name}-validate-env",
+        f"cd -- {_shell(runtime.workspace)} && ./validate_env.sh",
+        log_dir,
+        180,
+    )
+    if VALIDATION_SUCCESS not in output:
+        raise IntegrationTestError(
+            f"{runtime.scenario.name}/{runtime.selector}/{step.name}: "
+            "validate_env.sh omitted its success marker"
+        )
+
+
+def _retained_path(result: Path) -> str:
+    """Return the sole generated path from a one-execution retained result."""
+    targets = _execution_targets(result)
+    if len(targets) != 1:
+        raise IntegrationTestError(
+            f"expected one retained generated target, found {targets!r}"
+        )
+    return targets[0]
+
+
+def _assert_read_cache(step: ScenarioStep, result: Path) -> None:
+    """Validate the cache miss/hit contract for retained read invocations."""
+    if step.name not in {"read-cache-miss", "read-cache-hit"}:
+        return
+    workload = _workload_values(result / "executions" / "0001.workload.tsv")
+    expected = (
+        ("cache_miss_scan", "created")
+        if step.name == "read-cache-miss"
+        else ("cache_hit", "reused")
+    )
+    actual = (
+        workload.get("treefile_source"),
+        workload.get("treefile_cache_publish_outcome"),
+    )
+    if actual != expected:
+        raise IntegrationTestError(
+            f"{step.name}: expected treefile cache {expected!r}, found {actual!r}"
+        )
+
+
+def _assert_live_capture(result: Path) -> None:
+    """Require a stable live counter series without comparing performance."""
+    files = [path for path in result.rglob("*.live.csv") if path.stat().st_size]
+    if not files:
+        raise IntegrationTestError(f"live-capture result has no live CSV: {result}")
+    stable_series = False
+    for path in files:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if len(lines) < 3:
+            continue
+        header = lines[0]
+        if "DoneBytes" not in header:
+            raise IntegrationTestError(f"live CSV lacks DoneBytes column: {path}")
+        stable_series = True
+    if not stable_series:
+        raise IntegrationTestError(
+            "live capture has no service/phase series with at least two samples"
+        )
+
+
+def _assert_slurm_scheduling(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    result: Path,
+) -> None:
+    """Verify the real allocation's name, node constraint, CPUs, and state."""
+    job_id = (result / "executions" / "0001.jobid").read_text(encoding="utf-8").strip()
+    command = (
+        f"sacct -X -j {_shell(job_id)} -n -P "
+        "--format=JobName,NodeList,AllocCPUS,State"
+    )
+    output = _login_shell(runner, config, fixture, command)
+    records = [line.split("|") for line in output.splitlines() if line.strip()]
+    matches = [record for record in records if len(record) >= 4 and record[0]]
+    if not matches:
+        raise IntegrationTestError(f"Slurm accounting omitted job {job_id}")
+    name, nodes, cpus, state = matches[0][:4]
+    if (
+        not name.startswith("itest-elbencho-")
+        or fixture.slurm_nodes[0] not in nodes
+        or fixture.slurm_nodes[1] in nodes
+        or not cpus.isdigit()
+        or int(cpus) < 1
+        or not state.startswith("COMPLETED")
+    ):
+        raise IntegrationTestError(
+            f"unexpected Slurm scheduling evidence for {job_id}: {matches[0]!r}"
+        )
+
+
+def _assert_step_specials(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    step: ScenarioStep,
+    result: Path,
+) -> None:
+    """Apply focused assertions unique to individual real scenarios."""
+    _assert_read_cache(step, result)
+    if runtime.scenario.name == "live-capture":
+        _assert_live_capture(result)
+    if runtime.scenario.name == "slurm-scheduling":
+        _assert_slurm_scheduling(runner, config, fixture, result)
+    if runtime.scenario.name == "ssh-single-big-file" and step.name == (
+        "inferred-extent-read"
+    ):
+        path = f"{runtime.values['test_root']}/staged-input/integration-bigfile"
+        output = _login_shell(
+            runner,
+            config,
+            fixture,
+            f"stat -c %s -- {_shell(path)} && sha256sum -- {_shell(path)}",
+        )
+        if not output.startswith(f"{16 * 1024 * 1024}\n"):
+            raise IntegrationTestError("staged single-file input changed size")
+
+
+def _run_regular_step(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    step: ScenarioStep,
+    template: Path,
+    report_workspace: Path,
+    log_dir: Path,
+) -> StepOutcome:
+    """Render, execute, collect, and validate one ordinary scenario step."""
+    if step.kind is CommandKind.RESUME:
+        raise IntegrationTestError("resume steps require the failure scenario runner")
+    result_base = f"{runtime.workspace}/results/{step.name}"
+    _reset_result_base(runner, config, fixture, runtime, result_base)
+    _sync_step_runtime(
+        runner,
+        config,
+        fixture,
+        runtime,
+        step,
+        template,
+        result_base,
+    )
+    _create_generated_inputs(runner, config, fixture, runtime, step)
+    _validate_step_environment(runner, config, fixture, runtime, step, log_dir)
+    arguments = shlex.join(step.render_arguments(runtime.values))
+    command = (
+        f"cd -- {_shell(runtime.workspace)} && "
+        f"./storage-tests/fs/nv-elbencho-sweep.sh {arguments}"
+    )
+    output = _run_step(
+        runner,
+        config,
+        fixture,
+        runtime.selector,
+        step.name,
+        command,
+        log_dir,
+        step.timeout_seconds,
+    )
+    if step.kind is CommandKind.DELETE:
+        _assert_dataset_state(
+            runner,
+            config,
+            fixture,
+            step,
+            None,
+            runtime.values.get("retained_data_dir")
+            or f"{runtime.values['test_root']}/staged-input",
+        )
+        return StepOutcome(output, None, None)
+    remote_result = _discover_result(
+        runner,
+        config,
+        fixture,
+        runtime,
+        step,
+        result_base,
+        log_dir,
+    )
+    local_result = _copy_scenario_result(
+        runner, config, fixture, runtime, step, remote_result
+    )
+    _assert_execution_contract(runtime.scenario, step, local_result)
+    _assert_semantic_flags(runtime.scenario.name, step, local_result)
+    if "retained_data_dir" in step.exports:
+        runtime.values["retained_data_dir"] = _retained_path(local_result)
+    _assert_dataset_state(
+        runner,
+        config,
+        fixture,
+        step,
+        local_result,
+        runtime.values.get("retained_data_dir"),
+    )
+    _assert_step_specials(runner, config, fixture, runtime, step, local_result)
+    _assert_scenario_report(
+        runner,
+        report_workspace,
+        local_result,
+        runtime,
+        step,
+        log_dir,
+    )
+    if {item.coordinate.nodes for item in step.executions} == {1, 2}:
+        _assert_ordered_workers(fixture, runtime.selector, output)
+    return StepOutcome(output, remote_result, local_result)
+
+
+def _make_scenario_runtime(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    scenario: FilesystemScenarioSpec,
+    selector: str,
+    archive: Path,
+    extracted: Path,
+    build_root: Path,
+    artifact_root: Path,
+    run_id: str,
+) -> ScenarioRuntime:
+    """Stage one isolated deployment and storage subtree for a scenario."""
+    workspace_id = f"{run_id}-{scenario.name}-{selector}"
+    workspace = _stage_workspace(
+        runner,
+        config,
+        fixture,
+        selector,
+        archive,
+        extracted,
+        build_root,
+        workspace_id,
+    )
+    data_root = f"{REMOTE_BASE}/test-data/{workspace_id}"
+    _prepare_scenario_data(runner, config, fixture, data_root)
+    values = {
+        "workspace": workspace,
+        "test_root": f"{data_root}/primary",
+        "test_root_secondary": f"{data_root}/secondary",
+        "slurm_node_1": fixture.slurm_nodes[0],
+        "slurm_node_2": fixture.slurm_nodes[1],
+    }
+    return ScenarioRuntime(
+        scenario,
+        selector,
+        workspace,
+        build_root,
+        artifact_root,
+        data_root,
+        values,
+        [],
+    )
+
+
+def _run_regular_scenario(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    template: Path,
+    report_workspace: Path,
+    log_dir: Path,
+) -> None:
+    """Run all ordered steps for a non-failure scenario."""
+    for step in runtime.scenario.steps:
+        _run_regular_step(
+            runner,
+            config,
+            fixture,
+            runtime,
+            step,
+            template,
+            report_workspace,
+            log_dir,
+        )
+
+
+def _cleanup_ssh_remote_results(runner: Any, config: Any) -> None:
+    """Remove retrieved per-scenario output trees from bounded SSH homes."""
+    for pod in _pods_with_container(_pod_inventory(runner, config), "sshd"):
+        runner.run(
+            [
+                *_kubectl(
+                    config,
+                    "-n",
+                    config.namespace,
+                    "exec",
+                    pod["metadata"]["name"],
+                    "-c",
+                    "sshd",
+                    "--",
+                ),
+                "bash",
+                "-c",
+                "rm -rf -- /home/tester/elbencho-[0-9]*",
+            ],
+            check=False,
+            timeout=60,
+        )
+
+
+def _cleanup_scenario_storage(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+) -> None:
+    """Remove one scenario's isolated PVC data and Slurm deployment."""
+    data_root = PurePosixPath(runtime.data_root)
+    data_base = PurePosixPath(REMOTE_BASE) / "test-data"
+    targets = [data_root]
+    if runtime.selector == "slurm":
+        workspace_root = PurePosixPath(runtime.workspace).parent
+        workspace_base = PurePosixPath(REMOTE_BASE) / "workspaces"
+        if workspace_root.parent != workspace_base:
+            raise IntegrationTestError(
+                f"refusing to remove unexpected Slurm workspace: {workspace_root}"
+            )
+        targets.append(workspace_root)
+    if data_root.parent != data_base:
+        raise IntegrationTestError(
+            f"refusing to remove unexpected scenario data path: {data_root}"
+        )
+    command = "rm -rf -- " + " ".join(_shell(path) for path in targets)
+    result = runner.run(
+        _pod_command(
+            config,
+            fixture.login_pod,
+            fixture.login_container,
+            command,
+            timeout=120,
+        ),
+        check=False,
+        timeout=135,
+    )
+    if result.returncode:
+        LOG.warning(
+            "Could not clean scenario-owned remote storage for %s/%s",
+            runtime.scenario.name,
+            runtime.selector,
+        )
+
+
+def _remote_staging_operations(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    selector: str,
+    local_wrapper: Path | None,
+    restore_binary: Path | None,
+    remote_wrapper: PurePosixPath | None = None,
+) -> FailureInjectionOperations:
+    """Return concrete PVC or SSH-pod operations for failure staging."""
+
+    def _container(_endpoint: str) -> str:
+        return fixture.login_container if selector == "slurm" else "sshd"
+
+    def _command(endpoint: str, command: str, *, stdin: Any = None) -> None:
+        if endpoint == "local":
+            return
+        runner.run(
+            [
+                *_kubectl(
+                    config,
+                    "-n",
+                    config.namespace,
+                    "exec",
+                    "-i",
+                    endpoint,
+                    "-c",
+                    _container(endpoint),
+                    "--",
+                ),
+                "bash",
+                "-ec",
+                command,
+            ],
+            stdin=stdin,
+            timeout=180,
+        )
+
+    def make_directory(endpoint: str, path: PurePosixPath) -> None:
+        _command(
+            endpoint,
+            f"mkdir -p -- {_shell(path)} && chown {POD_TEST_UID}:{POD_TEST_GID} "
+            f"-- {_shell(path)}",
+        )
+
+    def copy_file(
+        source: Path, endpoint: str, destination: PurePosixPath, mode: int
+    ) -> None:
+        if endpoint == "local":
+            return
+        with tempfile.TemporaryFile() as stream:
+            stream.write(source.read_bytes())
+            stream.seek(0)
+            _command(
+                endpoint,
+                f"cat > {_shell(destination)} && chmod {mode:o} -- "
+                f"{_shell(destination)} && chown {POD_TEST_UID}:{POD_TEST_GID} "
+                f"-- {_shell(destination)}",
+                stdin=stream,
+            )
+
+    def copy_tree(source: Path, endpoint: str, destination: PurePosixPath) -> None:
+        if endpoint == "local":
+            return
+        if selector == "ssh":
+            _command(
+                endpoint,
+                f"rm -rf -- {_shell(destination)} && ln -s -- "
+                f"/home/tester/elbencho-runtime {_shell(destination)}",
+            )
+            return
+        with tempfile.TemporaryFile() as stream:
+            with tarfile.open(fileobj=stream, mode="w") as archive:
+                for child in sorted(source.rglob("*")):
+                    archive.add(child, arcname=child.relative_to(source))
+            stream.seek(0)
+            _command(
+                endpoint,
+                f"rm -rf -- {_shell(destination)} && mkdir -p -- "
+                f"{_shell(destination)} && tar -xf - -C {_shell(destination)} "
+                f"&& chown -R {POD_TEST_UID}:{POD_TEST_GID} -- "
+                f"{_shell(destination)}",
+                stdin=stream,
+            )
+
+    def write_text(
+        endpoint: str, destination: PurePosixPath, content: str, mode: int
+    ) -> None:
+        if endpoint == "local":
+            if local_wrapper is None:
+                raise IntegrationTestError("local failure wrapper path is absent")
+            local_wrapper.write_text(content, encoding="utf-8")
+            local_wrapper.chmod(mode)
+            return
+        if remote_wrapper is not None:
+            destination = remote_wrapper
+        with tempfile.TemporaryFile() as stream:
+            stream.write(content.encode())
+            stream.seek(0)
+            _command(
+                endpoint,
+                f"cat > {_shell(destination)} && chmod {mode:o} -- "
+                f"{_shell(destination)} && chown {POD_TEST_UID}:{POD_TEST_GID} "
+                f"-- {_shell(destination)}",
+                stdin=stream,
+            )
+
+    def remove_tree(endpoint: str, path: PurePosixPath) -> None:
+        if endpoint == "local":
+            if local_wrapper is not None and restore_binary is not None:
+                shutil.copy2(restore_binary, local_wrapper)
+            return
+        if remote_wrapper is not None:
+            _command(
+                endpoint,
+                f"cp -- {_shell(path / 'delegate' / 'elbencho')} "
+                f"{_shell(remote_wrapper)}",
+            )
+        _command(endpoint, f"rm -rf -- {_shell(path)}")
+
+    return FailureInjectionOperations(
+        make_directory, copy_file, copy_tree, write_text, remove_tree
+    )
+
+
+def _failure_plan(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    binary_name: str,
+    source_binary: Path,
+    bundled_runtime: Path | None,
+) -> tuple[Any, FailureInjectionOperations]:
+    """Build a feasible substrate-specific failure staging plan."""
+    packaged_binary = (
+        Path(runtime.workspace) / "utils" / binary_name
+        if runtime.selector == "ssh"
+        else runtime.local_workspace / "source-elbencho"
+    )
+    if runtime.selector == "slurm":
+        raise IntegrationTestError("internal Slurm failure source was not prepared")
+    pods = sorted(
+        _pods_with_container(_pod_inventory(runner, config), "sshd"),
+        key=lambda item: item["metadata"]["name"],
+    )
+    plan = build_ssh_failure_injection_plan(
+        scenario_id=f"{runtime.scenario.name}-{os.getpid()}",
+        staging_root="/home/tester/.storage-scale-test-failure",
+        source_binary=source_binary,
+        source_runtime=bundled_runtime,
+        target_argument="executions/0002.write.json",
+        coordinator_endpoint="local",
+        worker_endpoints=[item["metadata"]["name"] for item in pods],
+    )
+    operations = _remote_staging_operations(
+        runner,
+        config,
+        fixture,
+        runtime.selector,
+        packaged_binary,
+        source_binary,
+    )
+    return plan, operations
+
+
+def _slurm_failure_plan(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    source_binary: Path,
+    binary_name: str,
+    bundled_runtime: Path | None,
+) -> tuple[Any, FailureInjectionOperations]:
+    """Build failure staging on the Slurm deployment's shared PVC."""
+    plan = build_slurm_failure_injection_plan(
+        scenario_id=f"{runtime.scenario.name}-{os.getpid()}",
+        staging_root=f"{runtime.workspace}/.storage-scale-test-failure",
+        source_binary=source_binary,
+        source_runtime=bundled_runtime,
+        target_argument="executions/0002.write.json",
+        shared_endpoint=fixture.login_pod,
+    )
+    operations = _remote_staging_operations(
+        runner,
+        config,
+        fixture,
+        runtime.selector,
+        None,
+        None,
+        PurePosixPath(runtime.workspace) / "utils" / binary_name,
+    )
+    return plan, operations
+
+
+def _hash_execution_contract(result: Path, execution_id: str) -> dict[str, str]:
+    """Hash stable evidence that resume must not replace for successful cells."""
+    evidence: dict[str, str] = {}
+    for path in sorted((result / "executions").glob(f"{execution_id}.*")):
+        if path.is_file():
+            evidence[path.name] = _sha256(path)
+    return evidence
+
+
+def _capture_failure_diagnostics(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    plan: Any,
+    selector: str,
+    log_dir: Path,
+) -> None:
+    """Copy wrapper invocation traces before scenario-level cleanup."""
+    chunks: list[str] = []
+    container = fixture.login_container if selector == "slurm" else "sshd"
+    for target in plan.targets:
+        if target.endpoint == "local":
+            continue
+        result = runner.run(
+            [
+                *_kubectl(
+                    config,
+                    "-n",
+                    config.namespace,
+                    "exec",
+                    target.endpoint,
+                    "-c",
+                    container,
+                    "--",
+                ),
+                "bash",
+                "-c",
+                f"cat -- {_shell(plan.layout.root / 'invocations.log')} "
+                "2>/dev/null || true",
+            ],
+            check=False,
+            timeout=30,
+        )
+        chunks.append(f"## {target.endpoint}\n{result.stdout}")
+    (log_dir / "failure-wrapper-invocations.log").write_text(
+        "\n".join(chunks), encoding="utf-8"
+    )
+
+
+def _run_failure_resume(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    template: Path,
+    report_workspace: Path,
+    log_dir: Path,
+    binary_name: str,
+    source_binary: Path,
+    bundled_runtime: Path | None,
+) -> None:
+    """Run one real injected failure and resume without restaging the marker."""
+    first, resume = runtime.scenario.steps
+    if runtime.selector == "ssh":
+        plan, operations = _failure_plan(
+            runner,
+            config,
+            fixture,
+            runtime,
+            binary_name,
+            source_binary,
+            bundled_runtime,
+        )
+        injected_first = first
+    else:
+        plan, operations = _slurm_failure_plan(
+            runner,
+            config,
+            fixture,
+            runtime,
+            source_binary,
+            binary_name,
+            bundled_runtime,
+        )
+        injected_first = first
+    result_base = f"{runtime.workspace}/results/{first.name}"
+    with staged_failure_injection(plan, operations):
+        _reset_result_base(runner, config, fixture, runtime, result_base)
+        _sync_step_runtime(
+            runner,
+            config,
+            fixture,
+            runtime,
+            injected_first,
+            template,
+            result_base,
+        )
+        _validate_step_environment(
+            runner, config, fixture, runtime, injected_first, log_dir
+        )
+        arguments = shlex.join(first.render_arguments(runtime.values))
+        command = (
+            f"cd -- {_shell(runtime.workspace)} && "
+            f"./storage-tests/fs/nv-elbencho-sweep.sh {arguments}"
+        )
+        _run_step(
+            runner,
+            config,
+            fixture,
+            runtime.selector,
+            first.name,
+            command,
+            log_dir,
+            first.timeout_seconds,
+            expected_failure=True,
+        )
+        remote_result = _discover_result(
+            runner,
+            config,
+            fixture,
+            runtime,
+            first,
+            result_base,
+            log_dir,
+        )
+        failed_result = _copy_scenario_result(
+            runner, config, fixture, runtime, first, remote_result
+        )
+        _capture_failure_diagnostics(
+            runner, config, fixture, plan, runtime.selector, log_dir
+        )
+        _assert_execution_contract(runtime.scenario, first, failed_result)
+        runtime.values["failed_results_dir"] = remote_result
+        _assert_dataset_state(runner, config, fixture, first, failed_result, None)
+        preserved = _hash_execution_contract(failed_result, "0001")
+        resume_command = (
+            f"cd -- {_shell(runtime.workspace)} && "
+            "./storage-tests/fs/nv-elbencho-sweep.sh "
+            f"{shlex.join(resume.render_arguments(runtime.values))}"
+        )
+        _run_step(
+            runner,
+            config,
+            fixture,
+            runtime.selector,
+            resume.name,
+            resume_command,
+            log_dir,
+            resume.timeout_seconds,
+        )
+        resumed_result = _copy_scenario_result(
+            runner, config, fixture, runtime, resume, remote_result
+        )
+        _assert_execution_contract(runtime.scenario, resume, resumed_result)
+        if _hash_execution_contract(resumed_result, "0001") != preserved:
+            raise IntegrationTestError("resume replaced successful execution 0001")
+        _assert_dataset_state(runner, config, fixture, resume, resumed_result, None)
+        _assert_scenario_report(
+            runner,
+            report_workspace,
+            resumed_result,
+            runtime,
+            resume,
+            log_dir,
+        )
+
+
 def _run_substrate(
     runner: Any,
     config: Any,
@@ -1244,6 +2552,7 @@ def _run_substrate(
         archive,
         extracted,
         build_root,
+        f"baseline-{selector}",
     )
     prefix = f"cd -- {_shell(remote_root)} && "
     validation = _run_step(
@@ -1347,27 +2656,65 @@ def run_filesystem_tests(
                     transition_ssh_home(step.target.value, "ssh-shared-home")
                     home_mode = step.target.value
                     fixture = _require_fixture(runner, config, home_mode)
+                    if runtime is not None:
+                        _stage_ssh_runtime(
+                            runner,
+                            config,
+                            runtime,
+                            _pod_inventory(runner, config),
+                        )
                     continue
                 scenario = step.scenario.name
-                if scenario != "baseline":
-                    raise IntegrationTestError(
-                        f"integration scenario is not implemented: {scenario}"
-                    )
                 scenario_root = build_root / f"{scenario}-{step.substrate.value}"
                 scenario_root.mkdir()
                 scenario_logs = log_dir / f"{scenario}-{step.substrate.value}"
                 scenario_logs.mkdir()
-                _run_substrate(
+                specification = SCENARIO_SPECS_BY_NAME[scenario]
+                runtime_state = _make_scenario_runtime(
                     runner,
                     config,
                     fixture,
+                    specification,
                     step.substrate.value,
                     archive,
                     extracted,
                     scenario_root,
-                    report_workspace,
                     scenario_logs,
+                    run_id,
                 )
+                try:
+                    if scenario == "failure-resume":
+                        _run_failure_resume(
+                            runner,
+                            config,
+                            fixture,
+                            runtime_state,
+                            extracted / "env.sh.template",
+                            report_workspace,
+                            scenario_logs,
+                            binary_name,
+                            binary,
+                            runtime,
+                        )
+                    else:
+                        _run_regular_scenario(
+                            runner,
+                            config,
+                            fixture,
+                            runtime_state,
+                            extracted / "env.sh.template",
+                            report_workspace,
+                            scenario_logs,
+                        )
+                finally:
+                    if step.substrate.value == "ssh":
+                        _cleanup_ssh_remote_results(runner, config)
+                    _cleanup_scenario_storage(
+                        runner,
+                        config,
+                        fixture,
+                        runtime_state,
+                    )
         finally:
             if home_mode == "shared" and transition_ssh_home is not None:
                 transition_ssh_home("separate", "ssh-shared-home-restore")

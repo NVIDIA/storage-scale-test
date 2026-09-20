@@ -101,17 +101,27 @@ no setup state or privileges. Actual tests refuse root execution, require the
 saved non-root identity, validate the live topology, generate environments
 from the packaged `env.sh.template`, and run `validate_env.sh` before a sweep.
 
-Each substrate runs one 4 KiB buffered execution on one node and one on two
-nodes through the real filesystem sweep entry point. The harness materializes
-one immutable tracked-source snapshot and builds a real deployment archive from
-it with `utils/build_tarball.sh`. It caches the validated archive by snapshot
-manifest, architecture, builder options, and seeded Elbencho/runtime identity.
-Targeted reruns extract that artifact into isolated workspaces instead of
-rebuilding it. The SSH case launches `validate_env.sh` and
-`nv-elbencho-sweep.sh` on
-the host and reaches the two worker pods over SSH. The Slurm case streams the
-same archive to the LoginSet, extracts it in the shared storage filesystem, and
-launches both commands there.
+The real scenario catalog covers buffered and direct I/O, one- and two-node
+selection, failure and resume, retained write/read/delete data, extended live
+CSV capture, and result reporting on both SSH and Slurm. Focused cases add a
+multidimensional Slurm sweep, Slurm include/exclude and exclusive-user
+allocation behavior, SSH weighted roots, generated and staged single-file
+work, and shared SSH homes. Workloads stay deliberately small; assertions
+check execution coordinates and state transitions, phase and workload
+evidence, dataset totals, required native flags, relevant scheduling evidence,
+and semantic report rows and plot families without treating incidental output
+or performance values as contracts.
+
+The harness materializes one immutable tracked-source snapshot and builds a
+real deployment archive from it with `utils/build_tarball.sh`. It caches the
+validated archive by snapshot manifest, architecture, builder options, and
+seeded Elbencho/runtime identity. Every scenario extracts that artifact into an
+isolated workspace, adds only its own environment and inputs, and cleans its
+remote data afterward; host-side results and diagnostics remain under the
+state directory. The SSH cases launch `validate_env.sh` and
+`nv-elbencho-sweep.sh` on the host and reach the two worker pods over SSH. The
+Slurm cases stream the same archive to the LoginSet, extract it in shared
+storage, and launch both commands there.
 
 The NFS profile uses a size-limited, checksum-verified upstream benchmark
 archive. Docker SBX, where GitHub release assets may be unavailable, extracts
@@ -120,9 +130,9 @@ the binary and runtime libraries from the digest-pinned upstream
 deployment. Timestamped build and step logs are retained below the state
 directory's `test-runs/` directory. The test also requires successful execution
 records, exact one- and two-node workload totals, ordered worker selection,
-nonempty benchmark output, environment snapshots, and cleanup of its generated
-data directories. It then runs `utils/extract-elbencho.sh` on a host-side copy
-of each result and requires the report to contain both node counts.
+nonempty benchmark output, environment snapshots, and cleanup of generated
+data directories. It runs `utils/extract-elbencho.sh` on host-side result
+copies and checks the semantic report content applicable to each scenario.
 
 ## On-demand CI
 

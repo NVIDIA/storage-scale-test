@@ -77,11 +77,15 @@ crash-recoverable StatefulSet transition; separate SSH homes are canonical.
 Deployment archives remain products of `utils/build_tarball.sh`, but the
 harness caches them by the exact immutable tracked-source snapshot, build
 options, architecture, and seeded Elbencho/runtime identity. Each scenario
-extracts that artifact into isolated state. Tests run as the non-root account
-recorded by setup and validate real SSH or Slurm dispatch, workload results,
-cleanup, and reporting. The on-demand integration workflow runs the lifecycle
-concurrently on amd64 and arm64; Kubernetes remains fixture infrastructure and
-is not a benchmark execution substrate.
+extracts that artifact into isolated state. The real catalog covers baseline
+and default I/O, failure/resume, retained datasets, live capture, Cartesian
+sweeps, single-file and weighted-root behavior, shared SSH homes, and Slurm
+scheduling. Tests run as the non-root account recorded by setup and validate
+real SSH or Slurm dispatch, workload results, cleanup, and reporting. Scenario
+storage is isolated and removed after host-side evidence is retained. The
+on-demand integration workflow explicitly selects NFS and runs the complete
+catalog concurrently on amd64 and arm64; Kubernetes remains fixture
+infrastructure and is not a benchmark execution substrate.
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 3.14 unit tests run weekly and on manual request.

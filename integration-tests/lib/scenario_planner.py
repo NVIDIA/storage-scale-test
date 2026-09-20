@@ -167,9 +167,7 @@ SCENARIO_CATALOG = (
     ),
 )
 
-# The harness refactor initially preserves the real baseline. Later commits
-# enable catalog entries as their substrate implementations land.
-SCENARIOS = SCENARIO_CATALOG[:1]
+SCENARIOS = SCENARIO_CATALOG
 
 
 def _concrete_substrates(substrate: Substrate) -> frozenset[Substrate]:
