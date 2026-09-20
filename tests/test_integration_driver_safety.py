@@ -19,6 +19,7 @@
 
 import importlib.util
 import json
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -45,6 +46,24 @@ _ensure_elbencho = getattr(_FILESYSTEM, "_ensure_elbencho")
 _pods_with_container = getattr(_FILESYSTEM, "_pods_with_container")
 
 
+def test_scenario_listing_short_circuits_before_privileged_state(monkeypatch, capsys):
+    """Listing scenarios needs no account, state, fixture, or root exception."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [str(_DRIVER_PATH), "test", "--list-scenarios"],
+    )
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        _DRIVER,
+        "_config",
+        lambda _arguments: pytest.fail("scenario listing resolved an account"),
+    )
+
+    assert _DRIVER.main() == 0
+    assert capsys.readouterr().out.startswith("baseline\t")
+
+
 def _config(state_dir: Path, export_dir: Path) -> object:
     """Return a minimal real driver configuration."""
     return _DRIVER.Config(
@@ -54,7 +73,6 @@ def _config(state_dir: Path, export_dir: Path) -> object:
         export_dir=export_dir,
         storage_backend="sbx-shared",
         sbx_shared_root=_REPO_ROOT / "tmp" / "test-shared",
-        ssh_home_mode="separate",
         test_user="tester",
         test_uid=2000,
         test_gid=2000,

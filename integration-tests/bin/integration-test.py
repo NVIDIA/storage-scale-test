@@ -45,8 +45,19 @@ sys.path.insert(0, str(INTEGRATION_LIB))
 
 from filesystem_integration import (  # pylint: disable=wrong-import-position
     IntegrationTestError,
-    TEST_SELECTORS,
     run_filesystem_tests,
+)
+from scenario_planner import (  # pylint: disable=wrong-import-position
+    SUBSTRATES,
+    format_scenario_listing,
+)
+from ssh_home_transition import (  # pylint: disable=wrong-import-position
+    CANONICAL_HOME_MODE,
+    SHARED_HOME_MODE,
+    PoolObservation,
+    SshHomeTransitionError,
+    SshHomeTransitionManager,
+    statefulset_checksum,
 )
 
 KIND_VERSION = "v0.33.0"
@@ -89,6 +100,8 @@ NFS_EXPORT_CONFIG = Path("/etc/exports.d/storage-scale-test-integration.exports"
 NFS_DAEMON_CONFIG = Path("/etc/nfs.conf.d/storage-scale-test-integration.conf")
 EXPORT_MARKER = ".storage-scale-test-integration.json"
 STATE_MARKER = "state-owner.json"
+SSH_HOME_ANNOTATION = "storage-scale-test/ssh-home-mode"
+SSH_CONFIG_ANNOTATION = "storage-scale-test/ssh-config-checksum"
 UFW_COMMENT = "storage-scale-test integration NFSv4"
 LOG = logging.getLogger("storage-scale-integration")
 
@@ -115,7 +128,6 @@ class Config:
     export_dir: Path
     storage_backend: str
     sbx_shared_root: Path
-    ssh_home_mode: str
     test_user: str
     test_uid: int
     test_gid: int
@@ -1497,16 +1509,130 @@ def _install_ssh_workers(runner: Runner, config: Config) -> None:
         "storage-ssh-identity",
         {"id_ed25519": private_key, "authorized_keys": public_key},
     )
-    home_volume = (
-        "persistentVolumeClaim:\n            claimName: ssh-home-rwx"
-        if config.ssh_home_mode == "shared"
-        else "emptyDir:\n            sizeLimit: 64Mi"
-    )
-    manifest = _render_resource(
+    _ensure_ssh_home_mode(
+        runner,
         config,
-        "manifests/ssh-workers.yaml.tmpl",
-        {"NAMESPACE": config.namespace, "SSH_HOME_VOLUME": home_volume},
+        CANONICAL_HOME_MODE,
+        run_id="setup",
+        scenario_id="setup-preflight",
     )
+
+
+def _ssh_home_volume(mode: str) -> str:
+    """Return the manifest fragment for one supported SSH home mode."""
+    if mode == SHARED_HOME_MODE:
+        return "persistentVolumeClaim:\n            claimName: ssh-home-rwx"
+    if mode == CANONICAL_HOME_MODE:
+        return "emptyDir:\n            sizeLimit: 64Mi"
+    raise ProvisionError(f"unsupported SSH home mode: {mode}")
+
+
+def _render_ssh_workers(config: Config, mode: str) -> tuple[Path, str]:
+    """Render one canonical SSH StatefulSet form and return its checksum."""
+    source = _resource_path("manifests/ssh-workers.yaml.tmpl")
+    rendered = source.read_text(encoding="utf-8")
+    replacements = {
+        "NAMESPACE": config.namespace,
+        "SSH_HOME_MODE": mode,
+        "SSH_HOME_VOLUME": _ssh_home_volume(mode),
+    }
+    for token, value in replacements.items():
+        rendered = rendered.replace(f"@@{token}@@", value)
+    checksum = statefulset_checksum(rendered.replace("@@SSH_CONFIG_CHECKSUM@@", ""))
+    rendered = rendered.replace("@@SSH_CONFIG_CHECKSUM@@", checksum)
+    unresolved = [word for word in rendered.split() if "@@" in word]
+    if unresolved:
+        raise ProvisionError(
+            f"unresolved SSH manifest token in {source}: {unresolved[0]}"
+        )
+    destination = config.manifests_dir / f"ssh-workers-{mode}.yaml"
+    _write_text(destination, rendered)
+    return destination, checksum
+
+
+def _inspect_ssh_home_pool(runner: Runner, config: Config) -> PoolObservation:
+    """Return the live SSH StatefulSet form and rollout state."""
+    statefulset = runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "get",
+            "statefulset/ssh-worker",
+            "-o",
+            "json",
+        ),
+        check=False,
+        timeout=30,
+    )
+    if statefulset.returncode:
+        return PoolObservation("absent", "", 0, 0, statefulset.stderr.strip())
+    document = json.loads(statefulset.stdout)
+    annotations = document.get("metadata", {}).get("annotations", {})
+    pods = _ssh_pods(runner, config)
+    terminating = sum(
+        bool(pod.get("metadata", {}).get("deletionTimestamp")) for pod in pods
+    )
+    ready = sum(
+        _pod_ready(pod) and not pod.get("metadata", {}).get("deletionTimestamp")
+        for pod in pods
+    )
+    names = ", ".join(str(pod.get("metadata", {}).get("name", "?")) for pod in pods)
+    return PoolObservation(
+        str(annotations.get(SSH_HOME_ANNOTATION, "unknown")),
+        str(annotations.get(SSH_CONFIG_ANNOTATION, "")),
+        ready,
+        terminating,
+        f"pods=[{names}]",
+    )
+
+
+def _pod_ready(pod: dict[str, object]) -> bool:
+    """Return whether every container in a running pod is ready."""
+    status = pod.get("status", {})
+    if not isinstance(status, dict) or status.get("phase") != "Running":
+        return False
+    containers = status.get("containerStatuses", [])
+    return bool(containers) and all(
+        isinstance(item, dict) and item.get("ready") for item in containers
+    )
+
+
+def _wait_for_no_ssh_pods(runner: Runner, config: Config) -> None:
+    """Wait until the host-network SSH port has no owning pod."""
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        if not _ssh_pods(runner, config):
+            return
+        time.sleep(2)
+    names = [str(pod["metadata"]["name"]) for pod in _ssh_pods(runner, config)]
+    raise ProvisionError(f"SSH pods did not terminate before transition: {names}")
+
+
+def _reconcile_ssh_home_pool(
+    runner: Runner, config: Config, mode: str, expected_checksum: str
+) -> None:
+    """Replace only the SSH StatefulSet with one validated home mode."""
+    manifest, checksum = _render_ssh_workers(config, mode)
+    if checksum != expected_checksum:
+        raise ProvisionError(
+            "SSH StatefulSet checksum changed during reconciliation: "
+            f"expected {expected_checksum}, rendered {checksum}"
+        )
+    existing = runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "get",
+            "statefulset/ssh-worker",
+        ),
+        check=False,
+        timeout=30,
+    )
+    if existing.returncode == 0:
+        _scale_ssh(runner, config, replicas=0)
+        _wait_for_no_ssh_pods(runner, config)
     runner.run(
         _kubectl(
             config,
@@ -1518,8 +1644,54 @@ def _install_ssh_workers(runner: Runner, config: Config) -> None:
             manifest,
         )
     )
+    _scale_ssh(runner, config, replicas=2)
     _wait_for_ssh(runner, config)
-    _validate_ssh_workers(runner, config, private_key)
+    _validate_ssh_workers(runner, config, config.keys_dir / "id_ed25519", mode)
+
+
+def _ssh_transition_manager(runner: Runner, config: Config) -> SshHomeTransitionManager:
+    """Return a transition manager backed by the live Kubernetes fixture."""
+    return SshHomeTransitionManager(
+        config.state_dir,
+        lambda: _inspect_ssh_home_pool(runner, config),
+        lambda mode, checksum: _reconcile_ssh_home_pool(runner, config, mode, checksum),
+    )
+
+
+def _ensure_ssh_home_mode(
+    runner: Runner,
+    config: Config,
+    mode: str,
+    *,
+    run_id: str,
+    scenario_id: str,
+) -> None:
+    """Enter a validated SSH home mode through persistent transition state."""
+    separate_checksum = _render_ssh_workers(config, CANONICAL_HOME_MODE)[1]
+    shared_checksum = _render_ssh_workers(config, SHARED_HOME_MODE)[1]
+    manager = _ssh_transition_manager(runner, config)
+    if mode == CANONICAL_HOME_MODE:
+        manager.preflight(separate_checksum, run_id=run_id, scenario_id=scenario_id)
+        return
+    if mode == SHARED_HOME_MODE:
+        manager.enter_shared(
+            run_id=run_id,
+            scenario_id=scenario_id,
+            separate_checksum=separate_checksum,
+            shared_checksum=shared_checksum,
+        )
+        return
+    raise ProvisionError(f"unsupported SSH home mode: {mode}")
+
+
+def _restore_ssh_home_mode(
+    runner: Runner, config: Config, *, run_id: str, scenario_id: str
+) -> None:
+    """Restore canonical SSH homes after a shared-home scenario batch."""
+    checksum = _render_ssh_workers(config, CANONICAL_HOME_MODE)[1]
+    _ssh_transition_manager(runner, config).restore_separate(
+        checksum, run_id=run_id, scenario_id=scenario_id
+    )
 
 
 def _ssh_pods(runner: Runner, config: Config) -> list[dict[str, object]]:
@@ -1542,7 +1714,9 @@ def _ssh_pods(runner: Runner, config: Config) -> list[dict[str, object]]:
     )
 
 
-def _validate_ssh_workers(runner: Runner, config: Config, private_key: Path) -> None:
+def _validate_ssh_workers(
+    runner: Runner, config: Config, private_key: Path, home_mode: str
+) -> None:
     """Validate placement, host SSH, home semantics, and RWX visibility."""
     pods = _ssh_pods(runner, config)
     if len(pods) != 2:
@@ -1612,7 +1786,7 @@ def _validate_ssh_workers(runner: Runner, config: Config, private_key: Path) -> 
             "-o StrictHostKeyChecking=accept-new "
             f"tester@{addresses[destination]} true",
         )
-    _validate_ssh_storage(runner, config, pods)
+    _validate_ssh_storage(runner, config, pods, home_mode)
 
 
 def _pod_exec(
@@ -1637,7 +1811,10 @@ def _pod_exec(
 
 
 def _validate_ssh_storage(
-    runner: Runner, config: Config, pods: list[dict[str, object]]
+    runner: Runner,
+    config: Config,
+    pods: list[dict[str, object]],
+    home_mode: str,
 ) -> None:
     """Validate the selected home mode and shared storage claim."""
     names = [str(pod["metadata"]["name"]) for pod in pods]
@@ -1680,7 +1857,7 @@ def _validate_ssh_storage(
             or host_probe.read_text(encoding="utf-8").strip() != token
         ):
             raise ProvisionError("SBX shared data is not visible from the agent")
-    expected_home_rc = 0 if config.ssh_home_mode == "shared" else 1
+    expected_home_rc = 0 if home_mode == "shared" else 1
     if home_probe.returncode != expected_home_rc or rwx_probe.returncode:
         raise ProvisionError("SSH home or RWX visibility validation failed")
     cleanup = (
@@ -2087,7 +2264,7 @@ def _write_state_summary(
         "cluster_name": config.cluster_name,
         "namespace": config.namespace,
         "export_dir": str(config.export_dir),
-        "ssh_home_mode": config.ssh_home_mode,
+        "ssh_home_mode": "separate",
         "storage_backend": backend,
         "test_user": config.test_user,
         "test_uid": config.test_uid,
@@ -2160,7 +2337,7 @@ def setup_environment(runner: Runner, config: Config) -> None:
     _scale_ssh(runner, config, replicas=2)
     _wait_for_ssh(runner, config)
     private_key = config.keys_dir / "id_ed25519"
-    _validate_ssh_workers(runner, config, private_key)
+    _validate_ssh_workers(runner, config, private_key, "separate")
     _write_state_summary(config, backend, subnet, gateway)
     LOG.info("Integration environment is provisioned and running")
 
@@ -2229,19 +2406,30 @@ def _scale_ssh(runner: Runner, config: Config, replicas: int) -> None:
 
 
 def _wait_for_ssh(runner: Runner, config: Config) -> None:
-    """Wait for both SSH workers after restoring the running fixture."""
-    runner.run(
-        _kubectl(
-            config,
-            "-n",
-            config.namespace,
-            "rollout",
-            "status",
-            "statefulset/ssh-worker",
-            "--timeout=180s",
-        ),
-        timeout=210,
-    )
+    """Wait for exactly two ready, nonterminating SSH workers."""
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        pods = _ssh_pods(runner, config)
+        ready = [
+            pod
+            for pod in pods
+            if _pod_ready(pod) and not pod.get("metadata", {}).get("deletionTimestamp")
+        ]
+        terminating = [
+            pod for pod in pods if pod.get("metadata", {}).get("deletionTimestamp")
+        ]
+        if len(ready) == 2 and not terminating and len(pods) == 2:
+            return
+        time.sleep(2)
+    details = [
+        {
+            "name": pod.get("metadata", {}).get("name"),
+            "ready": _pod_ready(pod),
+            "terminating": bool(pod.get("metadata", {}).get("deletionTimestamp")),
+        }
+        for pod in _ssh_pods(runner, config)
+    ]
+    raise ProvisionError(f"SSH worker rollout did not become healthy: {details}")
 
 
 def stop_environment(runner: Runner, config: Config) -> None:
@@ -2797,18 +2985,29 @@ def _parser() -> argparse.ArgumentParser:
             "SUDO_USER identifies it"
         ),
     )
-    parser.add_argument(
-        "--ssh-home-mode", choices=("separate", "shared"), default="separate"
-    )
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument(
-        "action", choices=("setup", "start", "stop", "teardown", "test")
+    actions = parser.add_subparsers(dest="action", required=True)
+    for action in ("setup", "start", "stop", "teardown"):
+        actions.add_parser(action)
+    test_parser = actions.add_parser("test")
+    test_parser.add_argument(
+        "--substrate",
+        choices=SUBSTRATES,
+        default="all",
+        help="execution substrate to test (default: all)",
     )
-    parser.add_argument(
-        "tests",
-        nargs="*",
-        metavar="TEST",
-        help="test selectors for the test action: " + ", ".join(TEST_SELECTORS),
+    test_parser.add_argument(
+        "--scenario",
+        dest="scenarios",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="scenario to run; repeat to select more than one",
+    )
+    test_parser.add_argument(
+        "--list-scenarios",
+        action="store_true",
+        help="list scenarios without inspecting or changing fixture state",
     )
     return parser
 
@@ -2823,7 +3022,6 @@ def _config(arguments: argparse.Namespace) -> Config:
         export_dir=arguments.export_dir.resolve(),
         storage_backend=arguments.storage_backend,
         sbx_shared_root=arguments.sbx_shared_root.resolve(),
-        ssh_home_mode=arguments.ssh_home_mode,
         test_user=account.pw_name,
         test_uid=account.pw_uid,
         test_gid=account.pw_gid,
@@ -2861,10 +3059,43 @@ def _test_account(explicit_user: str | None) -> pwd.struct_passwd:
     return account
 
 
+def _run_filesystem_action(
+    runner: Runner, config: Config, arguments: argparse.Namespace
+) -> None:
+    """Run selected scenarios with crash-recoverable SSH home transitions."""
+    run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{os.getpid()}"
+
+    def transition(mode: str, scenario_id: str) -> None:
+        if mode == CANONICAL_HOME_MODE and scenario_id != "preflight":
+            _restore_ssh_home_mode(
+                runner, config, run_id=run_id, scenario_id=scenario_id
+            )
+            return
+        _ensure_ssh_home_mode(
+            runner,
+            config,
+            mode,
+            run_id=run_id,
+            scenario_id=scenario_id,
+        )
+
+    run_filesystem_tests(
+        runner,
+        config,
+        _repository_root(),
+        arguments.substrate,
+        arguments.scenarios,
+        transition,
+    )
+
+
 def main() -> int:
     """Run one integration environment lifecycle action."""
     _require_python()
     arguments = _parser().parse_args()
+    if arguments.action == "test" and arguments.list_scenarios:
+        print(format_scenario_listing())
+        return 0
     try:
         if arguments.action == "test" and os.geteuid() == 0:
             raise ProvisionError(
@@ -2873,8 +3104,6 @@ def main() -> int:
             )
         config = _config(arguments)
         _validate_lifecycle_paths(config)
-        if arguments.action != "test" and arguments.tests:
-            raise ProvisionError("test selectors are valid only with the test action")
         if arguments.action == "test" and not config.state_dir.is_dir():
             raise ProvisionError(
                 f"setup state directory is absent at {config.state_dir}; run setup first"
@@ -2889,9 +3118,7 @@ def main() -> int:
             elif arguments.action == "teardown":
                 teardown_environment(runner, config)
             elif arguments.action == "test":
-                run_filesystem_tests(
-                    runner, config, _repository_root(), arguments.tests
-                )
+                _run_filesystem_action(runner, config, arguments)
             else:
                 setup_environment(runner, config)
                 _grant_test_user_access(runner, config)
@@ -2900,6 +3127,7 @@ def main() -> int:
     except (
         ProvisionError,
         IntegrationTestError,
+        SshHomeTransitionError,
         OSError,
         subprocess.TimeoutExpired,
         json.JSONDecodeError,

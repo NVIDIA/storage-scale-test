@@ -74,12 +74,11 @@ access to the private kubeconfig, key, and test-run workspace, and verifies it
 can use Docker, kind, and kubectl. A root shell without `SUDO_USER` must name
 the account explicitly with `--test-user USER`.
 
-The default SSH homes are separate `emptyDir` volumes. To mount the dedicated
-RWX shared-home claim at `/home/tester` in both workers instead, use:
-
-```bash
-integration-tests/bin/integration-test.py --ssh-home-mode shared setup
-```
+SSH workers normally use separate `emptyDir` homes. A scenario that requires
+the RWX shared-home claim owns a bounded StatefulSet transition and restores
+separate homes afterward. Setup and SSH test preflight recover an interrupted
+transition before allowing more SSH work; the kind and Slurm fixtures remain
+running throughout.
 
 The generated host SSH key, strict known-hosts file, and two worker addresses
 are kept under `/var/lib/storage-scale-test-integration/`. Re-running setup
@@ -89,21 +88,27 @@ or retained backend data.
 After setup succeeds, run the bounded filesystem regression cases with:
 
 ```bash
-integration-tests/bin/integration-test.py test all
+integration-tests/bin/integration-test.py test
+integration-tests/bin/integration-test.py test --substrate ssh
+integration-tests/bin/integration-test.py test --scenario baseline
+integration-tests/bin/integration-test.py test --list-scenarios
 ```
 
-`all` and `filesystem` select both substrates. `ssh` and `slurm` may be used
-individually, or together as two arguments. The `test` action never installs
-or reconciles the fixture, and it refuses to run as root. It requires the saved
-setup state to match the current non-root account, verifies that the live
-topology is healthy, generates each test environment from the packaged
-`env.sh.template`, and runs `validate_env.sh` before the sweep.
+With no options, `test` runs every available scenario on each applicable
+substrate. `--substrate` accepts `all`, `ssh`, or `slurm`; repeatable
+`--scenario` options select named cases independently. Scenario listing needs
+no setup state or privileges. Actual tests refuse root execution, require the
+saved non-root identity, validate the live topology, generate environments
+from the packaged `env.sh.template`, and run `validate_env.sh` before a sweep.
 
 Each substrate runs one 4 KiB buffered execution on one node and one on two
-nodes through the real filesystem sweep entry point. The harness builds a real
-deployment archive from a tracked-files-only snapshot with
-`utils/build_tarball.sh`, validates its contents, and runs from the extracted
-archive. The SSH case launches `validate_env.sh` and `nv-elbencho-sweep.sh` on
+nodes through the real filesystem sweep entry point. The harness materializes
+one immutable tracked-source snapshot and builds a real deployment archive from
+it with `utils/build_tarball.sh`. It caches the validated archive by snapshot
+manifest, architecture, builder options, and seeded Elbencho/runtime identity.
+Targeted reruns extract that artifact into isolated workspaces instead of
+rebuilding it. The SSH case launches `validate_env.sh` and
+`nv-elbencho-sweep.sh` on
 the host and reaches the two worker pods over SSH. The Slurm case streams the
 same archive to the LoginSet, extracts it in the shared storage filesystem, and
 launches both commands there.
@@ -123,7 +128,7 @@ of each result and requires the report to contain both node counts.
 
 The `Filesystem integration` GitHub Actions workflow runs independent amd64
 and arm64 jobs concurrently. Each job runs setup twice, stops and restarts the
-fixture, proves that root test execution is rejected, runs `test all` as the
+fixture, proves that root test execution is rejected, runs `test` as the
 ordinary runner account, and tears down twice. A final status job requires both
 architectures to pass. The workflow is deliberately absent from ordinary
 pull-request and default-branch events.

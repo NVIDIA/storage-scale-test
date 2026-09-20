@@ -34,6 +34,18 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from deployment_cache import (
+    DeploymentCacheError,
+    DeploymentCacheRequest,
+    get_or_build_deployment,
+)
+from scenario_planner import (
+    ScenarioPlanningError,
+    SshHomeTransition,
+    WorkItem,
+    plan_scenarios,
+)
+
 LOG = logging.getLogger("storage-scale-integration")
 
 ELBENCHO_VERSION = "v3.1-11"
@@ -63,7 +75,6 @@ ELBENCHO_ARCHIVES = {
 }
 REMOTE_BASE = "/mnt/storage-test/integration-regression"
 VALIDATION_SUCCESS = "All validation checks passed successfully"
-TEST_SELECTORS = ("all", "filesystem", "ssh", "slurm")
 
 
 class IntegrationTestError(RuntimeError):
@@ -282,7 +293,9 @@ def _probe_pod(
     return result.stdout.strip()
 
 
-def _require_fixture(runner: Any, config: Any) -> Fixture:
+def _require_fixture(
+    runner: Any, config: Any, ssh_home_mode: str = "separate"
+) -> Fixture:
     """Validate setup without reconciling or installing anything."""
     state = _load_state(config)
     required_host_tools = (
@@ -373,7 +386,7 @@ def _require_fixture(runner: Any, config: Any) -> Fixture:
         slurm_nodes=(slurm_nodes[0], slurm_nodes[1]),
         slurm_addresses=(slurm_addresses[0], slurm_addresses[1]),
         architecture=host_arch,
-        ssh_home_mode=str(state["ssh_home_mode"]),
+        ssh_home_mode=ssh_home_mode,
         storage_backend=str(state["storage_backend"]),
     )
 
@@ -698,34 +711,6 @@ def _render_env(
     return rendered, support
 
 
-def _copy_tracked_snapshot(runner: Any, repo_root: Path, destination: Path) -> None:
-    """Copy only tracked working-tree files into an isolated packaging tree."""
-    required = (repo_root / "utils" / "build_tarball.sh", repo_root / "NOTICE")
-    missing = [str(path) for path in required if not path.is_file()]
-    if missing:
-        raise IntegrationTestError(
-            "deployment tarball sources are absent: " + ", ".join(missing)
-        )
-    result = runner.run(
-        ["git", "ls-files", "-z", "--cached"], cwd=repo_root, timeout=30
-    )
-    destination.mkdir(parents=True)
-    for name in result.stdout.split("\0"):
-        if not name:
-            continue
-        relative = PurePosixPath(name)
-        if relative.is_absolute() or ".." in relative.parts:
-            raise IntegrationTestError(f"unsafe tracked path from git: {name!r}")
-        source = repo_root / Path(*relative.parts)
-        target = destination / Path(*relative.parts)
-        if not source.is_file() or source.is_symlink():
-            raise IntegrationTestError(
-                f"deployment snapshot requires a regular tracked file: {source}"
-            )
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-
-
 def _validate_deployment_archive(
     archive: Path,
     destination: Path,
@@ -816,6 +801,7 @@ def _validate_deployment_archive(
 
 def _build_deployment_archive(
     runner: Any,
+    config: Any,
     repo_root: Path,
     build_root: Path,
     binary: Path,
@@ -823,29 +809,26 @@ def _build_deployment_archive(
     architecture: str,
     runtime: Path | None,
 ) -> tuple[Path, Path]:
-    """Build and inspect one filesystem-only deployment tarball."""
-    snapshot = build_root / "source"
-    _copy_tracked_snapshot(runner, repo_root, snapshot)
-    seeded_binary = snapshot / "utils" / binary_name
-    shutil.copy2(binary, seeded_binary)
-    seeded_binary.chmod(0o755)
-    if runtime is not None:
-        shutil.copytree(runtime, snapshot / "utils" / "elbencho-runtime")
-    LOG.info("Building deployment tarball from a tracked-files-only snapshot")
-    result = runner.run(
-        [
-            snapshot / "utils" / "build_tarball.sh",
-            "--arch",
-            architecture,
-            "--skip-object-tools",
-        ],
-        cwd=snapshot,
-        timeout=600,
+    """Reuse or build and inspect one filesystem-only deployment tarball."""
+    request = DeploymentCacheRequest(
+        repo_root=repo_root,
+        cache_root=config.state_dir / "test-cache" / "deployments",
+        architecture=architecture,
+        binary=binary,
+        binary_name=binary_name,
+        runtime=runtime,
     )
-    (build_root / "build-tarball.log").write_text(
-        result.stdout + result.stderr, encoding="utf-8"
+    try:
+        cached = get_or_build_deployment(runner, request)
+    except DeploymentCacheError as error:
+        raise IntegrationTestError(str(error)) from error
+    LOG.info(
+        "%s deployment cache entry %s",
+        "Reusing" if cached.cache_hit else "Built",
+        cached.key,
     )
-    archive = build_root / "storage-scale-test.tar.gz"
+    shutil.copy2(cached.build_log, build_root / "build-tarball.log")
+    archive = cached.archive
     extracted = _validate_deployment_archive(
         archive,
         build_root / "extracted",
@@ -1303,34 +1286,25 @@ def _run_substrate(
     _assert_report(runner, report_workspace, local_result, selector, log_dir)
 
 
-def _selected_tests(selectors: list[str]) -> tuple[str, ...]:
-    """Normalize public selectors to ordered substrate names."""
-    requested = selectors or ["all"]
-    unknown = sorted(set(requested) - set(TEST_SELECTORS))
-    if unknown:
-        raise IntegrationTestError(
-            f"unknown test selector(s): {', '.join(unknown)}; "
-            f"choose from {', '.join(TEST_SELECTORS)}"
-        )
-    duplicates = sorted(name for name in set(requested) if requested.count(name) > 1)
-    if duplicates:
-        raise IntegrationTestError(
-            f"duplicate test selector(s): {', '.join(duplicates)}"
-        )
-    if "all" in requested and len(requested) > 1:
-        raise IntegrationTestError("test selector 'all' cannot be combined")
-    if "filesystem" in requested and len(requested) > 1:
-        raise IntegrationTestError("test selector 'filesystem' cannot be combined")
-    if requested in (["all"], ["filesystem"]):
-        return ("ssh", "slurm")
-    return tuple(name for name in ("ssh", "slurm") if name in requested)
-
-
 def run_filesystem_tests(
-    runner: Any, config: Any, repo_root: Path, selectors: list[str]
+    runner: Any,
+    config: Any,
+    repo_root: Path,
+    substrate: str,
+    scenarios: list[str],
+    transition_ssh_home: Any | None = None,
 ) -> None:
     """Run selected filesystem regression cases against an existing setup."""
-    selected = _selected_tests(selectors)
+    try:
+        plan = plan_scenarios(substrate=substrate, requested=scenarios)
+    except ScenarioPlanningError as error:
+        raise IntegrationTestError(str(error)) from error
+    work = [step for step in plan if isinstance(step, WorkItem)]
+    selected = {step.substrate.value for step in work}
+    if "ssh" in selected:
+        if transition_ssh_home is None:
+            raise IntegrationTestError("SSH scenarios require a home transition hook")
+        transition_ssh_home("separate", "preflight")
     LOG.info("Requiring an already-running integration setup")
     fixture = _require_fixture(runner, config)
     binary, binary_name, runtime = _ensure_elbencho(
@@ -1348,6 +1322,7 @@ def run_filesystem_tests(
         build_root = Path(temporary)
         archive, extracted = _build_deployment_archive(
             runner,
+            config,
             repo_root,
             build_root,
             binary,
@@ -1365,16 +1340,36 @@ def run_filesystem_tests(
             fixture,
             template=extracted / "env.sh.template",
         )
-        for selector in selected:
-            _run_substrate(
-                runner,
-                config,
-                fixture,
-                selector,
-                archive,
-                extracted,
-                build_root,
-                report_workspace,
-                log_dir,
-            )
-    LOG.info("Filesystem integration tests passed: %s", ", ".join(selected))
+        home_mode = "separate"
+        try:
+            for step in plan:
+                if isinstance(step, SshHomeTransition):
+                    transition_ssh_home(step.target.value, "ssh-shared-home")
+                    home_mode = step.target.value
+                    fixture = _require_fixture(runner, config, home_mode)
+                    continue
+                scenario = step.scenario.name
+                if scenario != "baseline":
+                    raise IntegrationTestError(
+                        f"integration scenario is not implemented: {scenario}"
+                    )
+                scenario_root = build_root / f"{scenario}-{step.substrate.value}"
+                scenario_root.mkdir()
+                scenario_logs = log_dir / f"{scenario}-{step.substrate.value}"
+                scenario_logs.mkdir()
+                _run_substrate(
+                    runner,
+                    config,
+                    fixture,
+                    step.substrate.value,
+                    archive,
+                    extracted,
+                    scenario_root,
+                    report_workspace,
+                    scenario_logs,
+                )
+        finally:
+            if home_mode == "shared" and transition_ssh_home is not None:
+                transition_ssh_home("separate", "ssh-shared-home-restore")
+    names = ", ".join(f"{step.scenario.name}/{step.substrate.value}" for step in work)
+    LOG.info("Filesystem integration tests passed: %s", names)

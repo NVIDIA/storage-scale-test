@@ -32,6 +32,9 @@ kind: StatefulSet
 metadata:
   name: ssh-worker
   namespace: @@NAMESPACE@@
+  annotations:
+    storage-scale-test/ssh-home-mode: "@@SSH_HOME_MODE@@"
+    storage-scale-test/ssh-config-checksum: "@@SSH_CONFIG_CHECKSUM@@"
 spec:
   serviceName: ssh-workers
   replicas: 2
@@ -42,6 +45,9 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: storage-ssh-worker
+      annotations:
+        storage-scale-test/ssh-home-mode: "@@SSH_HOME_MODE@@"
+        storage-scale-test/ssh-config-checksum: "@@SSH_CONFIG_CHECKSUM@@"
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet

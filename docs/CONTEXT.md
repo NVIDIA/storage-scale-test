@@ -71,15 +71,17 @@ directory until teardown. The SBX compatibility profile pairs kind/Kubernetes
 when their pinned image or bundle recipe changes. Slurm coordinators restore
 configured `ORDER_NODES` include-list order after Slurm canonicalizes an
 allocation's node list.
-The test action builds and validates a deployment tarball,
-derives environments from the packaged `env.sh.template`, and runs bounded
-one-node and two-node filesystem sweeps through SSH and Slurm as the non-root
-account recorded by setup. It verifies ordered worker selection, exact workload
-totals, cleanup, and report extraction for both node counts. The SSH entry point
-runs on the host; the Slurm entry point runs from the archive extracted by the
-LoginSet on shared storage. The on-demand integration workflow runs the full
-lifecycle concurrently on amd64 and arm64. It does not add Kubernetes dispatch
-to the benchmark entry points.
+The test action selects execution substrate and named scenario independently.
+Its deterministic planner batches the one shared-home SSH scenario behind a
+crash-recoverable StatefulSet transition; separate SSH homes are canonical.
+Deployment archives remain products of `utils/build_tarball.sh`, but the
+harness caches them by the exact immutable tracked-source snapshot, build
+options, architecture, and seeded Elbencho/runtime identity. Each scenario
+extracts that artifact into isolated state. Tests run as the non-root account
+recorded by setup and validate real SSH or Slurm dispatch, workload results,
+cleanup, and reporting. The on-demand integration workflow runs the lifecycle
+concurrently on amd64 and arm64; Kubernetes remains fixture infrastructure and
+is not a benchmark execution substrate.
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 3.14 unit tests run weekly and on manual request.

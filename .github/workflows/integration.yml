@@ -72,13 +72,13 @@ jobs:
         run: sudo "$(command -v python)" integration-tests/bin/integration-test.py start
       - name: Verify root test execution is rejected
         run: |
-          if sudo "$(command -v python)" integration-tests/bin/integration-test.py test filesystem; then
+          if sudo "$(command -v python)" integration-tests/bin/integration-test.py test; then
             echo "integration test action unexpectedly accepted root" >&2
             exit 1
           fi
       - name: Run all integration tests
         run: |
-          "$(command -v python)" integration-tests/bin/integration-test.py test all
+          "$(command -v python)" integration-tests/bin/integration-test.py test
       - name: Tear down the integration environment
         if: ${{ always() }}
         run: |
