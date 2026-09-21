@@ -72,10 +72,59 @@ def _scenario(name):
     return _SCENARIOS.SCENARIO_SPECS_BY_NAME[name]
 
 
+def test_environment_overrides_use_variable_identity():
+    """Overrides tolerate harmless shell quoting and formatting changes."""
+    lines = ('export SAMPLE = "old"', "unset OTHER")
+
+    assert _SCENARIOS._override_env(  # pylint: disable=protected-access
+        lines, {"SAMPLE": 'export SAMPLE="new"'}
+    ) == ('export SAMPLE="new"', "unset OTHER")
+
+
+@pytest.mark.parametrize(
+    "lines, name, matches",
+    [
+        (("export PRESENT=1",), "MISSING", 0),
+        (("unset DUPLICATE", "export DUPLICATE=1"), "DUPLICATE", 2),
+    ],
+)
+def test_environment_overrides_reject_ambiguous_targets(lines, name, matches):
+    """Missing and duplicate scenario variables cannot silently drift."""
+    with pytest.raises(ScenarioSpecError, match=rf"{name} \({matches} matches\)"):
+        _SCENARIOS._override_env(  # pylint: disable=protected-access
+            lines, {name: f"export {name}=replacement"}
+        )
+
+
+def test_environment_overrides_reject_replacement_for_another_variable():
+    """A valid target cannot silently be replaced with another variable."""
+    with pytest.raises(ScenarioSpecError, match="FOO names BAR"):
+        _SCENARIOS._override_env(  # pylint: disable=protected-access
+            ("export FOO=1",), {"FOO": "export BAR=2"}
+        )
+
+
+def test_environment_overrides_reject_multiline_replacements():
+    """One override cannot smuggle in an additional shell statement."""
+    with pytest.raises(ScenarioSpecError, match="require one statement: FOO"):
+        _SCENARIOS._override_env(  # pylint: disable=protected-access
+            ("export FOO=1",), {"FOO": "export FOO=1\nexport BAR=2"}
+        )
+
+
 def test_catalog_defines_every_planned_real_scenario():
     """The execution catalog and workload catalog have matching stable names."""
     assert set(_SCENARIOS.SCENARIO_SPECS_BY_NAME) == EXPECTED_NAMES
     assert {scenario.name for scenario in _PLANNER.SCENARIO_CATALOG} == EXPECTED_NAMES
+    planned_substrates = {
+        scenario.name: {substrate.value for substrate in scenario.substrates}
+        for scenario in _PLANNER.SCENARIO_CATALOG
+    }
+    specified_substrates = {
+        scenario.name: set(scenario.substrates)
+        for scenario in _SCENARIOS.SCENARIO_SPECS
+    }
+    assert planned_substrates == specified_substrates
     validate_scenario_specs()
 
 

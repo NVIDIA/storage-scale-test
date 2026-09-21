@@ -57,69 +57,50 @@ and are responsible for every binary they place in it.
 Slurm is the default execution substrate. Setting `SSH_HOST_LIST` selects
 passwordless SSH instead. Kubernetes execution is not implemented.
 The separate `integration-tests/` fixture provisions a three-node kind cluster,
-a shared RWX storage backend, two passwordless-SSH workers, and a Slinky Slurm
-environment on one Linux host. The `nfs` backend uses a loop-backed NFSv4
-export and NFS CSI. The Docker-SBX-specific `sbx-shared` backend mounts a
-repository-backed directory into every kind node and uses static RWX volumes;
-both backends validate the repository's same shared-storage contract. Backend
-selection is explicit or capability-based and persists until teardown. The
-SBX shared directories are non-sticky writable fixture paths because SBX can
-remap bind-mounted file ownership between replacement pods.
-harness's state and export directories are dedicated leaves: an existing path
-must carry the exact harness ownership marker before setup changes it or
-teardown removes it. Every lifecycle action runs as an ordinary user. Its
-kubeconfig, keys, client tools, caches, manifests, logs, and runs are user-owned
-under `tmp/integration-state`; the driver invokes `sudo` only for the NFS
-profile's narrow host-system operations, while `sbx-shared` never invokes it.
-The driver adds standard `sbin` locations to its ordinary-user tool search
-path. It records NFS service ownership before package installation can start
-the service, and repeated teardown remains valid after its private clients are
-removed. Partial bootstrap teardown also tolerates `exportfs` not having been
-installed yet.
-Bootstrap creates the known default `tmp/` parent in a clean checkout, while a
-custom state path must remain a leaf below an existing directory.
-A completed setup also locks its namespace and, for NFS, export directory until
-teardown. NFS teardown removes only the harness export and configuration; a
-server or unrelated exports that predated the fixture remain active. The SBX
-compatibility profile pairs kind/Kubernetes
-1.34 with kubectl 1.34 and rebuilds cached container-derived Elbencho bundles
-when their pinned image or bundle recipe changes. Slurm coordinators restore
-configured `ORDER_NODES` include-list order after Slurm canonicalizes an
-allocation's node list.
-The test action selects execution substrate and named scenario independently.
-Its deterministic planner batches the one shared-home SSH scenario behind a
-crash-recoverable StatefulSet transition; separate SSH homes are canonical.
-Transitions require the StatefulSet rollout to finish before accepting two
-ready nonterminating pods. Cross-pod storage checks use unique probe paths,
-bounded visibility retries, and unconditional cleanup.
-Fixture preflight requires only the workloads selected by the plan, so Slurm
-diagnosis remains available while SSH workers are unhealthy. Host operator
-UIDs own local state only. LoginSet coordination, Slurm tasks, SSH workers, and
-pod-side staging use the fixed `tester` UID/GID 2000 contract. Setup provisions
-the matching Slurm account, verifies the coordinator and both real `srun`
-tasks, and all-squashed NFS paths retain their server-assigned ownership.
-Slurm worker-order assertions use the copied execution logs rather than the
-asynchronous submission stream. Failure scenarios validate the real Elbencho
-binary before replacing it with their scenario-owned wrapper.
-Deployment archives remain products of `utils/build_tarball.sh`, but the
-harness caches them by the exact immutable tracked-source snapshot, build
-options, architecture, and seeded Elbencho/runtime identity. Each scenario
-extracts that artifact into isolated state. The real catalog covers baseline
-and default I/O, failure/resume, retained datasets, live capture, Cartesian
-sweeps, single-file and weighted-root behavior, shared SSH homes, and Slurm
-scheduling. Tests run as the non-root account recorded by setup and validate
-real SSH or Slurm dispatch, workload results, cleanup, and reporting. Scenario
-storage is isolated and removed after host-side evidence is retained. The
-on-demand integration workflow explicitly selects NFS and runs the complete
-catalog concurrently on amd64 and arm64; Kubernetes remains fixture
-infrastructure and is not a benchmark execution substrate.
-Fast shell contract tests cover node-range parsing and Cartesian order,
-configuration precedence, SSH host parsing and selection, workload-mode and
-path safety, sizing limits, and Slurm argument boundaries without a live
-fixture. Elbencho CSV reload resolves postponed dataclass annotations before
-coercing types, so cached metrics remain filterable. Its reporting CLI treats
-`--from-csv` as exclusive with raw directories and rejects malformed or
-no-match filters independently for aggregate metrics and live CSV reports.
+a shared RWX backend, two passwordless-SSH workers, and Slinky Slurm. The `nfs`
+backend uses loop-backed NFSv4 and NFS CSI; Docker SBX uses static volumes over
+a repository-shared path. Both validate the same storage contract.
+
+One budget drives PVC capacity and the growable 4 GiB sparse NFS image. Setup
+publishes new images transactionally, grows retained images, validates mounted
+free space, and reconciles eight NFS workers. Teardown restores the service's
+recorded active, enabled, and worker-count states. The SBX profile uses
+kind/Kubernetes and kubectl 1.34; setup replaces retained clusters with a
+different observed kubelet version.
+
+Lifecycle actions run as an ordinary user and keep state below
+`tmp/integration-state`; only narrow NFS host operations use `sudo`. Dedicated
+state and export leaves require ownership markers. A host-global lock and owner
+record protect fixed NFS configuration; the root-owned lock directory rejects
+links and unowned paths. Cached NFS CSI images must match the pinned
+multi-architecture index and runner architecture, and chart tags exist only in
+the disposable kind nodes. Cache misses try `registry.k8s.io` and the
+`gcr.io/k8s-staging-sig-storage` mirror; interrupted private aliases are
+reconciled. Digest-qualified fixture images are reused when verified and retry
+bounded transient pull failures through host Docker. MariaDB and Slinky's
+Alpine helpers use fixture-private tags preloaded into their kind nodes.
+Cleanup removes only owned resources, recovers partial bootstrap, preserves
+prior NFS state, and verifies unmounts. Capacity checks use the fixture and
+Docker backing filesystems.
+
+The test CLI selects substrates and named scenarios independently. Its planner
+batches shared-home SSH work behind a crash-recoverable transition; separate
+homes are canonical. Pod-side work uses `tester` UID/GID 2000, matching the
+all-squashed NFS export and Slurm account.
+
+The harness builds the ordinary deployment archive from an immutable tracked
+source snapshot, caches it by source, architecture, and seeded Elbencho/runtime
+identity, and extracts isolated scenario workspaces. The real catalog covers
+baseline and default I/O, failure/resume, retained datasets, live capture,
+Cartesian sweeps, single-file and weighted-root behavior, shared SSH homes,
+and Slurm scheduling. Fast tests cover parsing, precedence, workload and path
+safety, sizing, scheduler boundaries, failure contracts, and reporting. CI
+runs the complete NFS-backed catalog concurrently on amd64 and arm64 with time
+reserved for repeatable teardown; SBX is a supported local backend. Kubernetes
+version checks follow the kind node-image pin rather than the kubectl client.
+Unwritable diagnostics cannot prevent teardown. Kubernetes remains fixture
+infrastructure rather than a benchmark execution substrate.
+
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 3.14 unit tests run weekly and on manual request.
@@ -143,8 +124,7 @@ alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 | `utils/build_tarball.sh` | User-local deployment-tarball builder |
 | `utils/build/` | Helpers for building Warp and the in-tree s3test program |
 | `tests/` | Python and shell-behavior regression tests collected by `pytest` |
-| `integration-tests/` | Single-host kind, RWX storage, SSH, and Slinky fixture provisioner and manifests |
-| `docs/research/` | Feasibility studies and implementation handoffs for future integration work |
+| `integration-tests/` | Single-host kind, RWX storage, SSH, and Slinky fixture |
 
 The checked-in benchmark entry points are:
 
@@ -230,7 +210,12 @@ In Slurm mode, `dispatch_slurm_executions` allocates the largest node count
 needed by any non-successful cell and submits
 `storage-tests/fs/sbatch/_nv-elbencho-coordinator.sh`. The coordinator starts
 elbencho services once across the allocation and processes cells sequentially,
-using the first requested number of allocation hosts for each cell.
+using the first requested number of allocation hosts for each cell. Initial
+service health failure preserves its log and gets one bounded restart attempt;
+phase-level checks can also restart unhealthy services. Signals cancel and
+wait for the exact allocation before restoring the caller's traps. Cancellation
+is armed immediately after submission, before dispatch-lock handoff; an
+unverified cancellation retains the lock.
 
 In SSH mode, `dispatch_ssh_executions` starts services once across the usable
 host pool. It selects a fresh host subset for each cell, runs cells sequentially,
@@ -475,10 +460,6 @@ into a benchmark environment. It:
   missing or stale; and
 - includes existing Warp binaries but does not download or automatically build
   them, warning when an architecture is missing.
-
-By default the helper retains that full behavior. `--arch` can select only the
-native elbencho architecture, and `--skip-object-tools` omits Warp checks and
-s3test builds when creating a filesystem-only deployment archive.
 
 `utils/build/build_s3test_from_source.sh` tries suitable local compilers, Docker,
 and Docker Buildx. Failure to produce one architecture warns and permits tarball

@@ -26,7 +26,7 @@ metadata:
   name: storage-scale-sbx-data
 spec:
   capacity:
-    storage: 2Gi
+    storage: @@STORAGE_TEST_CAPACITY@@
   accessModes:
     - ReadWriteMany
   persistentVolumeReclaimPolicy: Retain
@@ -50,7 +50,7 @@ spec:
   volumeName: storage-scale-sbx-data
   resources:
     requests:
-      storage: 2Gi
+      storage: @@STORAGE_TEST_CAPACITY@@
 ---
 apiVersion: v1
 kind: PersistentVolume
@@ -58,7 +58,7 @@ metadata:
   name: storage-scale-sbx-home
 spec:
   capacity:
-    storage: 64Mi
+    storage: @@SSH_HOME_CAPACITY@@
   accessModes:
     - ReadWriteMany
   persistentVolumeReclaimPolicy: Retain
@@ -82,4 +82,4 @@ spec:
   volumeName: storage-scale-sbx-home
   resources:
     requests:
-      storage: 64Mi
+      storage: @@SSH_HOME_CAPACITY@@

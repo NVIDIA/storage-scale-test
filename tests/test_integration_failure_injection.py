@@ -350,6 +350,89 @@ def test_cleanup_runs_in_reverse_target_order(tmp_path):
     ]
 
 
+@pytest.mark.parametrize("fail_at", range(1, 11))
+def test_partial_staging_failure_cleans_every_endpoint(tmp_path, fail_at):
+    """Every partial staging boundary remains inside the cleanup scope."""
+    source = tmp_path / "elbencho"
+    _write_delegate(source, "exit 0")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    plan = build_ssh_failure_injection_plan(
+        scenario_id="failure-resume",
+        staging_root="/var/tmp/storage-scale-test",
+        source_binary=source,
+        source_runtime=runtime,
+        target_argument=TARGET_ARGUMENT,
+        coordinator_endpoint="coordinator",
+        worker_endpoints=("worker-1", "worker-2"),
+    )
+    recorder = _Recorder()
+    base = recorder.operations()
+    calls = 0
+
+    def _failing(operation):
+        def _wrapped(*arguments):
+            nonlocal calls
+            calls += 1
+            if calls == fail_at:
+                raise RuntimeError(f"staging failure {fail_at}")
+            return operation(*arguments)
+
+        return _wrapped
+
+    operations = FailureInjectionOperations(
+        _failing(base.make_directory),
+        _failing(base.copy_file),
+        _failing(base.copy_tree),
+        _failing(base.write_text),
+        base.remove_tree,
+    )
+
+    with pytest.raises(RuntimeError, match="staging failure"):
+        with staged_failure_injection(plan, operations):
+            pytest.fail("staging unexpectedly completed")
+
+    assert [call[1] for call in recorder.calls if call[0] == "remove"] == [
+        "worker-2",
+        "worker-1",
+        "coordinator",
+    ]
+
+
+def test_cleanup_attempts_every_endpoint_and_aggregates_errors(tmp_path):
+    """One removal failure cannot prevent cleanup of later endpoints."""
+    source = tmp_path / "elbencho"
+    _write_delegate(source, "exit 0")
+    plan = build_ssh_failure_injection_plan(
+        scenario_id="failure-resume",
+        staging_root="/var/tmp/storage-scale-test",
+        source_binary=source,
+        source_runtime=None,
+        target_argument=TARGET_ARGUMENT,
+        coordinator_endpoint="coordinator",
+        worker_endpoints=("worker-1", "worker-2"),
+    )
+    attempted = []
+
+    def _remove(endpoint, _path):
+        attempted.append(endpoint)
+        if endpoint != "worker-1":
+            raise OSError(f"cannot remove {endpoint}")
+
+    operations = FailureInjectionOperations(
+        lambda *_args: None,
+        lambda *_args: None,
+        lambda *_args: None,
+        lambda *_args: None,
+        _remove,
+    )
+
+    with pytest.raises(FailureInjectionError, match="worker-2.*coordinator"):
+        cleanup_failure_injection(plan, operations)
+
+    assert attempted == ["worker-2", "worker-1", "coordinator"]
+
+
 def test_real_binary_validation_precedes_wrapper_staging(tmp_path, monkeypatch):
     """The validator observes Elbencho before the failure wrapper replaces it."""
     events = []

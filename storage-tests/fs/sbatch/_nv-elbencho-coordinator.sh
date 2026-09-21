@@ -155,26 +155,44 @@ _elbencho_sweep_running_to_pending "$EXECUTIONS_DIR" || exit 1
 # Start elbencho services on every allocation node, in background, ONCE.
 SRUN_ELBENCHO_PID=""
 SRUN_ELBENCHO_PID_FILE=""
+SRUN_ELBENCHO_LOG="${OUTPUT_DIR}/elbencho-svc-j${SLURM_JOB_ID}-portdefault.log"
 ACTIVE_EXECUTION_ID=""
 if [[ "${SLURM_JOB_NUM_NODES:-1}" -gt 1 ]]; then
     stop_elbencho_services_srun "" || true  # initial cleanup of stale processes
-    SRUN_ELBENCHO_PID=$(start_elbencho_services_srun "")
-    if [[ ! "$SRUN_ELBENCHO_PID" =~ ^[0-9]+$ ]]; then
-        echo "Error: unable to start elbencho service owner" >&2
-        exit 1
-    fi
     SRUN_ELBENCHO_PID_FILE="${EXECUTIONS_DIR}/.service-srun.pid"
-    if ! _atomic_write_sentinel "$SRUN_ELBENCHO_PID_FILE" "$SRUN_ELBENCHO_PID"; then
-        echo "Error: unable to record elbencho service owner PID" >&2
-        stop_elbencho_services_srun "$SRUN_ELBENCHO_PID" || true
-        exit 1
-    fi
-    if ! check_elbencho_services_srun ""; then
-        echo "Error: elbencho services failed initial health check" >&2
+    for attempt in 1 2; do
+        SRUN_ELBENCHO_PID=$(start_elbencho_services_srun "" "$OUTPUT_DIR")
+        if [[ ! "$SRUN_ELBENCHO_PID" =~ ^[0-9]+$ ]]; then
+            echo "Error: unable to start elbencho service owner" >&2
+            exit 1
+        fi
+        if ! _atomic_write_sentinel \
+                "$SRUN_ELBENCHO_PID_FILE" "$SRUN_ELBENCHO_PID"; then
+            echo "Error: unable to record elbencho service owner PID" >&2
+            stop_elbencho_services_srun "$SRUN_ELBENCHO_PID" || true
+            exit 1
+        fi
+        if check_elbencho_services_srun ""; then
+            break
+        fi
+        echo "Warning: elbencho services failed initial health check "\
+            "(attempt $attempt/2)" >&2
+        if [[ -f "$SRUN_ELBENCHO_LOG" ]]; then
+            echo "Service log from failed attempt $attempt:" >&2
+            tail -n 200 -- "$SRUN_ELBENCHO_LOG" >&2 || true
+            cp -f -- "$SRUN_ELBENCHO_LOG" \
+                "${SRUN_ELBENCHO_LOG}.attempt-${attempt}" || true
+        else
+            echo "Service log is missing: $SRUN_ELBENCHO_LOG" >&2
+        fi
         stop_elbencho_services_srun "$SRUN_ELBENCHO_PID" || true
         rm -f -- "$SRUN_ELBENCHO_PID_FILE"
-        exit 1
-    fi
+        if [[ "$attempt" -eq 2 ]]; then
+            echo "Error: elbencho services failed after one restart" >&2
+            exit 1
+        fi
+        echo "Retrying initial elbencho service startup once" >&2
+    done
 fi
 
 # Refresh the coordinator's copy after a phase-level check restarts services

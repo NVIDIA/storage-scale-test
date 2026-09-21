@@ -218,6 +218,61 @@ def _coordinates(
     )
 
 
+def _env_name(line: str) -> str:
+    """Return the variable named by one supported environment statement."""
+    statement = line.strip()
+    for prefix in ("export ", "unset ", "declare -A "):
+        if statement.startswith(prefix):
+            statement = statement.removeprefix(prefix)
+            break
+    return statement.partition("=")[0].strip()
+
+
+def _override_env(
+    lines: tuple[str, ...], replacements: Mapping[str, str]
+) -> tuple[str, ...]:
+    """Replace uniquely named variables without depending on shell formatting."""
+    compound = {
+        name
+        for name, replacement in replacements.items()
+        if "\n" in replacement or "\r" in replacement
+    }
+    if compound:
+        raise ScenarioSpecError(
+            "environment overrides require one statement: "
+            + ", ".join(sorted(compound))
+        )
+    indexes: dict[str, list[int]] = {}
+    for index, line in enumerate(lines):
+        indexes.setdefault(_env_name(line), []).append(index)
+    invalid = {
+        name: indexes.get(name, [])
+        for name in replacements
+        if len(indexes.get(name, [])) != 1
+    }
+    if invalid:
+        details = ", ".join(
+            f"{name} ({len(matches)} matches)"
+            for name, matches in sorted(invalid.items())
+        )
+        raise ScenarioSpecError(f"environment overrides require one match: {details}")
+    mismatched = {
+        name: _env_name(replacement)
+        for name, replacement in replacements.items()
+        if _env_name(replacement) != name
+    }
+    if mismatched:
+        details = ", ".join(
+            f"{name} names {replacement_name or '<empty>'}"
+            for name, replacement_name in sorted(mismatched.items())
+        )
+        raise ScenarioSpecError(f"environment override name mismatch: {details}")
+    rendered = list(lines)
+    for name, replacement in replacements.items():
+        rendered[indexes[name][0]] = replacement
+    return tuple(rendered)
+
+
 def _step(
     name: str,
     arguments: tuple[str, ...],
@@ -300,12 +355,9 @@ def _failure_resume() -> FilesystemScenarioSpec:
         coordinates[3]: ExecutionStatus.PENDING,
     }
     initial = _coordinates((1, 2), ("4K", "8K"), (1,), (1,), statuses=statuses)
-    env_lines = tuple(
-        line.replace(
-            'ELBENCHO_SCALE_IO_SIZES=("4K")',
-            'ELBENCHO_SCALE_IO_SIZES=("4K" "8K")',
-        )
-        for line in _SHARED_ENV
+    env_lines = _override_env(
+        _SHARED_ENV,
+        {"ELBENCHO_SCALE_IO_SIZES": ('export ELBENCHO_SCALE_IO_SIZES=("4K" "8K")')},
     )
     first = _step(
         "inject-one-failure",
@@ -386,14 +438,15 @@ def _retained_lifecycle() -> FilesystemScenarioSpec:
 
 
 def _live_capture() -> FilesystemScenarioSpec:
-    env_lines = tuple(
-        line.replace(
-            "ELBENCHO_SCALE_READ_WRITE_DURATION=1",
-            "ELBENCHO_SCALE_READ_WRITE_DURATION=3",
-        )
-        .replace("ELBENCHO_FILES_PER_NODE=1", "ELBENCHO_FILES_PER_NODE=2")
-        .replace("ELBENCHO_LIVE_CSV_EXTENDED=0", "ELBENCHO_LIVE_CSV_EXTENDED=1")
-        for line in _SHARED_ENV
+    env_lines = _override_env(
+        _SHARED_ENV,
+        {
+            "ELBENCHO_SCALE_READ_WRITE_DURATION": (
+                "export ELBENCHO_SCALE_READ_WRITE_DURATION=3"
+            ),
+            "ELBENCHO_FILES_PER_NODE": "export ELBENCHO_FILES_PER_NODE=2",
+            "ELBENCHO_LIVE_CSV_EXTENDED": "export ELBENCHO_LIVE_CSV_EXTENDED=1",
+        },
     ) + ("export ELBENCHO_LIVEINT=10",)
     return FilesystemScenarioSpec(
         "live-capture",
@@ -416,22 +469,19 @@ def _live_capture() -> FilesystemScenarioSpec:
 
 
 def _slurm_cartesian() -> FilesystemScenarioSpec:
-    env_lines = tuple(
-        line.replace("ELBENCHO_FILES_PER_NODE=1", "ELBENCHO_FILES_PER_NODE=2")
-        .replace('ELBENCHO_FILE_SIZE="16M"', 'ELBENCHO_FILE_SIZE="1M"')
-        .replace(
-            'ELBENCHO_SCALE_THREAD_LIST=("1")',
-            'ELBENCHO_SCALE_THREAD_LIST=("1" "2")',
-        )
-        .replace(
-            'ELBENCHO_SCALE_IO_SIZES=("4K")',
-            'ELBENCHO_SCALE_IO_SIZES=("4K" "4K,r8K")',
-        )
-        .replace(
-            'ELBENCHO_IODEPTH_LIST=("1")',
-            'ELBENCHO_IODEPTH_LIST=("1" "2")',
-        )
-        for line in _SHARED_ENV
+    env_lines = _override_env(
+        _SHARED_ENV,
+        {
+            "ELBENCHO_FILES_PER_NODE": "export ELBENCHO_FILES_PER_NODE=2",
+            "ELBENCHO_FILE_SIZE": 'export ELBENCHO_FILE_SIZE="1M"',
+            "ELBENCHO_SCALE_THREAD_LIST": (
+                'export ELBENCHO_SCALE_THREAD_LIST=("1" "2")'
+            ),
+            "ELBENCHO_SCALE_IO_SIZES": (
+                'export ELBENCHO_SCALE_IO_SIZES=("4K" "4K,r8K")'
+            ),
+            "ELBENCHO_IODEPTH_LIST": ('export ELBENCHO_IODEPTH_LIST=("1" "2")'),
+        },
     )
     return FilesystemScenarioSpec(
         "slurm-cartesian",
@@ -473,12 +523,13 @@ def _ssh_single_big_file() -> FilesystemScenarioSpec:
         _coordinates((1, 2), ("4K",), (1,), (1,)),
         (WorkloadPhase.WRITE, WorkloadPhase.READ, WorkloadPhase.REMOVE_FILES),
     )
-    read_env = tuple(
-        line.replace(
-            "ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=0",
-            "ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=1",
-        )
-        for line in env_lines
+    read_env = _override_env(
+        env_lines,
+        {
+            "ELBENCHO_ALL_NODES_ACCESS_ALL_DATA": (
+                "export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=1"
+            )
+        },
     )
     read = ScenarioStep(
         name="inferred-extent-read",
@@ -569,9 +620,9 @@ def _slurm_scheduling() -> FilesystemScenarioSpec:
         SupportFile("slurm-scenario-includes", "{slurm_node_1}\n{slurm_node_2}\n"),
         SupportFile("slurm-scenario-ignores", "{slurm_node_2}\n"),
     )
-    env_lines = tuple(
-        line.replace('ELBENCHO_FILE_SIZE="16M"', 'ELBENCHO_FILE_SIZE="4M"')
-        for line in _SHARED_ENV
+    env_lines = _override_env(
+        _SHARED_ENV,
+        {"ELBENCHO_FILE_SIZE": 'export ELBENCHO_FILE_SIZE="4M"'},
     ) + (
         "SLURM_EXCLUSIVE_USER=1",
         'SLURM_JOB_NAME_PREFIX="itest-"',

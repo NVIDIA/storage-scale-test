@@ -76,6 +76,15 @@ class TestFindViolations(unittest.TestCase):
 
         self.assertEqual([path for path, _error in violations], paths[:2])
 
+    def test_skips_tracked_path_deleted_from_working_tree(self) -> None:
+        """A pending tracked-file deletion is not a header violation."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+
+            violations = find_violations([Path("deleted.md")], root)
+
+        self.assertEqual(violations, [])
+
 
 if __name__ == "__main__":
     unittest.main()

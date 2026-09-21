@@ -47,6 +47,48 @@ def _run_bash(script: str) -> subprocess.CompletedProcess:
 class TestElbenchoDispatchShell(unittest.TestCase):
     """Dispatch helpers preserve per-execution state across retries."""
 
+    def test_slurm_dispatch_signals_cancel_once_and_preserve_exit_trap(self) -> None:
+        """INT and TERM cancel once before the caller's EXIT cleanup runs."""
+        for signal_name, expected_rc in (("INT", 130), ("TERM", 143)):
+            with self.subTest(signal=signal_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    record = Path(temp_dir) / "record"
+                    script = f"""
+                    source "{_ENV_FUNCTIONS}"
+                    RECORD={record!s}
+                    trap 'printf "owner\\n" >> "$RECORD"' EXIT
+                    scancel() {{ printf 'cancel\\n' >> "$RECORD"; }}
+                    squeue() {{ return 0; }}
+                    _slurm_arm_dispatch_cleanup 4242
+                    kill -{signal_name} $$
+                    """
+                    result = _run_bash(textwrap.dedent(script))
+                    self.assertEqual(result.returncode, expected_rc, result.stderr)
+                    self.assertEqual(
+                        record.read_text(encoding="utf-8").splitlines(),
+                        ["cancel", "owner"],
+                    )
+
+    def test_slurm_dispatch_exit_cancels_once_and_runs_inherited_exit(self) -> None:
+        """Unexpected shell exit retains both job and caller cleanup actions."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            record = Path(temp_dir) / "record"
+            script = f"""
+            source "{_ENV_FUNCTIONS}"
+            RECORD={record!s}
+            trap 'printf "owner\\n" >> "$RECORD"' EXIT
+            scancel() {{ printf 'cancel\\n' >> "$RECORD"; }}
+            squeue() {{ return 0; }}
+            _slurm_arm_dispatch_cleanup 4242
+            exit 9
+            """
+            result = _run_bash(textwrap.dedent(script))
+            self.assertEqual(result.returncode, 9, result.stderr)
+            self.assertEqual(
+                record.read_text(encoding="utf-8").splitlines(),
+                ["cancel", "owner"],
+            )
+
     def test_reified_execution_records_stable_test_dirs(self) -> None:
         script = f"""
         set -e
@@ -347,11 +389,15 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         result = _run_bash(textwrap.dedent(script))
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_coordinator_keeps_initial_check_without_post_execution_duplicate(
+    def test_coordinator_retries_initial_services_without_per_execution_probe(
         self,
     ) -> None:
         coordinator = _SLURM_COORDINATOR.read_text(encoding="utf-8")
         self.assertEqual(coordinator.count("check_elbencho_services_srun"), 1)
+        self.assertIn("for attempt in 1 2; do", coordinator)
+        self.assertIn('start_elbencho_services_srun "" "$OUTPUT_DIR"', coordinator)
+        self.assertIn('"${SRUN_ELBENCHO_LOG}.attempt-${attempt}"', coordinator)
+        self.assertIn("failed after one restart", coordinator)
         self.assertNotIn(
             'maybe_restart_elbencho_services_slurm "execution-${ID}"',
             coordinator,
@@ -480,6 +526,112 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         result = _run_bash(textwrap.dedent(script))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("circular name reference", result.stderr)
+
+    def test_slurm_adoption_failure_cancels_armed_job_and_waits(self) -> None:
+        """A submitted job is cancellation-owned before lock adoption starts."""
+        script = f"""
+        set -e
+        source "{_ENV_FUNCTIONS}"
+        source "{_ELBENCHO_FUNCTIONS}"
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        mkdir -p "$tmp/executions"
+        printf 'export nodes=1\n' > "$tmp/executions/0001.sh"
+        printf 'PENDING\n' > "$tmp/executions/0001.status"
+        SCALE_TEST_BASE="{_REPO_ROOT}"
+
+        build_sbatch_cmd() {{ local -n ref="$1"; ref=(sbatch); }}
+        run_sbatch_job() {{ JOBID=6161; log_files+=("$tmp/coordinator.log"); }}
+        _elbencho_adopt_slurm_dispatch_lock() {{
+            [[ "${{ELBENCHO_SLURM_CANCEL_ARMED:-0}}" -eq 1 ]]
+            [[ "${{ELBENCHO_SLURM_ACTIVE_JOB_ID:-}}" == 6161 ]]
+            return 1
+        }}
+        tail_until_complete() {{ touch "$tmp/unexpected-monitor"; }}
+        scancel() {{ [[ "$1" == 6161 ]]; touch "$tmp/cancelled"; }}
+        squeue() {{ [[ "$*" == *6161* ]]; return 0; }}
+        sleep() {{ :; }}
+
+        set +e
+        dispatch_slurm_executions "$tmp"
+        rc=$?
+        set -e
+        [[ "$rc" -eq 1 ]]
+        [[ -e "$tmp/cancelled" ]]
+        [[ ! -e "$tmp/unexpected-monitor" ]]
+        [[ ! -e "$tmp/executions/.dispatch.lock" ]]
+        [[ "$(trap -p EXIT)" == *'rm -rf'* ]]
+        """
+        result = _run_bash(textwrap.dedent(script))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_slurm_adoption_failure_retains_lock_when_cancel_is_unverified(
+        self,
+    ) -> None:
+        """An allocation of unknown state keeps exclusive dispatch ownership."""
+        script = f"""
+        set -e
+        source "{_ENV_FUNCTIONS}"
+        source "{_ELBENCHO_FUNCTIONS}"
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        mkdir -p "$tmp/executions"
+        printf 'export nodes=1\n' > "$tmp/executions/0001.sh"
+        printf 'PENDING\n' > "$tmp/executions/0001.status"
+        SCALE_TEST_BASE="{_REPO_ROOT}"
+
+        build_sbatch_cmd() {{ local -n ref="$1"; ref=(sbatch); }}
+        run_sbatch_job() {{ JOBID=6262; log_files+=("$tmp/coordinator.log"); }}
+        _elbencho_adopt_slurm_dispatch_lock() {{ return 1; }}
+        scancel() {{ [[ "$1" == 6262 ]]; }}
+        squeue() {{ return 1; }}
+
+        set +e
+        dispatch_slurm_executions "$tmp"
+        rc=$?
+        set -e
+        [[ "$rc" -eq 1 ]]
+        [[ -d "$tmp/executions/.dispatch.lock" ]]
+        [[ "$(cat "$tmp/executions/.dispatch.lock/token")" != "" ]]
+        printf '999999\n' > "$tmp/executions/.dispatch.lock/pid"
+        retry_token=""
+        if _elbencho_acquire_dispatch_lock \
+                "$tmp/executions" slurm-submit retry_token; then
+            exit 1
+        fi
+        """
+        result = _run_bash(textwrap.dedent(script))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("retaining dispatch lock", result.stderr)
+
+    def test_slurm_monitor_timeout_cancels_exact_handed_off_job(self) -> None:
+        script = f"""
+        set -e
+        source "{_ENV_FUNCTIONS}"
+        source "{_ELBENCHO_FUNCTIONS}"
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        mkdir -p "$tmp/executions"
+        printf 'export nodes=1\n' > "$tmp/executions/0001.sh"
+        printf 'PENDING\n' > "$tmp/executions/0001.status"
+        SCALE_TEST_BASE="{_REPO_ROOT}"
+
+        build_sbatch_cmd() {{ local -n ref="$1"; ref=(sbatch); }}
+        run_sbatch_job() {{ JOBID=6262; log_files+=("$tmp/coordinator.log"); }}
+        tail_until_complete() {{ return 124; }}
+        scancel() {{ [[ "$1" == 6262 ]]; touch "$tmp/cancelled"; }}
+        squeue() {{ [[ "$*" == *6262* ]]; return 0; }}
+        sleep() {{ :; }}
+
+        set +e
+        dispatch_slurm_executions "$tmp"
+        rc=$?
+        set -e
+        [[ "$rc" -eq 124 ]]
+        [[ -e "$tmp/cancelled" ]]
+        """
+        result = _run_bash(textwrap.dedent(script))
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_active_lock_blocks_slurm_and_ssh_before_status_reset(self) -> None:
         script = f"""

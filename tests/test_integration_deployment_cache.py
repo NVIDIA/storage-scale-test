@@ -83,13 +83,8 @@ def _repository(tmp_path: Path) -> tuple[Path, Path]:
         repository / "utils" / "build_tarball.sh",
         """#!/usr/bin/env bash
 set -eu
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --arch) shift 2 ;;
-        --skip-object-tools|--fixture-option) shift ;;
-        *) exit 64 ;;
-    esac
-done
+[[ $# -eq 0 ]]
+printf 'generated\n' > utils/generated-tool
 tar -czf ../storage-scale-test.tar.gz .
 """,
         0o755,
@@ -153,7 +148,27 @@ def test_snapshot_uses_current_tracked_content_and_excludes_untracked(tmp_path):
         payload = archive.extractfile("./payload.txt")
         assert payload is not None
         assert payload.read() == b"modified\n"
+        assert "./utils/generated-tool" in names
     assert "./untracked.txt" not in names
+
+
+def test_snapshot_honors_tracked_working_tree_deletions(tmp_path):
+    """A tracked file deleted locally is absent from the archive and identity."""
+    repository, binary = _repository(tmp_path)
+    runner = _Runner()
+    request = _request(tmp_path, repository, binary)
+    first = _CACHE.get_or_build_deployment(runner, request)
+    (repository / "payload.txt").unlink()
+
+    second = _CACHE.get_or_build_deployment(runner, request)
+
+    assert first.key != second.key
+    with tarfile.open(second.archive, "r:gz") as archive:
+        assert "./payload.txt" not in archive.getnames()
+    paths = [
+        entry["path"] for entry in _manifest(second)["identity"]["source"]["entries"]
+    ]
+    assert "payload.txt" not in paths
 
 
 def test_file_mode_participates_in_cache_identity(tmp_path):
@@ -176,12 +191,11 @@ def test_file_mode_participates_in_cache_identity(tmp_path):
     ("field", "value"),
     (
         ("architecture", "aarch64"),
-        ("build_options", ("--skip-object-tools", "--fixture-option")),
         ("recipe", 2),
     ),
 )
-def test_build_identity_options_invalidate_cache(tmp_path, field, value):
-    """Architecture, builder options, and recipe are cache-key inputs."""
+def test_build_identity_inputs_invalidate_cache(tmp_path, field, value):
+    """Architecture and builder recipe are cache-key inputs."""
     repository, binary = _repository(tmp_path)
     runner = _Runner()
     request = _request(tmp_path, repository, binary)
@@ -266,10 +280,12 @@ def test_builder_receives_snapshot_not_working_tree(tmp_path):
         def __init__(self):
             super().__init__()
             self.builder_cwd = None
+            self.builder_arguments = None
 
         def run(self, arguments, *, cwd=None, timeout=None):
             if str(arguments[0]).endswith("build_tarball.sh"):
                 self.builder_cwd = Path(cwd)
+                self.builder_arguments = [str(argument) for argument in arguments]
                 assert self.builder_cwd != repository
                 assert self.builder_cwd.name == "source"
             return super().run(arguments, cwd=cwd, timeout=timeout)
@@ -279,6 +295,9 @@ def test_builder_receives_snapshot_not_working_tree(tmp_path):
     _CACHE.get_or_build_deployment(runner, _request(tmp_path, repository, binary))
 
     assert runner.builder_cwd is not None
+    assert runner.builder_arguments == [
+        str(runner.builder_cwd / "utils" / "build_tarball.sh")
+    ]
 
 
 def test_unsafe_tracked_symlink_is_rejected(tmp_path):

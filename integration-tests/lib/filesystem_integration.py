@@ -25,6 +25,7 @@ import platform
 import re
 import shlex
 import shutil
+import subprocess
 import tarfile
 import tempfile
 import time
@@ -44,6 +45,10 @@ from failure_injection import (
     build_slurm_failure_injection_plan,
     build_ssh_failure_injection_plan,
     staged_failure_injection,
+)
+from fixture_capacity import (
+    MAX_DEPLOYMENT_CONTENT_BYTES,
+    MAX_LIVE_CAPTURE_DATASET_BYTES,
 )
 from filesystem_scenario_specs import (
     SCENARIO_SPECS_BY_NAME,
@@ -75,7 +80,7 @@ SBX_ELBENCHO_BUNDLE_RECIPE = 1
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
 MAX_DEPLOYMENT_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_DEPLOYMENT_FILES = 10_000
-MAX_DEPLOYMENT_CONTENT_BYTES = 512 * 1024 * 1024
+SLURM_CLEANUP_MARGIN_SECONDS = 120
 ELBENCHO_ARCHIVES = {
     "x86_64": (
         "elbencho-static-x86_64.tar.gz",
@@ -150,6 +155,7 @@ def _pod_command(
     *,
     as_user: str | None = None,
     timeout: int = 600,
+    kill_after: int = 10,
 ) -> list[str | Path]:
     """Build a remotely bounded command for one fixture pod."""
     prefix: list[str | Path] = _kubectl(
@@ -167,8 +173,7 @@ def _pod_command(
     prefix.extend(
         (
             "timeout",
-            "--foreground",
-            "--kill-after=10s",
+            f"--kill-after={kill_after}s",
             f"{timeout}s",
             "bash",
             "-lc",
@@ -234,6 +239,19 @@ def _load_state(config: Any) -> dict[str, Any]:
     backend = state.get("storage_backend")
     if backend not in {"nfs", "sbx-shared"}:
         raise IntegrationTestError(f"invalid storage_backend in {path}: {backend!r}")
+    requested_backend = getattr(config, "storage_backend", "auto")
+    if requested_backend not in {"auto", backend}:
+        raise IntegrationTestError(
+            f"requested storage backend {requested_backend} does not match "
+            f"retained backend {backend}"
+        )
+    if backend == "sbx-shared":
+        expected_root = str(config.sbx_shared_root)
+        if state.get("sbx_shared_root") != expected_root:
+            raise IntegrationTestError(
+                "retained SBX shared root does not match the requested fixture: "
+                f"{state.get('sbx_shared_root')!r} != {expected_root!r}"
+            )
     return state
 
 
@@ -738,6 +756,14 @@ def _shell(value: str | Path) -> str:
     return shlex.quote(str(value))
 
 
+def _slurm_run_time(timeout_seconds: int) -> str:
+    """Return an allocation limit that outlives the harness deadline."""
+    total = timeout_seconds + SLURM_CLEANUP_MARGIN_SECONDS
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 def _override_block(
     selector: str,
     remote_root: str,
@@ -746,6 +772,7 @@ def _override_block(
     results_dir: str | None = None,
     logs_dir: str | None = None,
     extra_env: str = "",
+    timeout_seconds: int = 300,
 ) -> tuple[str, dict[str, str]]:
     """Return template overrides and small support-file contents."""
     data = "/mnt/storage-test"
@@ -798,7 +825,7 @@ def _override_block(
                 'account="storage-test"',
                 'reservation=""',
                 'partition="all"',
-                'run_time="00:05:00"',
+                f"run_time={_shell(_slurm_run_time(timeout_seconds))}",
                 "SLURM_EXCLUSIVE_USER=0",
                 f"export SLURM_NODE_INCLUDES={_shell(include_file)}",
                 f"export SLURM_NODE_IGNORES={_shell(ignore_file)}",
@@ -820,13 +847,14 @@ def _render_env(
     results_dir: str | None = None,
     logs_dir: str | None = None,
     extra_env: str = "",
+    timeout_seconds: int = 300,
 ) -> tuple[str, dict[str, str]]:
     """Render one runtime env from the repository's real user template."""
     text = template.read_text(encoding="utf-8")
-    anchor = 'source "${SCALE_TEST_BASE}/lib/env_base.sh"'
+    anchor = "# STORAGE_SCALE_TEST_INTEGRATION_OVERRIDES"
     if text.count(anchor) != 1:
         raise IntegrationTestError(
-            f"expected exactly one env_base source anchor in {template}"
+            f"expected exactly one integration override marker in {template}"
         )
     overrides, support = _override_block(
         selector,
@@ -835,6 +863,7 @@ def _render_env(
         results_dir=results_dir,
         logs_dir=logs_dir,
         extra_env=extra_env,
+        timeout_seconds=timeout_seconds,
     )
     rendered = text.replace(anchor, overrides + "\n" + anchor)
     return rendered, support
@@ -981,6 +1010,7 @@ def _write_runtime_files(
     logs_dir: str | None = None,
     extra_env: str = "",
     extra_support: dict[str, str] | None = None,
+    timeout_seconds: int = 300,
 ) -> None:
     """Add the generated environment and support files to a deployment."""
     rendered, support = _render_env(
@@ -991,6 +1021,7 @@ def _write_runtime_files(
         results_dir=results_dir,
         logs_dir=logs_dir,
         extra_env=extra_env,
+        timeout_seconds=timeout_seconds,
     )
     (workspace / "env.sh").write_text(rendered, encoding="utf-8")
     (workspace / "env.sh").chmod(0o640)
@@ -1166,7 +1197,6 @@ def _test_command(
         )
         return [
             "timeout",
-            "--foreground",
             "--kill-after=10s",
             f"{timeout}s",
             "bash",
@@ -1180,6 +1210,7 @@ def _test_command(
         command,
         as_user=WORKLOAD_USER,
         timeout=timeout,
+        kill_after=105,
     )
 
 
@@ -1197,109 +1228,33 @@ def _run_step(
 ) -> str:
     """Run one bounded substrate step and preserve diagnostic output."""
     LOG.info("Running %s filesystem step: %s", selector, name)
+    outer_grace = 120 if selector == "slurm" else 30
     result = runner.run(
         _test_command(config, fixture, selector, command, timeout),
         check=False,
-        timeout=timeout + 30,
+        timeout=timeout + outer_grace,
     )
     output = result.stdout + result.stderr
     log_path = log_dir / f"{selector}-{name}.log"
     log_path.write_text(output, encoding="utf-8")
     log_path.chmod(0o640)
+    if expected_failure and result.returncode == 0:
+        raise IntegrationTestError(
+            f"{selector} {name} unexpectedly succeeded; full output: {log_path}"
+        )
     if result.returncode and not expected_failure:
         detail = output.strip()[-8000:]
         raise IntegrationTestError(
             f"{selector} {name} failed with exit code {result.returncode}; "
             f"full output: {log_path}\n{detail}"
         )
-    LOG.info("Passed %s filesystem step: %s", selector, name)
+    LOG.info(
+        "%s %s filesystem step: %s",
+        "Observed expected failure for" if expected_failure else "Passed",
+        selector,
+        name,
+    )
     return output
-
-
-def _assert_results(
-    runner: Any,
-    config: Any,
-    fixture: Fixture,
-    selector: str,
-    remote_root: str,
-    log_dir: Path,
-) -> str:
-    """Assert the two execution records and bounded-data cleanup."""
-    results = f"{remote_root}/results"
-    discover = (
-        f"find {_shell(results)} -mindepth 1 -maxdepth 1 -type d "
-        "-name 'elbencho-*' -printf '%p\\n'"
-    )
-    output = _run_step(
-        runner,
-        config,
-        fixture,
-        selector,
-        "discover-results",
-        discover,
-        log_dir,
-        30,
-    )
-    directories = [line for line in output.splitlines() if line.strip()]
-    if len(directories) != 1:
-        raise IntegrationTestError(
-            f"expected one {selector} results directory; found {directories}"
-        )
-    result_dir = directories[0]
-    if selector == "ssh":
-        quoted_addresses = " ".join(
-            _shell(address) for address in fixture.ssh_addresses
-        )
-        remote_cleanup = (
-            'test -z "$(find /mnt/storage-test -mindepth 1 -maxdepth 1 '
-            "-type d -name 'elbencho-sweep-target-*' -print -quit)\""
-        )
-        cleanup_probe = f"""
-for host in {quoted_addresses}; do
-    ssh -T -o BatchMode=yes -o ConnectTimeout=15 \\
-        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
-        -o PreferredAuthentications=publickey -o LogLevel=ERROR \\
-        "tester@$host" {_shell(remote_cleanup)}
-done
-""".strip()
-    else:
-        cleanup_probe = (
-            'test -z "$(find /mnt/storage-test -mindepth 1 -maxdepth 1 '
-            "-type d -name 'elbencho-sweep-target-*' -print -quit)\""
-        )
-    assertion = f"""
-set -euo pipefail
-result={_shell(result_dir)}
-test -s "$result/env_used.yaml"
-test -s "$result/env_used.sh"
-test "$(find "$result/executions" -maxdepth 1 -name '*.status' | wc -l)" -eq 2
-for id in 0001 0002; do
-    grep -qx SUCCESS "$result/executions/$id.status"
-    grep -qx 0 "$result/executions/$id.exitcode"
-    test -s "$result/executions/$id.log"
-    test -s "$result/executions/$id.workload.tsv"
-done
-grep -qx $'dataset_files_total\t1' "$result/executions/0001.workload.tsv"
-grep -qx $'dataset_files_total\t2' "$result/executions/0002.workload.tsv"
-grep -qx $'dataset_bytes_total\t16777216' "$result/executions/0001.workload.tsv"
-grep -qx $'dataset_bytes_total\t33554432' "$result/executions/0002.workload.tsv"
-grep -qx $'completion_state\tcompleted' "$result/executions/0001.workload.tsv"
-grep -qx $'completion_state\tcompleted' "$result/executions/0002.workload.tsv"
-test "$(find "$result" -type f -name '*.csv' -size +0c | wc -l)" -ge 2
-test "$(find "$result" -type f -name '*.out' -size +0c | wc -l)" -ge 2
-{cleanup_probe}
-""".strip()
-    _run_step(
-        runner,
-        config,
-        fixture,
-        selector,
-        "assert-results",
-        assertion,
-        log_dir,
-        60,
-    )
-    return result_dir
 
 
 def _ordered_worker_evidence(selector: str, sweep_output: str, result: Path) -> str:
@@ -1359,46 +1314,6 @@ def _copy_result_for_reporting(
             timeout=120,
         )
     return destination / Path(result_dir).name
-
-
-def _assert_report(
-    runner: Any,
-    report_workspace: Path,
-    result_dir: Path,
-    selector: str,
-    log_dir: Path,
-) -> None:
-    """Run the supported report wrapper and verify both sweep sizes appear."""
-    result = runner.run(
-        [
-            report_workspace / "utils" / "extract-elbencho.sh",
-            "--markdown",
-            result_dir,
-        ],
-        cwd=report_workspace,
-        timeout=600,
-        check=False,
-    )
-    output = result.stdout + result.stderr
-    report_log = log_dir / f"{selector}-extract-elbencho.log"
-    report_log.write_text(output, encoding="utf-8")
-    report_log.chmod(0o640)
-    if result.returncode:
-        raise IntegrationTestError(
-            f"{selector} result reporting failed with exit code {result.returncode}; "
-            f"full output: {report_log}\n{output.strip()[-8000:]}"
-        )
-    missing = []
-    if "| Nodes" not in output:
-        missing.append("Nodes header")
-    for node_count in (1, 2):
-        if not re.search(rf"^\|\s*{node_count}\s*\|", output, re.MULTILINE):
-            missing.append(f"{node_count}-node row")
-    if missing:
-        raise IntegrationTestError(
-            f"{selector} report omitted expected node-count rows {missing}; "
-            f"full output: {report_log}"
-        )
 
 
 def _login_shell(
@@ -1467,6 +1382,7 @@ def _sync_step_runtime(
             logs_dir=f"{runtime.workspace}/logs/{step.name}",
             extra_env=extra_env,
             extra_support=extra_support,
+            timeout_seconds=step.timeout_seconds,
         )
         return
     stage = runtime.local_workspace / f"runtime-{step.name}"
@@ -1483,6 +1399,7 @@ def _sync_step_runtime(
         logs_dir=f"{runtime.workspace}/logs/{step.name}",
         extra_env=extra_env,
         extra_support=extra_support,
+        timeout_seconds=step.timeout_seconds,
     )
     archive_path = runtime.local_workspace / f"runtime-{step.name}.tar"
     with tarfile.open(archive_path, "w") as archive:
@@ -1626,7 +1543,7 @@ def _expected_dataset_totals(
     if scenario in {"baseline", "ssh-shared-home", "failure-resume"}:
         return nodes, nodes * 16 * 1024 * 1024
     if scenario == "live-capture":
-        return nodes * 2, nodes * 2 * 16 * 1024 * 1024
+        return nodes * 2, nodes * (MAX_LIVE_CAPTURE_DATASET_BYTES // 2)
     if scenario == "slurm-cartesian":
         return nodes * 2, nodes * 2 * 1024 * 1024
     if scenario == "retained-lifecycle" and step.kind is not CommandKind.DELETE:
@@ -2136,31 +2053,21 @@ def _run_regular_step(
 
 
 def _make_scenario_runtime(
-    runner: Any,
-    config: Any,
     fixture: Fixture,
     scenario: FilesystemScenarioSpec,
     selector: str,
-    archive: Path,
-    extracted: Path,
     build_root: Path,
     artifact_root: Path,
     run_id: str,
 ) -> ScenarioRuntime:
-    """Stage one isolated deployment and storage subtree for a scenario."""
+    """Create cleanup-capable scenario identity before remote mutation."""
     workspace_id = f"{run_id}-{scenario.name}-{selector}"
-    workspace = _stage_workspace(
-        runner,
-        config,
-        fixture,
-        selector,
-        archive,
-        extracted,
-        build_root,
-        workspace_id,
+    workspace = (
+        str(build_root / "ssh" / "storage-scale-test")
+        if selector == "ssh"
+        else f"{REMOTE_BASE}/workspaces/{workspace_id}/storage-scale-test"
     )
     data_root = f"{REMOTE_BASE}/test-data/{workspace_id}"
-    _prepare_scenario_data(runner, config, fixture, data_root)
     values = {
         "workspace": workspace,
         "test_root": f"{data_root}/primary",
@@ -2178,6 +2085,33 @@ def _make_scenario_runtime(
         values,
         [],
     )
+
+
+def _prepare_scenario_runtime(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    archive: Path,
+    extracted: Path,
+) -> None:
+    """Stage deployment and data after cleanup identity exists."""
+    workspace_id = PurePosixPath(runtime.data_root).name
+    workspace = _stage_workspace(
+        runner,
+        config,
+        fixture,
+        runtime.selector,
+        archive,
+        extracted,
+        runtime.local_workspace,
+        workspace_id,
+    )
+    if workspace != runtime.workspace:
+        raise IntegrationTestError(
+            f"scenario workspace drifted: expected {runtime.workspace}, found {workspace}"
+        )
+    _prepare_scenario_data(runner, config, fixture, runtime.data_root)
 
 
 def _run_regular_scenario(
@@ -2205,8 +2139,9 @@ def _run_regular_scenario(
 
 def _cleanup_ssh_remote_results(runner: Any, config: Any) -> None:
     """Remove retrieved per-scenario output trees from bounded SSH homes."""
+    failures = []
     for pod in _pods_with_container(_pod_inventory(runner, config), "sshd"):
-        runner.run(
+        result = runner.run(
             [
                 *_kubectl(
                     config,
@@ -2228,6 +2163,69 @@ def _cleanup_ssh_remote_results(runner: Any, config: Any) -> None:
             ],
             check=False,
             timeout=60,
+        )
+        if result.returncode:
+            failures.append(
+                f"{pod['metadata']['name']}: "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+    if failures:
+        raise IntegrationTestError(
+            "could not clean SSH scenario results: " + "; ".join(failures)
+        )
+
+
+def _preserve_scenario_failure_diagnostics(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    log_dir: Path,
+    error: Exception,
+) -> None:
+    """Copy bounded scenario logs before its disposable workspace is removed."""
+    destination = log_dir / "failure-diagnostics"
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "failure.txt").write_text(f"{error!r}\n", encoding="utf-8")
+    failures: list[str] = []
+    for name in ("logs", "results"):
+        source = f"{runtime.workspace}/{name}"
+        target = destination / name
+        try:
+            if runtime.selector == "ssh":
+                local_source = Path(source)
+                if local_source.exists():
+                    shutil.copytree(local_source, target, dirs_exist_ok=True)
+                else:
+                    failures.append(f"missing local diagnostic path: {source}")
+                continue
+            result = runner.run(
+                [
+                    *_kubectl(config, "-n", config.namespace, "cp"),
+                    "-c",
+                    fixture.login_container,
+                    f"{fixture.login_pod}:{source}",
+                    target,
+                ],
+                check=False,
+                timeout=180,
+            )
+            if result.returncode:
+                detail = (result.stderr or result.stdout).strip()
+                failures.append(
+                    f"could not copy {source} (exit {result.returncode}): {detail}"
+                )
+        except (OSError, subprocess.SubprocessError) as diagnostic_error:
+            failures.append(f"could not copy {source}: {diagnostic_error!r}")
+    if failures:
+        (destination / "collection-errors.txt").write_text(
+            "\n".join(failures) + "\n", encoding="utf-8"
+        )
+        LOG.warning(
+            "Some %s/%s failure diagnostics could not be retained; see %s",
+            runtime.scenario.name,
+            runtime.selector,
+            destination / "collection-errors.txt",
         )
 
 
@@ -2267,10 +2265,64 @@ def _cleanup_scenario_storage(
         timeout=135,
     )
     if result.returncode:
-        LOG.warning(
-            "Could not clean scenario-owned remote storage for %s/%s",
-            runtime.scenario.name,
-            runtime.selector,
+        raise IntegrationTestError(
+            "could not clean scenario-owned remote storage for "
+            f"{runtime.scenario.name}/{runtime.selector}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+
+
+def _cleanup_scenario_resources(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+) -> None:
+    """Attempt every scenario cleanup and report all failures together."""
+    failures = []
+    operations = []
+    if runtime.selector == "ssh":
+        operations.append(lambda: _cleanup_ssh_remote_results(runner, config))
+    operations.append(
+        lambda: _cleanup_scenario_storage(runner, config, fixture, runtime)
+    )
+    operations.append(lambda: _cleanup_local_scenario_workspace(config, runtime))
+    for cleanup in operations:
+        try:
+            cleanup()
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            failures.append(f"{type(error).__name__}: {error}")
+    if failures:
+        raise IntegrationTestError("; ".join(failures))
+
+
+def _cleanup_local_scenario_workspace(config: Any, runtime: ScenarioRuntime) -> None:
+    """Remove only a scenario workspace below the harness test-run root."""
+    workspace = runtime.local_workspace
+    test_runs = (config.state_dir / "test-runs").resolve()
+    resolved = workspace.resolve(strict=False)
+    if workspace.is_symlink() or test_runs not in resolved.parents:
+        raise IntegrationTestError(
+            f"refusing to remove unexpected local scenario workspace: {workspace}"
+        )
+    if workspace.exists():
+        shutil.rmtree(workspace)
+
+
+def _record_secondary_cleanup_failure(log_dir: Path, error: Exception) -> None:
+    """Retain cleanup failure without replacing the scenario's primary error."""
+    try:
+        destination = log_dir / "failure-diagnostics"
+        destination.mkdir(parents=True, exist_ok=True)
+        path = destination / "cleanup-error.txt"
+        path.write_text(f"{type(error).__name__}: {error}\n", encoding="utf-8")
+        LOG.error("Scenario cleanup also failed; retained details in %s", path)
+    except OSError as diagnostic_error:
+        LOG.error(
+            "Scenario cleanup also failed (%r), and its diagnostic could not "
+            "be retained: %r",
+            error,
+            diagnostic_error,
         )
 
 
@@ -2649,69 +2701,6 @@ def _run_failure_resume(
         )
 
 
-def _run_substrate(
-    runner: Any,
-    config: Any,
-    fixture: Fixture,
-    selector: str,
-    archive: Path,
-    extracted: Path,
-    build_root: Path,
-    report_workspace: Path,
-    log_dir: Path,
-) -> None:
-    """Stage, validate, run, and inspect one filesystem substrate."""
-    remote_root = _stage_workspace(
-        runner,
-        config,
-        fixture,
-        selector,
-        archive,
-        extracted,
-        build_root,
-        f"baseline-{selector}",
-    )
-    prefix = f"cd -- {_shell(remote_root)} && "
-    validation = _run_step(
-        runner,
-        config,
-        fixture,
-        selector,
-        "validate-env",
-        prefix + "./validate_env.sh",
-        log_dir,
-        180,
-    )
-    if VALIDATION_SUCCESS not in validation:
-        raise IntegrationTestError(
-            f"{selector} validate_env.sh omitted its success marker"
-        )
-    sweep = prefix + "./storage-tests/fs/nv-elbencho-sweep.sh -b --nodes 1,2"
-    sweep_output = _run_step(
-        runner,
-        config,
-        fixture,
-        selector,
-        "filesystem-sweep",
-        sweep,
-        log_dir,
-        600,
-    )
-    result_dir = _assert_results(
-        runner, config, fixture, selector, remote_root, log_dir
-    )
-    local_result = _copy_result_for_reporting(
-        runner,
-        config,
-        fixture,
-        selector,
-        result_dir,
-        build_root / f"{selector}-report-input",
-    )
-    _assert_ordered_workers(fixture, selector, sweep_output, local_result)
-    _assert_report(runner, report_workspace, local_result, selector, log_dir)
-
-
 def run_filesystem_tests(
     runner: Any,
     config: Any,
@@ -2772,6 +2761,7 @@ def run_filesystem_tests(
             template=extracted / "env.sh.template",
         )
         home_mode = "separate"
+        suite_error: Exception | None = None
         try:
             for step in plan:
                 if isinstance(step, SshHomeTransition):
@@ -2795,18 +2785,23 @@ def run_filesystem_tests(
                 scenario_logs.mkdir()
                 specification = SCENARIO_SPECS_BY_NAME[scenario]
                 runtime_state = _make_scenario_runtime(
-                    runner,
-                    config,
                     fixture,
                     specification,
                     step.substrate.value,
-                    archive,
-                    extracted,
                     scenario_root,
                     scenario_logs,
                     run_id,
                 )
+                primary_error: Exception | None = None
                 try:
+                    _prepare_scenario_runtime(
+                        runner,
+                        config,
+                        fixture,
+                        runtime_state,
+                        archive,
+                        extracted,
+                    )
                     if scenario == "failure-resume":
                         _run_failure_resume(
                             runner,
@@ -2830,17 +2825,47 @@ def run_filesystem_tests(
                             report_workspace,
                             scenario_logs,
                         )
+                except Exception as error:
+                    primary_error = error
+                    try:
+                        _preserve_scenario_failure_diagnostics(
+                            runner,
+                            config,
+                            fixture,
+                            runtime_state,
+                            scenario_logs,
+                            error,
+                        )
+                    except (OSError, subprocess.SubprocessError) as diagnostic_error:
+                        LOG.warning(
+                            "Could not retain %s/%s failure diagnostics: %r",
+                            scenario,
+                            step.substrate.value,
+                            diagnostic_error,
+                        )
+                    raise
                 finally:
-                    if step.substrate.value == "ssh":
-                        _cleanup_ssh_remote_results(runner, config)
-                    _cleanup_scenario_storage(
-                        runner,
-                        config,
-                        fixture,
-                        runtime_state,
-                    )
+                    try:
+                        _cleanup_scenario_resources(
+                            runner, config, fixture, runtime_state
+                        )
+                    # Cleanup must never replace an active scenario exception.
+                    # pylint: disable-next=broad-exception-caught
+                    except Exception as cleanup_error:
+                        if primary_error is None:
+                            raise
+                        _record_secondary_cleanup_failure(scenario_logs, cleanup_error)
+        except Exception as error:
+            suite_error = error
+            raise
         finally:
             if home_mode == "shared" and transition_ssh_home is not None:
-                transition_ssh_home("separate", "ssh-shared-home-restore")
+                try:
+                    transition_ssh_home("separate", "ssh-shared-home-restore")
+                # pylint: disable-next=broad-exception-caught
+                except Exception as restore_error:
+                    if suite_error is None:
+                        raise
+                    _record_secondary_cleanup_failure(log_dir, restore_error)
     names = ", ".join(f"{step.scenario.name}/{step.substrate.value}" for step in work)
     LOG.info("Filesystem integration tests passed: %s", names)

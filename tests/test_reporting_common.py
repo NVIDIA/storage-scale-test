@@ -92,3 +92,9 @@ def test_scale_filter_and_histogram_ranges():
         "min_count": 1.0,
         "max_count": 110.00000000000001,
     }
+    assert histogram_axis_ranges([([0.0012, 0.091], [4080.0, 1.0])]) == {
+        "min_latency": 0.00108,
+        "max_latency": 0.10010000000000001,
+        "min_count": 1.0,
+        "max_count": 4488.0,
+    }

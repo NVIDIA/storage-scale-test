@@ -49,7 +49,6 @@ class DeploymentCacheRequest:
     binary: Path
     binary_name: str
     runtime: Path | None = None
-    build_options: tuple[str, ...] = ("--skip-object-tools",)
     recipe: int = DEFAULT_RECIPE
     build_timeout: int = 600
 
@@ -164,7 +163,7 @@ def _copy_tracked_snapshot(
         relative = _safe_relative(name)
         source = repo_root / relative
         if not source.exists() and not source.is_symlink():
-            raise DeploymentCacheError(f"tracked path is absent: {source}")
+            continue
         target = destination / relative
         _copy_tracked_file(source, target)
         copied.append(target)
@@ -239,7 +238,6 @@ def _identity_document(
         "schema": CACHE_SCHEMA,
         "recipe": request.recipe,
         "architecture": request.architecture,
-        "build_options": list(request.build_options),
         "source": source_manifest,
         "binary": binary_identity,
         "runtime": runtime_identity,
@@ -292,18 +290,15 @@ def _valid_entry(cache_root: Path, key: str, identity: dict[str, object]) -> boo
 def _run_builder(
     runner: Any, request: DeploymentCacheRequest, staging: Path, snapshot: Path
 ) -> tuple[Path, str]:
-    """Invoke the repository's existing deployment builder from the snapshot."""
-    builder = snapshot / "utils" / "build_tarball.sh"
+    """Invoke the existing builder from an exact disposable snapshot copy."""
+    build_parent = staging / "builder"
+    build_tree = build_parent / "source"
+    shutil.copytree(snapshot, build_tree, symlinks=True)
+    builder = build_tree / "utils" / "build_tarball.sh"
     if not builder.is_file() or builder.is_symlink():
         raise DeploymentCacheError(f"deployment builder is absent: {builder}")
-    arguments: list[str | Path] = [
-        builder,
-        "--arch",
-        request.architecture,
-        *request.build_options,
-    ]
-    result = runner.run(arguments, cwd=snapshot, timeout=request.build_timeout)
-    archive = staging / ARCHIVE_NAME
+    result = runner.run([builder], cwd=build_tree, timeout=request.build_timeout)
+    archive = build_parent / ARCHIVE_NAME
     if not archive.is_file() or archive.is_symlink() or archive.stat().st_size <= 0:
         raise DeploymentCacheError(f"deployment builder did not create {archive}")
     return archive, result.stdout + result.stderr

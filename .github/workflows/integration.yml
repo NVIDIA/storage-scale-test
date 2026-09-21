@@ -39,7 +39,7 @@ jobs:
           - architecture: arm64
             runner: linux-arm64-cpu4
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 135
     permissions:
       contents: read
     steps:
@@ -62,34 +62,18 @@ jobs:
         run: |
           sudo -n true
           docker info >/dev/null
-      - name: Set up the integration environment
+      - name: Run the bounded integration lifecycle
         run: |
-          "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs setup
-      - name: Verify repeated setup
-        run: |
-          "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs setup
-      - name: Stop the integration environment
-        run: |
-          "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs stop
-      - name: Restart the integration environment
-        run: |
-          "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs start
-      - name: Verify root lifecycle execution is rejected
-        run: |
-          for action in setup test; do
-            if sudo "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs "$action"; then
-              echo "integration $action action unexpectedly accepted root" >&2
-              exit 1
-            fi
-          done
-      - name: Run all integration tests
-        run: |
-          "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs test
-      - name: Tear down the integration environment
+          timeout --kill-after=10m 105m \
+            integration-tests/bin/ci-integration.sh "${{ matrix.architecture }}"
+      - name: Upload integration diagnostics
         if: ${{ always() }}
-        run: |
-          "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs teardown
-          "$(command -v python)" integration-tests/bin/integration-test.py --storage-backend nfs teardown
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: filesystem-integration-${{ matrix.architecture }}
+          path: tmp/integration-diagnostics
+          if-no-files-found: warn
+          retention-days: 7
 
   integration-status:
     name: Filesystem integration status

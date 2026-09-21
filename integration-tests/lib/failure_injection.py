@@ -333,9 +333,17 @@ def stage_failure_injection(
 def cleanup_failure_injection(
     plan: FailureInjectionPlan, operations: FailureInjectionOperations
 ) -> None:
-    """Remove all scenario-owned staging, including the persistent marker."""
+    """Attempt removal on every endpoint and report aggregate failures."""
+    failures = []
     for target in reversed(plan.targets):
-        operations.remove_tree(target.endpoint, plan.layout.root)
+        try:
+            operations.remove_tree(target.endpoint, plan.layout.root)
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            failures.append(f"{target.endpoint}: {error!r}")
+    if failures:
+        raise FailureInjectionError(
+            "failure-injection cleanup failed: " + "; ".join(failures)
+        )
 
 
 @contextmanager
@@ -348,8 +356,14 @@ def staged_failure_injection(
     diagnostics, execute resume, and copy final diagnostics inside the context.
     Cleanup also runs if the overall scenario aborts.
     """
-    stage_failure_injection(plan, operations)
     try:
+        stage_failure_injection(plan, operations)
         yield plan
-    finally:
+    except BaseException as primary:
+        try:
+            cleanup_failure_injection(plan, operations)
+        except FailureInjectionError as cleanup_error:
+            primary.add_note(str(cleanup_error))
+        raise
+    else:
         cleanup_failure_injection(plan, operations)

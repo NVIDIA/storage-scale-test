@@ -44,7 +44,7 @@ spec:
   storageClassName: storage-scale-nfs-csi
   resources:
     requests:
-      storage: 2Gi
+      storage: @@STORAGE_TEST_CAPACITY@@
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -57,4 +57,4 @@ spec:
   storageClassName: storage-scale-nfs-csi
   resources:
     requests:
-      storage: 64Mi
+      storage: @@SSH_HOME_CAPACITY@@

@@ -216,23 +216,27 @@ def histogram_axis_ranges(
     for x_values_iter, y_values_iter in series:
         x_values = list(x_values_iter)
         y_values = list(y_values_iter)
-        if x_values:
-            min_latency = min(min_latency, *x_values)
-            max_latency = max(max_latency, *x_values)
+        positive_latencies = [value for value in x_values if value > 0]
+        if positive_latencies:
+            min_latency = min(min_latency, *positive_latencies)
+            max_latency = max(max_latency, *positive_latencies)
         if y_values:
             nonzero_counts = [value for value in y_values if value > 0]
             if nonzero_counts:
                 min_count = min(min_count, *nonzero_counts)
             max_count = max(max_count, *y_values)
 
-    min_latency = 0.1 if min_latency == float("inf") else min_latency
+    latency_data_found = min_latency != float("inf")
+    min_latency = 0.1 if not latency_data_found else min_latency
     max_latency = 1000.0 if max_latency == 0 else max_latency
     min_count = 1.0 if min_count == float("inf") else min_count
     max_count = 100.0 if max_count == 0 else max_count
 
     padding_factor = 0.1
     return {
-        "min_latency": max(0.1, min_latency * (1 - padding_factor)),
+        "min_latency": (
+            min_latency * (1 - padding_factor) if latency_data_found else min_latency
+        ),
         "max_latency": max_latency * (1 + padding_factor),
         "min_count": max(1.0, min_count * (1 - padding_factor)),
         "max_count": max_count * (1 + padding_factor),

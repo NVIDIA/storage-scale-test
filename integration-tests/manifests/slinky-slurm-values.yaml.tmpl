@@ -33,6 +33,11 @@ controller:
         cpu: 100m
         memory: 128Mi
   logfile:
+    image:
+      repository: @@SLINKY_HELPER_IMAGE_REPOSITORY@@
+      tag: "@@SLINKY_HELPER_IMAGE_TAG@@"
+      digest: null
+    imagePullPolicy: Never
     resources:
       requests:
         cpu: 5m
@@ -73,6 +78,7 @@ loginsets:
         repository: storage-scale-integration-login
         tag: slinky-26.05-user
         digest: null
+      imagePullPolicy: Never
       resources:
         requests:
           cpu: 25m
@@ -84,6 +90,11 @@ loginsets:
         - name: shared-storage
           mountPath: /mnt/storage-test
     initconf:
+      image:
+        repository: @@SLINKY_HELPER_IMAGE_REPOSITORY@@
+        tag: "@@SLINKY_HELPER_IMAGE_TAG@@"
+        digest: null
+      imagePullPolicy: Never
       resources:
         requests:
           cpu: 5m
@@ -111,6 +122,7 @@ nodesets:
         repository: storage-scale-integration-slurmd
         tag: slinky-26.05-user
         digest: null
+      imagePullPolicy: Never
       resources:
         requests:
           cpu: 100m
@@ -121,6 +133,11 @@ nodesets:
         - name: shared-storage
           mountPath: /mnt/storage-test
     logfile:
+      image:
+        repository: @@SLINKY_HELPER_IMAGE_REPOSITORY@@
+        tag: "@@SLINKY_HELPER_IMAGE_TAG@@"
+        digest: null
+      imagePullPolicy: Never
       resources:
         requests:
           cpu: 5m
