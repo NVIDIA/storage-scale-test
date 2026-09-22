@@ -138,8 +138,12 @@ SBX_SHARED_DIRECTORY_MODE = 0o777
 SSH_STORAGE_VISIBILITY_TIMEOUT_SECONDS = 30
 TEMPORARY_UNMOUNT_ATTEMPTS = 10
 TEMPORARY_UNMOUNT_RETRY_SECONDS = 1
-IMAGE_PULL_ATTEMPTS = 3
-IMAGE_PULL_TIMEOUT_SECONDS = 45
+IMAGE_PULL_ATTEMPTS = 4
+IMAGE_PULL_TIMEOUT_SECONDS = 60
+IMAGE_PULL_DEADLINE_SECONDS = 240
+IMAGE_PULL_INITIAL_BACKOFF_SECONDS = 10
+IMAGE_PULL_JITTER_MILLISECONDS = 5000
+IMAGE_INSPECT_TIMEOUT_SECONDS = 30
 DEFAULT_STATE_DIR = Path(__file__).resolve().parents[2] / "tmp" / "integration-state"
 DEFAULT_EXPORT_DIR = Path("/srv/storage-scale-test-integration")
 DEFAULT_SBX_SHARED_ROOT = (
@@ -1124,6 +1128,7 @@ def _create_cluster(runner: Runner, config: Config, backend: str) -> None:
     """Create a new owned kind cluster."""
     manifest = _render_kind_config(config, backend)
     node_image = SBX_KIND_NODE_IMAGE if backend == "sbx-shared" else KIND_NODE_IMAGE
+    _ensure_pinned_image(runner, node_image)
     LOG.info("Creating three-node kind cluster %s", config.cluster_name)
     runner.run(
         [
@@ -1167,6 +1172,7 @@ def _sbx_shared_marker(config: Config) -> dict[str, object]:
 def _prepare_sbx_shared(runner: Runner, config: Config) -> None:
     """Create and prove the repository-backed Docker-shared directory."""
     _validate_sbx_shared_root(config)
+    _ensure_pinned_image(runner, SBX_KIND_NODE_IMAGE)
     root = config.sbx_shared_root
     marker = root / EXPORT_MARKER
     if root.exists() and not marker.exists() and any(root.iterdir()):
@@ -1978,13 +1984,23 @@ def _image_id(runner: Runner, image: str) -> str | None:
 
 
 def _inspect_pinned_image(
-    runner: Runner, reference: str, digest: str, architecture: str
+    runner: Runner,
+    reference: str,
+    digest: str,
+    architecture: str,
+    timeout: float = IMAGE_INSPECT_TIMEOUT_SECONDS,
 ) -> bool:
     """Return whether one local reference has the required digest and platform."""
-    result = runner.run(
-        ["docker", "image", "inspect", "--format", "{{json .}}", reference],
-        check=False,
-    )
+    try:
+        result = runner.run(
+            ["docker", "image", "inspect", "--format", "{{json .}}", reference],
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ProvisionError(
+            f"Docker timed out inspecting image {reference} after {timeout:.1f} seconds"
+        ) from error
     if result.returncode:
         detail = (result.stderr or result.stdout).lower()
         if result.returncode == 1 and (
@@ -2037,10 +2053,18 @@ def _transient_image_pull_failure(detail: str) -> bool:
 
 
 def _pull_pinned_image(
-    runner: Runner, reference: str, digest: str, architecture: str
+    runner: Runner,
+    reference: str,
+    digest: str,
+    architecture: str,
+    deadline: float,
 ) -> str | None:
     """Pull and verify one image, returning its final error when unavailable."""
     for attempt in range(1, IMAGE_PULL_ATTEMPTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "image pull retry budget expired"
+        pull_timeout = min(float(IMAGE_PULL_TIMEOUT_SECONDS), remaining)
         try:
             pulled = runner.run(
                 [
@@ -2051,10 +2075,22 @@ def _pull_pinned_image(
                     reference,
                 ],
                 check=False,
-                timeout=IMAGE_PULL_TIMEOUT_SECONDS,
+                timeout=pull_timeout,
             )
             if pulled.returncode == 0:
-                if _inspect_pinned_image(runner, reference, digest, architecture):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return (
+                        f"image acquisition exceeded "
+                        f"{IMAGE_PULL_DEADLINE_SECONDS} seconds"
+                    )
+                if _inspect_pinned_image(
+                    runner,
+                    reference,
+                    digest,
+                    architecture,
+                    timeout=min(float(IMAGE_INSPECT_TIMEOUT_SECONDS), remaining),
+                ):
                     return None
                 raise ProvisionError(
                     "Docker pulled the wrong digest or architecture for " f"{reference}"
@@ -2063,10 +2099,18 @@ def _pull_pinned_image(
                 f"docker pull exited {pulled.returncode}"
             )
         except subprocess.TimeoutExpired:
-            detail = f"timed out after {IMAGE_PULL_TIMEOUT_SECONDS} seconds"
+            detail = f"timed out after {pull_timeout:.1f} seconds"
         if attempt == IMAGE_PULL_ATTEMPTS or not _transient_image_pull_failure(detail):
             return detail
-        delay = (2 ** (attempt - 1)) + (secrets.randbelow(1000) / 1000)
+        remaining = deadline - time.monotonic()
+        delay = IMAGE_PULL_INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1)) + (
+            secrets.randbelow(IMAGE_PULL_JITTER_MILLISECONDS) / 1000
+        )
+        if delay >= remaining:
+            return (
+                f"{detail}; insufficient retry time within the "
+                "image acquisition deadline"
+            )
         LOG.warning(
             "Image pull attempt %d/%d failed for %s: %s; retrying in %.2fs",
             attempt,
@@ -2084,10 +2128,22 @@ def _acquire_pinned_image(
 ) -> str:
     """Reuse or pull one verified platform image from ordered references."""
     architecture = _check_platform()
+    deadline = time.monotonic() + IMAGE_PULL_DEADLINE_SECONDS
     for reference in references:
-        if _inspect_pinned_image(runner, reference, digest, architecture):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProvisionError(
+                f"image acquisition exceeded {IMAGE_PULL_DEADLINE_SECONDS} seconds"
+            )
+        if _inspect_pinned_image(
+            runner,
+            reference,
+            digest,
+            architecture,
+            timeout=min(float(IMAGE_INSPECT_TIMEOUT_SECONDS), remaining),
+        ):
             return reference
-    failures: list[str] = []
+    pull_references: list[str] = []
     for reference in references:
         repository, separator, reference_digest = reference.rpartition("@")
         if not separator:
@@ -2096,7 +2152,19 @@ def _acquire_pinned_image(
             raise ProvisionError(
                 f"fixture image reference does not match {digest}: {reference}"
             )
-        failure = _pull_pinned_image(runner, reference, digest, architecture)
+        pull_references.append(reference)
+    failures: list[str] = []
+    reserve_per_reference = IMAGE_PULL_TIMEOUT_SECONDS + IMAGE_INSPECT_TIMEOUT_SECONDS
+    for index, reference in enumerate(pull_references):
+        later_references = len(pull_references) - index - 1
+        reference_deadline = deadline - (later_references * reserve_per_reference)
+        failure = _pull_pinned_image(
+            runner,
+            reference,
+            digest,
+            architecture,
+            reference_deadline,
+        )
         if failure is None:
             return reference
         failures.append(f"{reference}: {failure}")
@@ -3982,6 +4050,7 @@ def _validate_sbx_teardown_ownership(
 def _remove_sbx_shared(runner: Runner, config: Config) -> None:
     """Remove only the validated marker-owned Docker SBX shared root."""
     root = config.sbx_shared_root
+    _ensure_pinned_image(runner, SBX_KIND_NODE_IMAGE)
     runner.run(
         [
             "docker",

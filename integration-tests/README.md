@@ -72,8 +72,10 @@ default shared root is `tmp/integration-sbx-shared`; an alternate path may be
 set with `--sbx-shared-root`, but must remain below the repository's `tmp/`
 directory. This profile never invokes `sudo`; required host packages and an
 accessible Docker engine must already be present. Its two disposable backing
-directories use sticky shared-directory permissions so UID 2000 workloads can
-create their own restricted scenario trees without host-side ownership changes.
+directories deliberately use non-sticky mode `0777`. Docker SBX can map the
+host caller and UID 2000 workloads to different owners, so omitting the sticky
+bit lets either side create and remove scenario data. This is safe only for
+these marker-owned, disposable leaves below the repository's `tmp/` directory.
 
 Every lifecycle action runs as the ordinary test account and refuses root.
 Kubeconfig, keys, downloaded clients, cached deployments, rendered manifests,
@@ -128,12 +130,13 @@ and semantic report rows and plot families without treating incidental output
 or performance values as contracts.
 
 The harness materializes one immutable tracked-source snapshot and builds a
-real deployment archive from it with `utils/build_tarball.sh`. It caches the
-validated archive by snapshot manifest, architecture, builder options, and
-seeded Elbencho/runtime identity. Every scenario extracts that artifact into an
-isolated workspace, adds only its own environment and inputs, and cleans its
-remote data afterward; host-side results and diagnostics remain under the
-state directory. The SSH cases launch `validate_env.sh` and
+real deployment archive from it with the zero-argument
+`utils/build_tarball.sh`. It caches the validated archive by snapshot manifest,
+architecture, fixed integration recipe, and seeded Elbencho/runtime identity.
+Every scenario extracts that artifact into an isolated workspace, adds only
+its own environment and inputs, and cleans its remote data afterward; host-side
+results and diagnostics remain under the state directory. The SSH cases launch
+`validate_env.sh` and
 `nv-elbencho-sweep.sh` on the host and reach the two worker pods over SSH. The
 Slurm cases stream the same archive to the LoginSet, extract it in shared
 storage, and launch both commands there.

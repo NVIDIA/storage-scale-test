@@ -45,6 +45,7 @@ _check_docker_capacity = getattr(_DRIVER, "_check_docker_capacity")
 _check_host_capacity = getattr(_DRIVER, "_check_host_capacity")
 _collect_diagnostics = getattr(_DRIVER, "_collect_diagnostics")
 _configure_nfs = getattr(_DRIVER, "_configure_nfs")
+_create_cluster = getattr(_DRIVER, "_create_cluster")
 _claim_nfs_host_owner = getattr(_DRIVER, "_claim_nfs_host_owner")
 _configure_user_tool_path = getattr(_DRIVER, "_configure_user_tool_path")
 _ensure_apt_packages = getattr(_DRIVER, "_ensure_apt_packages")
@@ -70,6 +71,7 @@ _retained_cluster_matches_profile = getattr(
 _stop_owned_nfs = getattr(_DRIVER, "_stop_owned_nfs")
 _driver_pods_with_container = getattr(_DRIVER, "_pods_with_container")
 _remove_nfs_configuration = getattr(_DRIVER, "_remove_nfs_configuration")
+_remove_sbx_shared = getattr(_DRIVER, "_remove_sbx_shared")
 _restore_nfs_service_state = getattr(_DRIVER, "_restore_nfs_service_state")
 _restore_preexisting_nfs_threads = getattr(_DRIVER, "_restore_preexisting_nfs_threads")
 _select_storage_backend = getattr(_DRIVER, "_select_storage_backend")
@@ -85,6 +87,7 @@ _validate_ssh_storage = getattr(_DRIVER, "_validate_ssh_storage")
 _teardown_environment_locked = getattr(_DRIVER, "_teardown_environment_locked")
 _begin_image_build = getattr(_DRIVER, "_begin_image_build")
 _build_owned_image = getattr(_DRIVER, "_build_owned_image")
+_acquire_pinned_image = getattr(_DRIVER, "_acquire_pinned_image")
 _ensure_pinned_image = getattr(_DRIVER, "_ensure_pinned_image")
 _install_slurm = getattr(_DRIVER, "_install_slurm")
 _render_resource_text = getattr(_DRIVER, "_render_resource_text")
@@ -1100,8 +1103,11 @@ def test_sbx_shared_directories_allow_replacement_pod_cleanup(tmp_path, monkeypa
         sbx_shared_root=repository / "tmp" / "shared",
     )
 
+    events = []
+
     class _SbxProbeRunner:
         def run(self, arguments, **_kwargs):
+            events.append(("run", str(arguments[0])))
             token = str(arguments[-1])
             (config.sbx_shared_root / "engine-probe").write_text(
                 token + "\n", encoding="utf-8"
@@ -1109,12 +1115,50 @@ def test_sbx_shared_directories_allow_replacement_pod_cleanup(tmp_path, monkeypa
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(_DRIVER, "_repository_root", lambda: repository)
+    monkeypatch.setattr(
+        _DRIVER,
+        "_ensure_pinned_image",
+        lambda _runner, image: events.append(("acquire", image)),
+    )
 
     _prepare_sbx_shared(_SbxProbeRunner(), config)
 
+    assert events[:2] == [
+        ("acquire", _DRIVER.SBX_KIND_NODE_IMAGE),
+        ("run", "docker"),
+    ]
     for name in ("storage-test", "ssh-home"):
         mode = (config.sbx_shared_root / name).stat().st_mode & 0o7777
         assert mode == _DRIVER.SBX_SHARED_DIRECTORY_MODE == 0o777
+
+
+def test_sbx_cleanup_preacquires_its_container_image(tmp_path, monkeypatch):
+    """SBX teardown cannot bypass verified image acquisition either."""
+    config = replace(
+        _config(tmp_path / "state", tmp_path / "export"),
+        sbx_shared_root=tmp_path / "shared",
+    )
+    config.sbx_shared_root.mkdir()
+    (config.sbx_shared_root / _DRIVER.EXPORT_MARKER).touch()
+    events = []
+
+    class _CleanupRunner:
+        def run(self, arguments, **_kwargs):
+            events.append(("run", str(arguments[0])))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        _DRIVER,
+        "_ensure_pinned_image",
+        lambda _runner, image: events.append(("acquire", image)),
+    )
+
+    _remove_sbx_shared(_CleanupRunner(), config)
+
+    assert events == [
+        ("acquire", _DRIVER.SBX_KIND_NODE_IMAGE),
+        ("run", "docker"),
+    ]
 
 
 def test_sbx_diagnostics_never_invoke_privileged_nfs_tools(tmp_path, monkeypatch):
@@ -2199,7 +2243,7 @@ def test_pinned_image_pull_retries_rate_limit_then_verifies(monkeypatch):
 
     assert _ensure_pinned_image(runner, reference) == reference
     assert runner.pull_attempts == 3
-    assert sleeps == [1.0, 2.0]
+    assert sleeps == [10.0, 20.0]
 
 
 def test_pinned_image_pull_retries_command_timeout(monkeypatch):
@@ -2238,7 +2282,9 @@ def test_pinned_image_pull_retries_command_timeout(monkeypatch):
                 )
             self.pull_attempts += 1
             if self.pull_attempts == 1:
-                raise _DRIVER.subprocess.TimeoutExpired(command, 45)
+                raise _DRIVER.subprocess.TimeoutExpired(
+                    command, _DRIVER.IMAGE_PULL_TIMEOUT_SECONDS
+                )
             self.present = True
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -2291,6 +2337,172 @@ def test_pinned_image_pull_reports_final_registry_failure(monkeypatch):
         _ensure_pinned_image(runner, reference)
 
     assert runner.pull_attempts == _DRIVER.IMAGE_PULL_ATTEMPTS
+
+
+def test_pinned_image_pull_respects_overall_deadline(monkeypatch):
+    """Slow retries cannot exceed the shared image-acquisition deadline."""
+    reference = "docker.io/library/fixture:1@sha256:index"
+
+    class _Clock:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    class _ImageDeadlineRunner:
+        def __init__(self, clock):
+            self.clock = clock
+            self.pull_attempts = 0
+
+        def run(self, arguments, *, timeout=None, **_kwargs):
+            command = [str(item) for item in arguments]
+            if command[:5] == [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{json .}}",
+            ]:
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Error: No such image",
+                )
+            self.pull_attempts += 1
+            assert timeout is not None
+            assert self.clock.now + timeout <= _DRIVER.IMAGE_PULL_DEADLINE_SECONDS
+            self.clock.now += timeout
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="429 Too Many Requests",
+            )
+
+    clock = _Clock()
+    runner = _ImageDeadlineRunner(clock)
+    monkeypatch.setattr(_DRIVER, "_check_platform", lambda: "amd64")
+    monkeypatch.setattr(_DRIVER.secrets, "randbelow", lambda _limit: 0)
+    monkeypatch.setattr(_DRIVER.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(_DRIVER.time, "sleep", clock.sleep)
+
+    with pytest.raises(_DRIVER.ProvisionError, match="acquisition deadline"):
+        _ensure_pinned_image(runner, reference)
+
+    assert runner.pull_attempts == 3
+    assert clock.now < _DRIVER.IMAGE_PULL_DEADLINE_SECONDS
+
+
+def test_pinned_image_pull_reserves_fallback_attempt(monkeypatch):
+    """A hanging primary leaves one full pull and inspect window per fallback."""
+    digest = "sha256:index"
+    primary = f"registry.example/fixture@{digest}"
+    fallback = f"mirror.example/fixture@{digest}"
+
+    class _Clock:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    class _FallbackRunner:
+        def __init__(self, clock):
+            self.clock = clock
+            self.present = set()
+            self.fallback_timeouts = []
+
+        def run(self, arguments, *, timeout=None, **_kwargs):
+            command = [str(item) for item in arguments]
+            reference = command[-1]
+            if command[:5] == [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{json .}}",
+            ]:
+                if reference not in self.present:
+                    return SimpleNamespace(
+                        returncode=1,
+                        stdout="",
+                        stderr="Error: No such image",
+                    )
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(
+                        {
+                            "Architecture": "amd64",
+                            "RepoDigests": [f"fixture@{digest}"],
+                        }
+                    ),
+                    stderr="",
+                )
+            assert command[:2] == ["docker", "pull"]
+            assert timeout is not None
+            if reference == primary:
+                self.clock.now += timeout
+                raise _DRIVER.subprocess.TimeoutExpired(command, timeout)
+            self.fallback_timeouts.append(timeout)
+            self.present.add(reference)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    clock = _Clock()
+    runner = _FallbackRunner(clock)
+    monkeypatch.setattr(_DRIVER, "_check_platform", lambda: "amd64")
+    monkeypatch.setattr(_DRIVER.secrets, "randbelow", lambda _limit: 0)
+    monkeypatch.setattr(_DRIVER.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(_DRIVER.time, "sleep", clock.sleep)
+
+    selected = _acquire_pinned_image(runner, (primary, fallback), digest)
+
+    assert selected == fallback
+    assert runner.fallback_timeouts == [float(_DRIVER.IMAGE_PULL_TIMEOUT_SECONDS)]
+    assert clock.now < _DRIVER.IMAGE_PULL_DEADLINE_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    (
+        ("nfs", _DRIVER.KIND_NODE_IMAGE),
+        ("sbx-shared", _DRIVER.SBX_KIND_NODE_IMAGE),
+    ),
+)
+def test_cluster_creation_preacquires_pinned_node_image(
+    tmp_path, monkeypatch, backend, expected
+):
+    """kind cannot bypass verified host-Docker image acquisition."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    events = []
+
+    class _KindRunner:
+        def run(self, arguments, **_kwargs):
+            events.append(("run", [str(item) for item in arguments]))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        _DRIVER,
+        "_render_kind_config",
+        lambda _config, _backend: tmp_path / "kind.yaml",
+    )
+    monkeypatch.setattr(
+        _DRIVER,
+        "_ensure_pinned_image",
+        lambda _runner, image: events.append(("acquire", image)),
+    )
+
+    _create_cluster(_KindRunner(), config, backend)
+
+    assert events[0] == ("acquire", expected)
+    assert events[1][0] == "run"
+    assert events[1][1][:3] == ["kind", "create", "cluster"]
+    assert events[1][1][events[1][1].index("--image") + 1] == expected
 
 
 def test_fixture_build_does_not_force_registry_refresh(tmp_path, monkeypatch):

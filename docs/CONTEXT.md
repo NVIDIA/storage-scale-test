@@ -54,52 +54,45 @@ only: NVIDIA and the project do not publish or deliver benchmark binaries or
 prepared deployment tarballs. Users may create a deployment tarball locally
 and are responsible for every binary they place in it.
 
-Slurm is the default execution substrate. Setting `SSH_HOST_LIST` selects
-passwordless SSH instead. Kubernetes execution is not implemented.
-The separate `integration-tests/` fixture provisions a three-node kind cluster,
-a shared RWX backend, two passwordless-SSH workers, and Slinky Slurm. The `nfs`
-backend uses loop-backed NFSv4 and NFS CSI; Docker SBX uses static volumes over
-a repository-shared path. Both validate the same storage contract.
+Slurm is the default execution substrate; `SSH_HOST_LIST` selects passwordless
+SSH. Kubernetes benchmark execution is not implemented. The `integration-tests/`
+fixture provisions three kind nodes, RWX storage, two SSH workers, and Slinky
+Slurm. Its `nfs` backend uses loop-backed NFSv4 and NFS CSI; `sbx-shared` uses
+static volumes over a repository-shared path. Both test the same storage contract.
 
-One budget drives PVC capacity and the growable 4 GiB sparse NFS image. Setup
-publishes new images transactionally, grows retained images, validates mounted
-free space, and reconciles eight NFS workers. Teardown restores the service's
-recorded active, enabled, and worker-count states. The SBX profile uses
-kind/Kubernetes and kubectl 1.34; setup replaces retained clusters with a
-different observed kubelet version.
+One budget drives PVC capacity and the growable 4 GiB NFS image. Setup publishes
+image tags transactionally, grows retained filesystems, checks fixture and Docker
+backing capacity, and reconciles eight NFS workers. Teardown restores recorded
+NFS active, enabled, and worker-count states. SBX pins kind 0.30 and
+Kubernetes/kubectl 1.34; setup replaces clusters whose kubelets do not match the
+node-image profile.
 
-Lifecycle actions run as an ordinary user and keep state below
-`tmp/integration-state`; only narrow NFS host operations use `sudo`. Dedicated
-state and export leaves require ownership markers. A host-global lock and owner
-record protect fixed NFS configuration; the root-owned lock directory rejects
-links and unowned paths. Cached NFS CSI images must match the pinned
-multi-architecture index and runner architecture, and chart tags exist only in
-the disposable kind nodes. Cache misses try `registry.k8s.io` and the
-`gcr.io/k8s-staging-sig-storage` mirror; interrupted private aliases are
-reconciled. Digest-qualified fixture images are reused when verified and retry
-bounded transient pull failures through host Docker. MariaDB and Slinky's
-Alpine helpers use fixture-private tags preloaded into their kind nodes.
-Cleanup removes only owned resources, recovers partial bootstrap, preserves
-prior NFS state, and verifies unmounts. Capacity checks use the fixture and
-Docker backing filesystems.
+Lifecycle actions run as an ordinary user, store state under
+`tmp/integration-state`, and use `sudo` only for NFS host operations. Ownership
+markers protect dedicated state and export leaves. A symlink-safe root-owned
+global lock and owner record protect fixed NFS configuration. Cached upstream
+images must match their pinned digest and runner architecture. NFS CSI misses try
+`registry.k8s.io` and `gcr.io/k8s-staging-sig-storage`; its chart tags exist only
+inside kind. Kind node and other image misses use bounded host-Docker retries.
+Interrupted private aliases are reconciled; MariaDB and Slinky's Alpine helpers
+use preloaded fixture-private tags. Cleanup recovers partial bootstrap, removes
+only owned resources, restores prior NFS state, verifies unmounts, and does not
+depend on writable diagnostics.
 
-The test CLI selects substrates and named scenarios independently. Its planner
-batches shared-home SSH work behind a crash-recoverable transition; separate
-homes are canonical. Pod-side work uses `tester` UID/GID 2000, matching the
-all-squashed NFS export and Slurm account.
+The test CLI selects substrates and scenarios independently. Its planner batches
+shared-home SSH cases behind a crash-recoverable transition; separate homes are
+canonical. Pod work uses `tester` UID/GID 2000, matching the all-squashed NFS
+export and Slurm account.
 
 The harness builds the ordinary deployment archive from an immutable tracked
-source snapshot, caches it by source, architecture, and seeded Elbencho/runtime
-identity, and extracts isolated scenario workspaces. The real catalog covers
-baseline and default I/O, failure/resume, retained datasets, live capture,
-Cartesian sweeps, single-file and weighted-root behavior, shared SSH homes,
-and Slurm scheduling. Fast tests cover parsing, precedence, workload and path
-safety, sizing, scheduler boundaries, failure contracts, and reporting. CI
-runs the complete NFS-backed catalog concurrently on amd64 and arm64 with time
-reserved for repeatable teardown; SBX is a supported local backend. Kubernetes
-version checks follow the kind node-image pin rather than the kubectl client.
-Unwritable diagnostics cannot prevent teardown. Kubernetes remains fixture
-infrastructure rather than a benchmark execution substrate.
+snapshot, caches it by snapshot, architecture, fixed recipe, and seeded
+Elbencho/runtime identity, and extracts isolated scenario workspaces. Real cases
+cover baseline and default I/O, failure/resume, retained data, live capture,
+Cartesian sweeps, single-file and weighted-root behavior, shared SSH homes, and
+Slurm scheduling. Fast tests cover parsing, precedence, path and workload safety,
+sizing, scheduler boundaries, failure contracts, and reporting. CI runs the full
+NFS-backed catalog concurrently on amd64 and arm64 with repeatable-teardown
+headroom; SBX is a supported local backend.
 
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
