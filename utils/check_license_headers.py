@@ -113,7 +113,7 @@ def find_violations(
     violations: list[tuple[Path, str]] = []
     for path in paths:
         absolute_path = repo_root / path
-        if absolute_path.is_symlink():
+        if not absolute_path.exists() or absolute_path.is_symlink():
             continue
         data = absolute_path.read_bytes()
         if b"\0" in data:

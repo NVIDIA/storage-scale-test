@@ -210,7 +210,7 @@ edit-validate loop:
    | Slurm connectivity | `sinfo`, `sbatch` a test job, wait for completion |
    | SSH connectivity | `ssh` command execution + scriptlet execution on each host |
    | Binary architecture match | `file` on binary vs. `uname -m` on remote |
-   | Filesystem paths are mountpoints | `mountpoint` on compute nodes (via Slurm/SSH) |
+   | Filesystem paths use storage distinct from `/` | Compare `stat -c %d` device IDs on compute nodes (via Slurm/SSH) |
    | Filesystem paths are writable | Touch test on compute nodes |
    | S3 credentials and bucket access | `s3test` binary |
    | S3 bucket emptiness | Object count check (warning if non-empty) |
@@ -692,7 +692,10 @@ All analysis scripts support filtering to reduce clutter:
 
 Intermediate data can be cached (`--to-csv`, `--to-json`) and reloaded
 (`--from-csv`, `--from-json`) to avoid re-parsing raw files, enabling fast
-iterative report refinement.
+iterative report refinement. For Elbencho, `--from-csv` is an alternative input
+source and cannot be combined with raw result directories. Malformed filters
+and filters that match neither aggregate nor live metrics fail instead of
+silently producing an unfiltered or empty report.
 
 ### 9.5 Plot Design Principles
 

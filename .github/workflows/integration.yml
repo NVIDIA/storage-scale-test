@@ -1,0 +1,87 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Filesystem integration
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - pull-request/[0-9]+
+
+permissions: {}
+
+concurrency:
+  group: filesystem-integration
+  cancel-in-progress: false
+
+jobs:
+  integration:
+    name: Setup and test all (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: linux-amd64-cpu4
+          - architecture: arm64
+            runner: linux-arm64-cpu4
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 135
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - name: Configure the package proxy
+        uses: nv-gha-runners/setup-proxy-cache@eadc57871cde0c92a223d0f486ab669a2360f978 # main
+        with:
+          enable-apt: "true"
+          enable-pip: "true"
+          enable-conda: "false"
+          enable-pypi-anaconda: "false"
+      - name: Verify privileged runner prerequisites
+        run: |
+          sudo -n true
+          docker info >/dev/null
+      - name: Run the bounded integration lifecycle
+        run: |
+          timeout --kill-after=10m 105m \
+            integration-tests/bin/ci-integration.sh "${{ matrix.architecture }}"
+      - name: Upload integration diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: filesystem-integration-${{ matrix.architecture }}
+          path: tmp/integration-diagnostics
+          if-no-files-found: warn
+          retention-days: 7
+
+  integration-status:
+    name: Filesystem integration status
+    if: ${{ always() }}
+    needs: integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every architecture to pass
+        env:
+          INTEGRATION_RESULT: ${{ needs.integration.result }}
+        run: test "$INTEGRATION_RESULT" = success

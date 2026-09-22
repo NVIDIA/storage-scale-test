@@ -124,6 +124,8 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
                 '{{"phase_type":"WRITE","last_done":{{"elapsed_time_ms":"7","entries":"2","bytes":"8192"}}}}' \
                 '{{"phase_type":"SYNC"}}' >"$tmp/good"
             [[ "$(_elbencho_parse_phase_json "$tmp/good" WRITE)" == $'2\t8192\t7' ]]
+            tr -d '\n' <"$tmp/good" >"$tmp/adjacent"
+            [[ "$(_elbencho_parse_phase_json "$tmp/adjacent" WRITE)" == $'2\t8192\t7' ]]
             printf '%s\n' \
                 '{{"phase_type":"WRITE","last_done":{{"elapsed_time_ms":"7","entries":"2","entries":"2","bytes":"8192"}}}}' \
                 >"$tmp/bad"

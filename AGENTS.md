@@ -63,6 +63,9 @@ See the README "Getting Started" section for the full quickstart and
 ./utils/run_ci_checks.sh
 ```
 
+After changing `.github/`, parse every `.yml` and `.yaml` file beneath it with
+a YAML parser before committing.
+
 If any required check tool is missing from the sandbox, install it into the
 repo's local environment and rerun the check. Do not skip required tooling just
 because it is not preinstalled.
@@ -72,6 +75,8 @@ The script creates and reuses `.venv-ci` with the pinned tools. Pass
 `pylint`, or `pytest` to run one check. Set `CI_CHECK_JOBS=1` in a constrained
 sandbox. In a pre-provisioned, network-restricted sandbox, set `CI_BOOTSTRAP=0`
 and use `CI_PYTHON` or `CI_SHELLCHECK` to select installed tools.
+Run tests and lint through this script or an environment populated from both
+requirements files; never treat ambient Python tooling as authoritative.
 
 `black` must be 25.9.0+; `pylint` must score 10.00/10. Details and rationale:
 [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md).
@@ -92,6 +97,8 @@ and use `CI_PYTHON` or `CI_SHELLCHECK` to select installed tools.
 - Don't restate rules the linters already enforce; rely on `black`/`pylint`/`shellcheck`.
 
 ## Pull requests
+
+Wrap commit-message lines at about 72 characters.
 
 This project is currently not accepting external contributions. For maintainer
 changes: keep PRs focused, ensure the checks above pass, and update

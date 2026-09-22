@@ -547,6 +547,89 @@ tail_until_complete() {
     done
 }
 
+_cancel_slurm_job_and_wait() {
+    local job_id=$1
+    local attempt
+    [[ -n "$job_id" ]] || return 0
+    scancel "$job_id" 2>/dev/null || true
+    for ((attempt = 1; attempt <= 30; attempt++)); do
+        local active
+        if ! active=$(squeue -h -j "$job_id" -o '%i'); then
+            echo "Error: unable to verify cancellation of Slurm job $job_id" >&2
+            return 1
+        fi
+        [[ -z "$active" ]] && return 0
+        sleep 2
+    done
+    echo "Error: Slurm job $job_id remained active after cancellation" >&2
+    return 1
+}
+
+_slurm_cancel_active_dispatch_once() {
+    if [[ "${ELBENCHO_SLURM_CANCEL_ARMED:-0}" != 1 ]]; then
+        return 0
+    fi
+    ELBENCHO_SLURM_CANCEL_ARMED=0
+    _cancel_slurm_job_and_wait "${ELBENCHO_SLURM_ACTIVE_JOB_ID:-}"
+}
+
+_slurm_restore_dispatch_traps() {
+    trap - EXIT INT TERM
+    [[ -n "${ELBENCHO_SLURM_OLD_EXIT_TRAP:-}" ]] \
+        && eval "$ELBENCHO_SLURM_OLD_EXIT_TRAP"
+    [[ -n "${ELBENCHO_SLURM_OLD_INT_TRAP:-}" ]] \
+        && eval "$ELBENCHO_SLURM_OLD_INT_TRAP"
+    [[ -n "${ELBENCHO_SLURM_OLD_TERM_TRAP:-}" ]] \
+        && eval "$ELBENCHO_SLURM_OLD_TERM_TRAP"
+    ELBENCHO_SLURM_CANCEL_ARMED=0
+    ELBENCHO_SLURM_TRAPS_INSTALLED=0
+}
+
+# shellcheck disable=SC2317,SC2329  # Invoked by the active dispatch EXIT trap.
+_slurm_active_dispatch_exit() {
+    local original_rc=$?
+    local old_exit_trap="${ELBENCHO_SLURM_OLD_EXIT_TRAP:-}"
+    trap - EXIT INT TERM
+    _slurm_cancel_active_dispatch_once || true
+    if [[ -n "$old_exit_trap" ]]; then
+        (eval "$old_exit_trap"; exit "$original_rc") || true
+    fi
+    return "$original_rc"
+}
+
+# shellcheck disable=SC2317,SC2329  # Invoked by active dispatch signal traps.
+_slurm_active_dispatch_signal() {
+    local signal_name=$1
+    local signal_rc=1
+    [[ "$signal_name" == INT ]] && signal_rc=130
+    [[ "$signal_name" == TERM ]] && signal_rc=143
+    trap - EXIT INT TERM
+    _slurm_cancel_active_dispatch_once || true
+    _slurm_restore_dispatch_traps
+    exit "$signal_rc"
+}
+
+_slurm_arm_dispatch_cleanup() {
+    local job_id=$1
+    ELBENCHO_SLURM_OLD_EXIT_TRAP=$(trap -p EXIT)
+    ELBENCHO_SLURM_OLD_INT_TRAP=$(trap -p INT)
+    ELBENCHO_SLURM_OLD_TERM_TRAP=$(trap -p TERM)
+    ELBENCHO_SLURM_ACTIVE_JOB_ID=$job_id
+    ELBENCHO_SLURM_CANCEL_ARMED=1
+    ELBENCHO_SLURM_TRAPS_INSTALLED=1
+    trap '_slurm_active_dispatch_exit' EXIT
+    trap '_slurm_active_dispatch_signal INT' INT
+    trap '_slurm_active_dispatch_signal TERM' TERM
+}
+
+_slurm_disarm_dispatch_cleanup() {
+    if [[ "${ELBENCHO_SLURM_TRAPS_INSTALLED:-0}" != 1 ]]; then
+        return 0
+    fi
+    ELBENCHO_SLURM_CANCEL_ARMED=0
+    _slurm_restore_dispatch_traps
+}
+
 # Monitor array of Slurm array jobs until completion
 # Args: Array of job IDs to monitor
 # Returns: 0 on success, 1 on failure
@@ -1825,7 +1908,7 @@ coordinator_run_one_execution() {
         test_dirs_csv=$(_compute_test_dirs_csv_for_execution) || exit 1
 
         # shellcheck disable=SC2154  # nodes, io_size, thread_count, io_depth come from sourcing NNNN.sh
-        _echo_ts "[coordinator] starting execution ${id}: nodes=${nodes} io_size=${io_size} threads=${thread_count} iodepth=${io_depth}"
+        _echo_ts "[coordinator] starting execution ${id}: nodes=${nodes} hosts=${first_n_hosts_csv} io_size=${io_size} threads=${thread_count} iodepth=${io_depth}"
         run_elbencho_io_sweep_iteration
     ) 2>&1 | tee "$log_file"
     execution_pipe_status=("${PIPESTATUS[@]}")
@@ -2125,13 +2208,13 @@ dispatch_slurm_executions() {
     fi
     _elbencho_verify_no_active_slurm_coordinator "$executions_dir" || return 1
     local dispatch_lock_token=""
-    local dispatch_lock_handed_off=0
+    local dispatch_lock_release=1
     _elbencho_acquire_dispatch_lock \
         "$executions_dir" slurm-submit dispatch_lock_token || return 1
     local rc=0
     _dispatch_slurm_executions_owned \
-        "$output_dir" "$dispatch_lock_token" dispatch_lock_handed_off || rc=$?
-    if [[ "$dispatch_lock_handed_off" -eq 0 ]]; then
+        "$output_dir" "$dispatch_lock_token" dispatch_lock_release || rc=$?
+    if [[ "$dispatch_lock_release" -eq 1 ]]; then
         _elbencho_release_dispatch_lock \
             "$executions_dir" "$dispatch_lock_token" || rc=1
     fi
@@ -2139,12 +2222,12 @@ dispatch_slurm_executions() {
 }
 
 # Run Slurm dispatch after the public entry point has acquired exclusive
-# ownership. The output variable reports whether ownership transferred to
-# the job.
+# ownership. The output variable reports whether the submitter may release
+# its dispatch lock; it stays false after handoff or unverified cancellation.
 _dispatch_slurm_executions_owned() {
     local output_dir="$1"
     local dispatch_lock_token="$2"
-    local dispatch_lock_handed_off_var="$3"
+    local dispatch_lock_release_var="$3"
     local executions_dir="${output_dir}/executions"
     _elbencho_sweep_running_to_pending "$executions_dir" || return 1
 
@@ -2183,15 +2266,27 @@ _dispatch_slurm_executions_owned() {
         echo "Error: sbatch submission failed" >&2
         return 1
     fi
+    _slurm_arm_dispatch_cleanup "$job_id"
     if ! _elbencho_adopt_slurm_dispatch_lock \
             "$executions_dir" "$dispatch_lock_token" "$job_id"; then
         echo "Error: unable to transfer dispatch lock to coordinator job $job_id; cancelling it" >&2
-        scancel "$job_id" || true
+        local cancel_rc=0
+        _slurm_cancel_active_dispatch_once || cancel_rc=$?
+        _slurm_disarm_dispatch_cleanup
+        if [[ "$cancel_rc" -ne 0 ]]; then
+            printf -v "$dispatch_lock_release_var" '%s' 0
+            echo "Error: cancellation of Slurm job $job_id was not verified; retaining dispatch lock" >&2
+        fi
         return 1
     fi
-    printf -v "$dispatch_lock_handed_off_var" '%s' 1
-    tail_until_complete "$job_id" "${log_files[@]}"
-    return $?
+    printf -v "$dispatch_lock_release_var" '%s' 0
+    local monitor_rc=0
+    tail_until_complete "$job_id" "${log_files[@]}" || monitor_rc=$?
+    if [[ "$monitor_rc" -ne 0 ]]; then
+        _slurm_cancel_active_dispatch_once || monitor_rc=1
+    fi
+    _slurm_disarm_dispatch_cleanup
+    return "$monitor_rc"
 }
 
 # SSH dispatcher: sequential per-execution dispatch with fresh host selection.
@@ -2223,7 +2318,7 @@ dispatch_ssh_executions() {
 # The nameref lets the entry point stop services before releasing the lock.
 _dispatch_ssh_executions_owned() {
     local output_dir="$1"
-    local -n ssh_services_started="$2"
+    local -n ssh_services_started_ref="$2"
     local executions_dir="${output_dir}/executions"
     _elbencho_sweep_running_to_pending "$executions_dir" || return 1
 
@@ -2248,7 +2343,8 @@ _dispatch_ssh_executions_owned() {
         echo "Error: failed to start elbencho services on any reachable SSH host" >&2
         return 1
     fi
-    ssh_services_started=1
+    # shellcheck disable=SC2034  # Nameref assignment updates the caller's flag.
+    ssh_services_started_ref=1
 
     local max_nodes
     if ! max_nodes=$(max_nodes_remaining_executions "$executions_dir"); then
@@ -2323,7 +2419,7 @@ _ssh_fan_out_to_each_host() {
     }
 
     local rc=0
-    local -a successful_hosts=()
+    local -a completed_hosts=()
     local spawn_output
     if ! spawn_output=$(spawn_N_ssh "$status_dir" true "$scriptlet"); then
         rc=1
@@ -2341,7 +2437,7 @@ _ssh_fan_out_to_each_host() {
                     echo "Warning: SSH command failed on $hostname (rc=$ssh_rc)" >&2
                     rc=1
                 else
-                    successful_hosts+=("$hostname")
+                    completed_hosts+=("$hostname")
                 fi
             done
         fi
@@ -2354,7 +2450,7 @@ _ssh_fan_out_to_each_host() {
     if [[ -n "$successful_hosts_array_name" ]]; then
         local -n successful_hosts_ref="$successful_hosts_array_name"
         # shellcheck disable=SC2034  # Assignment intentionally updates the caller's named array
-        successful_hosts_ref=("${successful_hosts[@]}")
+        successful_hosts_ref=("${completed_hosts[@]}")
     fi
     return "$rc"
 }

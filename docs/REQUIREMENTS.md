@@ -219,7 +219,7 @@ These requirements address the infrastructure and runtime constraints the tool m
 | CV-2.3 | Validation shall verify that benchmark binaries are present, executable, and compiled for the correct architecture. | Yes |
 | CV-2.4 | Validation shall verify Slurm connectivity (if Slurm mode is enabled): partition access, account, reservation, sbatch and srun functionality. | Yes |
 | CV-2.5 | Validation shall verify SSH connectivity (if SSH mode is enabled): ability to run commands and scriptlets on remote hosts. | Yes |
-| CV-2.6 | Validation shall verify that filesystem test paths are mountpoints and writable on compute nodes. | Yes |
+| CV-2.6 | Validation shall verify that filesystem test paths reside on a filesystem device distinct from `/` and are writable on compute nodes. | Yes |
 | CV-2.7 | Validation shall verify S3 object storage credentials and bucket accessibility (if object tests are enabled). | Yes |
 | CV-2.8 | Validation shall warn if the target S3 bucket contains existing objects (warp deletes all objects). | Yes |
 | CV-2.9 | Validation shall validate elbencho configuration parameters (thread list contains integers, IO sizes are valid, duration is valid). | Yes |

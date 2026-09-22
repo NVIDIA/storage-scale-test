@@ -58,9 +58,10 @@ export PATH
 # If TEST_DIR is defined and TEST_DIRS is empty, use TEST_DIR as the only test directory
 if [[ -n "${TEST_DIR:-}" ]]; then
     # Check if TEST_DIRS is not defined or is empty
-    if [[ -z "${TEST_DIRS+x}" ]] || [[ ${#TEST_DIRS[@]} -eq 0 ]]; then
+    if ! declare -p TEST_DIRS &>/dev/null || [[ ${#TEST_DIRS[@]} -eq 0 ]]; then
         # Initialize TEST_DIRS as an associative array if not already defined
-        declare -A TEST_DIRS
+        unset TEST_DIRS
+        declare -gA TEST_DIRS
         # Set TEST_DIR as the only test directory with weight 1
         TEST_DIRS["$TEST_DIR"]=1
     fi

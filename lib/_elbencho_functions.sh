@@ -238,6 +238,13 @@ kill_elbencho_by_pid() {
 kill_all_elbencho_processes() {
     local port="${1:-1611}"
 
+    # A launcher or dynamic loader can give the service process a name other
+    # than "elbencho". Prefer the exact listening port when fuser is present,
+    # then retain the name-based cleanup for other processes and platforms.
+    if type -P fuser >/dev/null 2>&1; then
+        fuser -k "${port}/tcp" >/dev/null 2>&1 || true
+    fi
+
     # Determine kill tool (prefer pkill over killall)
     local kill_tool=""
     if type -P pkill >/dev/null 2>&1; then
@@ -1458,7 +1465,8 @@ _elbencho_workload_update_failure_cleanup_state() {
     _elbencho_workload_write
 }
 
-# Parse elbencho newline-delimited JSON without a runtime JSON dependency.
+# Parse elbencho streamed JSON without a runtime JSON dependency. Releases may
+# delimit top-level phase objects with newlines or write them adjacently.
 # Prints canonical "entries<TAB>bytes-or-null<TAB>elapsed-ms" for one phase.
 # WRITE/READ require bytes; RMFILES must not contain a bytes counter.
 _elbencho_parse_phase_json() {
@@ -1558,19 +1566,23 @@ _elbencho_parse_phase_json() {
     {
         if ($0 ~ /^[ \t\r]*$/) { fail(); next }
         s = $0; p = 1; n = length(s); records++
-        phase_count = last_count = entries_count = bytes_count = elapsed_count = 0
-        phase = entries = bytes = elapsed = ""
-        ws(); object("top"); ws()
-        if (bad || p <= n || phase_count != 1) { fail(); next }
-        if (phase == expected) {
-            matches++
-            if (last_count != 1 || entries_count != 1 || elapsed_count != 1) fail()
-            if (expected == "RMFILES" && bytes_count != 0) fail()
-            if (expected != "RMFILES" && bytes_count != 1) fail()
-            found_entries = entries
-            found_bytes = expected == "RMFILES" ? "null" : bytes
-            found_elapsed = elapsed
-        } else if (phase != "SYNC") fail()
+        ws()
+        while (p <= n && !bad) {
+            phase_count = last_count = entries_count = bytes_count = elapsed_count = 0
+            phase = entries = bytes = elapsed = ""
+            object("top"); ws()
+            if (bad || phase_count != 1) { fail(); break }
+            if (phase == expected) {
+                matches++
+                if (last_count != 1 || entries_count != 1 || elapsed_count != 1) fail()
+                if (expected == "RMFILES" && bytes_count != 0) fail()
+                if (expected != "RMFILES" && bytes_count != 1) fail()
+                found_entries = entries
+                found_bytes = expected == "RMFILES" ? "null" : bytes
+                found_elapsed = elapsed
+            } else if (phase != "SYNC") fail()
+            if (p <= n) records++
+        }
     }
     END {
         if (records == 0 || matches != 1 || bad) exit 1
@@ -3482,11 +3494,13 @@ reify_all_elbencho_executions() {
     local sweep_write_no_read="$7"
     local sweep_read_from="$8"
 
-    local -a node_counts
-    if ! mapfile -t node_counts < <(parse_range_specification "$nodes_spec"); then
+    local node_counts_output=""
+    if ! node_counts_output=$(parse_range_specification "$nodes_spec"); then
         echo "Error: Invalid node specification: $nodes_spec" >&2
         return 1
     fi
+    local -a node_counts
+    mapfile -t node_counts <<<"$node_counts_output"
     if [[ ${#node_counts[@]} -eq 0 ]]; then
         echo "Error: Node specification produced no node counts" >&2
         return 1

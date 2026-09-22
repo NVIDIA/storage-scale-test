@@ -54,8 +54,46 @@ only: NVIDIA and the project do not publish or deliver benchmark binaries or
 prepared deployment tarballs. Users may create a deployment tarball locally
 and are responsible for every binary they place in it.
 
-Slurm is the default execution substrate. Setting `SSH_HOST_LIST` selects
-passwordless SSH instead. Kubernetes execution is not implemented.
+Slurm is the default execution substrate; `SSH_HOST_LIST` selects passwordless
+SSH. Kubernetes benchmark execution is not implemented. The `integration-tests/`
+fixture provisions three kind nodes, RWX storage, two SSH workers, and Slinky
+Slurm. Its `nfs` backend uses loop-backed NFSv4 and NFS CSI; `sbx-shared` uses
+static volumes over a repository-shared path. Both test the same storage contract.
+
+One budget drives PVC capacity and the growable 4 GiB NFS image. Setup publishes
+image tags transactionally, grows retained filesystems, checks fixture and Docker
+backing capacity, and reconciles eight NFS workers. Teardown restores recorded
+NFS active, enabled, and worker-count states. SBX pins kind 0.30 and
+Kubernetes/kubectl 1.34; setup replaces clusters whose kubelets do not match the
+node-image profile.
+
+Lifecycle actions run as an ordinary user, store state under
+`tmp/integration-state`, and use `sudo` only for NFS host operations. Ownership
+markers protect dedicated state and export leaves. A symlink-safe root-owned
+global lock and owner record protect fixed NFS configuration. Cached upstream
+images must match their pinned digest and runner architecture. NFS CSI misses try
+`registry.k8s.io` and `gcr.io/k8s-staging-sig-storage`; its chart tags exist only
+inside kind. Kind node and other image misses use bounded host-Docker retries.
+Interrupted private aliases are reconciled; MariaDB and Slinky's Alpine helpers
+use preloaded fixture-private tags. Cleanup recovers partial bootstrap, removes
+only owned resources, restores prior NFS state, verifies unmounts, and does not
+depend on writable diagnostics.
+
+The test CLI selects substrates and scenarios independently. Its planner batches
+shared-home SSH cases behind a crash-recoverable transition; separate homes are
+canonical. Pod work uses `tester` UID/GID 2000, matching the all-squashed NFS
+export and Slurm account.
+
+The harness builds the ordinary deployment archive from an immutable tracked
+snapshot, caches it by snapshot, architecture, fixed recipe, and seeded
+Elbencho/runtime identity, and extracts isolated scenario workspaces. Real cases
+cover baseline and default I/O, failure/resume, retained data, live capture,
+Cartesian sweeps, single-file and weighted-root behavior, shared SSH homes, and
+Slurm scheduling. Fast tests cover parsing, precedence, path and workload safety,
+sizing, scheduler boundaries, failure contracts, and reporting. CI runs the full
+NFS-backed catalog concurrently on amd64 and arm64 with repeatable-teardown
+headroom; SBX is a supported local backend.
+
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 3.14 unit tests run weekly and on manual request.
@@ -79,6 +117,7 @@ alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 | `utils/build_tarball.sh` | User-local deployment-tarball builder |
 | `utils/build/` | Helpers for building Warp and the in-tree s3test program |
 | `tests/` | Python and shell-behavior regression tests collected by `pytest` |
+| `integration-tests/` | Single-host kind, RWX storage, SSH, and Slinky fixture |
 
 The checked-in benchmark entry points are:
 
@@ -119,6 +158,9 @@ Important configuration relationships:
   inclusive ranges, and `+step` increments. Entry points validate the complete
   expanded list before dispatch.
 - `TEST_DIRS` is an associative array of filesystem test roots and weights.
+  `validate_env.sh` compares each path's `stat -c %d` device number with `/`
+  through both dispatch interfaces; this establishes distinct backing storage,
+  not that the configured path is itself the exact mountpoint.
   Object tests use a dedicated `OBJ_BUCKET`, endpoint settings, and credentials
   sourced from `OBJ_AUTH_FILE`.
 
@@ -161,7 +203,12 @@ In Slurm mode, `dispatch_slurm_executions` allocates the largest node count
 needed by any non-successful cell and submits
 `storage-tests/fs/sbatch/_nv-elbencho-coordinator.sh`. The coordinator starts
 elbencho services once across the allocation and processes cells sequentially,
-using the first requested number of allocation hosts for each cell.
+using the first requested number of allocation hosts for each cell. Initial
+service health failure preserves its log and gets one bounded restart attempt;
+phase-level checks can also restart unhealthy services. Signals cancel and
+wait for the exact allocation before restoring the caller's traps. Cancellation
+is armed immediately after submission, before dispatch-lock handoff; an
+unverified cancellation retains the lock.
 
 In SSH mode, `dispatch_ssh_executions` starts services once across the usable
 host pool. It selects a fresh host subset for each cell, runs cells sequentially,

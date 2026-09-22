@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: sbx-shared
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: Immediate
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: storage-scale-sbx-data
+spec:
+  capacity:
+    storage: @@STORAGE_TEST_CAPACITY@@
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: sbx-shared
+  claimRef:
+    namespace: @@NAMESPACE@@
+    name: storage-test-rwx
+  hostPath:
+    path: /var/local/storage-scale-shared/storage-test
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: storage-test-rwx
+  namespace: @@NAMESPACE@@
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: sbx-shared
+  volumeName: storage-scale-sbx-data
+  resources:
+    requests:
+      storage: @@STORAGE_TEST_CAPACITY@@
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: storage-scale-sbx-home
+spec:
+  capacity:
+    storage: @@SSH_HOME_CAPACITY@@
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: sbx-shared
+  claimRef:
+    namespace: @@NAMESPACE@@
+    name: ssh-home-rwx
+  hostPath:
+    path: /var/local/storage-scale-shared/ssh-home
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ssh-home-rwx
+  namespace: @@NAMESPACE@@
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: sbx-shared
+  volumeName: storage-scale-sbx-home
+  resources:
+    requests:
+      storage: @@SSH_HOME_CAPACITY@@

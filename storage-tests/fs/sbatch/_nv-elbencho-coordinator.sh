@@ -94,9 +94,31 @@ _elbencho_adopt_slurm_dispatch_lock \
     "$EXECUTIONS_DIR" "$DISPATCH_LOCK_TOKEN" "$SLURM_JOB_ID" || exit 1
 COORDINATOR_LOCK_OWNED=1
 
-# Build the allocation IPv4 nodelist (same approach as the previous sbatch
-# driver: some clusters intermittently fail to resolve short hostnames in
-# elbencho's resolver, so we resolve once here and propagate as IPs).
+# Build the allocation IPv4 nodelist. Slurm may canonicalize SLURM_JOB_NODELIST
+# instead of preserving the configured include-list order, so restore that
+# order when ORDER_NODES is active before choosing per-execution prefixes.
+mapfile -t allocation_nodes < <(
+    scontrol show hostname "${SLURM_JOB_NODELIST:-}"
+)
+if [[ -n "${ORDER_NODES_ENABLED:-}" && ${#SLURM_ORDERED_NODES[@]} -gt 0 ]]; then
+    ordered_allocation_nodes=()
+    for ordered_node in "${SLURM_ORDERED_NODES[@]}"; do
+        for allocated_node in "${allocation_nodes[@]}"; do
+            if [[ "$ordered_node" == "$allocated_node" ]]; then
+                ordered_allocation_nodes+=("$allocated_node")
+                break
+            fi
+        done
+    done
+    if [[ ${#ordered_allocation_nodes[@]} -ne ${#allocation_nodes[@]} ]]; then
+        echo "Error: configured node order does not match the Slurm allocation" >&2
+        exit 1
+    fi
+    allocation_nodes=("${ordered_allocation_nodes[@]}")
+fi
+
+# Some clusters intermittently fail to resolve short hostnames in elbencho's
+# resolver, so resolve once here and propagate IPs.
 nodelist_ips=()
 while read -r node; do
     ip=$(getent ahostsv4 "$node" | awk '{print $1; exit}')
@@ -105,7 +127,7 @@ while read -r node; do
         ip="$node"
     fi
     nodelist_ips+=("$ip")
-done < <(scontrol show hostname "${SLURM_JOB_NODELIST:-}")
+done < <(printf '%s\n' "${allocation_nodes[@]}")
 ALLOC_HOSTS_CSV=$(IFS=,; printf '%s' "${nodelist_ips[*]}")
 # nodelist_expanded_comma_separated is read by run_an_elbencho (a bash
 # function in this same shell scope) as a fallback when no per-execution
@@ -133,26 +155,44 @@ _elbencho_sweep_running_to_pending "$EXECUTIONS_DIR" || exit 1
 # Start elbencho services on every allocation node, in background, ONCE.
 SRUN_ELBENCHO_PID=""
 SRUN_ELBENCHO_PID_FILE=""
+SRUN_ELBENCHO_LOG="${OUTPUT_DIR}/elbencho-svc-j${SLURM_JOB_ID}-portdefault.log"
 ACTIVE_EXECUTION_ID=""
 if [[ "${SLURM_JOB_NUM_NODES:-1}" -gt 1 ]]; then
     stop_elbencho_services_srun "" || true  # initial cleanup of stale processes
-    SRUN_ELBENCHO_PID=$(start_elbencho_services_srun "")
-    if [[ ! "$SRUN_ELBENCHO_PID" =~ ^[0-9]+$ ]]; then
-        echo "Error: unable to start elbencho service owner" >&2
-        exit 1
-    fi
     SRUN_ELBENCHO_PID_FILE="${EXECUTIONS_DIR}/.service-srun.pid"
-    if ! _atomic_write_sentinel "$SRUN_ELBENCHO_PID_FILE" "$SRUN_ELBENCHO_PID"; then
-        echo "Error: unable to record elbencho service owner PID" >&2
-        stop_elbencho_services_srun "$SRUN_ELBENCHO_PID" || true
-        exit 1
-    fi
-    if ! check_elbencho_services_srun ""; then
-        echo "Error: elbencho services failed initial health check" >&2
+    for attempt in 1 2; do
+        SRUN_ELBENCHO_PID=$(start_elbencho_services_srun "" "$OUTPUT_DIR")
+        if [[ ! "$SRUN_ELBENCHO_PID" =~ ^[0-9]+$ ]]; then
+            echo "Error: unable to start elbencho service owner" >&2
+            exit 1
+        fi
+        if ! _atomic_write_sentinel \
+                "$SRUN_ELBENCHO_PID_FILE" "$SRUN_ELBENCHO_PID"; then
+            echo "Error: unable to record elbencho service owner PID" >&2
+            stop_elbencho_services_srun "$SRUN_ELBENCHO_PID" || true
+            exit 1
+        fi
+        if check_elbencho_services_srun ""; then
+            break
+        fi
+        echo "Warning: elbencho services failed initial health check "\
+            "(attempt $attempt/2)" >&2
+        if [[ -f "$SRUN_ELBENCHO_LOG" ]]; then
+            echo "Service log from failed attempt $attempt:" >&2
+            tail -n 200 -- "$SRUN_ELBENCHO_LOG" >&2 || true
+            cp -f -- "$SRUN_ELBENCHO_LOG" \
+                "${SRUN_ELBENCHO_LOG}.attempt-${attempt}" || true
+        else
+            echo "Service log is missing: $SRUN_ELBENCHO_LOG" >&2
+        fi
         stop_elbencho_services_srun "$SRUN_ELBENCHO_PID" || true
         rm -f -- "$SRUN_ELBENCHO_PID_FILE"
-        exit 1
-    fi
+        if [[ "$attempt" -eq 2 ]]; then
+            echo "Error: elbencho services failed after one restart" >&2
+            exit 1
+        fi
+        echo "Retrying initial elbencho service startup once" >&2
+    done
 fi
 
 # Refresh the coordinator's copy after a phase-level check restarts services
