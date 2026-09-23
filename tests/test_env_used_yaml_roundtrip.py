@@ -252,6 +252,54 @@ class TestEnvUsedYamlRoundTrip(unittest.TestCase):
         self.assertEqual(metric.configured_files_per_node, "16")
         self.assertEqual(metric.configured_file_size, "128M")
 
+    def test_kubernetes_snapshot_preserves_runtime_identity_and_mapped_paths(self):
+        """Resume snapshots retain Kubernetes identity, not only env.sh defaults."""
+        with tempfile.TemporaryDirectory() as tmp:
+            script = _bash_script_with_repo("""export EXECUTION_SUBSTRATE=kubectl
+export KUBECTL_NAMESPACE=test-ns
+export KUBECTL_PV=test-pv
+export KUBECTL_PVC=test-pvc
+export KUBECTL_NODE_SELECTOR=storage-test=true
+export KUBECTL_ELBENCHO_IMAGE=example.invalid/elbencho@sha256:abc
+export KUBECTL_IMAGE_PULL_POLICY=Never
+export KUBECTL_RUN_AS_USER=2000
+export KUBECTL_RUN_AS_GROUP=2000
+export KUBECTL_MAPPED_READ_FROM=/mnt/storage-scale-test/bench/input
+declare -A KUBECTL_MAPPED_TEST_DIRS=(
+  [/mnt/storage-scale-test/bench/primary]=2
+  [/mnt/storage-scale-test/bench/secondary]=1
+)
+export ELBENCHO_SCALE_THREAD_LIST=("1")
+export ELBENCHO_SCALE_IO_SIZES=("4K")
+export ELBENCHO_IODEPTH_LIST=("1")
+export ELBENCHO_FILE_SIZE_MULTIPLIER=1024
+export ELBENCHO_FILE_LAYOUT=worker-directories
+export ELBENCHO_FILES_PER_NODE=
+export ELBENCHO_FILE_SIZE=
+export ELBENCHO_SCALE_READ_WRITE_DURATION=60
+export ELBENCHO_READ_AFTER_WRITE_PAUSE=0
+export ELBENCHO_LIVE_CSV_EXTENDED=0
+export ELBENCHO_LIVEINT=1000
+export ELBENCHO_SINGLE_BIG_FILE=0
+export ELBENCHO_SINGLE_BIG_FILE_BASENAME=elbencho-bigfile
+export ELBENCHO_SINGLE_BIG_FILE_SIZE=
+export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=0
+""" + f'write_elbencho_env_used "{tmp}/env_used.yaml" dio 0 0 0 0 "" 1\n')
+            _run_bash_write(tmp, script)
+            loaded = load_env_used_yaml(tmp)
+            self.assertEqual(loaded["KUBECTL_NAMESPACE"], "test-ns")
+            self.assertEqual(loaded["KUBECTL_PV"], "test-pv")
+            self.assertEqual(loaded["KUBECTL_PVC"], "test-pvc")
+            self.assertEqual(
+                loaded["KUBECTL_MAPPED_TEST_DIRS"][
+                    "/mnt/storage-scale-test/bench/primary"
+                ],
+                2,
+            )
+            shell_snapshot = (Path(tmp) / "env_used.sh").read_text(encoding="utf-8")
+            self.assertIn("export KUBECTL_NAMESPACE=test-ns", shell_snapshot)
+            self.assertIn("KUBECTL_MAPPED_TEST_DIRS", shell_snapshot)
+
     def test_mdtest_elbencho_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             _run_bash_write(tmp, _bash_write_mdtest_env_used_yaml(tmp))

@@ -1016,11 +1016,13 @@ compute_target_file_count_per_thread() {
 #
 # Usage: elbencho_set_cell_run_context <id> <nodes> <hosts_csv> <test_dirs_csv> \
 #          <scratch_result_dir> <durable_result_dir> <service_health_hook> \
-#          <result_publication_hook>
+#          <result_publication_hook> [coordinator_local]
+# coordinator_local=1 is the Kubernetes one-node exception: it permits an
+# empty hosts CSV only for direct coordinator-Pod execution.
 elbencho_set_cell_run_context() {
     unset ELBENCHO_RUN_CONTEXT_READY
-    if [[ "$#" -ne 8 ]]; then
-        echo "Error: elbencho cell context requires exactly 8 arguments" >&2
+    if [[ "$#" -ne 8 && "$#" -ne 9 ]]; then
+        echo "Error: elbencho cell context requires 8 arguments plus optional coordinator-local mode" >&2
         return 1
     fi
     local execution_id="$1"
@@ -1031,6 +1033,11 @@ elbencho_set_cell_run_context() {
     local durable_result_dir="$6"
     local service_health_hook="$7"
     local result_publication_hook="$8"
+    local coordinator_local="${9:-0}"
+    [[ "$coordinator_local" =~ ^(0|1)$ ]] || {
+        echo "Error: invalid elbencho coordinator-local context mode" >&2
+        return 1
+    }
 
     local coordinate
     for coordinate in io_size thread_count io_depth dio_or_bio use_random force_single; do
@@ -1048,6 +1055,7 @@ elbencho_set_cell_run_context() {
     export ELBENCHO_RUN_DURABLE_OUTPUT_DIR="$durable_result_dir"
     export ELBENCHO_RUN_SERVICE_HEALTH_HOOK="$service_health_hook"
     export ELBENCHO_RUN_RESULT_PUBLICATION_HOOK="$result_publication_hook"
+    export ELBENCHO_RUN_COORDINATOR_LOCAL="$coordinator_local"
     export ELBENCHO_RUN_IO_SIZE="$io_size"
     export ELBENCHO_RUN_THREAD_COUNT="$thread_count"
     export ELBENCHO_RUN_IO_DEPTH="$io_depth"
@@ -1078,6 +1086,10 @@ _elbencho_validate_cell_run_context() {
         echo "Error: invalid elbencho cell node count: ${ELBENCHO_RUN_NODE_COUNT:-}" >&2
         return 1
     fi
+    if [[ ! "${ELBENCHO_RUN_COORDINATOR_LOCAL:-0}" =~ ^(0|1)$ ]]; then
+        echo "Error: invalid elbencho coordinator-local context mode" >&2
+        return 1
+    fi
     local path_value
     for path_value in "${ELBENCHO_RUN_TEST_DIRS_CSV:-}" \
             "${ELBENCHO_RUN_SCRATCH_OUTPUT_DIR:-}" \
@@ -1090,24 +1102,32 @@ _elbencho_validate_cell_run_context() {
 
     local endpoint
     local -a endpoints=()
-    if [[ -z "${ELBENCHO_RUN_HOSTS_CSV:-}" \
+    if [[ "${ELBENCHO_RUN_COORDINATOR_LOCAL:-0}" == 1 ]]; then
+        if [[ "$ELBENCHO_RUN_NODE_COUNT" -ne 1 \
+                || -n "${ELBENCHO_RUN_HOSTS_CSV:-}" ]]; then
+            echo "Error: coordinator-local elbencho context requires one node and no worker endpoints" >&2
+            return 1
+        fi
+    elif [[ -z "${ELBENCHO_RUN_HOSTS_CSV:-}" \
             || "${ELBENCHO_RUN_HOSTS_CSV}" == ,* \
             || "${ELBENCHO_RUN_HOSTS_CSV}" == *, \
             || "${ELBENCHO_RUN_HOSTS_CSV}" == *,,* ]]; then
         echo "Error: elbencho cell worker endpoint CSV contains an empty endpoint" >&2
         return 1
     fi
-    IFS=',' read -ra endpoints <<< "$ELBENCHO_RUN_HOSTS_CSV"
-    if [[ "${#endpoints[@]}" -ne "$ELBENCHO_RUN_NODE_COUNT" ]]; then
-        echo "Error: elbencho cell requires $ELBENCHO_RUN_NODE_COUNT worker endpoints, got ${#endpoints[@]}" >&2
-        return 1
-    fi
-    for endpoint in "${endpoints[@]}"; do
-        if [[ -z "$endpoint" || "$endpoint" =~ [[:space:]] ]]; then
-            echo "Error: elbencho cell worker endpoint is empty or contains whitespace" >&2
+    if [[ "${ELBENCHO_RUN_COORDINATOR_LOCAL:-0}" != 1 ]]; then
+        IFS=',' read -ra endpoints <<< "$ELBENCHO_RUN_HOSTS_CSV"
+        if [[ "${#endpoints[@]}" -ne "$ELBENCHO_RUN_NODE_COUNT" ]]; then
+            echo "Error: elbencho cell requires $ELBENCHO_RUN_NODE_COUNT worker endpoints, got ${#endpoints[@]}" >&2
             return 1
         fi
-    done
+        for endpoint in "${endpoints[@]}"; do
+            if [[ -z "$endpoint" || "$endpoint" =~ [[:space:]] ]]; then
+                echo "Error: elbencho cell worker endpoint is empty or contains whitespace" >&2
+                return 1
+            fi
+        done
+    fi
 
     local hook
     for hook in "${ELBENCHO_RUN_SERVICE_HEALTH_HOOK:-}" \

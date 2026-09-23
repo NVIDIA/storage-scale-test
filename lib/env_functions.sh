@@ -1365,6 +1365,18 @@ _elbencho_env_used_emit_treefile_cache_sh() {
     return 0
 }
 
+yaml_double_quote() {
+    # Emit one YAML double-quoted scalar for generated immutable snapshots.
+    # The shell snapshot remains authoritative for arbitrary Bash values.
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '"%s"' "$value"
+}
+
 write_elbencho_env_used() {
     local out_file="$1"
     local dio_or_bio="$2"
@@ -1383,6 +1395,28 @@ write_elbencho_env_used() {
         printf '# Generated: %s\n\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
         printf 'EXECUTION_SUBSTRATE: "%s"\n\n' "${EXECUTION_SUBSTRATE:?}"
+
+        if [[ "${EXECUTION_SUBSTRATE:?}" == kubectl ]]; then
+            printf 'KUBECTL_NAMESPACE: %s\n' "$(yaml_double_quote "${KUBECTL_NAMESPACE:?}")"
+            printf 'KUBECTL_PV: %s\n' "$(yaml_double_quote "${KUBECTL_PV:?}")"
+            printf 'KUBECTL_PVC: %s\n' "$(yaml_double_quote "${KUBECTL_PVC:?}")"
+            printf 'KUBECTL_NODE_SELECTOR: %s\n' "$(yaml_double_quote "${KUBECTL_NODE_SELECTOR:?}")"
+            printf 'KUBECTL_ELBENCHO_IMAGE: %s\n' "$(yaml_double_quote "${KUBECTL_ELBENCHO_IMAGE:?}")"
+            printf 'KUBECTL_IMAGE_PULL_POLICY: %s\n' "$(yaml_double_quote "${KUBECTL_IMAGE_PULL_POLICY:?}")"
+            printf 'KUBECTL_RUN_AS_USER: %s\n' "${KUBECTL_RUN_AS_USER:?}"
+            printf 'KUBECTL_RUN_AS_GROUP: %s\n' "${KUBECTL_RUN_AS_GROUP:?}"
+            printf 'KUBECTL_MAPPED_READ_FROM: %s\n' \
+                "$(yaml_double_quote "${KUBECTL_MAPPED_READ_FROM:-}")"
+            printf 'KUBECTL_MAPPED_TEST_DIRS:\n'
+            local _mapped_path
+            if declare -p KUBECTL_MAPPED_TEST_DIRS &>/dev/null; then
+                for _mapped_path in "${!KUBECTL_MAPPED_TEST_DIRS[@]}"; do
+                    printf '  %s: %s\n' "$(yaml_double_quote "$_mapped_path")" \
+                        "${KUBECTL_MAPPED_TEST_DIRS[$_mapped_path]}"
+                done
+            fi
+            printf '\n'
+        fi
 
         printf 'TEST_DIRS:\n'
         local _path
@@ -1499,6 +1533,28 @@ _write_elbencho_env_used_sh() {
         printf '# Generated: %s\n\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
         printf 'export EXECUTION_SUBSTRATE=%q\n\n' "${EXECUTION_SUBSTRATE:?}"
+
+        if [[ "${EXECUTION_SUBSTRATE:?}" == kubectl ]]; then
+            printf 'export KUBECTL_NAMESPACE=%q\n' "${KUBECTL_NAMESPACE:?}"
+            printf 'export KUBECTL_PV=%q\n' "${KUBECTL_PV:?}"
+            printf 'export KUBECTL_PVC=%q\n' "${KUBECTL_PVC:?}"
+            printf 'export KUBECTL_NODE_SELECTOR=%q\n' "${KUBECTL_NODE_SELECTOR:?}"
+            printf 'export KUBECTL_ELBENCHO_IMAGE=%q\n' "${KUBECTL_ELBENCHO_IMAGE:?}"
+            printf 'export KUBECTL_IMAGE_PULL_POLICY=%q\n' "${KUBECTL_IMAGE_PULL_POLICY:?}"
+            printf 'export KUBECTL_RUN_AS_USER=%q\n' "${KUBECTL_RUN_AS_USER:?}"
+            printf 'export KUBECTL_RUN_AS_GROUP=%q\n' "${KUBECTL_RUN_AS_GROUP:?}"
+            printf 'export KUBECTL_MAPPED_READ_FROM=%q\n' "${KUBECTL_MAPPED_READ_FROM:-}"
+            if declare -p KUBECTL_MAPPED_TEST_DIRS &>/dev/null; then
+                printf 'unset KUBECTL_MAPPED_TEST_DIRS\ndeclare -gA KUBECTL_MAPPED_TEST_DIRS=(\n'
+                local _mapped_path
+                for _mapped_path in "${!KUBECTL_MAPPED_TEST_DIRS[@]}"; do
+                    printf '    [%q]=%q\n' "$_mapped_path" \
+                        "${KUBECTL_MAPPED_TEST_DIRS[$_mapped_path]}"
+                done
+                printf ')\nexport KUBECTL_MAPPED_TEST_DIRS\n'
+            fi
+            printf '\n'
+        fi
 
         _emit_bash_test_dirs_decl
         printf '\n'

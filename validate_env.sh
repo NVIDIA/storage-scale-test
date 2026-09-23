@@ -145,6 +145,26 @@ check_dirs() {
     [[ -d "${LOGS_DIR}" ]] || register_error "Directory ${LOGS_DIR} does not exist"
 }
 
+check_kubectl_filesystem_prerequisites() {
+    local kubectl_functions="${SCALE_TEST_BASE}/storage-tests/fs/kubectl/_nv-elbencho-kubectl-functions.sh"
+    if [[ ! -f "$kubectl_functions" ]]; then
+        register_error "Kubernetes filesystem support files are missing: $kubectl_functions"
+        return 1
+    fi
+    # shellcheck disable=SC1090  # Checked-in filesystem-sweep validation helpers.
+    source "$kubectl_functions"
+    local identity
+    if ! identity=$(kubectl_validate_cluster_identity 2>&1); then
+        register_error "Kubernetes filesystem prerequisite validation failed: $identity"
+        return 1
+    fi
+    if ! kubectl_validate_runtime_pod; then
+        register_error "Kubernetes workload image or PVC runtime validation failed"
+        return 1
+    fi
+    printf '  Kubernetes namespace/PV/PVC identity: %s\n' "$identity"
+}
+
 # Determine architecture & check for binaries
 check_arch_and_binaries() {
     # Since we support SSH mode, we can no longer rely on an assumption that the invoking
@@ -776,7 +796,7 @@ EOF
 check_dirs
 
 if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
-    register_error "Kubernetes runtime validation is not implemented yet; use the filesystem sweep only after kubectl support is complete"
+    check_kubectl_filesystem_prerequisites
     slurm_rc=1
     ssh_rc=1
 elif [ -n "$SLURM_ENABLED" ]; then

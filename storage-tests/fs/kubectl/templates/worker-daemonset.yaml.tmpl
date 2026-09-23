@@ -1,0 +1,100 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: @@RESOURCE_NAME@@
+  namespace: @@NAMESPACE@@
+  labels:
+    app.kubernetes.io/name: storage-scale-test
+    app.kubernetes.io/instance: sst-elb-@@ATTEMPT_ID@@
+    app.kubernetes.io/component: workers
+    app.kubernetes.io/managed-by: storage-scale-test
+    storage-scale-test.nvidia.com/benchmark: elbencho
+    storage-scale-test.nvidia.com/run: @@ATTEMPT_ID@@
+  annotations:
+    storage-scale-test.nvidia.com/ownership: @@OWNERSHIP_NONCE@@
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: sst-elb-@@ATTEMPT_ID@@
+      app.kubernetes.io/component: workers
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: storage-scale-test
+        app.kubernetes.io/instance: sst-elb-@@ATTEMPT_ID@@
+        app.kubernetes.io/component: workers
+        app.kubernetes.io/managed-by: storage-scale-test
+        storage-scale-test.nvidia.com/benchmark: elbencho
+        storage-scale-test.nvidia.com/run: @@ATTEMPT_ID@@
+      annotations:
+        storage-scale-test.nvidia.com/ownership: @@OWNERSHIP_NONCE@@
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+@@NODE_SELECTOR_BLOCK@@
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values:
+@@NODE_AFFINITY_VALUES@@
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: @@RUN_AS_USER@@
+        runAsGroup: @@RUN_AS_GROUP@@
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: elbencho
+          image: @@IMAGE@@
+          imagePullPolicy: @@IMAGE_PULL_POLICY@@
+          command: ["elbencho", "--service", "--foreground", "--port", "1611"]
+          ports:
+            - name: status
+              containerPort: 1611
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /status
+              port: status
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: status
+            periodSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /status
+              port: status
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: storage
+              mountPath: /mnt/storage-scale-test
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: @@PVC_NAME@@

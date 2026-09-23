@@ -154,14 +154,20 @@ def test_other_benchmarks_reject_kubectl_before_creating_results(
     assert not (tmp_path / "results").exists()
 
 
-def test_filesystem_sweep_keeps_kubectl_dispatch_unreachable(tmp_path):
-    """Selection is public before the Kubernetes dispatcher is enabled."""
+def test_filesystem_sweep_selects_kubectl_before_dispatch(tmp_path):
+    """Kubernetes selection reaches common sweep validation, not a stub."""
     fake_root = tmp_path / "deployment"
     destination = fake_root / "storage-tests" / "fs" / "nv-elbencho-sweep.sh"
     destination.parent.mkdir(parents=True)
     shutil.copy2(
         _REPOSITORY_ROOT / "storage-tests" / "fs" / "nv-elbencho-sweep.sh",
         destination,
+    )
+    kubectl_dir = destination.parent / "kubectl"
+    kubectl_dir.mkdir()
+    shutil.copy2(
+        _REPOSITORY_ROOT / "storage-tests/fs/kubectl/_nv-elbencho-kubectl-functions.sh",
+        kubectl_dir / "_nv-elbencho-kubectl-functions.sh",
     )
     (fake_root / "env.sh").write_text(
         textwrap.dedent(f"""
@@ -183,7 +189,7 @@ def test_filesystem_sweep_keeps_kubectl_dispatch_unreachable(tmp_path):
         capture_output=True,
     )
     assert result.returncode != 0
-    assert "kubectl execution is not implemented yet" in result.stderr
+    assert "Filesystem testing is not enabled" in result.stderr
     assert not (tmp_path / "results").exists()
 
 
@@ -249,6 +255,6 @@ def test_legacy_resume_cannot_be_reinterpreted_as_kubectl(tmp_path):
     result = _run_resume_selection_case(tmp_path, "kubectl", "")
     assert result.returncode != 0
     assert (
-        "legacy resume snapshots require EXECUTION_SUBSTRATE=ssh or slurm"
+        "legacy resume snapshots require inherited EXECUTION_SUBSTRATE=ssh or slurm"
         in result.stderr
     )

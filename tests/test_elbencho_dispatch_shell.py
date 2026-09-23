@@ -1703,6 +1703,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             )
             env = os.environ.copy()
             env["SHELL"] = _BASH
+            env["EXECUTION_SUBSTRATE"] = "slurm"
             result = subprocess.run(
                 [str(sweep_script), "--resume", str(resume_dir)],
                 check=False,
@@ -1778,6 +1779,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             )
             env = os.environ.copy()
             env["SHELL"] = _BASH
+            env["EXECUTION_SUBSTRATE"] = "slurm"
             result = subprocess.run(
                 [str(sweep_script), "--resume", str(resume_dir)],
                 check=False,

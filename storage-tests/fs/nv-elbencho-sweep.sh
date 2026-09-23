@@ -15,7 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Boilerplate to find and source env.sh
+# Boilerplate to find the deployment before parsing the operation. Environment
+# loading is intentionally deferred until argument grammar is known.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd) || {
     echo "Error: Failed to determine script directory" >&2
     exit 1
@@ -25,36 +26,16 @@ if [[ ! -d "${SCRIPT_DIR}" ]]; then
     exit 1
 fi
 readonly SCRIPT_DIR
-
-if ! source_output=$("$SHELL" -c ". '${SCRIPT_DIR}/../../env.sh'" 2>&1); then
-    printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
-    exit 1
-fi
-
-# shellcheck disable=SC1091
-source "${SCRIPT_DIR}/../../env.sh"
-
-# Source the elbencho helpers library directly. env.sh chains through
-# lib/env_base.sh -> lib/env_functions.sh, but the elbencho-specific
-# helpers (reify_all_elbencho_executions, _elbencho_sweep_running_to_pending,
-# list_elbencho_execution_ids, max_nodes_remaining_executions, etc.) live
-# in lib/_elbencho_functions.sh and are needed by this top-level
-# orchestrator (reify + dispatch + --resume paths).
-# shellcheck disable=SC1091
-source "${SCALE_TEST_BASE}/lib/_elbencho_functions.sh"
-
-# Only run directly, not from within slurm unless SSH_ENABLED is set (slurm
-# may be used to get nodes to ssh to)
-if [ -n "${SLURM_JOB_ID:-}" ] && [ -z "${SSH_ENABLED:-}" ]; then
-    echo "Error: Don't run this with slurm, just run it directly." >&2
-    exit 1
-fi
+readonly INVOKING_EXECUTION_SUBSTRATE="${EXECUTION_SUBSTRATE:-}"
 
 print_usage() {
     cat << EOF
 Usage: $0 [FLAGS] --nodes <node_spec>
    or: $0 [FLAGS] --delete-only <path>
    or: $0 --resume <results_dir>
+   or: $0 --status <results_dir>
+   or: $0 --cancel <results_dir>
+   or: $0 --collect <results_dir>
 
 Runs elbencho on one or more nodes (sweep over node counts and IO sizes), or deletes
 a prior sweep subtree with --delete-only, or resumes an interrupted sweep with --resume.
@@ -87,6 +68,11 @@ Resume (continue an interrupted prior sweep run):
                           executions: SLURM srun-steps pick fresh subsets of the live allocation;
                           SSH dispatch calls choose_N_ssh_hosts per execution. Mutually exclusive
                           with all other flags.
+
+Kubernetes lifecycle (kubectl substrate only):
+  --status <results_dir>   Query an asynchronous sweep without changing it.
+  --cancel <results_dir>   Stop the exact saved attempt and preserve results.
+  --collect <results_dir>  Publish a terminal attempt into the local result tree.
 
 Path modes (at most one; --write-only and --read-from require a single TEST_DIRS entry):
   --write-only          Only mkdir + write; retain one uniquely suffixed data directory per
@@ -129,6 +115,9 @@ sweep_write_no_read="0"
 sweep_read_from=""
 delete_only_path=""
 resume_dir=""
+status_dir=""
+cancel_dir=""
+collect_dir=""
 
 # Parse flags
 while [[ $# -gt 0 ]]; do
@@ -187,7 +176,47 @@ while [[ $# -gt 0 ]]; do
                 echo "Error: --resume requires a path argument" >&2
                 exit 1
             fi
+            if [[ -n "$resume_dir" ]]; then
+                echo "Error: --resume may be specified only once" >&2
+                exit 1
+            fi
             resume_dir="$2"
+            shift 2
+            ;;
+        --status)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "Error: --status requires a results directory" >&2
+                exit 1
+            fi
+            if [[ -n "$status_dir" ]]; then
+                echo "Error: --status may be specified only once" >&2
+                exit 1
+            fi
+            status_dir="$2"
+            shift 2
+            ;;
+        --cancel)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "Error: --cancel requires a results directory" >&2
+                exit 1
+            fi
+            if [[ -n "$cancel_dir" ]]; then
+                echo "Error: --cancel may be specified only once" >&2
+                exit 1
+            fi
+            cancel_dir="$2"
+            shift 2
+            ;;
+        --collect)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "Error: --collect requires a results directory" >&2
+                exit 1
+            fi
+            if [[ -n "$collect_dir" ]]; then
+                echo "Error: --collect may be specified only once" >&2
+                exit 1
+            fi
+            collect_dir="$2"
             shift 2
             ;;
         -*)
@@ -204,18 +233,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+_has_workload_options() {
+    [[ "$g_bio_or_dio" != dio || "$rand_option" != 0 \
+        || "$single_option" != 0 || -n "$nodes_spec" \
+        || "$sweep_write_only" != 0 || "$sweep_write_no_read" != 0 \
+        || -n "$sweep_read_from" || -n "$delete_only_path" ]]
+}
+
 # Validate that --resume is the only flag in play.
 _validate_resume_mutual_exclusivity() {
-    local has_extra=0
-    [[ "$g_bio_or_dio" != "dio" ]] && has_extra=1
-    [[ "$rand_option" != "0" ]] && has_extra=1
-    [[ "$single_option" != "0" ]] && has_extra=1
-    [[ -n "$nodes_spec" ]] && has_extra=1
-    [[ "$sweep_write_only" != "0" ]] && has_extra=1
-    [[ "$sweep_write_no_read" != "0" ]] && has_extra=1
-    [[ -n "$sweep_read_from" ]] && has_extra=1
-    [[ -n "$delete_only_path" ]] && has_extra=1
-    if [[ "$has_extra" -eq 1 ]]; then
+    if _has_workload_options; then
         echo "Error: --resume is mutually exclusive with the other flags" >&2
         echo "  (when resuming, the original sweep's settings are read from <results_dir>/env_used.sh)" >&2
         exit 1
@@ -223,20 +250,68 @@ _validate_resume_mutual_exclusivity() {
     return 0
 }
 
-# Load <results_dir>/env_used.sh into the current shell, setting OUTPUT_DIR,
-# DS, and the sweep-script CLI vars (g_bio_or_dio, rand_option, etc.).
-_resume_load_env_used() {
+_select_operation() {
+    local lifecycle_count=0
+    [[ -n "$resume_dir" ]] && lifecycle_count=$((lifecycle_count + 1))
+    [[ -n "$status_dir" ]] && lifecycle_count=$((lifecycle_count + 1))
+    [[ -n "$cancel_dir" ]] && lifecycle_count=$((lifecycle_count + 1))
+    [[ -n "$collect_dir" ]] && lifecycle_count=$((lifecycle_count + 1))
+    if [[ "$lifecycle_count" -gt 1 ]]; then
+        echo "Error: --resume, --status, --cancel, and --collect are mutually exclusive" >&2
+        return 1
+    fi
+    if [[ -n "$resume_dir" ]]; then
+        _validate_resume_mutual_exclusivity
+        SWEEP_OPERATION=resume
+    elif [[ -n "$status_dir" || -n "$cancel_dir" || -n "$collect_dir" ]]; then
+        if _has_workload_options; then
+            echo "Error: lifecycle operations are mutually exclusive with workload flags" >&2
+            return 1
+        fi
+        if [[ -n "$status_dir" ]]; then
+            SWEEP_OPERATION=status
+        elif [[ -n "$cancel_dir" ]]; then
+            SWEEP_OPERATION=cancel
+        else
+            SWEEP_OPERATION=collect
+        fi
+    elif [[ -n "$delete_only_path" ]]; then
+        SWEEP_OPERATION=delete-only
+    else
+        SWEEP_OPERATION=submit
+    fi
+    readonly SWEEP_OPERATION
+    return 0
+}
+
+_select_operation || exit 1
+
+# The Kubernetes lifecycle is intentionally sourced from the deployment, not
+# from env.sh.  Keep it lazy so legacy SSH/Slurm deployment tests need not
+# carry Kubernetes-only files.  --status/--cancel/--collect call this before
+# consulting env.sh, so a changed current configuration cannot retarget a Job.
+_source_kubectl_lifecycle_helpers() {
+    # shellcheck disable=SC1091
+    source "${SCRIPT_DIR}/kubectl/_nv-elbencho-kubectl-functions.sh" || {
+        echo "Error: Kubernetes lifecycle helpers are missing from this deployment" >&2
+        return 1
+    }
+}
+
+# Inspect and restore the saved configuration before consulting today's
+# env.sh. New snapshots carry their substrate. A legacy snapshot may use only
+# an explicitly inherited SSH/Slurm selector; sourcing current env.sh to infer
+# that choice would let configuration drift change the meaning of --resume.
+_resume_prepare_saved_snapshot() {
     local dir="$1"
-    local invoking_substrate="${EXECUTION_SUBSTRATE:-}"
     if [[ ! -d "$dir" ]]; then
         echo "Error: --resume directory does not exist: $dir" >&2
         exit 1
     fi
     local abs
     abs=$(cd "$dir" && pwd) || exit 1
-    if [[ ! -f "$abs/env_used.sh" ]]; then
-        echo "Error: $abs/env_used.sh not found (cannot rehydrate sweep configuration)" >&2
-        echo "  --resume requires a results dir created by this code revision (env_used.sh sidecar)." >&2
+    if [[ ! -f "$abs/env_used.sh" || -L "$abs/env_used.sh" ]]; then
+        echo "Error: $abs/env_used.sh not found or is a symlink" >&2
         exit 1
     fi
     if [[ ! -d "$abs/executions" ]]; then
@@ -245,51 +320,95 @@ _resume_load_env_used() {
     fi
     OUTPUT_DIR="$abs"
     DS="${OUTPUT_DIR##*-}"
-    echo "Resuming sweep at $OUTPUT_DIR (DS=$DS)"
-    # Older snapshots predate the generated shared-directory controls. Reset
-    # them before sourcing so current env.sh settings cannot leak into resume.
     ELBENCHO_FILE_LAYOUT=worker-directories
     ELBENCHO_FILES_PER_NODE=
     ELBENCHO_FILE_SIZE=
     export ELBENCHO_FILE_LAYOUT ELBENCHO_FILES_PER_NODE ELBENCHO_FILE_SIZE
-    # Do not let the current environment leak its substrate into a new
-    # snapshot. Legacy snapshots deliberately fall back to the invoking
-    # environment, but only for the two substrates they could represent.
     unset EXECUTION_SUBSTRATE
-    # shellcheck disable=SC1091
+    # shellcheck disable=SC1091  # Trusted, result-directory-local snapshot.
     source "$OUTPUT_DIR/env_used.sh" || {
         echo "Error: failed to source $OUTPUT_DIR/env_used.sh" >&2
         exit 1
     }
-    local saved_substrate="${EXECUTION_SUBSTRATE:-}"
-    if [[ -z "$saved_substrate" ]]; then
-        case "$invoking_substrate" in
-            ssh|slurm) saved_substrate="$invoking_substrate" ;;
+    SAVED_EXECUTION_SUBSTRATE="${EXECUTION_SUBSTRATE:-}"
+    if [[ -z "$SAVED_EXECUTION_SUBSTRATE" ]]; then
+        case "$INVOKING_EXECUTION_SUBSTRATE" in
+            ssh|slurm) SAVED_EXECUTION_SUBSTRATE="$INVOKING_EXECUTION_SUBSTRATE" ;;
             *)
-                echo "Error: legacy resume snapshots require EXECUTION_SUBSTRATE=ssh or slurm in env.sh" >&2
+                echo "Error: legacy resume snapshots require inherited EXECUTION_SUBSTRATE=ssh or slurm" >&2
                 exit 1
                 ;;
         esac
-        EXECUTION_SUBSTRATE="$saved_substrate"
     fi
-    case "$saved_substrate" in
+    case "$SAVED_EXECUTION_SUBSTRATE" in
         ssh|slurm|kubectl) ;;
         *)
-            echo "Error: saved EXECUTION_SUBSTRATE is unsupported: $saved_substrate" >&2
+            echo "Error: saved EXECUTION_SUBSTRATE is unsupported: $SAVED_EXECUTION_SUBSTRATE" >&2
             exit 1
             ;;
     esac
-    if [[ "$saved_substrate" != "$invoking_substrate" ]]; then
-        echo "Error: saved EXECUTION_SUBSTRATE=$saved_substrate does not match current env.sh EXECUTION_SUBSTRATE=$invoking_substrate" >&2
+    if [[ -n "$INVOKING_EXECUTION_SUBSTRATE" \
+            && "$INVOKING_EXECUTION_SUBSTRATE" != "$SAVED_EXECUTION_SUBSTRATE" ]]; then
+        echo "Error: saved EXECUTION_SUBSTRATE=$SAVED_EXECUTION_SUBSTRATE does not match inherited EXECUTION_SUBSTRATE=$INVOKING_EXECUTION_SUBSTRATE" >&2
         exit 1
     fi
-    export EXECUTION_SUBSTRATE
-    # Bridge the lone variable name mismatch between env_used.sh's `dio_or_bio`
-    # (matches the YAML key) and this script's local `g_bio_or_dio`.
-    # shellcheck disable=SC2154  # dio_or_bio comes from sourcing env_used.sh above
-    g_bio_or_dio="$dio_or_bio"
-    return 0
+    export SAVED_EXECUTION_SUBSTRATE OUTPUT_DIR DS
 }
+
+if [[ "$SWEEP_OPERATION" == resume ]]; then
+    _resume_prepare_saved_snapshot "$resume_dir"
+    if [[ "$SAVED_EXECUTION_SUBSTRATE" == kubectl ]]; then
+        _source_kubectl_lifecycle_helpers || exit 1
+        kubectl_resume_collected_sweep "$OUTPUT_DIR" || exit 1
+        exit 0
+    fi
+fi
+
+case "$SWEEP_OPERATION" in
+    status|cancel|collect)
+        _source_kubectl_lifecycle_helpers || exit 1
+        kubectl_lifecycle_operation "$SWEEP_OPERATION" \
+            "${status_dir:-${cancel_dir:-$collect_dir}}"
+        exit $?
+        ;;
+esac
+
+if ! source_output=$("$SHELL" -c ". '${SCRIPT_DIR}/../../env.sh'" 2>&1); then
+    printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
+    exit 1
+fi
+
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../../env.sh"
+
+if [[ "$SWEEP_OPERATION" == resume ]]; then
+    current_substrate="${EXECUTION_SUBSTRATE:-}"
+    if [[ "$current_substrate" != "$SAVED_EXECUTION_SUBSTRATE" ]]; then
+        echo "Error: saved EXECUTION_SUBSTRATE=$SAVED_EXECUTION_SUBSTRATE does not match current env.sh EXECUTION_SUBSTRATE=$current_substrate" >&2
+        exit 1
+    fi
+    # Restore workload settings after env.sh supplied current transport
+    # configuration. The saved selector remains authoritative.
+    ELBENCHO_FILE_LAYOUT=worker-directories
+    ELBENCHO_FILES_PER_NODE=
+    ELBENCHO_FILE_SIZE=
+    export ELBENCHO_FILE_LAYOUT ELBENCHO_FILES_PER_NODE ELBENCHO_FILE_SIZE
+    unset EXECUTION_SUBSTRATE
+    # shellcheck disable=SC1091  # Trusted, result-directory-local snapshot.
+    source "$OUTPUT_DIR/env_used.sh" || exit 1
+    EXECUTION_SUBSTRATE="$SAVED_EXECUTION_SUBSTRATE"
+    export EXECUTION_SUBSTRATE
+fi
+
+# shellcheck disable=SC1091
+source "${SCALE_TEST_BASE}/lib/_elbencho_functions.sh"
+
+# Only run directly, not from within slurm unless SSH_ENABLED is set (slurm
+# may be used to get nodes to ssh to).
+if [ -n "${SLURM_JOB_ID:-}" ] && [ -z "${SSH_ENABLED:-}" ]; then
+    echo "Error: Don't run this with slurm, just run it directly." >&2
+    exit 1
+fi
 
 # Validate the active configuration after env_used.sh has been restored on resume.
 _validate_elbencho_sweep_environment() {
@@ -399,12 +518,9 @@ _run_delete_only_path() {
 # configuration from <dir>/env_used.sh, then dispatch any non-SUCCESS executions
 # already reified under <dir>/executions/ via the SLURM coordinator or SSH loop.
 if [[ -n "$resume_dir" ]]; then
-    _validate_resume_mutual_exclusivity
-    _resume_load_env_used "$resume_dir"
-    if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
-        echo "Error: kubectl execution is not implemented yet" >&2
-        exit 1
-    fi
+    echo "Resuming sweep at $OUTPUT_DIR (DS=$DS)"
+    # shellcheck disable=SC2154  # dio_or_bio comes from env_used.sh.
+    g_bio_or_dio="$dio_or_bio"
     _validate_elbencho_sweep_environment || exit 1
     validate_elbencho_sweep_workload_mode \
         "$g_bio_or_dio" "$rand_option" "$sweep_read_from" || exit 1
@@ -428,11 +544,6 @@ if [[ -n "$resume_dir" ]]; then
         exit $?
     fi
     echo "Error: neither SLURM_ENABLED nor SSH_ENABLED is set; cannot dispatch" >&2
-    exit 1
-fi
-
-if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
-    echo "Error: kubectl execution is not implemented yet" >&2
     exit 1
 fi
 
@@ -562,6 +673,12 @@ if ! reify_all_elbencho_executions "$OUTPUT_DIR" "$nodes_spec" \
         "$sweep_write_only" "$sweep_write_no_read" "$sweep_read_from"; then
     echo "Error: failed to reify executions" >&2
     exit 1
+fi
+
+if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
+    _source_kubectl_lifecycle_helpers || exit 1
+    kubectl_submit_sweep "$OUTPUT_DIR" "$max_node_count" || exit 1
+    exit 0
 fi
 
 # Dispatch: SLURM submits one coordinator sbatch and tails its log; SSH

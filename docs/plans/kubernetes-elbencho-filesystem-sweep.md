@@ -190,6 +190,17 @@ root; map its relative suffix under the corresponding container root. Recompute
 generated paths from mapped roots where possible instead of rewriting strings.
 Never map result, scratch, or control paths through this rule.
 
+The local mapping helper is lexical validation only; it cannot prove PVC
+containment in the presence of symlinks. In phase 5, a validation Pod must
+mount the claim and canonicalize the mount root plus every existing mapped
+path, or the nearest existing parent for a path that will be created. Follow
+symlinks with the image's `realpath`/coreutils and require each canonical path
+to remain boundary-contained below the canonical mount root. Apply the check
+to `TEST_DIRS`, read-from paths, generated-target parents, treefile-cache
+paths, and the reserved orchestration parent. Reject any symlink escape before
+creating resources or benchmark data; do not describe lexical normalization
+as protection against filesystem-level aliasing.
+
 Reserve this PVC-relative tree for orchestration state:
 
 ```text
