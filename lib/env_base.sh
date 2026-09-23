@@ -26,8 +26,10 @@
 # LOGS_DIR
 # client_type {cpu,gpu}
 #
+# EXECUTION_SUBSTRATE {slurm,ssh,kubectl}
+#
 # For SSH-based testing:
-# SSH_HOST_LIST   (set to non-empty value disables SLURM-based testing)
+# SSH_HOST_LIST
 # SSH_USER
 #
 # For SLURM-based testing:
@@ -46,6 +48,40 @@
 # Load utility functions
 # shellcheck disable=SC1091
 . "${SCALE_TEST_BASE:?}/lib/env_functions.sh"
+
+# Select one execution substrate explicitly. Do this before creating local
+# directories, loading modules, or querying Slurm so an invalid environment
+# has no setup side effects.
+case "${EXECUTION_SUBSTRATE:-}" in
+    slurm)
+        export SLURM_ENABLED=1
+        export SSH_ENABLED=""
+        export KUBECTL_ENABLED=""
+        ;;
+    ssh)
+        if [[ -z "${SSH_HOST_LIST:-}" ]]; then
+            echo "Error: SSH_HOST_LIST is required when EXECUTION_SUBSTRATE=ssh" >&2
+            return 1
+        fi
+        export SLURM_ENABLED=""
+        export SSH_ENABLED=1
+        export KUBECTL_ENABLED=""
+        ;;
+    kubectl)
+        export SLURM_ENABLED=""
+        export SSH_ENABLED=""
+        export KUBECTL_ENABLED=1
+        ;;
+    "")
+        echo "Error: EXECUTION_SUBSTRATE is required (slurm, ssh, or kubectl)" >&2
+        return 1
+        ;;
+    *)
+        echo "Error: unsupported EXECUTION_SUBSTRATE '${EXECUTION_SUBSTRATE}' (expected slurm, ssh, or kubectl)" >&2
+        return 1
+        ;;
+esac
+export EXECUTION_SUBSTRATE
 
 # Make directories if not present
 mkdir -p "${RESULTS_DIR:?}"
@@ -87,16 +123,6 @@ case "${ORDER_NODES,,}" in
     *)          ORDER_NODES_ENABLED="" ;;
 esac
 export ORDER_NODES ORDER_NODES_ENABLED
-
-# Key env vars toggle the various execution modes:
-#   "" if not enabled, "1" if they are
-# (adding a third or more execution modes will make this more complicated)
-export SSH_ENABLED=${SSH_HOST_LIST:+1}
-if [ -n "$SSH_ENABLED" ]; then
-    export SLURM_ENABLED=""
-else
-    export SLURM_ENABLED="1"
-fi
 
 # Parse the SSH host file into an array of hostnames/IPs
 if [ -n "$SSH_ENABLED" ]; then

@@ -41,9 +41,9 @@ Warp for S3-compatible object storage) as **separate processes** — they are
 - `utils/` — result processing (`extract-*.sh`/`.py`) and build helpers (`build_tarball.sh`, `build/`).
 - `tests/` — `pytest` unit tests for the Python parsers/reporters.
 - `docs/` — `DESIGN.md`, `REQUIREMENTS.md`, `ARCHITECTURE_DIAGRAMS.md`, `CONTEXT.md`, `CODING_STANDARDS.md`.
-- Config is environment-driven (`env.sh`); substrate is Slurm by default,
-  `SSH_HOST_LIST` switches to passwordless SSH. kubectl is planned
-  (see `ROADMAP.md`), not yet implemented.
+- Config is environment-driven (`env.sh`); `EXECUTION_SUBSTRATE` explicitly
+  selects Slurm or passwordless SSH. kubectl is planned (see `ROADMAP.md`),
+  not yet implemented.
 
 ## Setup
 

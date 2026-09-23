@@ -172,6 +172,9 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         export io_size=1M
         export thread_count=64
         export io_depth=4
+        export dio_or_bio=dio
+        export use_random=0
+        export force_single=1
         export ELBENCHO_FILE_LAYOUT=shared-directory
         export ELBENCHO_FILES_PER_NODE=8
         export ELBENCHO_FILE_SIZE=64G
@@ -180,6 +183,12 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         printf 'stale\n' > "$executions_dir/0001.log"
         _compute_test_dirs_csv_for_execution() {{ printf '/tmp/target'; }}
         run_elbencho_io_sweep_iteration() {{
+            [[ "$ELBENCHO_RUN_CONTEXT_READY" == 1 ]]
+            [[ "$ELBENCHO_RUN_NODE_COUNT" == 1 ]]
+            [[ "$ELBENCHO_RUN_HOSTS_CSV" == host-a ]]
+            [[ "$ELBENCHO_RUN_TEST_DIRS_CSV" == /tmp/target ]]
+            [[ "$ELBENCHO_RUN_SCRATCH_OUTPUT_DIR" == "$output_dir" ]]
+            [[ "$ELBENCHO_RUN_DURABLE_OUTPUT_DIR" == "$output_dir" ]]
             [[ "$ELBENCHO_FILE_LAYOUT" == shared-directory ]]
             [[ "$ELBENCHO_FILES_PER_NODE" == 8 ]]
             [[ "$ELBENCHO_FILE_SIZE" == 64G ]]
@@ -202,6 +211,143 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         grep -q 'LIVE STDOUT' "$executions_dir/0001.log"
         grep -q 'LIVE STDERR' "$executions_dir/0001.log"
         ! grep -q stale "$executions_dir/0001.log"
+        """
+        result = _run_bash(textwrap.dedent(script))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cell_context_drives_hooks_and_preserves_benchmark_failure(self) -> None:
+        script = f"""
+        set -e
+        source "{_ELBENCHO_FUNCTIONS}"
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        io_size=1M
+        thread_count=8
+        io_depth=4
+        dio_or_bio=dio
+        use_random=0
+        force_single=1
+        health_hook() {{ printf 'health:%s\n' "$1" >> "$tmp/hooks"; }}
+        publish_hook() {{
+            printf 'publish:%s:%s:%s\n' "$1" "$2" "$3" >> "$tmp/hooks"
+            [[ "$2" != "$3" && -f "$2/artifact" ]]
+            mkdir -p "$3"
+            cp -f "$2/artifact" "$3/artifact"
+            return "${{PUBLISH_RC:-0}}"
+        }}
+        run_elbencho_io_sweep_iteration() {{
+            printf 'bound:%s:%s:%s:%s:%s:%s:%s\n' \
+                "$output_dir" "$io_size" "$thread_count" "$io_depth" \
+                "$dio_or_bio" "$use_random" "$force_single" >> "$tmp/hooks"
+            mkdir -p "$output_dir"
+            printf 'scratch-only\n' > "$output_dir/artifact"
+            _elbencho_run_service_health_hook write
+            return "${{BENCHMARK_RC:-0}}"
+        }}
+        elbencho_set_cell_run_context 0007 2 host-a,host-b \
+            /mnt/a,/mnt/b "$tmp/scratch" "$tmp/durable" \
+            health_hook publish_hook
+        [[ "$ELBENCHO_RUN_CONTEXT_READY" == 1 ]]
+        [[ "$ELBENCHO_RUN_EXECUTION_ID" == 0007 ]]
+        [[ "$ELBENCHO_RUN_TEST_DIRS_CSV" == /mnt/a,/mnt/b ]]
+        [[ "$ELBENCHO_RUN_SCRATCH_OUTPUT_DIR" == "$tmp/scratch" ]]
+        [[ "$ELBENCHO_RUN_DURABLE_OUTPUT_DIR" == "$tmp/durable" ]]
+        io_size=corrupted
+        thread_count=999
+        io_depth=999
+        dio_or_bio=corrupted
+        use_random=999
+        force_single=999
+
+        BENCHMARK_RC=17
+        PUBLISH_RC=23
+        set +e
+        run_elbencho_cell
+        first_rc=$?
+        set -e
+        [[ "$first_rc" -eq 17 ]]
+        grep -q "^publish:17:$tmp/scratch:$tmp/durable$" "$tmp/hooks"
+        grep -q "^bound:$tmp/scratch:1M:8:4:dio:0:1$" "$tmp/hooks"
+        grep -q '^scratch-only$' "$tmp/durable/artifact"
+
+        BENCHMARK_RC=0
+        set +e
+        run_elbencho_cell
+        second_rc=$?
+        set -e
+        [[ "$second_rc" -eq 23 ]]
+        [[ $(grep -c '^health:write$' "$tmp/hooks") -eq 2 ]]
+        grep -q "^publish:0:$tmp/scratch:$tmp/durable$" "$tmp/hooks"
+        """
+        result = _run_bash(textwrap.dedent(script))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cell_context_rejects_incomplete_inputs_and_ambient_fallback(
+        self,
+    ) -> None:
+        script = f"""
+        set -e
+        source "{_ELBENCHO_FUNCTIONS}"
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        output_dir="$tmp/ambient-output"
+        test_dirs_csv="$tmp/ambient-data"
+        SLURM_JOB_NUM_NODES=2
+        nodelist_expanded_comma_separated=host-a,host-b
+        SSH_NODELIST=host-a,host-b
+        local_context_probe() {{
+            local node_count remote_output_dir hosts_csv
+            _elbencho_resolve_run_context
+        }}
+        ! local_context_probe 2> "$tmp/no-context"
+        grep -q 'was not initialized' "$tmp/no-context"
+
+        ELBENCHO_RUN_CONTEXT_READY=1
+        ELBENCHO_RUN_EXECUTION_ID=0007
+        ELBENCHO_RUN_NODE_COUNT=2
+        ELBENCHO_RUN_HOSTS_CSV=host-a,host-b
+        ELBENCHO_RUN_TEST_DIRS_CSV=/mnt/a,/mnt/b
+        run_elbencho_io_sweep_iteration() {{ touch "$tmp/forged-ran"; }}
+        ! local_context_probe 2> "$tmp/forged-context"
+        grep -q 'context paths must not be empty' "$tmp/forged-context"
+        ! run_elbencho_cell 2> "$tmp/forged-cell"
+        grep -q 'context paths must not be empty' "$tmp/forged-cell"
+        [[ ! -e "$tmp/forged-ran" ]]
+        unset ELBENCHO_RUN_CONTEXT_READY
+
+        io_size=1M
+        thread_count=8
+        io_depth=4
+        dio_or_bio=dio
+        use_random=0
+        unset force_single
+        ! elbencho_set_cell_run_context 0007 2 host-a,host-b \
+            /mnt/a,/mnt/b "$tmp/scratch" "$tmp/durable" \
+            _elbencho_noop_cell_hook _elbencho_noop_cell_hook \
+            2> "$tmp/missing-coordinate"
+        grep -q 'lacks saved coordinate: force_single' "$tmp/missing-coordinate"
+
+        force_single=1
+        ! elbencho_set_cell_run_context 0007 2 host-a \
+            /mnt/a,/mnt/b "$tmp/scratch" "$tmp/durable" \
+            _elbencho_noop_cell_hook _elbencho_noop_cell_hook \
+            2> "$tmp/missing-endpoint"
+        grep -q 'requires 2 worker endpoints' "$tmp/missing-endpoint"
+        ! elbencho_set_cell_run_context 0007 3 host-a,,host-c \
+            /mnt/a,/mnt/b "$tmp/scratch" "$tmp/durable" \
+            _elbencho_noop_cell_hook _elbencho_noop_cell_hook \
+            2> "$tmp/empty-endpoint"
+        grep -q 'contains an empty endpoint' "$tmp/empty-endpoint"
+        ! elbencho_set_cell_run_context 0007 2 'host-a, host-b' \
+            /mnt/a,/mnt/b "$tmp/scratch" "$tmp/durable" \
+            _elbencho_noop_cell_hook _elbencho_noop_cell_hook \
+            2> "$tmp/whitespace-endpoint"
+        grep -q 'contains whitespace' "$tmp/whitespace-endpoint"
+        ! elbencho_set_cell_run_context 0007 2 host-a,host-b \
+            /mnt/a,/mnt/b "$tmp/scratch" "$tmp/durable" \
+            unavailable_hook _elbencho_noop_cell_hook \
+            2> "$tmp/missing-hook"
+        grep -q 'hook is unavailable' "$tmp/missing-hook"
         """
         result = _run_bash(textwrap.dedent(script))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -402,10 +548,11 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             'maybe_restart_elbencho_services_slurm "execution-${ID}"',
             coordinator,
         )
-        self.assertIn(
-            'maybe_restart_elbencho_services_slurm "write"',
-            _ELBENCHO_FUNCTIONS.read_text(encoding="utf-8"),
-        )
+        common_functions = _ELBENCHO_FUNCTIONS.read_text(encoding="utf-8")
+        adapter_functions = _ENV_FUNCTIONS.read_text(encoding="utf-8")
+        self.assertIn('_elbencho_run_service_health_hook "write"', common_functions)
+        self.assertNotIn("maybe_restart_elbencho_services_slurm()", common_functions)
+        self.assertIn("maybe_restart_elbencho_services_slurm()", adapter_functions)
 
     def test_live_slurm_coordinator_blocks_redispatch(self) -> None:
         script = f"""
@@ -957,13 +1104,21 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             'export ELBENCHO_FILES_PER_NODE=8' \
             'export ELBENCHO_FILE_SIZE=64G' > "$nnnn"
         cat > "$tmp/_elbencho_functions.sh" <<'EOS'
+        elbencho_set_cell_run_context() {{
+            export ELBENCHO_RUN_EXECUTION_ID="$1"
+            export ELBENCHO_RUN_NODE_COUNT="$2"
+            export ELBENCHO_RUN_HOSTS_CSV="$3"
+            export ELBENCHO_RUN_TEST_DIRS_CSV="$4"
+            export ELBENCHO_RUN_SCRATCH_OUTPUT_DIR="$5"
+        }}
         run_elbencho_io_sweep_iteration() {{
-            printf 'remote=%s\\n' "$ELBENCHO_RUN_REMOTE_OUTPUT_DIR"
+            printf 'remote=%s\\n' "$ELBENCHO_RUN_SCRATCH_OUTPUT_DIR"
             printf 'output=%s\\n' "$output_dir"
             printf 'layout=%s\\n' "$ELBENCHO_FILE_LAYOUT"
             printf 'files=%s\\n' "$ELBENCHO_FILES_PER_NODE"
             printf 'size=%s\\n' "$ELBENCHO_FILE_SIZE"
         }}
+        run_elbencho_cell() {{ run_elbencho_io_sweep_iteration; }}
         EOS
         scriptlet=$(_ssh_build_execution_scriptlet \
             "$nnnn" "host-a,host-b" 2 "/data/a,/data/b" "elbencho-DS" "0001")
@@ -996,10 +1151,6 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         output_dir="$tmp/elbencho-20260731Z010203"
         mkdir -p "$tmp/read-from"
         test_dirs_csv="$tmp/read-from"
-        ELBENCHO_RUN_NODE_COUNT=1
-        ELBENCHO_RUN_HOSTS_CSV=host-a
-        ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$output_dir"
-        ELBENCHO_RUN_EXECUTION_ID=0001
         ELBENCHO_SWEEP_READ_FROM="$tmp/read-from"
         ELBENCHO_SCALE_READ_WRITE_DURATION=1s
         ELBENCHO_FILE_SIZE_MULTIPLIER=1
@@ -1013,6 +1164,9 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         single_option=0
         use_random=0
         dio_or_bio=dio
+        elbencho_set_cell_run_context 0001 1 host-a "$tmp/read-from" \
+            "$output_dir" "$output_dir" _elbencho_noop_cell_hook \
+            _elbencho_noop_cell_hook
         run_elbencho_io_sweep_iteration
         tree_arg=$(awk '$0 == "--treefile" { getline; print; exit }' "$capture")
         [[ -n "$tree_arg" ]]
@@ -1044,10 +1198,6 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         run_an_elbencho() { printf '%s\\n' "$@" > "$capture"; }
         output_dir="$tmp/elbencho-20260731Z010203"
         test_dirs_csv="$tmp/read-from"
-        ELBENCHO_RUN_NODE_COUNT=1
-        ELBENCHO_RUN_HOSTS_CSV=host-a
-        ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$output_dir"
-        ELBENCHO_RUN_EXECUTION_ID=0001
         ELBENCHO_SWEEP_READ_FROM="$tmp/read-from"
         ELBENCHO_SCALE_READ_WRITE_DURATION=1s
         ELBENCHO_FILE_SIZE_MULTIPLIER=1
@@ -1061,6 +1211,9 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         single_option=0
         use_random=0
         dio_or_bio=dio
+        elbencho_set_cell_run_context 0001 1 host-a "$tmp/read-from" \
+            "$output_dir" "$output_dir" _elbencho_noop_cell_hook \
+            _elbencho_noop_cell_hook
         run_elbencho_io_sweep_iteration
         grep -Fx -- '--treefile' "$capture"
         grep -Fx -- "$tmp/read-from/.storage-scale-test-elbencho-treefile.txt" "$capture"
@@ -1098,10 +1251,6 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         }
         output_dir="$tmp/elbencho-20260731Z010203"
         test_dirs_csv="$tmp/read-from"
-        ELBENCHO_RUN_NODE_COUNT=1
-        ELBENCHO_RUN_HOSTS_CSV=host-a
-        ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$output_dir"
-        ELBENCHO_RUN_EXECUTION_ID=0001
         ELBENCHO_SWEEP_READ_FROM="$tmp/read-from"
         ELBENCHO_SCALE_READ_WRITE_DURATION=1s
         ELBENCHO_FILE_SIZE_MULTIPLIER=1
@@ -1115,6 +1264,9 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         single_option=0
         use_random=0
         dio_or_bio=dio
+        elbencho_set_cell_run_context 0001 1 host-a "$tmp/read-from" \
+            "$output_dir" "$output_dir" _elbencho_noop_cell_hook \
+            _elbencho_noop_cell_hook
         run_elbencho_io_sweep_iteration
         grep -Fx -- '--treescan' "$capture"
         grep -Fx -- '--treefile' "$capture"
@@ -1178,6 +1330,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         ELBENCHO_SINGLE_BIG_FILE_BASENAME=elbencho-bigfile
         ELBENCHO_SINGLE_BIG_FILE_SIZE=
         ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=0
+        EXECUTION_SUBSTRATE=slurm
         write_elbencho_env_used "$output_dir/env_used.yaml" dio 0 0 0 0 "$tmp/read-from" 1
         printf '2026-08-17T00:00:00Z\\thit\\treused\\t%s\\n' \\
             "$tmp/read-from/.storage-scale-test-elbencho-treefile.txt" \\
@@ -1477,7 +1630,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         _elbencho_io_build_common_args() {{ common_args=(); }}
         _elbencho_io_append_rotated_hosts_for_read() {{ return 0; }}
         run_an_elbencho() {{ printf '%s\n' "$*" >> "$tmp/calls"; }}
-        maybe_restart_elbencho_services_slurm() {{ return 0; }}
+        _elbencho_run_service_health_hook() {{ return 0; }}
         _elbencho_cleanup_single_big_file_sweep() {{
             printf 'cleanup:%s:%s\n' "$1" "$2" >> "$tmp/cleanup"
         }}
@@ -1509,6 +1662,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             (lib_dir / "_elbencho_functions.sh").write_text("", encoding="utf-8")
             env_text = """
             SCALE_TEST_BASE=__FAKE_ROOT__
+            EXECUTION_SUBSTRATE=slurm
             SLURM_ENABLED=1
             SSH_ENABLED=
             ELBENCHO_FILE_LAYOUT=shared-directory
@@ -1577,6 +1731,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             (lib_dir / "_elbencho_functions.sh").write_text("", encoding="utf-8")
             env_text = """
             SCALE_TEST_BASE=__FAKE_ROOT__
+            EXECUTION_SUBSTRATE=slurm
             SLURM_ENABLED=1
             SSH_ENABLED=
             ELBENCHO_FILE_LAYOUT=worker-directories
@@ -1650,6 +1805,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             env_text = """
             SCALE_TEST_BASE=__FAKE_ROOT__
             RESULTS_DIR=__RESULTS_DIR__
+            EXECUTION_SUBSTRATE=slurm
             SLURM_ENABLED=1
             SSH_ENABLED=
             declare -gA TEST_DIRS=([/tmp/fs]=1)

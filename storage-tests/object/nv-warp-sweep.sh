@@ -34,6 +34,11 @@ fi
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../../env.sh"
 
+if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
+    echo "Error: kubectl execution is not supported by nv-warp-sweep.sh" >&2
+    exit 1
+fi
+
 # Only run directly, not from within slurm unless SSH_ENABLED is set (slurm
 # may be used to get nodes to ssh to)
 if [ -n "${SLURM_JOB_ID:-}" ] && [ -z "${SSH_ENABLED:-}" ]; then

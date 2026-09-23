@@ -227,6 +227,7 @@ _validate_resume_mutual_exclusivity() {
 # DS, and the sweep-script CLI vars (g_bio_or_dio, rand_option, etc.).
 _resume_load_env_used() {
     local dir="$1"
+    local invoking_substrate="${EXECUTION_SUBSTRATE:-}"
     if [[ ! -d "$dir" ]]; then
         echo "Error: --resume directory does not exist: $dir" >&2
         exit 1
@@ -251,11 +252,38 @@ _resume_load_env_used() {
     ELBENCHO_FILES_PER_NODE=
     ELBENCHO_FILE_SIZE=
     export ELBENCHO_FILE_LAYOUT ELBENCHO_FILES_PER_NODE ELBENCHO_FILE_SIZE
+    # Do not let the current environment leak its substrate into a new
+    # snapshot. Legacy snapshots deliberately fall back to the invoking
+    # environment, but only for the two substrates they could represent.
+    unset EXECUTION_SUBSTRATE
     # shellcheck disable=SC1091
     source "$OUTPUT_DIR/env_used.sh" || {
         echo "Error: failed to source $OUTPUT_DIR/env_used.sh" >&2
         exit 1
     }
+    local saved_substrate="${EXECUTION_SUBSTRATE:-}"
+    if [[ -z "$saved_substrate" ]]; then
+        case "$invoking_substrate" in
+            ssh|slurm) saved_substrate="$invoking_substrate" ;;
+            *)
+                echo "Error: legacy resume snapshots require EXECUTION_SUBSTRATE=ssh or slurm in env.sh" >&2
+                exit 1
+                ;;
+        esac
+        EXECUTION_SUBSTRATE="$saved_substrate"
+    fi
+    case "$saved_substrate" in
+        ssh|slurm|kubectl) ;;
+        *)
+            echo "Error: saved EXECUTION_SUBSTRATE is unsupported: $saved_substrate" >&2
+            exit 1
+            ;;
+    esac
+    if [[ "$saved_substrate" != "$invoking_substrate" ]]; then
+        echo "Error: saved EXECUTION_SUBSTRATE=$saved_substrate does not match current env.sh EXECUTION_SUBSTRATE=$invoking_substrate" >&2
+        exit 1
+    fi
+    export EXECUTION_SUBSTRATE
     # Bridge the lone variable name mismatch between env_used.sh's `dio_or_bio`
     # (matches the YAML key) and this script's local `g_bio_or_dio`.
     # shellcheck disable=SC2154  # dio_or_bio comes from sourcing env_used.sh above
@@ -373,6 +401,10 @@ _run_delete_only_path() {
 if [[ -n "$resume_dir" ]]; then
     _validate_resume_mutual_exclusivity
     _resume_load_env_used "$resume_dir"
+    if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
+        echo "Error: kubectl execution is not implemented yet" >&2
+        exit 1
+    fi
     _validate_elbencho_sweep_environment || exit 1
     validate_elbencho_sweep_workload_mode \
         "$g_bio_or_dio" "$rand_option" "$sweep_read_from" || exit 1
@@ -396,6 +428,11 @@ if [[ -n "$resume_dir" ]]; then
         exit $?
     fi
     echo "Error: neither SLURM_ENABLED nor SSH_ENABLED is set; cannot dispatch" >&2
+    exit 1
+fi
+
+if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
+    echo "Error: kubectl execution is not implemented yet" >&2
     exit 1
 fi
 

@@ -775,7 +775,11 @@ EOF
 
 check_dirs
 
-if [ -n "$SLURM_ENABLED" ]; then
+if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
+    register_error "Kubernetes runtime validation is not implemented yet; use the filesystem sweep only after kubectl support is complete"
+    slurm_rc=1
+    ssh_rc=1
+elif [ -n "$SLURM_ENABLED" ]; then
     check_slurm
     slurm_rc=$?
 else
@@ -845,18 +849,20 @@ if [ -n "$FS_ENABLED" ]; then
     }
     check_elbencho_config
 
-    # Loop over all filesystems in TEST_DIRS
-    for fs_path in "${!TEST_DIRS[@]}"; do
-        # Skip empty paths
-        if [ -n "$fs_path" ]; then
-            check_fs "$slurm_rc" "$fs_path"
-        fi
-    done
+    if [[ -z "${KUBECTL_ENABLED:-}" ]]; then
+        # Loop over all filesystems in TEST_DIRS
+        for fs_path in "${!TEST_DIRS[@]}"; do
+            # Skip empty paths
+            if [ -n "$fs_path" ]; then
+                check_fs "$slurm_rc" "$fs_path"
+            fi
+        done
+    fi
 else
     printf "  (NOTE: FS not enabled; not checking filesystem testability)\n\n"
 fi
 
-if [ -n "$OBJ_ENABLED" ]; then
+if [[ -n "$OBJ_ENABLED" && -z "${KUBECTL_ENABLED:-}" ]]; then
     check_obj "$slurm_rc" "$ssh_rc"
 else
     printf "  (NOTE: OBJ not enabled; not checking object testability)\n\n"

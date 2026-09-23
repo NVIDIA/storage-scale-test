@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -57,6 +58,10 @@ from fixture_capacity import (  # pylint: disable=wrong-import-position
     SSH_HOME_CAPACITY,
     STORAGE_TEST_CAPACITY,
 )
+from fixture_images import (  # pylint: disable=wrong-import-position
+    ELBENCHO_FIXTURE_IMAGE,
+    ELBENCHO_UPSTREAM_IMAGE,
+)
 from scenario_planner import (  # pylint: disable=wrong-import-position
     SUBSTRATES,
     format_scenario_listing,
@@ -85,6 +90,36 @@ SBX_KIND_NODE_IMAGE = (
     f"kindest/node:{SBX_KUBERNETES_VERSION}@"
     "sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8ec94d976dc5a"
 )
+CALICO_VERSION = "v3.32.2"
+CALICO_MANIFEST_SHA256 = (
+    "a8c828a06a87c629a282ebbc424895b77f3a030251993e41ea400a743675bb02"
+)
+CALICO_MANIFEST_URL = (
+    f"https://raw.githubusercontent.com/projectcalico/calico/{CALICO_VERSION}/"
+    "manifests/calico.yaml"
+)
+CALICO_POD_SUBNET = "192.168.0.0/16"
+CALICO_SBX_RECIPE = "iptables-without-securityfs-v2"
+CALICO_IMAGES = (
+    (
+        "cni",
+        "sha256:0ef740bc587f25565905adf1d1f61a7faff0d571c449c6bdd789feed743d3ef7",
+    ),
+    (
+        "kube-controllers",
+        "sha256:7870b67ebb13fabc3005252b44fe6e78b21635649bd3072b80afa1684b6565d0",
+    ),
+    (
+        "node",
+        "sha256:99b03fe91e8bfbcb153ae65ef4b701b24ce541ffdd74ff314eb041096008f7fd",
+    ),
+)
+KINDNET_IMAGE = "docker.io/kindest/kindnetd:v20260820-69b56db7"
+KUBECTL_PROBE_NAME = "storage-scale-kubectl-probe"
+KUBECTL_PROBE_WORKERS = f"{KUBECTL_PROBE_NAME}-workers"
+KUBECTL_PROBE_COORDINATOR = f"{KUBECTL_PROBE_NAME}-coordinator"
+KUBECTL_PROBE_DENIED = f"{KUBECTL_PROBE_NAME}-denied"
+KUBECTL_PROBE_STORAGE = "/mnt/storage-scale-test/.kubectl-prerequisite-probe"
 NFS_CSI_VERSION = "4.13.4"
 NFS_CSI_SOURCE_SHA256 = (
     "ded6ffba8b1600d4c723ce1ecb1fd91721ef48e732ce7ca30c0efeeecbb0b900"
@@ -1115,12 +1150,25 @@ def _fixture_profile(config: Config, backend: str) -> dict[str, str]:
     """Return the cluster inputs that require disposable-cluster replacement."""
     name, replacements = _kind_config_inputs(config, backend)
     rendered = _render_resource_text(name, replacements)
-    return {
+    profile = {
         "kind_version": SBX_KIND_VERSION if backend == "sbx-shared" else KIND_VERSION,
         "node_image": (
             SBX_KIND_NODE_IMAGE if backend == "sbx-shared" else KIND_NODE_IMAGE
         ),
         "kind_config_sha256": hashlib.sha256(rendered.encode()).hexdigest(),
+    }
+    if backend != "sbx-shared":
+        return {**profile, "cni": "kindnet", "cni_image": KINDNET_IMAGE}
+    return {
+        **profile,
+        "cni": "calico",
+        "cni_version": CALICO_VERSION,
+        "cni_manifest_sha256": CALICO_MANIFEST_SHA256,
+        "cni_recipe": CALICO_SBX_RECIPE,
+        "cni_pod_subnet": CALICO_POD_SUBNET,
+        "cni_images_sha256": hashlib.sha256(
+            json.dumps(CALICO_IMAGES, sort_keys=True).encode()
+        ).hexdigest(),
     }
 
 
@@ -1143,8 +1191,6 @@ def _create_cluster(runner: Runner, config: Config, backend: str) -> None:
             manifest,
             "--kubeconfig",
             config.kubeconfig,
-            "--wait",
-            "180s",
         ],
         timeout=600,
     )
@@ -1333,6 +1379,145 @@ def _expected_kubernetes_version(backend: str) -> str:
     return SBX_KUBERNETES_VERSION if backend == "sbx-shared" else KUBERNETES_VERSION
 
 
+def _validate_kindnet_profile(runner: Runner, config: Config) -> None:
+    """Require the exact healthy Kindnet bundled by the NFS node profile."""
+    document = json.loads(
+        runner.run(
+            _kubectl(
+                config,
+                "-n",
+                "kube-system",
+                "get",
+                "daemonset/kindnet",
+                "-o",
+                "json",
+            ),
+            timeout=30,
+        ).stdout
+    )
+    status = document.get("status", {})
+    containers = (
+        document.get("spec", {})
+        .get("template", {})
+        .get("spec", {})
+        .get("containers", [])
+    )
+    observed = containers[0].get("image") if len(containers) == 1 else None
+    if (
+        status.get("desiredNumberScheduled") != 3
+        or status.get("numberReady") != 3
+        or status.get("numberAvailable") != 3
+        or observed != KINDNET_IMAGE
+    ):
+        raise ProvisionError(
+            "Kindnet does not match the healthy NFS fixture profile: "
+            f"image={observed}, status={status}"
+        )
+
+
+def _calico_image(component: str) -> tuple[str, str]:
+    """Return the digest-qualified upstream image and fixture-private alias."""
+    digest = dict(CALICO_IMAGES)[component]
+    upstream = f"docker.io/calico/{component}:{CALICO_VERSION}@{digest}"
+    destination = (
+        "docker.io/storage-scale-test-integration/"
+        f"calico-{component}:{CALICO_VERSION}"
+    )
+    return upstream, destination
+
+
+def _observed_calico_images(runner: Runner, config: Config) -> dict[str, str]:
+    """Return images from the healthy Calico node and controller workloads."""
+    result = runner.run(
+        _kubectl(
+            config, "-n", "kube-system", "get", "daemonset/calico-node", "-o", "json"
+        ),
+        timeout=30,
+    )
+    document = json.loads(result.stdout)
+    status = document.get("status", {})
+    desired = status.get("desiredNumberScheduled")
+    ready = status.get("numberReady")
+    available = status.get("numberAvailable")
+    pod_spec = document.get("spec", {}).get("template", {}).get("spec", {})
+    containers = pod_spec.get("containers", [])
+    init_containers = pod_spec.get("initContainers", [])
+    if desired != 3 or ready != 3 or available != 3:
+        raise ProvisionError(
+            "Calico is not healthy on all fixture nodes: "
+            f"desired={desired}, ready={ready}, available={available}, "
+            f"containers={len(containers)}"
+        )
+    controller = json.loads(
+        runner.run(
+            _kubectl(
+                config,
+                "-n",
+                "kube-system",
+                "get",
+                "deployment/calico-kube-controllers",
+                "-o",
+                "json",
+            ),
+            timeout=30,
+        ).stdout
+    )
+    controller_status = controller.get("status", {})
+    if controller_status.get("availableReplicas") != 1:
+        raise ProvisionError("Calico kube-controllers is not available")
+    observed: dict[str, str] = {}
+    for container in [*containers, *init_containers]:
+        name = str(container.get("name", ""))
+        image = container.get("image")
+        if name in {
+            "calico-node",
+            "upgrade-ipam",
+            "install-cni",
+            "mount-bpffs",
+            "ebpf-bootstrap",
+        }:
+            if isinstance(image, str):
+                observed[name] = image
+    controller_containers = (
+        controller.get("spec", {})
+        .get("template", {})
+        .get("spec", {})
+        .get("containers", [])
+    )
+    if controller_containers:
+        observed["calico-kube-controllers"] = str(
+            controller_containers[0].get("image", "")
+        )
+    return observed
+
+
+def _validate_calico_profile(runner: Runner, config: Config) -> None:
+    """Require the exact preloaded Calico images selected by the fixture."""
+    observed = _observed_calico_images(runner, config)
+    expected = {
+        "calico-node": _calico_image("node")[1],
+        "ebpf-bootstrap": _calico_image("node")[1],
+        "upgrade-ipam": _calico_image("cni")[1],
+        "install-cni": _calico_image("cni")[1],
+        "calico-kube-controllers": _calico_image("kube-controllers")[1],
+    }
+    if observed != expected:
+        raise ProvisionError(
+            f"Calico images do not match the fixture profile: {observed} != {expected}"
+        )
+
+
+def _validate_network_policy_profile(
+    runner: Runner, config: Config, backend: str
+) -> str:
+    """Validate and name the backend-specific policy-capable CNI."""
+    if backend == "sbx-shared":
+        _validate_calico_profile(runner, config)
+        return f"Calico {CALICO_VERSION}"
+    _validate_kindnet_profile(runner, config)
+    return KINDNET_IMAGE
+
+
 def _observed_kubernetes_version(runner: Runner, config: Config) -> str:
     """Return the one kubelet version observed on every fixture node."""
     nodes = json.loads(
@@ -1366,14 +1551,23 @@ def _retained_cluster_matches_profile(
     _wait_for_kube_api(runner, config)
     observed = _observed_kubernetes_version(runner, config)
     expected = _expected_kubernetes_version(backend)
-    if observed == expected:
-        return True
-    LOG.warning(
-        "Replacing retained kind cluster with kubelet %s; profile requires %s",
-        observed,
-        expected,
-    )
-    return False
+    if observed != expected:
+        LOG.warning(
+            "Replacing retained kind cluster with kubelet %s; profile requires %s",
+            observed,
+            expected,
+        )
+        return False
+    try:
+        _validate_network_policy_profile(runner, config, backend)
+    except (
+        ProvisionError,
+        subprocess.CalledProcessError,
+        json.JSONDecodeError,
+    ) as error:
+        LOG.warning("Replacing retained kind cluster after CNI drift: %s", error)
+        return False
+    return True
 
 
 def _wait_for_kube_api(runner: Runner, config: Config) -> None:
@@ -3213,6 +3407,579 @@ def _stage_pinned_fixture_image(
     _load_image_into_nodes(runner, image, nodes)
 
 
+def _stage_pinned_node_alias(
+    runner: Runner,
+    upstream: str,
+    destination: str,
+    nodes: list[str],
+    component: str,
+) -> None:
+    """Import one verified image under a node-local fixture alias."""
+    selected = _ensure_pinned_image(runner, upstream)
+    host_prefix = f"storage-scale-test-integration/{component}-import:"
+    node_prefix = f"docker.io/{host_prefix}"
+    _remove_stale_host_image_aliases(runner, host_prefix)
+    _remove_stale_node_image_aliases(runner, nodes, node_prefix)
+    temporary = f"{host_prefix}{secrets.token_hex(6)}"
+    runner.run(["docker", "image", "tag", selected, temporary])
+    try:
+        _load_image_into_nodes(
+            runner,
+            temporary,
+            nodes,
+            destination=destination,
+        )
+    finally:
+        runner.run(["docker", "image", "rm", temporary], check=False)
+
+
+def _prepare_kubectl_prerequisite_image(runner: Runner, config: Config) -> None:
+    """Load the verified Elbencho image under a fixture-private node alias."""
+    nodes = _kind_containers(runner, config, running_only=True)
+    if len(nodes) != 3:
+        raise ProvisionError(
+            f"expected three running kind nodes before image import; found {nodes}"
+        )
+    _stage_pinned_node_alias(
+        runner,
+        ELBENCHO_UPSTREAM_IMAGE,
+        ELBENCHO_FIXTURE_IMAGE,
+        nodes,
+        "elbencho",
+    )
+
+
+def _ensure_calico_manifest(runner: Runner, config: Config) -> Path:
+    """Return the checksum-verified Calico manifest cached in fixture state."""
+    source = config.state_dir / "downloads" / f"calico-{CALICO_VERSION}.yaml"
+    if source.exists():
+        _verify_sha256(source, CALICO_MANIFEST_SHA256)
+        return source
+    source.parent.mkdir(parents=True, exist_ok=True)
+    temporary = source.with_suffix(".yaml.new")
+    temporary.unlink(missing_ok=True)
+    try:
+        _curl(runner, CALICO_MANIFEST_URL, temporary)
+        _verify_sha256(temporary, CALICO_MANIFEST_SHA256)
+        temporary.replace(source)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return source
+
+
+def _render_calico_manifest(runner: Runner, config: Config) -> Path:
+    """Render Calico with only preloaded fixture-private image aliases."""
+    source = _ensure_calico_manifest(runner, config)
+    text = source.read_text(encoding="utf-8")
+    for component in dict(CALICO_IMAGES):
+        upstream_tag = f"quay.io/calico/{component}:{CALICO_VERSION}"
+        destination = _calico_image(component)[1]
+        expected = 2 if component in {"cni", "node"} else 1
+        if text.count(upstream_tag) != expected:
+            raise ProvisionError(
+                f"Calico manifest image count changed for {upstream_tag}"
+            )
+        text = text.replace(upstream_tag, destination)
+    if "quay.io/calico/" in text:
+        raise ProvisionError("Calico manifest retains an unstaged workload image")
+    calico_node_env = """          env:
+            # Use Kubernetes API as the backing datastore.
+"""
+    explicit_iptables_env = """          env:
+            # Docker SBX cannot provide the kernel facilities for Calico eBPF mode.
+            - name: FELIX_BPFENABLED
+              value: "false"
+            # Use Kubernetes API as the backing datastore.
+"""
+    if text.count(calico_node_env) != 1:
+        raise ProvisionError("Calico manifest node environment changed")
+    text = text.replace(calico_node_env, explicit_iptables_env)
+    # Docker SBX exposes the kind node's sysfs read-only. The upstream mount is
+    # used only to let Felix distinguish a confidential kernel lockdown before
+    # selecting eBPF programs; in this iptables profile Felix documents a
+    # missing/unreadable lockdown file as not locked down. Removing only this
+    # optional mount avoids asking the nested runtime to create a read-only
+    # hostPath while retaining every networking and policy volume.
+    securityfs_mount = """            # Felix reads /sys/kernel/security/lockdown to detect kernel
+            # lockdown=confidentiality; under it, ftrace is disabled and Felix
+            # loads trace-printk-free BPF program variants. securityfs is a
+            # separate filesystem from /sys/fs, so it needs its own mount.
+            - name: sys-kernel-security
+              mountPath: /sys/kernel/security
+              readOnly: true
+"""
+    securityfs_volume = """        # securityfs, read by Felix to detect kernel lockdown=confidentiality.
+        # No type set (like nodeproc below) so nodes without securityfs still
+        # start; Felix treats an unreadable lockdown file as "not locked down".
+        - name: sys-kernel-security
+          hostPath:
+            path: /sys/kernel/security
+"""
+    for fragment in (securityfs_mount, securityfs_volume):
+        if text.count(fragment) != 1:
+            raise ProvisionError(
+                "Calico manifest securityfs compatibility fragment changed"
+            )
+        text = text.replace(fragment, "")
+    text = text.replace("imagePullPolicy: IfNotPresent", "imagePullPolicy: Never")
+    destination = config.manifests_dir / f"calico-{CALICO_VERSION}.yaml"
+    _write_text(destination, text)
+    return destination
+
+
+def _install_sbx_calico(runner: Runner, config: Config) -> None:
+    """Install the pinned iptables Calico profile required by Docker SBX."""
+    existing = runner.run(
+        _kubectl(
+            config,
+            "-n",
+            "kube-system",
+            "get",
+            "daemonset/calico-node",
+            "--ignore-not-found",
+            "-o",
+            "name",
+        ),
+        check=False,
+        timeout=30,
+    )
+    if existing.returncode == 0 and existing.stdout.strip():
+        _validate_calico_profile(runner, config)
+        return
+    nodes = _kind_containers(runner, config, running_only=True)
+    if len(nodes) != 3:
+        raise ProvisionError(
+            f"expected three running kind nodes before Calico import; found {nodes}"
+        )
+    for component in dict(CALICO_IMAGES):
+        upstream, destination = _calico_image(component)
+        _stage_pinned_node_alias(
+            runner, upstream, destination, nodes, f"calico-{component}"
+        )
+    manifest = _render_calico_manifest(runner, config)
+    runner.run(_kubectl(config, "apply", "-f", manifest), timeout=180)
+    runner.run(
+        _kubectl(
+            config,
+            "-n",
+            "kube-system",
+            "rollout",
+            "status",
+            "daemonset/calico-node",
+            "--timeout=300s",
+        ),
+        timeout=330,
+    )
+    runner.run(
+        _kubectl(
+            config,
+            "-n",
+            "kube-system",
+            "rollout",
+            "status",
+            "deployment/calico-kube-controllers",
+            "--timeout=300s",
+        ),
+        timeout=330,
+    )
+
+
+def _kubectl_probe_exec(
+    runner: Runner,
+    config: Config,
+    pod: str,
+    container: str,
+    arguments: Sequence[str],
+    *,
+    check: bool = True,
+    timeout: float = 30,
+) -> subprocess.CompletedProcess[str]:
+    """Execute one bounded prerequisite-probe command."""
+    return runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "exec",
+            pod,
+            "-c",
+            container,
+            "--",
+            *arguments,
+        ),
+        check=check,
+        timeout=timeout,
+    )
+
+
+def _kubectl_probe_status(
+    runner: Runner,
+    config: Config,
+    pod: str,
+    container: str,
+    address: str,
+    *,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Query one Elbencho service directly by numeric Pod IPv4 address."""
+    ipaddress.IPv4Address(address)
+    script = (
+        'response=$(exec 3<>/dev/tcp/"$1"/1611; '
+        "printf 'GET /status HTTP/1.0\\r\\nHost: %s:1611\\r\\n\\r\\n' "
+        '"$1" >&3; cat <&3); exec 3>&-; [[ "$response" == *"200"* ]]'
+    )
+    return _kubectl_probe_exec(
+        runner,
+        config,
+        pod,
+        container,
+        ("timeout", "5s", "bash", "-ceu", script, "bash", address),
+        check=check,
+        timeout=15,
+    )
+
+
+def _wait_for_kubectl_probe_denial(
+    runner: Runner,
+    config: Config,
+    coordinator: str,
+    denied: str,
+    address: str,
+) -> None:
+    """Wait for policy propagation while continuously proving the allowed path."""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        _kubectl_probe_status(runner, config, coordinator, "coordinator", address)
+        denied_result = _kubectl_probe_status(
+            runner,
+            config,
+            denied,
+            "denied",
+            address,
+            check=False,
+        )
+        if denied_result.returncode:
+            _kubectl_probe_status(runner, config, coordinator, "coordinator", address)
+            return
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    raise ProvisionError(
+        "the policy CNI did not enforce worker ingress isolation from the unrelated "
+        f"probe Pod for {address}"
+    )
+
+
+def _wait_for_kubectl_probe_access(
+    runner: Runner,
+    config: Config,
+    pod: str,
+    container: str,
+    address: str,
+) -> None:
+    """Wait for one pre-policy cross-node path to become usable."""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        result = _kubectl_probe_status(
+            runner, config, pod, container, address, check=False
+        )
+        if result.returncode == 0:
+            return
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    raise ProvisionError(
+        f"kubectl prerequisite Pod {pod} could not reach worker {address} "
+        "before NetworkPolicy creation"
+    )
+
+
+def _kubectl_probe_pods(runner: Runner, config: Config) -> list[dict[str, object]]:
+    """Return all nonterminating prerequisite-probe Pods."""
+    result = runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "get",
+            "pods",
+            "-l",
+            f"app.kubernetes.io/name={KUBECTL_PROBE_NAME}",
+            "-o",
+            "json",
+        ),
+        timeout=30,
+    )
+    return [
+        pod
+        for pod in json.loads(result.stdout).get("items", [])
+        if not pod.get("metadata", {}).get("deletionTimestamp")
+    ]
+
+
+def _validate_kubectl_probe_inventory(
+    runner: Runner, config: Config
+) -> tuple[list[dict[str, object]], dict[str, object], dict[str, object]]:
+    """Validate probe placement, readiness, identity, and Pod IPv4 addresses."""
+    pods = _kubectl_probe_pods(runner, config)
+    workers = [
+        pod
+        for pod in pods
+        if pod.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
+        == "worker"
+    ]
+    clients = {
+        str(
+            pod.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
+        ): pod
+        for pod in pods
+        if pod.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
+        in {"coordinator", "denied"}
+    }
+    target_output = runner.run(
+        _kubectl(
+            config,
+            "get",
+            "nodes",
+            "-l",
+            TARGET_LABEL,
+            "-o",
+            "jsonpath={.items[*].metadata.name}",
+        ),
+        timeout=30,
+    ).stdout
+    target_nodes = set(target_output.split())
+    worker_nodes = {str(pod.get("spec", {}).get("nodeName")) for pod in workers}
+    login_node = f"{config.cluster_name}-control-plane"
+    invalid = len(workers) != 2 or set(clients) != {"coordinator", "denied"}
+    invalid = invalid or target_nodes != worker_nodes or len(target_nodes) != 2
+    invalid = invalid or any(
+        pod.get("spec", {}).get("nodeName") != login_node for pod in clients.values()
+    )
+    invalid = invalid or any(not _pod_is_ready(pod) for pod in pods)
+    if invalid:
+        raise ProvisionError(
+            "kubectl prerequisite probe placement or readiness is invalid: "
+            f"pods={len(pods)}, workers={sorted(worker_nodes)}, "
+            f"targets={sorted(target_nodes)}, clients={sorted(clients)}"
+        )
+    addresses = [str(pod.get("status", {}).get("podIP", "")) for pod in workers]
+    try:
+        parsed_addresses = {ipaddress.IPv4Address(address) for address in addresses}
+    except ipaddress.AddressValueError as error:
+        raise ProvisionError(
+            f"kubectl prerequisite workers lack valid Pod IPv4 addresses: {addresses}"
+        ) from error
+    if len(parsed_addresses) != 2:
+        raise ProvisionError(
+            f"kubectl prerequisite workers lack distinct Pod IPv4 addresses: {addresses}"
+        )
+    image_ids = {
+        str(status.get("imageID"))
+        for pod in workers
+        for status in pod.get("status", {}).get("containerStatuses", [])
+    }
+    if len(image_ids) != 1 or image_ids == {"None"}:
+        raise ProvisionError(
+            f"kubectl prerequisite workers do not share one image ID: {image_ids}"
+        )
+    return workers, clients["coordinator"], clients["denied"]
+
+
+def _verify_kubectl_probe_storage(
+    runner: Runner,
+    config: Config,
+    workers: Sequence[dict[str, object]],
+    coordinator: dict[str, object],
+    token: str,
+) -> None:
+    """Prove bidirectional shared-PVC visibility under the workload identity."""
+    coordinator_name = str(coordinator["metadata"]["name"])  # type: ignore[index]
+    worker_nodes = sorted(str(pod["spec"]["nodeName"]) for pod in workers)  # type: ignore[index]
+    expected = " ".join(shlex.quote(node) for node in worker_nodes)
+    probe_path = f"{KUBECTL_PROBE_STORAGE}/{token}"
+    script = (
+        f"deadline=$((SECONDS + 30)); for node in {expected}; do "
+        f"expected={shlex.quote(token)}' '$node; "
+        f"while [[ $(cat {shlex.quote(probe_path)}/$node 2>/dev/null || true) "
+        '!= "$expected" ]]; do (( SECONDS < deadline )) || exit 1; '
+        "sleep 1; done; done; "
+        f"printf '%s\\n' {shlex.quote(token)} >"
+        f"{shlex.quote(probe_path)}/coordinator"
+    )
+    _kubectl_probe_exec(
+        runner,
+        config,
+        coordinator_name,
+        "coordinator",
+        ("bash", "-ceu", script),
+        timeout=45,
+    )
+    for worker in workers:
+        _kubectl_probe_exec(
+            runner,
+            config,
+            str(worker["metadata"]["name"]),  # type: ignore[index]
+            "elbencho",
+            (
+                "bash",
+                "-ceu",
+                f"[[ $(cat {shlex.quote(probe_path)}/coordinator) == "
+                f"{shlex.quote(token)} ]]",
+            ),
+        )
+
+
+def _cleanup_kubectl_prerequisite_probe(
+    runner: Runner, config: Config, manifests: Sequence[Path]
+) -> list[str]:
+    """Attempt all exact probe cleanup and return secondary diagnostics."""
+    failures: list[str] = []
+    try:
+        candidates = []
+        for item in _kubectl_probe_pods(runner, config):
+            component = (
+                item.get("metadata", {})
+                .get("labels", {})
+                .get("app.kubernetes.io/component")
+            )
+            if component == "coordinator":
+                candidates.append(
+                    (str(item.get("metadata", {}).get("name")), "coordinator")
+                )
+            elif component == "worker":
+                candidates.append(
+                    (str(item.get("metadata", {}).get("name")), "elbencho")
+                )
+    except (ProvisionError, subprocess.SubprocessError, OSError, json.JSONDecodeError):
+        candidates = []
+        failures.append("probe Pod discovery for storage cleanup failed")
+    for candidate, container in candidates:
+        try:
+            result = _kubectl_probe_exec(
+                runner,
+                config,
+                candidate,
+                container,
+                ("rm", "-rf", "--", KUBECTL_PROBE_STORAGE),
+                check=False,
+            )
+            if result.returncode:
+                failures.append(f"storage cleanup through {candidate} failed")
+        except (ProvisionError, subprocess.SubprocessError, OSError) as error:
+            failures.append(f"storage cleanup through {candidate} failed: {error}")
+    for manifest in manifests:
+        deletion = runner.run(
+            _kubectl(
+                config,
+                "delete",
+                "-f",
+                manifest,
+                "--ignore-not-found=true",
+                "--wait=true",
+                "--timeout=90s",
+            ),
+            check=False,
+            timeout=120,
+        )
+        if deletion.returncode:
+            failures.append(f"probe resource deletion failed for {manifest.name}")
+    return failures
+
+
+def _validate_kubectl_prerequisites(
+    runner: Runner, config: Config, backend: str
+) -> None:
+    """Prove the retained fixture can support the planned kubectl substrate."""
+    cni_profile = _validate_network_policy_profile(runner, config, backend)
+    _prepare_kubectl_prerequisite_image(runner, config)
+    token = secrets.token_hex(16)
+    workload_manifest = _render_resource(
+        config,
+        "manifests/kubectl-prerequisite-probe.yaml.tmpl",
+        {
+            "NAMESPACE": config.namespace,
+            "ELBENCHO_IMAGE": ELBENCHO_FIXTURE_IMAGE,
+            "PROBE_TOKEN": token,
+        },
+    )
+    policy_manifest = _render_resource(
+        config,
+        "manifests/kubectl-prerequisite-policy.yaml.tmpl",
+        {"NAMESPACE": config.namespace},
+    )
+    manifests = (policy_manifest, workload_manifest)
+    cleanup_failures = _cleanup_kubectl_prerequisite_probe(runner, config, manifests)
+    if cleanup_failures:
+        raise ProvisionError(
+            "stale kubectl prerequisite probe cleanup failed: "
+            + "; ".join(cleanup_failures)
+        )
+    primary_error: BaseException | None = None
+    try:
+        runner.run(_kubectl(config, "create", "-f", workload_manifest), timeout=60)
+        runner.run(
+            _kubectl(
+                config,
+                "-n",
+                config.namespace,
+                "rollout",
+                "status",
+                f"daemonset/{KUBECTL_PROBE_WORKERS}",
+                "--timeout=180s",
+            ),
+            timeout=210,
+        )
+        runner.run(
+            _kubectl(
+                config,
+                "-n",
+                config.namespace,
+                "wait",
+                "--for=condition=Ready",
+                f"pod/{KUBECTL_PROBE_COORDINATOR}",
+                f"pod/{KUBECTL_PROBE_DENIED}",
+                "--timeout=180s",
+            ),
+            timeout=210,
+        )
+        workers, coordinator, denied = _validate_kubectl_probe_inventory(runner, config)
+        coordinator_name = str(coordinator["metadata"]["name"])  # type: ignore[index]
+        denied_name = str(denied["metadata"]["name"])  # type: ignore[index]
+        # Establish the negative probe's working cross-node path before policy
+        # exists; otherwise an unrelated network failure could look like
+        # successful isolation.
+        for worker in workers:
+            address = str(worker["status"]["podIP"])  # type: ignore[index]
+            _wait_for_kubectl_probe_access(
+                runner, config, coordinator_name, "coordinator", address
+            )
+            _wait_for_kubectl_probe_access(
+                runner, config, denied_name, "denied", address
+            )
+        runner.run(_kubectl(config, "create", "-f", policy_manifest), timeout=60)
+        for worker in workers:
+            address = str(worker["status"]["podIP"])  # type: ignore[index]
+            _wait_for_kubectl_probe_denial(
+                runner, config, coordinator_name, denied_name, address
+            )
+        _verify_kubectl_probe_storage(runner, config, workers, coordinator, token)
+        LOG.info(
+            "Validated kubectl prerequisites with %s and direct Pod networking",
+            cni_profile,
+        )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        cleanup_failures = _cleanup_kubectl_prerequisite_probe(
+            runner, config, manifests
+        )
+        if cleanup_failures:
+            detail = "; ".join(cleanup_failures)
+            if primary_error is None:
+                raise ProvisionError(
+                    f"kubectl prerequisite probe cleanup failed: {detail}"
+                )
+            LOG.error("Secondary kubectl prerequisite cleanup failure: %s", detail)
+
+
 def _prepare_slurm_images(runner: Runner, config: Config) -> None:
     """Build or acquire every image that the Slurm fixture runs in kind."""
     control_plane = f"{config.cluster_name}-control-plane"
@@ -3739,6 +4506,10 @@ def _write_state_summary(
         "slinky_version": SLINKY_VERSION,
         "kind_subnet": subnet,
         "kind_gateway": gateway,
+        "cni": "calico" if backend == "sbx-shared" else "kindnet",
+        "cni_version": CALICO_VERSION if backend == "sbx-shared" else None,
+        "cni_image": None if backend == "sbx-shared" else KINDNET_IMAGE,
+        "kubectl_probe_image": ELBENCHO_FIXTURE_IMAGE,
     }
     _write_text(config.state_dir / "state.json", json.dumps(state, indent=2) + "\n")
 
@@ -3798,6 +4569,7 @@ def _setup_environment_locked(
         _create_cluster(runner, config, backend)
     if backend == "sbx-shared":
         _configure_sbx_node_trust(runner, config)
+        _install_sbx_calico(runner, config)
     _wait_for_cluster(runner, config)
     kubernetes_version = _observed_kubernetes_version(runner, config)
     _record_storage_backend_profile(config, backend)
@@ -3810,6 +4582,7 @@ def _setup_environment_locked(
         _install_nfs_csi(runner, config, gateway)
     else:
         _install_sbx_shared_storage(runner, config)
+    _validate_kubectl_prerequisites(runner, config, backend)
     _install_ssh_workers(runner, config)
     _scale_ssh(runner, config, replicas=0)
     _install_slurm(runner, config)

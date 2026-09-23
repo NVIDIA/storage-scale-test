@@ -21,6 +21,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
@@ -68,6 +69,13 @@ _nfs_host_owner_document = getattr(_DRIVER, "_nfs_host_owner_document")
 _retained_cluster_matches_profile = getattr(
     _DRIVER, "_retained_cluster_matches_profile"
 )
+_fixture_profile = getattr(_DRIVER, "_fixture_profile")
+_prepare_kubectl_prerequisite_image = getattr(
+    _DRIVER, "_prepare_kubectl_prerequisite_image"
+)
+_validate_kindnet_profile = getattr(_DRIVER, "_validate_kindnet_profile")
+_render_calico_manifest = getattr(_DRIVER, "_render_calico_manifest")
+_calico_image = getattr(_DRIVER, "_calico_image")
 _stop_owned_nfs = getattr(_DRIVER, "_stop_owned_nfs")
 _driver_pods_with_container = getattr(_DRIVER, "_pods_with_container")
 _remove_nfs_configuration = getattr(_DRIVER, "_remove_nfs_configuration")
@@ -872,6 +880,127 @@ def test_retained_cluster_profile_uses_observed_kubelet_version(tmp_path, monkey
     assert not _retained_cluster_matches_profile(
         SimpleNamespace(), config, "sbx-shared"
     )
+
+
+def test_retained_cluster_replaces_a_missing_cni(tmp_path, monkeypatch):
+    """A missing retained CNI is profile drift rather than an uncaught error."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    config.state_dir.mkdir()
+    (config.state_dir / "storage-backend.json").write_text(
+        json.dumps({"profile": _fixture_profile(config, "sbx-shared")}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_DRIVER, "_wait_for_kube_api", lambda *_args: None)
+    monkeypatch.setattr(
+        _DRIVER,
+        "_observed_kubernetes_version",
+        lambda *_args: _DRIVER.SBX_KUBERNETES_VERSION,
+    )
+    monkeypatch.setattr(
+        _DRIVER,
+        "_validate_network_policy_profile",
+        lambda *_args: (_ for _ in ()).throw(
+            subprocess.CalledProcessError(1, ["kubectl", "get", "daemonset"])
+        ),
+    )
+
+    assert not _retained_cluster_matches_profile(
+        SimpleNamespace(), config, "sbx-shared"
+    )
+
+
+def test_fixture_profile_pins_backend_specific_policy_cni(tmp_path):
+    """Retained clusters include their exact policy-capable CNI identity."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+
+    nfs = _fixture_profile(config, "nfs")
+    sbx = _fixture_profile(config, "sbx-shared")
+
+    assert nfs["cni"] == "kindnet"
+    assert nfs["cni_image"] == _DRIVER.KINDNET_IMAGE
+    assert sbx["cni"] == "calico"
+    assert sbx["cni_version"] == _DRIVER.CALICO_VERSION
+    assert sbx["cni_manifest_sha256"] == _DRIVER.CALICO_MANIFEST_SHA256
+    assert sbx["cni_recipe"] == _DRIVER.CALICO_SBX_RECIPE
+    assert sbx["cni_pod_subnet"] == _DRIVER.CALICO_POD_SUBNET
+
+
+def test_kindnet_profile_requires_all_fixture_nodes_and_exact_image(tmp_path):
+    """A retained CNI must be healthy and match its pinned node profile."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    document = {
+        "spec": {
+            "template": {"spec": {"containers": [{"image": _DRIVER.KINDNET_IMAGE}]}}
+        },
+        "status": {
+            "desiredNumberScheduled": 3,
+            "numberReady": 3,
+            "numberAvailable": 3,
+        },
+    }
+
+    class _KindnetRunner:
+        def run(self, _arguments, **_kwargs):
+            return SimpleNamespace(stdout=json.dumps(document))
+
+    runner = _KindnetRunner()
+    assert _validate_kindnet_profile(runner, config) is None
+    document["status"]["numberReady"] = 2
+    with pytest.raises(_DRIVER.ProvisionError, match="does not match"):
+        _validate_kindnet_profile(runner, config)
+
+
+def test_sbx_calico_render_uses_only_preloaded_images_and_omits_securityfs(
+    tmp_path, monkeypatch
+):
+    """The SBX recipe changes only images, pulls, and its optional mount."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    config.manifests_dir.mkdir(parents=True)
+    source = tmp_path / "calico.yaml"
+    securityfs_mount = """            # Felix reads /sys/kernel/security/lockdown to detect kernel
+            # lockdown=confidentiality; under it, ftrace is disabled and Felix
+            # loads trace-printk-free BPF program variants. securityfs is a
+            # separate filesystem from /sys/fs, so it needs its own mount.
+            - name: sys-kernel-security
+              mountPath: /sys/kernel/security
+              readOnly: true
+"""
+    securityfs_volume = """        # securityfs, read by Felix to detect kernel lockdown=confidentiality.
+        # No type set (like nodeproc below) so nodes without securityfs still
+        # start; Felix treats an unreadable lockdown file as "not locked down".
+        - name: sys-kernel-security
+          hostPath:
+            path: /sys/kernel/security
+"""
+    images = "\n".join(
+        [
+            f"image: quay.io/calico/cni:{_DRIVER.CALICO_VERSION}",
+            f"image: quay.io/calico/cni:{_DRIVER.CALICO_VERSION}",
+            f"image: quay.io/calico/node:{_DRIVER.CALICO_VERSION}",
+            f"image: quay.io/calico/node:{_DRIVER.CALICO_VERSION}",
+            f"image: quay.io/calico/kube-controllers:{_DRIVER.CALICO_VERSION}",
+        ]
+    )
+    source.write_text(
+        f"{images}\nimagePullPolicy: IfNotPresent\n"
+        "          env:\n"
+        "            # Use Kubernetes API as the backing datastore.\n"
+        f"{securityfs_mount}{securityfs_volume}",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        _DRIVER, "_ensure_calico_manifest", lambda _runner, _config: source
+    )
+
+    rendered = _render_calico_manifest(None, config).read_text(encoding="utf-8")
+
+    assert "quay.io/calico/" not in rendered
+    assert "imagePullPolicy: Never" in rendered
+    assert "/sys/kernel/security" not in rendered
+    assert 'name: FELIX_BPFENABLED\n              value: "false"' in rendered
+    for component in dict(_DRIVER.CALICO_IMAGES):
+        expected = 2 if component in {"cni", "node"} else 1
+        assert rendered.count(_calico_image(component)[1]) == expected
 
 
 def test_local_scenario_failure_diagnostics_survive_workspace_cleanup(tmp_path):
@@ -2633,6 +2762,149 @@ def test_slurm_install_preloads_verified_mariadb_and_helper_images(
     assert f"image: {_DRIVER.MARIADB_IMAGE}" in manifest
     assert "imagePullPolicy: Never" in manifest
     assert _DRIVER.MARIADB_BASE_IMAGE not in manifest
+
+
+def test_kubectl_probe_image_is_verified_and_imported_privately(tmp_path, monkeypatch):
+    """The Elbencho probe uses a verified index and only a node-local alias."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    commands = []
+    loaded = []
+
+    class _ProbeImageRunner:
+        def run(self, arguments, **_kwargs):
+            command = [str(item) for item in arguments]
+            commands.append(command)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        _DRIVER,
+        "_kind_containers",
+        lambda *_args, **_kwargs: ["control", "worker", "worker2"],
+    )
+    monkeypatch.setattr(
+        _DRIVER,
+        "_ensure_pinned_image",
+        lambda _runner, image: (
+            image
+            if image == _DRIVER.ELBENCHO_UPSTREAM_IMAGE
+            else pytest.fail(f"unexpected image {image}")
+        ),
+    )
+    monkeypatch.setattr(
+        _DRIVER,
+        "_load_image_into_nodes",
+        lambda _runner, image, nodes, *, destination=None: loaded.append(
+            (image, nodes, destination)
+        ),
+    )
+
+    _prepare_kubectl_prerequisite_image(_ProbeImageRunner(), config)
+
+    tag = next(
+        command for command in commands if command[:3] == ["docker", "image", "tag"]
+    )
+    temporary = tag[-1]
+    assert tag[-2] == _DRIVER.ELBENCHO_UPSTREAM_IMAGE
+    assert loaded == [
+        (
+            temporary,
+            ["control", "worker", "worker2"],
+            _DRIVER.ELBENCHO_FIXTURE_IMAGE,
+        )
+    ]
+    assert ["docker", "image", "rm", temporary] in commands
+
+
+def test_kubectl_prerequisite_manifest_matches_product_constraints():
+    """The real-cluster probe uses Pod IPs, non-root identity, RWX, and policy."""
+    rendered = _render_resource_text(
+        "manifests/kubectl-prerequisite-probe.yaml.tmpl",
+        {
+            "NAMESPACE": "fixture",
+            "ELBENCHO_IMAGE": _DRIVER.ELBENCHO_FIXTURE_IMAGE,
+            "PROBE_TOKEN": "0123456789abcdef",
+        },
+    )
+    documents = list(yaml.safe_load_all(rendered))
+    policy_rendered = _render_resource_text(
+        "manifests/kubectl-prerequisite-policy.yaml.tmpl",
+        {"NAMESPACE": "fixture"},
+    )
+    policies = list(yaml.safe_load_all(policy_rendered))
+    daemonset, coordinator, denied = documents
+    ingress, egress = policies
+    pod_specs = [
+        daemonset["spec"]["template"]["spec"],
+        coordinator["spec"],
+        denied["spec"],
+    ]
+
+    assert [document["kind"] for document in documents] == [
+        "DaemonSet",
+        "Pod",
+        "Pod",
+    ]
+    assert [document["kind"] for document in policies] == [
+        "NetworkPolicy",
+        "NetworkPolicy",
+    ]
+    assert daemonset["spec"]["template"]["spec"]["nodeSelector"] == {
+        "storage-scale-test/target": "true"
+    }
+    assert coordinator["spec"]["nodeSelector"] == {"storage-scale-test/login": "true"}
+    assert denied["spec"]["nodeSelector"] == {"storage-scale-test/login": "true"}
+    for pod_spec in pod_specs:
+        assert pod_spec["automountServiceAccountToken"] is False
+        assert pod_spec["securityContext"]["runAsNonRoot"] is True
+        assert pod_spec["securityContext"]["runAsUser"] == 2000
+        assert pod_spec["securityContext"]["runAsGroup"] == 2000
+        assert pod_spec["securityContext"]["seccompProfile"] == {
+            "type": "RuntimeDefault"
+        }
+        assert "hostNetwork" not in pod_spec
+        for container in pod_spec["containers"]:
+            assert container["image"] == _DRIVER.ELBENCHO_FIXTURE_IMAGE
+            assert container["imagePullPolicy"] == "Never"
+            assert container["securityContext"]["allowPrivilegeEscalation"] is False
+            assert container["securityContext"]["capabilities"]["drop"] == ["ALL"]
+            assert "hostPort" not in str(container)
+    worker = daemonset["spec"]["template"]["spec"]["containers"][0]
+    worker_script = worker["args"][0]
+    assert (
+        "/mnt/storage-scale-test/.kubectl-prerequisite-probe/"
+        "0123456789abcdef/$NODE_NAME" in worker_script
+    )
+    assert "'0123456789abcdef' \"$NODE_NAME\"" in worker_script
+    assert worker["ports"] == [
+        {"name": "status", "containerPort": 1611, "protocol": "TCP"}
+    ]
+    assert daemonset["spec"]["template"]["spec"]["volumes"] == [
+        {
+            "name": "storage",
+            "persistentVolumeClaim": {"claimName": "storage-test-rwx"},
+        }
+    ]
+    assert (
+        ingress["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/component"]
+        == "worker"
+    )
+    assert (
+        ingress["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"][
+            "app.kubernetes.io/component"
+        ]
+        == "coordinator"
+    )
+    assert ingress["spec"]["ingress"][0]["ports"][0]["port"] == 1611
+    assert (
+        egress["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/component"]
+        == "coordinator"
+    )
+    assert (
+        egress["spec"]["egress"][0]["to"][0]["podSelector"]["matchLabels"][
+            "app.kubernetes.io/component"
+        ]
+        == "worker"
+    )
 
 
 def _yaml_image_references(value):

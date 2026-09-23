@@ -54,11 +54,16 @@ only: NVIDIA and the project do not publish or deliver benchmark binaries or
 prepared deployment tarballs. Users may create a deployment tarball locally
 and are responsible for every binary they place in it.
 
-Slurm is the default execution substrate; `SSH_HOST_LIST` selects passwordless
-SSH. Kubernetes benchmark execution is not implemented. The `integration-tests/`
+`EXECUTION_SUBSTRATE` explicitly selects Slurm or passwordless SSH; there is no
+default, and `SSH_HOST_LIST` no longer selects a mode. Kubernetes benchmark
+execution is not implemented. The `integration-tests/`
 fixture provisions three kind nodes, RWX storage, two SSH workers, and Slinky
 Slurm. Its `nfs` backend uses loop-backed NFSv4 and NFS CSI; `sbx-shared` uses
-static volumes over a repository-shared path. Both test the same storage contract.
+static volumes over a repository-shared path. NFS retains pinned Kindnet;
+Docker SBX uses pinned, preloaded Calico because its nested kernel cannot run
+Kindnet's nftables policy path. Setup proves non-root Elbencho DaemonSet
+placement, direct Pod-IPv4 coordination, enforced NetworkPolicy, and PVC access
+before provisioning the existing SSH and Slurm workloads.
 
 One budget drives PVC capacity and the growable 4 GiB NFS image. Setup publishes
 image tags transactionally, grows retained filesystems, checks fixture and Docker
@@ -140,9 +145,11 @@ work begins.
 
 Important configuration relationships:
 
-- A non-empty `SSH_HOST_LIST` enables SSH and disables Slurm. The referenced
-  file accepts comma- or whitespace-separated hosts and ignores comment lines.
-- Without `SSH_HOST_LIST`, `env_base.sh` enables Slurm. `SLURM_NODE_INCLUDES`
+- `EXECUTION_SUBSTRATE` is required and derives exactly one mode flag. `ssh`
+  also requires `SSH_HOST_LIST`; that file accepts comma- or whitespace-separated
+  hosts and ignores comment lines. Other benchmarks reject `kubectl` while its
+  filesystem-sweep implementation is incomplete.
+- In Slurm mode, `SLURM_NODE_INCLUDES`
   and `SLURM_NODE_IGNORES` point to optional files containing valid Slurm
   hostlists, including compressed forms.
 - `ORDER_NODES=1` makes SSH selection use the first requested hosts. With a

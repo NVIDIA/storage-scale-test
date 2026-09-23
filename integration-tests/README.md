@@ -66,16 +66,26 @@ integration-tests/bin/integration-test.py \
 The SBX profile requires Docker's private engine to bind-mount the checked-out
 repository path. It uses the tested kind v0.30.0/Kubernetes v1.34.0 profile and
 maps `/dev/null` to `/dev/kmsg` in kind nodes only when the SBX environment
-lacks that device. When Docker SBX exposes its proxy CA, setup installs that CA
-in the disposable kind nodes so containerd can pull the fixture images. The
-default shared root is `tmp/integration-sbx-shared`; an alternate path may be
-set with `--sbx-shared-root`, but must remain below the repository's `tmp/`
-directory. This profile never invokes `sudo`; required host packages and an
-accessible Docker engine must already be present. Its two disposable backing
-directories deliberately use non-sticky mode `0777`. Docker SBX can map the
-host caller and UID 2000 workloads to different owners, so omitting the sticky
-bit lets either side create and remove scenario data. This is safe only for
-these marker-owned, disposable leaves below the repository's `tmp/` directory.
+lacks that device. The nested SBX kernel cannot run Kindnet's nftables policy
+path, so this backend uses checksum-verified Calico with digest-pinned images
+preloaded through host Docker. The NFS profile retains kind's pinned Kindnet.
+When Docker SBX exposes its proxy CA, setup installs that CA in the disposable
+kind nodes. The default shared root is `tmp/integration-sbx-shared`; an
+alternate path may be set with `--sbx-shared-root`, but must remain below the
+repository's `tmp/` directory. This profile never invokes `sudo`; required host
+packages and an accessible Docker engine must already be present. Its two
+disposable backing directories deliberately use non-sticky mode `0777`. Docker
+SBX can map the host caller and UID 2000 workloads to different owners, so
+omitting the sticky bit lets either side create and remove scenario data. This
+is safe only for these marker-owned, disposable leaves below the repository's
+`tmp/` directory.
+
+Setup also preloads the pinned upstream Elbencho image under a fixture-private
+node reference and runs a temporary Kubernetes prerequisite probe. It requires
+one non-root service Pod on each worker, direct Pod-IPv4 access from a
+coordinator, denial from an unrelated Pod, and bidirectional PVC visibility.
+The probe uses no Service, host networking, host ports, service-account token,
+or external pull from kind nodes, and removes its objects and storage afterward.
 
 Every lifecycle action runs as the ordinary test account and refuses root.
 Kubeconfig, keys, downloaded clients, cached deployments, rendered manifests,

@@ -67,6 +67,7 @@ def _assert_yaml_nonempty_with_common_fs(
 ) -> None:
     testcase.assertIsInstance(loaded, dict)
     testcase.assertNotEqual(loaded, {})
+    testcase.assertEqual(loaded["EXECUTION_SUBSTRATE"], "slurm")
     td = loaded.get("TEST_DIRS")
     testcase.assertIsInstance(td, dict)
     testcase.assertEqual(td["/mnt/fs1"], 2)
@@ -79,7 +80,8 @@ def _assert_yaml_nonempty_with_common_fs(
 def _bash_write_env_used_yaml(out_dir: str) -> str:
     """Bash script body: IO sweep env + write_elbencho_env_used."""
     return _bash_script_with_repo(
-        """export ELBENCHO_SCALE_THREAD_LIST=("1" "2" "4" "8" "16")
+        """export EXECUTION_SUBSTRATE=slurm
+export ELBENCHO_SCALE_THREAD_LIST=("1" "2" "4" "8" "16")
 export ELBENCHO_SCALE_IO_SIZES=("1M" "r4K" "4K,8K")
 export ELBENCHO_IODEPTH_LIST=("1" "4" "8")
 export ELBENCHO_FILE_SIZE_MULTIPLIER=16384
@@ -103,7 +105,8 @@ export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=1
 def _bash_write_env_used_yaml_write_no_read(out_dir: str) -> str:
     """Bash script body: IO sweep env + write_elbencho_env_used (--write-no-read)."""
     return _bash_script_with_repo(
-        """export ELBENCHO_SCALE_THREAD_LIST=("8")
+        """export EXECUTION_SUBSTRATE=slurm
+export ELBENCHO_SCALE_THREAD_LIST=("8")
 export ELBENCHO_SCALE_IO_SIZES=("1M")
 export ELBENCHO_IODEPTH_LIST=("1")
 export ELBENCHO_FILE_SIZE_MULTIPLIER=1024
@@ -122,7 +125,8 @@ export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=0
 def _bash_write_mdtest_env_used_yaml(out_dir: str, dense_args: str = "") -> str:
     """Bash script body: mdtest sweep env + write_mdtest_elbencho_env_used."""
     return _bash_script_with_repo(
-        """export MDTEST_BRANCH_FACTOR=7
+        """export EXECUTION_SUBSTRATE=slurm
+export MDTEST_BRANCH_FACTOR=7
 export MDTEST_ITEMS_PER_DIR=100
 export MDTEST_ITERATIONS=3
 export ELBENCHO_READ_AFTER_WRITE_PAUSE=5

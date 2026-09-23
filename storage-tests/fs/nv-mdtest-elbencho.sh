@@ -40,6 +40,11 @@ fi
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../../env.sh"
 
+if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
+    echo "Error: kubectl execution is not supported by nv-mdtest-elbencho.sh" >&2
+    exit 1
+fi
+
 # Validate FS testing is enabled
 if [ -z "${FS_ENABLED:-}" ]; then
     echo "Error: Filesystem testing is not enabled (FS_ENABLED is empty)" >&2

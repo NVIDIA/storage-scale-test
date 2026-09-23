@@ -40,6 +40,11 @@ fi
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../../env.sh"
 
+if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
+    echo "Error: kubectl execution is not supported by nv-netbench.sh" >&2
+    exit 1
+fi
+
 usage() {
     cat <<EOF
 Usage: $(basename "$0") --nodes <node_spec> [--mode <mode>] [--bidirectional]

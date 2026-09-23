@@ -37,7 +37,8 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_platform_functions.sh"
 # Benchmark Runners (filesystem):
 #   run_elbencho_io_sweep_iteration    - Run a single IO benchmark iteration
 #   run_elbencho_metadata_benchmark    - Run metadata operations benchmark
-#   maybe_restart_elbencho_services_slurm    - Check/restart services (SLURM multi-node)
+#   elbencho_set_cell_run_context     - Install one explicit dispatcher context
+#   run_elbencho_cell                 - Run one cell through its context hooks
 #
 # Execution Reification (per-execution dispatch model):
 #   reify_elbencho_execution           - Write one executions/NNNN.sh definition
@@ -71,17 +72,10 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_platform_functions.sh"
 #
 # =============================================================================
 #
-# It is intended to be sourced (with no side effects) in two environments:
-# 1. SLURM
-#   - script run by sbatch on one client node
-#   - would have access to env.sh, lib/env_functions.sh, etc.
-# 2. SSH
-#   - scriptlet run by ssh on one client node
-#   - does NOT have access to env.sh, lib/env_functions.sh, etc.
-#
-# Because of the SSH case constraints, this script cannot depend on env.sh or
-# lib/env_functions.sh. Its only sibling dependency is
-# lib/_platform_functions.sh, which is deployed alongside it. Call sites must
+# It is sourced without side effects by substrate adapters, including a remote
+# SSH scriptlet that has no env.sh or lib/env_functions.sh. It therefore cannot
+# depend on either file. Its only sibling dependency is
+# lib/_platform_functions.sh, which is deployed alongside it. Adapters must
 # set the required environment variables before calling the desired function.
 #
 # =============================================================================
@@ -1016,71 +1010,170 @@ compute_target_file_count_per_thread() {
     echo "$target_files"
 }
 
-# Check and restart elbencho services if unhealthy (SLURM multi-node only)
-# Usage: maybe_restart_elbencho_services_slurm phase_name
-#   phase_name - Name of the phase for logging (e.g., "write", "read")
-# This function is a no-op for SSH mode or single-node SLURM jobs.
-# Modifies global SRUN_ELBENCHO_PID if services are restarted.
-maybe_restart_elbencho_services_slurm() {
-    local phase_name="${1:-}"
-    local restarted_pid
-
-    # Only applies to SLURM multi-node jobs
-    if [[ -z "${SLURM_JOB_ID:-}" ]] || [[ "${SLURM_JOB_NUM_NODES:-1}" -le 1 ]]; then
-        return 0
+# Install the complete execution context consumed by one filesystem sweep cell.
+# The caller sources NNNN.sh first, so its coordinates and workload flags remain
+# in scope while this function validates the dispatcher-owned values.
+#
+# Usage: elbencho_set_cell_run_context <id> <nodes> <hosts_csv> <test_dirs_csv> \
+#          <scratch_result_dir> <durable_result_dir> <service_health_hook> \
+#          <result_publication_hook>
+elbencho_set_cell_run_context() {
+    unset ELBENCHO_RUN_CONTEXT_READY
+    if [[ "$#" -ne 8 ]]; then
+        echo "Error: elbencho cell context requires exactly 8 arguments" >&2
+        return 1
     fi
-    # Caller (e.g. the coordinator under the per-execution dispatch model)
-    # owns the srun-services lifecycle via SRUN_ELBENCHO_PID. If it's not in
-    # scope, we cannot perform a real restart: stop_elbencho_services_srun ""
-    # would fall through to a port-fuser cleanup that breaks live services.
-    # Treat as "leave services alone" -- the lifecycle owner handles checks.
-    if [[ -z "${SRUN_ELBENCHO_PID:-}" ]]; then
-        return 0
-    fi
+    local execution_id="$1"
+    local run_nodes="$2"
+    local run_hosts_csv="$3"
+    local run_test_dirs_csv="$4"
+    local scratch_result_dir="$5"
+    local durable_result_dir="$6"
+    local service_health_hook="$7"
+    local result_publication_hook="$8"
 
-    if ! check_elbencho_services_srun; then
-        echo "Elbencho services unhealthy after ${phase_name} phase, restarting..."
-        stop_elbencho_services_srun "$SRUN_ELBENCHO_PID" || return 1
-        restarted_pid=$(start_elbencho_services_srun) || return 1
-        if [[ -n "${SRUN_ELBENCHO_PID_FILE:-}" ]] \
-                && ! _atomic_write_sentinel "$SRUN_ELBENCHO_PID_FILE" "$restarted_pid"; then
-            echo "Error: unable to record restarted elbencho service PID" >&2
-            stop_elbencho_services_srun "$restarted_pid" || true
+    local coordinate
+    for coordinate in io_size thread_count io_depth dio_or_bio use_random force_single; do
+        if [[ -z "${!coordinate+x}" || -z "${!coordinate}" ]]; then
+            echo "Error: elbencho cell context lacks saved coordinate: $coordinate" >&2
             return 1
         fi
-        SRUN_ELBENCHO_PID="$restarted_pid"
-        if ! check_elbencho_services_srun; then
-            echo "Error: elbencho services still unhealthy after ${phase_name} restart" >&2
-            return 1
-        fi
+    done
+
+    export ELBENCHO_RUN_EXECUTION_ID="$execution_id"
+    export ELBENCHO_RUN_NODE_COUNT="$run_nodes"
+    export ELBENCHO_RUN_HOSTS_CSV="$run_hosts_csv"
+    export ELBENCHO_RUN_TEST_DIRS_CSV="$run_test_dirs_csv"
+    export ELBENCHO_RUN_SCRATCH_OUTPUT_DIR="$scratch_result_dir"
+    export ELBENCHO_RUN_DURABLE_OUTPUT_DIR="$durable_result_dir"
+    export ELBENCHO_RUN_SERVICE_HEALTH_HOOK="$service_health_hook"
+    export ELBENCHO_RUN_RESULT_PUBLICATION_HOOK="$result_publication_hook"
+    export ELBENCHO_RUN_IO_SIZE="$io_size"
+    export ELBENCHO_RUN_THREAD_COUNT="$thread_count"
+    export ELBENCHO_RUN_IO_DEPTH="$io_depth"
+    export ELBENCHO_RUN_DIO_OR_BIO="$dio_or_bio"
+    export ELBENCHO_RUN_USE_RANDOM="$use_random"
+    export ELBENCHO_RUN_FORCE_SINGLE="$force_single"
+    export ELBENCHO_RUN_CONTEXT_READY=1
+    if ! _elbencho_validate_cell_run_context; then
+        unset ELBENCHO_RUN_CONTEXT_READY
+        return 1
     fi
+}
+
+_elbencho_noop_cell_hook() {
     return 0
 }
 
-# Set node_count, remote_output_dir, hosts_csv for SLURM or SSH; mkdir remote_output_dir.
-# Caller must: local node_count remote_output_dir hosts_csv
-# Assignments intentionally omit 'local' so caller locals are updated.
-#
-# Resolution precedence (additive; backward-compatible):
-#   1. Explicit per-execution overrides (set by the new dispatch model):
-#      ELBENCHO_RUN_NODE_COUNT      -> node_count
-#      ELBENCHO_RUN_HOSTS_CSV       -> hosts_csv
-#      ELBENCHO_RUN_REMOTE_OUTPUT_DIR (optional) -> remote_output_dir
-#   2. SLURM env (existing behavior when no override is set)
-#   3. SSH env (existing behavior when no override is set and not SLURM)
+_elbencho_validate_cell_run_context() {
+    if [[ "${ELBENCHO_RUN_CONTEXT_READY:-0}" != 1 ]]; then
+        echo "Error: elbencho cell run context was not initialized" >&2
+        return 1
+    fi
+    if [[ ! "${ELBENCHO_RUN_EXECUTION_ID:-}" =~ ^[0-9]+$ ]]; then
+        echo "Error: invalid elbencho execution ID: ${ELBENCHO_RUN_EXECUTION_ID:-}" >&2
+        return 1
+    fi
+    if [[ ! "${ELBENCHO_RUN_NODE_COUNT:-}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: invalid elbencho cell node count: ${ELBENCHO_RUN_NODE_COUNT:-}" >&2
+        return 1
+    fi
+    local path_value
+    for path_value in "${ELBENCHO_RUN_TEST_DIRS_CSV:-}" \
+            "${ELBENCHO_RUN_SCRATCH_OUTPUT_DIR:-}" \
+            "${ELBENCHO_RUN_DURABLE_OUTPUT_DIR:-}"; do
+        if [[ ! "$path_value" =~ [^[:space:]] ]]; then
+            echo "Error: elbencho cell context paths must not be empty" >&2
+            return 1
+        fi
+    done
+
+    local endpoint
+    local -a endpoints=()
+    if [[ -z "${ELBENCHO_RUN_HOSTS_CSV:-}" \
+            || "${ELBENCHO_RUN_HOSTS_CSV}" == ,* \
+            || "${ELBENCHO_RUN_HOSTS_CSV}" == *, \
+            || "${ELBENCHO_RUN_HOSTS_CSV}" == *,,* ]]; then
+        echo "Error: elbencho cell worker endpoint CSV contains an empty endpoint" >&2
+        return 1
+    fi
+    IFS=',' read -ra endpoints <<< "$ELBENCHO_RUN_HOSTS_CSV"
+    if [[ "${#endpoints[@]}" -ne "$ELBENCHO_RUN_NODE_COUNT" ]]; then
+        echo "Error: elbencho cell requires $ELBENCHO_RUN_NODE_COUNT worker endpoints, got ${#endpoints[@]}" >&2
+        return 1
+    fi
+    for endpoint in "${endpoints[@]}"; do
+        if [[ -z "$endpoint" || "$endpoint" =~ [[:space:]] ]]; then
+            echo "Error: elbencho cell worker endpoint is empty or contains whitespace" >&2
+            return 1
+        fi
+    done
+
+    local hook
+    for hook in "${ELBENCHO_RUN_SERVICE_HEALTH_HOOK:-}" \
+            "${ELBENCHO_RUN_RESULT_PUBLICATION_HOOK:-}"; do
+        if [[ ! "$hook" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] \
+                || ! declare -F "$hook" >/dev/null; then
+            echo "Error: elbencho cell context hook is unavailable: $hook" >&2
+            return 1
+        fi
+    done
+    local coordinate
+    for coordinate in IO_SIZE THREAD_COUNT IO_DEPTH DIO_OR_BIO USE_RANDOM FORCE_SINGLE; do
+        local snapshot="ELBENCHO_RUN_${coordinate}"
+        if [[ -z "${!snapshot+x}" || -z "${!snapshot}" ]]; then
+            echo "Error: elbencho cell context lacks saved coordinate: $coordinate" >&2
+            return 1
+        fi
+    done
+    return 0
+}
+
+_elbencho_run_service_health_hook() {
+    _elbencho_validate_cell_run_context || return 1
+    local hook="$ELBENCHO_RUN_SERVICE_HEALTH_HOOK"
+    "$hook" "$1"
+}
+
+_elbencho_run_result_publication_hook() {
+    _elbencho_validate_cell_run_context || return 1
+    local hook="$ELBENCHO_RUN_RESULT_PUBLICATION_HOOK"
+    "$hook" "$1" "$ELBENCHO_RUN_SCRATCH_OUTPUT_DIR" \
+        "$ELBENCHO_RUN_DURABLE_OUTPUT_DIR"
+}
+
+# Set node_count, remote_output_dir, hosts_csv, and test_dirs_csv from the
+# explicit cell context, then create its scratch/result directory. Caller must
+# declare node_count, remote_output_dir, and hosts_csv; dynamic scope updates
+# those locals without substrate inference.
 _elbencho_resolve_run_context() {
-    if [ -n "${ELBENCHO_RUN_NODE_COUNT:-}" ]; then
+    _elbencho_validate_cell_run_context || return 1
+    node_count="$ELBENCHO_RUN_NODE_COUNT"
+    hosts_csv="$ELBENCHO_RUN_HOSTS_CSV"
+    remote_output_dir="$ELBENCHO_RUN_SCRATCH_OUTPUT_DIR"
+    test_dirs_csv="$ELBENCHO_RUN_TEST_DIRS_CSV"
+    mkdir -p "$remote_output_dir" || {
+        echo "Error: Unable to create directory" >&2
+        return 1
+    }
+}
+
+# Metadata benchmarks are not reified sweep cells. Preserve their existing
+# direct Slurm/SSH invocation contract while the filesystem scale sweep moves
+# to the explicit cell context above.
+_elbencho_resolve_metadata_run_context() {
+    if [[ -n "${ELBENCHO_RUN_NODE_COUNT:-}" ]]; then
         node_count="$ELBENCHO_RUN_NODE_COUNT"
         hosts_csv="${ELBENCHO_RUN_HOSTS_CSV:-}"
         remote_output_dir="${ELBENCHO_RUN_REMOTE_OUTPUT_DIR:-$output_dir}"
-    elif [ -n "${SLURM_JOB_NUM_NODES:-}" ]; then
+    elif [[ -n "${SLURM_JOB_NUM_NODES:-}" ]]; then
         node_count="$SLURM_JOB_NUM_NODES"
         remote_output_dir="$output_dir"
         hosts_csv="$nodelist_expanded_comma_separated"
     else
-        local _ssh_nodes
-        IFS=',' read -ra _ssh_nodes <<< "$SSH_NODELIST"
-        node_count="${#_ssh_nodes[@]}"
+        local -a ssh_nodes
+        IFS=',' read -ra ssh_nodes <<< "$SSH_NODELIST"
+        node_count="${#ssh_nodes[@]}"
         remote_output_dir=$(cd "$(pwd)" && pwd)/"$(basename "$output_dir")" || {
             echo "Error: Unable to get absolute path" >&2
             return 1
@@ -1091,6 +1184,28 @@ _elbencho_resolve_run_context() {
         echo "Error: Unable to create directory" >&2
         return 1
     }
+}
+
+# Run one initialized cell and let its adapter publish the outcome. Publication
+# sees the original benchmark return code. A benchmark failure remains primary;
+# publication failure turns only an otherwise-successful cell into failure.
+run_elbencho_cell() {
+    _elbencho_validate_cell_run_context || return 1
+    local run_rc=0
+    local publication_rc=0
+    local output_dir="$ELBENCHO_RUN_SCRATCH_OUTPUT_DIR"
+    local io_size="$ELBENCHO_RUN_IO_SIZE"
+    local thread_count="$ELBENCHO_RUN_THREAD_COUNT"
+    local io_depth="$ELBENCHO_RUN_IO_DEPTH"
+    local dio_or_bio="$ELBENCHO_RUN_DIO_OR_BIO"
+    local use_random="$ELBENCHO_RUN_USE_RANDOM"
+    local force_single="$ELBENCHO_RUN_FORCE_SINGLE"
+    run_elbencho_io_sweep_iteration || run_rc=$?
+    _elbencho_run_result_publication_hook "$run_rc" || publication_rc=$?
+    if [[ "$run_rc" -ne 0 ]]; then
+        return "$run_rc"
+    fi
+    return "$publication_rc"
 }
 
 # How elbencho learns per-file read/write extent for _elbencho_io_build_common_args (6th argument).
@@ -1622,7 +1737,7 @@ _elbencho_finish_sweep_read_from_only() {
     local rfpath
     local service_rc=0
     rfpath=$(realpath "$sweep_read_from" 2>/dev/null || echo "$sweep_read_from")
-    maybe_restart_elbencho_services_slurm "read" || service_rc=$?
+    _elbencho_run_service_health_hook "read" || service_rc=$?
     echo "Read-from: ${rfpath}"
     if [[ -n "$elbencho_treefile_path" ]]; then
         elbencho_treefile_print_operator_size_stats "$elbencho_treefile_path" || true
@@ -1718,11 +1833,11 @@ _elbencho_append_end_iso_date_to_resfile() {
 }
 
 # Directory where the elbencho master should dump cores (executions dir).
-# Uses ELBENCHO_RUN_REMOTE_OUTPUT_DIR when set (dispatch), else OUTPUT_DIR.
+# Uses the explicit cell scratch directory when set, else OUTPUT_DIR.
 # Creates the executions dir if needed (SSH remote may not have it yet).
 # Prints path or empty if unknown / unusable.
 _elbencho_coredump_dir() {
-    local base="${ELBENCHO_RUN_REMOTE_OUTPUT_DIR:-${OUTPUT_DIR:-}}"
+    local base="${ELBENCHO_RUN_SCRATCH_OUTPUT_DIR:-${OUTPUT_DIR:-}}"
     if [[ -z "$base" ]]; then
         return 0
     fi
@@ -2035,7 +2150,7 @@ _elbencho_finalize_generated_shared_failure() {
         cleanup_rc=1
         echo "ERROR: GENERATED DATASET FAILURE CLEANUP FAILED; manual cleanup may be required" >&2
     fi
-    local workload_path="${ELBENCHO_RUN_REMOTE_OUTPUT_DIR:-${output_dir:-}}/executions/${ELBENCHO_RUN_EXECUTION_ID:-unknown}.workload.tsv"
+    local workload_path="${ELBENCHO_RUN_SCRATCH_OUTPUT_DIR:-${output_dir:-}}/executions/${ELBENCHO_RUN_EXECUTION_ID:-unknown}.workload.tsv"
     if [[ -f "$workload_path" ]] \
             && ! _elbencho_workload_update_failure_cleanup_state \
                 "$workload_path" "$cleanup_state"; then
@@ -2303,13 +2418,13 @@ run_elbencho_io_sweep_iteration_single_big_file() {
     local write_rc=0
     run_an_elbencho "${elbencho_write_args[@]}" "$big_path" || write_rc=$?
     if [[ "$write_rc" -ne 0 ]]; then
-        maybe_restart_elbencho_services_slurm "write" || true
+        _elbencho_run_service_health_hook "write" || true
         _elbencho_abort_after_phase_failure "$write_rc" \
             _elbencho_cleanup_single_big_file_sweep "$big_path" "${test_dirs[0]}"
         return $?
     fi
 
-    maybe_restart_elbencho_services_slurm "write" || return 1
+    _elbencho_run_service_health_hook "write" || return 1
 
     if [[ "$sweep_write_only" == "1" ]]; then
         _elbencho_emit_write_only_data_dir "${test_dirs[0]}"
@@ -2326,7 +2441,7 @@ run_elbencho_io_sweep_iteration_single_big_file() {
     local read_rc=0
     local service_rc=0
     run_an_elbencho "${elbencho_read_args[@]}" "$big_path" || read_rc=$?
-    maybe_restart_elbencho_services_slurm "read" || service_rc=$?
+    _elbencho_run_service_health_hook "read" || service_rc=$?
     _elbencho_cleanup_single_big_file_sweep "$big_path" "${test_dirs[0]}" || true
     if [[ "$read_rc" -ne 0 ]]; then
         echo "Error: elbencho READ failed (rc=$read_rc)" >&2
@@ -2808,7 +2923,8 @@ _elbencho_shared_run_write() {
         _elbencho_shared_fail "$check_rc"
         return $?
     fi
-    maybe_restart_elbencho_services_slurm write || { _elbencho_shared_fail 1; return $?; }
+    _elbencho_run_service_health_hook write \
+        || { _elbencho_shared_fail 1; return $?; }
     return 0
 }
 
@@ -2829,7 +2945,7 @@ _elbencho_shared_run_read() {
     _elbencho_record_bounded_phase_completion read "$read_json" \
         "$total_files" "$total_bytes" || check_rc=$?
     _elbencho_workload_write || check_rc=1
-    maybe_restart_elbencho_services_slurm read || service_rc=$?
+    _elbencho_run_service_health_hook read || service_rc=$?
     if [[ "$phase_rc" -ne 0 ]]; then
         _elbencho_mark_bounded_phase_incomplete read || true
         _elbencho_shared_fail "$phase_rc"
@@ -2892,7 +3008,7 @@ _elbencho_shared_run_delete() {
     _elbencho_workload_set completion_state completed \
         || { _elbencho_shared_fail 1; return $?; }
     _elbencho_workload_write || { _elbencho_shared_fail 1; return $?; }
-    maybe_restart_elbencho_services_slurm delete \
+    _elbencho_run_service_health_hook delete \
         || { _elbencho_shared_fail 1; return $?; }
     _elbencho_shared_disarm_cleanup
     return 0
@@ -3221,13 +3337,13 @@ run_elbencho_io_sweep_iteration() {
     local write_rc=0
     run_an_elbencho "${elbencho_write_args[@]}" "${test_dirs[@]}" || write_rc=$?
     if [[ "$write_rc" -ne 0 ]]; then
-        maybe_restart_elbencho_services_slurm "write" || true
+        _elbencho_run_service_health_hook "write" || true
         _elbencho_abort_after_phase_failure "$write_rc" \
             _elbencho_cleanup_many_files_sweep_test_dirs "${test_dirs[@]}"
         return $?
     fi
 
-    maybe_restart_elbencho_services_slurm "write" || return 1
+    _elbencho_run_service_health_hook "write" || return 1
 
     if [[ "$sweep_write_only" == "1" ]]; then
         _elbencho_emit_write_only_data_dir "${test_dirs[0]}"
@@ -3245,7 +3361,7 @@ run_elbencho_io_sweep_iteration() {
     local service_rc=0
     run_an_elbencho "${elbencho_read_args[@]}" "${test_dirs[@]}" || read_rc=$?
 
-    maybe_restart_elbencho_services_slurm "read" || service_rc=$?
+    _elbencho_run_service_health_hook "read" || service_rc=$?
 
     if [[ -f "$treefile" ]]; then
         elbencho_treefile_print_operator_size_stats "$treefile" || true
@@ -3800,7 +3916,7 @@ run_elbencho_metadata_benchmark() {
     local remote_output_dir
     local hosts_csv
 
-    if ! _elbencho_resolve_run_context; then
+    if ! _elbencho_resolve_metadata_run_context; then
         return 1
     fi
 

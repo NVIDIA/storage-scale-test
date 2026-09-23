@@ -46,6 +46,7 @@ from failure_injection import (
     build_ssh_failure_injection_plan,
     staged_failure_injection,
 )
+from fixture_images import ELBENCHO_UPSTREAM_IMAGE
 from fixture_capacity import (
     MAX_DEPLOYMENT_CONTENT_BYTES,
     MAX_LIVE_CAPTURE_DATASET_BYTES,
@@ -72,10 +73,7 @@ ELBENCHO_VERSION = "v3.1-11"
 ELBENCHO_RELEASE_API = (
     "https://api.github.com/repos/breuner/elbencho/releases/tags/" + ELBENCHO_VERSION
 )
-ELBENCHO_CONTAINER = (
-    "breuner/elbencho:v3.1-11@"
-    "sha256:719fba92cab57c773ddf7a2776414b358aeb8126a15fbc8e3c52469ce3a5b8b2"
-)
+ELBENCHO_CONTAINER = ELBENCHO_UPSTREAM_IMAGE
 SBX_ELBENCHO_BUNDLE_RECIPE = 1
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
 MAX_DEPLOYMENT_ARCHIVE_BYTES = 128 * 1024 * 1024
@@ -778,6 +776,7 @@ def _override_block(
     data = "/mnt/storage-test"
     lines = [
         "# Bounded integration regression overrides.",
+        f"export EXECUTION_SUBSTRATE={_shell(selector)}",
         f"export RESULTS_DIR={_shell(results_dir or remote_root + '/results')}",
         f"export LOGS_DIR={_shell(logs_dir or remote_root + '/logs')}",
         "ORDER_NODES=1",

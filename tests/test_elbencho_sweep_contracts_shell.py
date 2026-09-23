@@ -116,6 +116,7 @@ def test_env_precedence_selects_test_dirs_ssh_and_order_aliases(tmp_path):
         declare -A TEST_DIRS=(["{tmp_path}/preferred"]=2)
         OBJ_BUCKET=
         OBJ_AUTH_FILE="{tmp_path}/missing-auth"
+        EXECUTION_SUBSTRATE=ssh
         SSH_HOST_LIST="{hosts}"
         SSH_USER=tester
         ORDER_NODES=YeS
@@ -145,6 +146,7 @@ def test_env_fallbacks_apply_only_when_primary_values_are_empty(tmp_path):
         declare -A TEST_DIRS=()
         OBJ_BUCKET=
         OBJ_AUTH_FILE="{tmp_path}/missing-auth"
+        EXECUTION_SUBSTRATE=ssh
         SSH_HOST_LIST="{hosts}"
         ORDER_NODES=off
         client_type=cpu
@@ -370,6 +372,7 @@ def _make_sweep_fixture(tmp_path: Path) -> Path:
             export FS_MAX_AGG_THROUGHPUT=1
             export FS_MAX_NODE_THROUGHPUT_GBPS=1
             export FS_MAX_NODE_IOPS=1
+            export EXECUTION_SUBSTRATE=slurm
             export SSH_ENABLED=
             export SLURM_ENABLED=
             source "$SCALE_TEST_BASE/lib/env_functions.sh"
