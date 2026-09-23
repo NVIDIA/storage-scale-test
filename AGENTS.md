@@ -35,15 +35,14 @@ Warp for S3-compatible object storage) as **separate processes** — they are
 
 ## Architecture
 
-- `storage-tests/{fs,object,network}/` — test entry points; each has `ssh/` and
-  `sbatch/` subdirs for the two execution substrates.
+- `storage-tests/{fs,object,network}/` — test entry points with `ssh/` and
+  `sbatch/` substrate code; filesystem tests also have `kubectl/`.
 - `lib/` — shared Bash libraries (`env_*.sh`, `_*_functions.sh`) + a few Python helpers.
 - `utils/` — result processing (`extract-*.sh`/`.py`) and build helpers (`build_tarball.sh`, `build/`).
 - `tests/` — `pytest` unit tests for the Python parsers/reporters.
 - `docs/` — `DESIGN.md`, `REQUIREMENTS.md`, `ARCHITECTURE_DIAGRAMS.md`, `CONTEXT.md`, `CODING_STANDARDS.md`.
 - Config is environment-driven (`env.sh`); `EXECUTION_SUBSTRATE` explicitly
-  selects Slurm or passwordless SSH. kubectl is planned (see `ROADMAP.md`),
-  not yet implemented.
+  selects Slurm, passwordless SSH, or kubectl for filesystem sweeps.
 
 ## Setup
 
@@ -94,6 +93,10 @@ requirements files; never treat ambient Python tooling as authoritative.
   prefer a local checkout at `tmp/elbencho-src` when present over web snippets.
 - **Python**: keep each function's cognitive complexity <= 15 (not linter-enforced);
   avoid duplicating a literal string 3+ times (use a constant). `pylint` 10.00/10.
+- **Kubernetes probe diagnosis**: `kubectl exec` returning `-9` does not prove
+  OOM or broken Pod networking. Check OOM evidence, then run the socket operation
+  from a Pod-resident script. If only exec-carried socket code is killed, keep
+  network I/O in the Pod and use exec for bounded request/result transfer.
 - Don't restate rules the linters already enforce; rely on `black`/`pylint`/`shellcheck`.
 
 ## Pull requests

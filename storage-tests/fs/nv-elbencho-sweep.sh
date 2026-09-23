@@ -127,52 +127,84 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         -b|--bio)
+            [[ "$g_bio_or_dio" == dio ]] || {
+                echo "Error: --bio may be specified only once" >&2
+                exit 1
+            }
             g_bio_or_dio="bio"
             shift
             ;;
         -r|--rand)
+            [[ "$rand_option" == 0 ]] || {
+                echo "Error: --rand may be specified only once" >&2
+                exit 1
+            }
             rand_option="1"
             shift
             ;;
         -s|--single)
+            [[ "$single_option" == 0 ]] || {
+                echo "Error: --single may be specified only once" >&2
+                exit 1
+            }
             single_option="1"
             shift
             ;;
         --nodes)
-            if [[ $# -lt 2 ]]; then
+            if [[ $# -lt 2 || -z "$2" ]]; then
                 echo "Error: --nodes requires an argument" >&2
                 print_usage
                 exit 1
             fi
+            [[ -z "$nodes_spec" ]] || {
+                echo "Error: --nodes may be specified only once" >&2
+                exit 1
+            }
             nodes_spec="$2"
             shift 2
             ;;
         --write-only)
+            [[ "$sweep_write_only" == 0 ]] || {
+                echo "Error: --write-only may be specified only once" >&2
+                exit 1
+            }
             sweep_write_only="1"
             shift
             ;;
         --write-no-read)
+            [[ "$sweep_write_no_read" == 0 ]] || {
+                echo "Error: --write-no-read may be specified only once" >&2
+                exit 1
+            }
             sweep_write_no_read="1"
             shift
             ;;
         --read-from)
-            if [[ $# -lt 2 ]]; then
+            if [[ $# -lt 2 || -z "$2" ]]; then
                 echo "Error: --read-from requires a path argument" >&2
                 exit 1
             fi
+            [[ -z "$sweep_read_from" ]] || {
+                echo "Error: --read-from may be specified only once" >&2
+                exit 1
+            }
             sweep_read_from="$2"
             shift 2
             ;;
         --delete-only)
-            if [[ $# -lt 2 ]]; then
+            if [[ $# -lt 2 || -z "$2" ]]; then
                 echo "Error: --delete-only requires a path argument" >&2
                 exit 1
             fi
+            [[ -z "$delete_only_path" ]] || {
+                echo "Error: --delete-only may be specified only once" >&2
+                exit 1
+            }
             delete_only_path="$2"
             shift 2
             ;;
         --resume)
-            if [[ $# -lt 2 ]]; then
+            if [[ $# -lt 2 || -z "$2" ]]; then
                 echo "Error: --resume requires a path argument" >&2
                 exit 1
             fi

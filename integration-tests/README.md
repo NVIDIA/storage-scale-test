@@ -122,7 +122,7 @@ integration-tests/bin/integration-test.py test --list-scenarios
 ```
 
 With no options, `test` runs every available scenario on each applicable
-substrate. `--substrate` accepts `all`, `ssh`, or `slurm`; repeatable
+substrate. `--substrate` accepts `all`, `ssh`, `slurm`, or `kubectl`; repeatable
 `--scenario` options select named cases independently. Scenario listing needs
 no setup state or privileges. Actual tests refuse root execution, require the
 saved non-root identity, validate the live topology, generate environments
@@ -130,8 +130,8 @@ from the packaged `env.sh.template`, and run `validate_env.sh` before a sweep.
 
 The real scenario catalog covers buffered and direct I/O, one- and two-node
 selection, failure and resume, retained write/read/delete data, extended live
-CSV capture, and result reporting on both SSH and Slurm. Focused cases add a
-multidimensional Slurm sweep, Slurm include/exclude and exclusive-user
+CSV capture, and result reporting on all applicable substrates. Focused cases
+add a multidimensional Slurm sweep, Slurm include/exclude and exclusive-user
 allocation behavior, SSH weighted roots, generated and staged single-file
 work, and shared SSH homes. Workloads stay deliberately small; assertions
 check execution coordinates and state transitions, phase and workload
@@ -173,6 +173,7 @@ With `EXECUTION_SUBSTRATE=kubectl` in `env.sh`, the lifecycle commands are:
 ```bash
 storage-tests/fs/nv-elbencho-sweep.sh --nodes 1,2
 storage-tests/fs/nv-elbencho-sweep.sh --status "$RESULTS_DIR/elbencho-<run>"
+storage-tests/fs/nv-elbencho-sweep.sh --cancel "$RESULTS_DIR/elbencho-<run>"
 storage-tests/fs/nv-elbencho-sweep.sh --collect "$RESULTS_DIR/elbencho-<run>"
 storage-tests/fs/nv-elbencho-sweep.sh --resume "$RESULTS_DIR/elbencho-<run>"
 ```

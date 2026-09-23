@@ -69,9 +69,11 @@ spec:
                 - /bin/bash
                 - -ceu
                 - |
-                  response=$(exec 3<>/dev/tcp/127.0.0.1/1611; printf 'GET /status HTTP/1.0\r\nHost: 127.0.0.1:1611\r\n\r\n' >&3; cat <&3)
+                  exec 3<>/dev/tcp/127.0.0.1/1611
+                  printf 'GET /status HTTP/1.0\r\nHost: 127.0.0.1:1611\r\n\r\n' >&3
+                  IFS= read -r -t 2 response <&3
                   exec 3>&-
-                  [[ "$response" == *"200"* ]]
+                  [[ "$response" == *" 200 "* ]]
             initialDelaySeconds: 1
             periodSeconds: 1
             timeoutSeconds: 3
@@ -116,7 +118,46 @@ spec:
         - |
           test "$(id -u)" = 2000
           test "$(id -g)" = 2000
-          exec sleep infinity
+          command -v timeout >/dev/null
+          perl -MIO::Socket::INET -e 1
+          probe_root=/tmp/storage-scale-kubectl-probe
+          request_script='use IO::Socket::INET; my $host=$ARGV[0]; my $socket=IO::Socket::INET->new(PeerHost=>$host, PeerPort=>1611, Proto=>"tcp", Timeout=>5) or exit 1; $socket->autoflush(1); print $socket "GET /status HTTP/1.0\r\nHost: $host:1611\r\n\r\n"; local $/; my $response=<$socket>; exit(($response // "") =~ /\AHTTP\/[0-9.]+ 200(?:[ \t]|\r?\n)/ ? 0 : 1);'
+          umask 077
+          mkdir -m 0700 -- "$probe_root"
+          shopt -s nullglob
+          while true; do
+            requests=("$probe_root"/*.request)
+            if (( ${#requests[@]} == 0 )); then
+              sleep 0.1
+              continue
+            fi
+            for request in "${requests[@]}"; do
+              operation=${request##*/}
+              operation=${operation%.request}
+              if ! [[ "$operation" =~ ^[0-9a-f]{16}$ ]]; then
+                rm -f -- "$request"
+                continue
+              fi
+              result="$probe_root/$operation"
+              address=$(cat -- "$request")
+              rm -f -- "$request"
+              mkdir -m 0700 -- "$result"
+              rc=0
+              timeout --kill-after=1s 5s perl -e "$request_script" "$address" \
+                >"$result/stdout" 2>"$result/stderr" || rc=$?
+              printf '%s\n' "$rc" > "$result/rc.tmp"
+              mv -f -- "$result/rc.tmp" "$result/rc"
+            done
+          done
+      readinessProbe:
+        exec:
+          command:
+            - /bin/bash
+            - -ceu
+            - test -d /tmp/storage-scale-kubectl-probe
+        periodSeconds: 1
+        timeoutSeconds: 1
+        failureThreshold: 30
       securityContext:
         allowPrivilegeEscalation: false
         capabilities:
@@ -157,7 +198,46 @@ spec:
         - |
           test "$(id -u)" = 2000
           test "$(id -g)" = 2000
-          exec sleep infinity
+          command -v timeout >/dev/null
+          perl -MIO::Socket::INET -e 1
+          probe_root=/tmp/storage-scale-kubectl-probe
+          request_script='use IO::Socket::INET; my $host=$ARGV[0]; my $socket=IO::Socket::INET->new(PeerHost=>$host, PeerPort=>1611, Proto=>"tcp", Timeout=>5) or exit 1; $socket->autoflush(1); print $socket "GET /status HTTP/1.0\r\nHost: $host:1611\r\n\r\n"; local $/; my $response=<$socket>; exit(($response // "") =~ /\AHTTP\/[0-9.]+ 200(?:[ \t]|\r?\n)/ ? 0 : 1);'
+          umask 077
+          mkdir -m 0700 -- "$probe_root"
+          shopt -s nullglob
+          while true; do
+            requests=("$probe_root"/*.request)
+            if (( ${#requests[@]} == 0 )); then
+              sleep 0.1
+              continue
+            fi
+            for request in "${requests[@]}"; do
+              operation=${request##*/}
+              operation=${operation%.request}
+              if ! [[ "$operation" =~ ^[0-9a-f]{16}$ ]]; then
+                rm -f -- "$request"
+                continue
+              fi
+              result="$probe_root/$operation"
+              address=$(cat -- "$request")
+              rm -f -- "$request"
+              mkdir -m 0700 -- "$result"
+              rc=0
+              timeout --kill-after=1s 5s perl -e "$request_script" "$address" \
+                >"$result/stdout" 2>"$result/stderr" || rc=$?
+              printf '%s\n' "$rc" > "$result/rc.tmp"
+              mv -f -- "$result/rc.tmp" "$result/rc"
+            done
+          done
+      readinessProbe:
+        exec:
+          command:
+            - /bin/bash
+            - -ceu
+            - test -d /tmp/storage-scale-kubectl-probe
+        periodSeconds: 1
+        timeoutSeconds: 1
+        failureThreshold: 30
       securityContext:
         allowPrivilegeEscalation: false
         capabilities:

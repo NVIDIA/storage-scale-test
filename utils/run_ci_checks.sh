@@ -155,10 +155,14 @@ run_captured_check() {
     local started="$SECONDS"
     local check_rc
 
-    set +e
-    "run_$check_name" "$jobs" >"$output_file" 2>&1
-    check_rc=$?
-    set -e
+    # Do not toggle errexit here. Nested captured checks would otherwise
+    # re-enable it in this shell and prevent an outer result from being
+    # recorded when the nested aggregate returns nonzero.
+    if "run_$check_name" "$jobs" >"$output_file" 2>&1; then
+        check_rc=0
+    else
+        check_rc=$?
+    fi
     printf '%s %s\n' "$check_rc" "$((SECONDS - started))" >"$result_file"
 }
 

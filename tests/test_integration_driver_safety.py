@@ -17,6 +17,9 @@
 
 """Safety and rollout regression tests for the integration driver."""
 
+# This module intentionally tests private integration-driver boundaries.
+# pylint: disable=protected-access
+
 import importlib.util
 import json
 import os
@@ -58,6 +61,7 @@ _export_paths = getattr(_DRIVER, "_export_paths")
 _kind_clusters = getattr(_DRIVER, "_kind_clusters")
 _login_pod = getattr(_DRIVER, "_login_pod")
 _load_state = getattr(_FILESYSTEM, "_load_state")
+_publish_temporary_file = getattr(_FILESYSTEM, "_publish_temporary_file")
 _inspect_ssh_home_pool = getattr(_DRIVER, "_inspect_ssh_home_pool")
 _migrate_export_data_to_image = getattr(_DRIVER, "_migrate_export_data_to_image")
 _prepare_host_dependencies = getattr(_DRIVER, "_prepare_host_dependencies")
@@ -65,6 +69,8 @@ _prepare_sbx_shared = getattr(_DRIVER, "_prepare_sbx_shared")
 _record_nfs_service_state = getattr(_DRIVER, "_record_nfs_service_state")
 _nfs_host_lock = getattr(_DRIVER, "_nfs_host_lock")
 _delete_nfs_firewall_rule = getattr(_DRIVER, "_delete_nfs_firewall_rule")
+_write_bytes = getattr(_DRIVER, "_write_bytes")
+_write_text = getattr(_DRIVER, "_write_text")
 _nfs_host_owner_document = getattr(_DRIVER, "_nfs_host_owner_document")
 _retained_cluster_matches_profile = getattr(
     _DRIVER, "_retained_cluster_matches_profile"
@@ -90,7 +96,9 @@ _validate_nfs_filesystem_capacity = getattr(
     _DRIVER, "_validate_nfs_filesystem_capacity"
 )
 _validate_teardown_ownership = getattr(_DRIVER, "_validate_teardown_ownership")
+_validate_sbx_teardown_ownership = getattr(_DRIVER, "_validate_sbx_teardown_ownership")
 _validate_lifecycle_paths = getattr(_DRIVER, "_validate_lifecycle_paths")
+_invalidate_setup_summary = getattr(_DRIVER, "_invalidate_setup_summary")
 _validate_ssh_storage = getattr(_DRIVER, "_validate_ssh_storage")
 _teardown_environment_locked = getattr(_DRIVER, "_teardown_environment_locked")
 _begin_image_build = getattr(_DRIVER, "_begin_image_build")
@@ -147,6 +155,7 @@ _run_kubectl_command = getattr(_FILESYSTEM, "_run_kubectl_command")
 _wait_for_kubectl_terminal_state = getattr(
     _FILESYSTEM, "_wait_for_kubectl_terminal_state"
 )
+IntegrationTestError = getattr(_FILESYSTEM, "IntegrationTestError")
 
 
 def test_scenario_listing_short_circuits_before_privileged_state(monkeypatch, capsys):
@@ -449,6 +458,65 @@ def test_kubectl_command_accepts_only_declared_terminal_failure(tmp_path):
     assert _kubectl_lifecycle_state(output) == "FAILED"
 
 
+def test_kubectl_command_rejects_zero_exit_for_declared_failure(tmp_path):
+    """A failed durable ledger must still propagate a failing CLI status."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    runtime = SimpleNamespace(workspace=str(workspace))
+
+    class _Runner:
+        def run(self, _arguments, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout="STORAGE_SCALE_TEST_KUBECTL_STATE=FAILED\n",
+                stderr="",
+            )
+
+    with pytest.raises(IntegrationTestError, match="must return nonzero"):
+        _run_kubectl_command(
+            _Runner(),
+            config,
+            runtime,
+            "collect",
+            ("--collect", "/tmp/results"),
+            logs,
+            30,
+            accepted_states=frozenset({"FAILED"}),
+        )
+
+
+def test_failed_kubectl_submit_arms_exact_lifecycle_cleanup(tmp_path):
+    """A retained PREPARED submit is discoverable before workspace cleanup."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    result_base = workspace / "results" / "baseline"
+    attempt_root = result_base / "elbencho-test"
+    (attempt_root / "kubernetes").mkdir(parents=True)
+    (attempt_root / "kubernetes/current-attempt").write_text(
+        "1234abcd\n", encoding="utf-8"
+    )
+    runtime = SimpleNamespace(
+        workspace=str(workspace),
+        values={"kubectl_result_base": str(result_base)},
+    )
+
+    class _Runner:
+        def run(self, _arguments, **_kwargs):
+            return SimpleNamespace(returncode=1, stdout="", stderr="submit failed")
+
+    with pytest.raises(IntegrationTestError, match="failed with exit code"):
+        _run_kubectl_command(
+            _Runner(), config, runtime, "baseline", ("--nodes", "1"), logs, 30
+        )
+    assert runtime.values["kubectl_result_root"] == str(attempt_root)
+
+
 def test_kubectl_generated_inputs_are_created_under_the_storage_mount(monkeypatch):
     """Generated input paths use logical roots only after PVC mapping."""
     commands = []
@@ -604,6 +672,18 @@ def test_state_bootstrap_is_user_owned_and_idempotent(tmp_path, monkeypatch):
     assert os.environ["HELM_CACHE_HOME"] == str(
         config.state_dir / "tool-state" / "helm" / "cache"
     )
+
+
+def test_setup_invalidates_prior_success_marker_before_retry(tmp_path):
+    """A failed retry cannot leave an old state.json authorizing tests."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    config.state_dir.mkdir()
+    summary = config.state_dir / "state.json"
+    summary.write_text('{"storage_backend":"sbx-shared"}\n', encoding="utf-8")
+
+    _invalidate_setup_summary(config)
+
+    assert not summary.exists()
 
 
 def test_lifecycle_lock_survives_state_tree_removal(tmp_path):
@@ -890,6 +970,67 @@ def test_nfs_server_configures_eight_workers(tmp_path, monkeypatch):
     )
     assert f"threads = {_DRIVER.NFS_SERVER_THREADS}\n" in daemon_config
     assert _DRIVER.NFS_SERVER_THREADS == 8
+
+
+def test_nfs_setup_rejects_another_active_v4_root(tmp_path):
+    """A second NFSv4 root cannot silently redirect fixture mounts."""
+    # pylint: disable=protected-access
+
+    class _ExportRunner:
+        def run(self, _arguments, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "/srv/unrelated\n"
+                    "\t\t172.18.0.0/16(sync,fsid=root,rw)\n"
+                    f"{tmp_path / 'expected'}\n"
+                    "\t\t172.18.0.0/16(sync,fsid=0,rw)\n"
+                ),
+                stderr="",
+            )
+
+    with pytest.raises(_DRIVER.ProvisionError, match="redirect CSI mounts"):
+        _DRIVER._assert_no_conflicting_nfs_v4_root(
+            _ExportRunner(), tmp_path / "expected"
+        )
+
+
+def test_nfs_setup_accepts_its_own_active_v4_root(tmp_path):
+    """Repeated setup accepts the already-active owned root export."""
+    # pylint: disable=protected-access
+
+    class _ExportRunner:
+        def run(self, _arguments, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"{tmp_path / 'expected'}\n" "\t\t172.18.0.0/16(sync,fsid=0,rw)\n"
+                ),
+                stderr="",
+            )
+
+    _DRIVER._assert_no_conflicting_nfs_v4_root(_ExportRunner(), tmp_path / "expected")
+
+
+@pytest.mark.parametrize("root_option", ("fsid=0", "fsid=root"))
+def test_nfs_setup_rejects_same_line_active_v4_root(tmp_path, root_option):
+    """The common one-line exportfs format cannot hide another v4 root."""
+
+    class _ExportRunner:
+        def run(self, _arguments, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"{tmp_path / 'unrelated'} 172.18.0.0/16"
+                    f"(sync,{root_option},rw)\n"
+                ),
+                stderr="",
+            )
+
+    with pytest.raises(_DRIVER.ProvisionError, match="redirect CSI mounts"):
+        _DRIVER._assert_no_conflicting_nfs_v4_root(
+            _ExportRunner(), tmp_path / "expected"
+        )
 
 
 def test_nfs_reconciliation_validates_previous_subnet_before_update(
@@ -1649,6 +1790,348 @@ def test_sbx_shared_directories_allow_replacement_pod_cleanup(tmp_path, monkeypa
         assert mode == _DRIVER.SBX_SHARED_DIRECTORY_MODE == 0o777
 
 
+@pytest.mark.parametrize("child_kind", ("symlink", "file"))
+def test_sbx_shared_setup_rejects_unsafe_child_paths(tmp_path, monkeypatch, child_kind):
+    """SBX setup never chmods or binds a symlink or non-directory child."""
+    repository = tmp_path / "repository"
+    (repository / "tmp").mkdir(parents=True)
+    config = replace(
+        _config(tmp_path / "state", tmp_path / "export"),
+        sbx_shared_root=repository / "tmp" / "shared",
+    )
+    config.sbx_shared_root.mkdir(parents=True)
+    (config.sbx_shared_root / _DRIVER.EXPORT_MARKER).write_text(
+        json.dumps(_DRIVER._sbx_shared_marker(config)), encoding="utf-8"
+    )
+    child = config.sbx_shared_root / "storage-test"
+    if child_kind == "symlink":
+        target = tmp_path / "outside"
+        target.mkdir()
+        child.symlink_to(target, target_is_directory=True)
+    else:
+        child.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setattr(_DRIVER, "_repository_root", lambda: repository)
+    monkeypatch.setattr(_DRIVER, "_ensure_pinned_image", lambda *_args: None)
+
+    with pytest.raises(_DRIVER.ProvisionError, match="unsafe SBX shared child path"):
+        _prepare_sbx_shared(_RecordingRunner(), config)
+
+
+def test_sbx_shared_setup_rejects_symlinked_root(tmp_path, monkeypatch):
+    """SBX setup cannot bind a repository path that redirects elsewhere."""
+    repository = tmp_path / "repository"
+    (repository / "tmp").mkdir(parents=True)
+    target = tmp_path / "outside"
+    target.mkdir()
+    root = repository / "tmp" / "shared"
+    root.symlink_to(target, target_is_directory=True)
+    config = replace(
+        _config(tmp_path / "state", tmp_path / "export"),
+        sbx_shared_root=root,
+    )
+    monkeypatch.setattr(_DRIVER, "_repository_root", lambda: repository)
+
+    with pytest.raises(_DRIVER.ProvisionError, match="unsafe Docker SBX shared root"):
+        _prepare_sbx_shared(_RecordingRunner(), config)
+
+
+def test_sbx_shared_setup_migrates_legacy_marker(tmp_path, monkeypatch):
+    """A marker from the previous driver version is upgraded in place."""
+    repository = tmp_path / "repository"
+    (repository / "tmp").mkdir(parents=True)
+    config = replace(
+        _config(tmp_path / "state", tmp_path / "export"),
+        sbx_shared_root=repository / "tmp" / "shared",
+    )
+    config.sbx_shared_root.mkdir(parents=True)
+    legacy_marker = {
+        **_DRIVER._owner_document(config),
+        "backend": "sbx-shared",
+        "shared_root": str(config.sbx_shared_root),
+    }
+    (config.sbx_shared_root / _DRIVER.EXPORT_MARKER).write_text(
+        json.dumps(legacy_marker), encoding="utf-8"
+    )
+
+    class _SbxProbeRunner:
+        def run(self, arguments, **_kwargs):
+            (config.sbx_shared_root / "engine-probe").write_text(
+                str(arguments[-1]) + "\n", encoding="utf-8"
+            )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_DRIVER, "_repository_root", lambda: repository)
+    monkeypatch.setattr(_DRIVER, "_ensure_pinned_image", lambda *_args: None)
+
+    _prepare_sbx_shared(_SbxProbeRunner(), config)
+
+    assert json.loads(
+        (config.sbx_shared_root / _DRIVER.EXPORT_MARKER).read_text(encoding="utf-8")
+    ) == _DRIVER._sbx_shared_marker(config)
+
+
+def test_sbx_shared_root_journal_recovers_interrupted_root_creation(
+    tmp_path, monkeypatch
+):
+    """A crash before the root marker can reclaim only the journaled empty root."""
+    repository = tmp_path / "repository"
+    (repository / "tmp").mkdir(parents=True)
+    config = replace(
+        _config(tmp_path / "state", tmp_path / "export"),
+        sbx_shared_root=repository / "tmp" / "shared",
+    )
+    config.state_dir.mkdir()
+    owner_document = json.dumps(_DRIVER._owner_document(config))
+    (config.state_dir / _DRIVER.STATE_MARKER).write_text(
+        owner_document, encoding="utf-8"
+    )
+    (config.state_dir / "cluster-owner.json").write_text(
+        owner_document, encoding="utf-8"
+    )
+    original_write = _DRIVER._write_text
+
+    def fail_root_marker(path, text, mode=0o640):
+        if path == config.sbx_shared_root / _DRIVER.EXPORT_MARKER:
+            raise OSError("simulated shared marker failure")
+        original_write(path, text, mode)
+
+    monkeypatch.setattr(_DRIVER, "_repository_root", lambda: repository)
+    monkeypatch.setattr(_DRIVER, "_ensure_pinned_image", lambda *_args: None)
+    monkeypatch.setattr(_DRIVER, "_write_text", fail_root_marker)
+    with pytest.raises(OSError, match="simulated shared marker failure"):
+        _prepare_sbx_shared(_RecordingRunner(), config)
+    assert config.sbx_shared_root.is_dir()
+    assert list(config.sbx_shared_root.iterdir()) == []
+    assert (config.state_dir / _DRIVER.SBX_SHARED_JOURNAL).is_file()
+
+    monkeypatch.setattr(_DRIVER, "_validate_image_ownership", lambda *_args: None)
+    assert _validate_sbx_teardown_ownership(_RecordingRunner(), config) == (
+        True,
+        True,
+        True,
+    )
+
+
+def test_sbx_shared_teardown_rejects_root_owned_by_another_state(tmp_path, monkeypatch):
+    """A shared-root marker cannot authorize a different state directory."""
+    repository = tmp_path / "repository"
+    (repository / "tmp").mkdir(parents=True)
+    owner = replace(
+        _config(tmp_path / "owner-state", tmp_path / "owner-export"),
+        sbx_shared_root=repository / "tmp" / "shared",
+    )
+    other = replace(owner, state_dir=tmp_path / "other-state")
+    owner.state_dir.mkdir()
+    other.state_dir.mkdir()
+    for config in (owner, other):
+        owner_document = json.dumps(_DRIVER._owner_document(config))
+        (config.state_dir / _DRIVER.STATE_MARKER).write_text(
+            owner_document, encoding="utf-8"
+        )
+        (config.state_dir / "cluster-owner.json").write_text(
+            owner_document, encoding="utf-8"
+        )
+    owner.sbx_shared_root.mkdir(parents=True)
+    (owner.sbx_shared_root / _DRIVER.EXPORT_MARKER).write_text(
+        json.dumps(_DRIVER._sbx_shared_marker(owner)), encoding="utf-8"
+    )
+    (owner.sbx_shared_root / "storage-test").mkdir()
+    (owner.sbx_shared_root / "ssh-home").mkdir()
+    monkeypatch.setattr(_DRIVER, "_repository_root", lambda: repository)
+
+    with pytest.raises(_DRIVER.ProvisionError, match="unowned SBX shared root"):
+        _validate_sbx_teardown_ownership(_RecordingRunner(), other)
+
+
+def test_sbx_shared_teardown_requires_state_and_cluster_ownership(
+    tmp_path, monkeypatch
+):
+    """A matching shared marker is insufficient without setup ownership."""
+    repository = tmp_path / "repository"
+    (repository / "tmp").mkdir(parents=True)
+    config = replace(
+        _config(tmp_path / "state", tmp_path / "export"),
+        sbx_shared_root=repository / "tmp" / "shared",
+    )
+    config.state_dir.mkdir()
+    (config.state_dir / _DRIVER.STATE_MARKER).write_text(
+        json.dumps(_DRIVER._owner_document(config)), encoding="utf-8"
+    )
+    config.sbx_shared_root.mkdir(parents=True)
+    (config.sbx_shared_root / _DRIVER.EXPORT_MARKER).write_text(
+        json.dumps(_DRIVER._sbx_shared_marker(config)), encoding="utf-8"
+    )
+    (config.sbx_shared_root / "storage-test").mkdir()
+    (config.sbx_shared_root / "ssh-home").mkdir()
+    monkeypatch.setattr(_DRIVER, "_repository_root", lambda: repository)
+
+    with pytest.raises(
+        _DRIVER.ProvisionError, match="matching state and cluster ownership"
+    ):
+        _validate_sbx_teardown_ownership(_RecordingRunner(), config)
+
+
+@pytest.mark.parametrize("marker_name", (_DRIVER.STATE_MARKER, "cluster-owner.json"))
+def test_sbx_shared_teardown_rejects_directory_ownership_marker(
+    tmp_path, monkeypatch, marker_name
+):
+    """A directory cannot impersonate either durable SBX owner marker."""
+    repository = tmp_path / "repository"
+    (repository / "tmp").mkdir(parents=True)
+    config = replace(
+        _config(tmp_path / "state", tmp_path / "export"),
+        sbx_shared_root=repository / "tmp" / "shared",
+    )
+    config.state_dir.mkdir()
+    (config.state_dir / marker_name).mkdir()
+    other = (
+        "cluster-owner.json"
+        if marker_name == _DRIVER.STATE_MARKER
+        else _DRIVER.STATE_MARKER
+    )
+    (config.state_dir / other).write_text(
+        json.dumps(_DRIVER._owner_document(config)), encoding="utf-8"
+    )
+    monkeypatch.setattr(_DRIVER, "_repository_root", lambda: repository)
+
+    with pytest.raises(_DRIVER.ProvisionError, match="unsafe ownership marker"):
+        _validate_sbx_teardown_ownership(_RecordingRunner(), config)
+
+
+def test_sbx_shared_teardown_migrates_legacy_marker(tmp_path, monkeypatch):
+    """Teardown upgrades a legacy marker only after both ownership checks."""
+    repository = tmp_path / "repository"
+    (repository / "tmp").mkdir(parents=True)
+    config = replace(
+        _config(tmp_path / "state", tmp_path / "export"),
+        sbx_shared_root=repository / "tmp" / "shared",
+    )
+    config.state_dir.mkdir()
+    owner_document = json.dumps(_DRIVER._owner_document(config))
+    (config.state_dir / _DRIVER.STATE_MARKER).write_text(
+        owner_document, encoding="utf-8"
+    )
+    (config.state_dir / "cluster-owner.json").write_text(
+        owner_document, encoding="utf-8"
+    )
+    config.sbx_shared_root.mkdir(parents=True)
+    legacy_marker = {
+        **_DRIVER._owner_document(config),
+        "backend": "sbx-shared",
+        "shared_root": str(config.sbx_shared_root),
+    }
+    (config.sbx_shared_root / _DRIVER.EXPORT_MARKER).write_text(
+        json.dumps(legacy_marker), encoding="utf-8"
+    )
+    (config.sbx_shared_root / "storage-test").mkdir()
+    (config.sbx_shared_root / "ssh-home").mkdir()
+    monkeypatch.setattr(_DRIVER, "_repository_root", lambda: repository)
+
+    assert _validate_sbx_teardown_ownership(_RecordingRunner(), config) == (
+        True,
+        True,
+        True,
+    )
+    assert json.loads(
+        (config.sbx_shared_root / _DRIVER.EXPORT_MARKER).read_text(encoding="utf-8")
+    ) == _DRIVER._sbx_shared_marker(config)
+
+
+def test_lifecycle_rejects_symlinked_state_marker(tmp_path):
+    """A symlink cannot impersonate the state ownership marker."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    config.state_dir.mkdir()
+    target = tmp_path / "outside-marker"
+    target.write_text(json.dumps(_DRIVER._owner_document(config)), encoding="utf-8")
+    (config.state_dir / _DRIVER.STATE_MARKER).symlink_to(target)
+
+    with pytest.raises(_DRIVER.ProvisionError, match="unowned setup state"):
+        _validate_lifecycle_paths(config)
+
+
+@pytest.mark.parametrize("path_name", ("state_dir", "export_dir", "nfs_image"))
+def test_lifecycle_rejects_symlinked_path_roots(tmp_path, path_name):
+    """Lifecycle paths cannot redirect setup or cleanup to another inode."""
+    state_dir = tmp_path / "state"
+    export_dir = tmp_path / "export"
+    config = _config(state_dir, export_dir)
+    target = tmp_path / f"{path_name}-target"
+    target.mkdir()
+    if path_name == "state_dir":
+        state_dir.symlink_to(target, target_is_directory=True)
+    elif path_name == "export_dir":
+        export_dir.symlink_to(target, target_is_directory=True)
+    else:
+        state_dir.mkdir()
+        (state_dir / "nfs-export.ext4").symlink_to(target)
+
+    with pytest.raises(_DRIVER.ProvisionError, match="symlinked"):
+        _validate_lifecycle_paths(config)
+
+
+@pytest.mark.parametrize("scope", ("root", "parent"))
+def test_config_preserves_cli_symlinks_for_rejection(tmp_path, monkeypatch, scope):
+    """CLI normalization stays absolute without hiding symlink components."""
+    target = tmp_path / "target"
+    target.mkdir()
+    if scope == "root":
+        state_argument = tmp_path / "state-link"
+        state_argument.symlink_to(target, target_is_directory=True)
+    else:
+        state_parent = tmp_path / "parent-link"
+        state_parent.symlink_to(target, target_is_directory=True)
+        state_argument = state_parent / "nested"
+    export_argument = tmp_path / "export"
+    monkeypatch.setattr(
+        _DRIVER,
+        "_test_account",
+        lambda: SimpleNamespace(
+            pw_name="tester", pw_uid=os.getuid(), pw_gid=os.getgid()
+        ),
+    )
+    arguments = _DRIVER._parser().parse_args(
+        [
+            "--state-dir",
+            str(state_argument),
+            "--export-dir",
+            str(export_argument),
+            "setup",
+        ]
+    )
+
+    config = _DRIVER._config(arguments)
+
+    assert config.state_dir == Path(os.path.abspath(state_argument))
+    with pytest.raises(_DRIVER.ProvisionError, match="symlinked state path"):
+        _validate_lifecycle_paths(config)
+
+
+def test_cluster_ownership_rejects_symlinked_marker(tmp_path):
+    """Cluster setup cannot trust an ownership marker outside state."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    config.state_dir.mkdir()
+    target = tmp_path / "outside-cluster-marker"
+    target.write_text(
+        json.dumps(
+            {"schema": _DRIVER.STATE_SCHEMA, "cluster_name": config.cluster_name}
+        ),
+        encoding="utf-8",
+    )
+    (config.state_dir / "cluster-owner.json").symlink_to(target)
+
+    with pytest.raises(_DRIVER.ProvisionError, match="symlinked cluster ownership"):
+        _DRIVER._ensure_cluster_ownership(config, cluster_exists=False)
+
+
+def test_cluster_ownership_rejects_directory_marker(tmp_path):
+    """Cluster setup requires its ownership marker to be a regular file."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    (config.state_dir / "cluster-owner.json").mkdir(parents=True)
+
+    with pytest.raises(_DRIVER.ProvisionError, match="unsafe cluster ownership"):
+        _DRIVER._ensure_cluster_ownership(config, cluster_exists=False)
+
+
 def test_sbx_cleanup_preacquires_its_container_image(tmp_path, monkeypatch):
     """SBX teardown cannot bypass verified image acquisition either."""
     config = replace(
@@ -1704,13 +2187,85 @@ def test_sbx_missing_packages_fail_without_sudo():
 
 
 def test_existing_state_requires_ownership_marker(tmp_path):
-    """Bootstrap cannot adopt an arbitrary existing directory."""
+    """Bootstrap cannot adopt a nonempty existing directory."""
     state_dir = tmp_path / "state"
     state_dir.mkdir()
+    (state_dir / "foreign.txt").write_text("do not adopt", encoding="utf-8")
     config = _config(state_dir, tmp_path / "export")
 
     with pytest.raises(_DRIVER.ProvisionError, match="unowned setup state"):
         _validate_lifecycle_paths(config)
+
+
+def test_empty_unmarked_state_recovers_after_marker_write_failure(
+    tmp_path, monkeypatch
+):
+    """An interrupted first marker write can safely bootstrap on retry."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    config = _config(state_dir, tmp_path / "export")
+    original_write = _DRIVER._write_text
+    failed = True
+
+    def fail_once(path, text, mode=0o640):
+        nonlocal failed
+        if failed and path == state_dir / _DRIVER.STATE_MARKER:
+            failed = False
+            raise OSError("simulated marker write failure")
+        original_write(path, text, mode)
+
+    monkeypatch.setattr(_DRIVER, "_write_text", fail_once)
+    _validate_lifecycle_paths(config)
+    with pytest.raises(OSError, match="simulated marker write failure"):
+        _bootstrap_state_dir(config)
+    assert not (state_dir / _DRIVER.STATE_MARKER).exists()
+
+    _validate_lifecycle_paths(config)
+    _bootstrap_state_dir(config)
+    assert (state_dir / _DRIVER.STATE_MARKER).is_file()
+
+
+@pytest.mark.parametrize(
+    ("writer", "content"),
+    ((_write_text, "content\n"), (_write_bytes, b"content\n")),
+)
+def test_atomic_writer_removes_temporary_file_after_publish_failure(
+    tmp_path, monkeypatch, writer, content
+):
+    """A failed atomic publish does not poison later ownership recovery."""
+    destination = tmp_path / "state" / "owner"
+    original_replace = Path.replace
+
+    def fail_destination_replace(path, target):
+        if Path(target) == destination:
+            raise OSError("injected publish failure")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_destination_replace)
+    with pytest.raises(OSError, match="injected publish failure"):
+        writer(destination, content)
+
+    assert destination.parent.is_dir()
+    assert not any(destination.parent.iterdir())
+
+
+def test_cached_file_publish_removes_temporary_file_after_failure(
+    tmp_path, monkeypatch
+):
+    """Cached downloads and extracted binaries cannot leave stale candidates."""
+    temporary = tmp_path / "temporary"
+    destination = tmp_path / "published"
+    temporary.write_bytes(b"content")
+
+    def fail_replace(_path, _target):
+        raise OSError("injected cache publish failure")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(OSError, match="injected cache publish failure"):
+        _publish_temporary_file(temporary, destination, 0o640)
+
+    assert not temporary.exists()
+    assert not destination.exists()
 
 
 def test_existing_state_accepts_matching_ownership_marker(tmp_path):
@@ -1804,6 +2359,8 @@ class _UnownedExportRunner:
         """Answer ownership probes without executing privileged commands."""
         command = [str(item) for item in arguments]
         self.commands.append(command)
+        if "test" in command and "-L" in command:
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
         if "test" in command and "-e" in command:
             exists = command[-1] == self.export_dir
             return SimpleNamespace(returncode=0 if exists else 1, stdout="", stderr="")
@@ -1823,6 +2380,49 @@ def test_existing_export_requires_marker_before_mutation(tmp_path):
     assert not any(
         "install" in command or "chown" in command for command in runner.commands
     )
+
+
+def test_export_ownership_journal_precedes_directory_mutation(tmp_path, monkeypatch):
+    """Export creation journals ownership before install or chown can run."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    config.state_dir.mkdir()
+    events = []
+
+    class _NewExportRunner:
+        def run(self, arguments, **_kwargs):
+            command = [str(item) for item in arguments]
+            if "test" in command and "-e" in command:
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            if "test" in command and "-d" in command:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            events.append(command[1] if command[0] == "sudo" else command[0])
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_DRIVER, "_read_system_file", lambda *_args: None)
+    monkeypatch.setattr(
+        _DRIVER,
+        "_write_text",
+        lambda path, _text, **_kwargs: events.append(f"journal:{path.name}"),
+    )
+
+    _ensure_export_marker(_NewExportRunner(), config)
+
+    assert events.index("journal:export-marker.json") < events.index("install")
+    assert events.index("journal:export-marker.json") < events.index("chown")
+
+
+def test_system_file_reader_rejects_symlinked_ownership_file(tmp_path):
+    """Fixed host ownership files cannot redirect reads through a symlink."""
+
+    class _SymlinkRunner:
+        def run(self, arguments, **_kwargs):
+            command = [str(item) for item in arguments]
+            if "test" in command and "-L" in command:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            pytest.fail(f"symlink probe did not stop system-file read: {command}")
+
+    with pytest.raises(_DRIVER.ProvisionError, match="symlinked system path"):
+        _DRIVER._read_system_file(_SymlinkRunner(), tmp_path / "owner.json")
 
 
 def test_host_nfs_claim_rejects_unowned_fixed_configuration(tmp_path, monkeypatch):
@@ -2262,6 +2862,57 @@ def test_teardown_validation_allows_unrelated_nfs_exports(tmp_path, monkeypatch)
     ownership = _validate_teardown_ownership(object(), config)
 
     assert ownership == (True, True, True, True)
+
+
+def test_teardown_recovers_empty_export_after_marker_install_crash(
+    tmp_path, monkeypatch
+):
+    """A pre-marker export crash remains attributable and removable."""
+    config = replace(
+        _config(tmp_path / "state", tmp_path / "export"), storage_backend="nfs"
+    )
+    config.state_dir.mkdir()
+    config.export_dir.mkdir()
+    owner = json.dumps(
+        {"schema": _DRIVER.STATE_SCHEMA, "cluster_name": config.cluster_name}
+    )
+    (config.state_dir / _DRIVER.STATE_MARKER).write_text(owner, encoding="utf-8")
+    (config.state_dir / "cluster-owner.json").write_text(owner, encoding="utf-8")
+    (config.state_dir / "export-marker.json").write_text(owner, encoding="utf-8")
+    monkeypatch.setattr(_DRIVER, "_read_system_file", lambda *_args: None)
+    monkeypatch.setattr(_DRIVER, "_export_mount_type", lambda *_args: "")
+    monkeypatch.setattr(_DRIVER, "_validate_loop_associations", lambda *_args: None)
+    monkeypatch.setattr(_DRIVER, "_validate_nfs_host_owner", lambda *_args: True)
+
+    ownership = _validate_teardown_ownership(_RecordingRunner(), config)
+
+    assert ownership == (True, True, True, True)
+
+
+@pytest.mark.parametrize("marker_name", (_DRIVER.STATE_MARKER, "cluster-owner.json"))
+def test_nfs_teardown_rejects_directory_ownership_marker(tmp_path, marker_name):
+    """A directory cannot impersonate either durable NFS owner marker."""
+    config = replace(
+        _config(tmp_path / "state", tmp_path / "export"), storage_backend="nfs"
+    )
+    config.state_dir.mkdir()
+    (config.state_dir / marker_name).mkdir()
+
+    with pytest.raises(_DRIVER.ProvisionError, match="unsafe ownership marker"):
+        _validate_teardown_ownership(_RecordingRunner(), config)
+
+
+def test_nfs_teardown_rejects_directory_export_journal(tmp_path, monkeypatch):
+    """A directory cannot impersonate the interrupted-export journal."""
+    config = replace(
+        _config(tmp_path / "state", tmp_path / "export"), storage_backend="nfs"
+    )
+    _bootstrap_state_dir(config)
+    (config.state_dir / "export-marker.json").mkdir()
+    monkeypatch.setattr(_DRIVER, "_read_system_file", lambda *_args: None)
+
+    with pytest.raises(_DRIVER.ProvisionError, match="unsafe export journal"):
+        _validate_teardown_ownership(_RecordingRunner(), config)
 
 
 def test_teardown_accepts_service_only_partial_nfs_bootstrap(tmp_path, monkeypatch):
@@ -3256,6 +3907,17 @@ def test_kubectl_prerequisite_manifest_matches_product_constraints():
             assert container["securityContext"]["allowPrivilegeEscalation"] is False
             assert container["securityContext"]["capabilities"]["drop"] == ["ALL"]
             assert "hostPort" not in str(container)
+    for client in (coordinator, denied):
+        client_script = client["spec"]["containers"][0]["args"][0]
+        assert "command -v timeout >/dev/null" in client_script
+        assert "perl -MIO::Socket::INET -e 1" in client_script
+        assert "probe_root=/tmp/storage-scale-kubectl-probe" in client_script
+        assert "timeout --kill-after=1s 5s" in client_script
+        assert "use IO::Socket::INET" in client_script
+        assert "PeerPort=>1611" in client_script
+        assert r"\AHTTP\/[0-9.]+ 200" in client_script
+        assert "=~ /200/" not in client_script
+        assert client["spec"]["containers"][0]["readinessProbe"]["exec"]
     worker = daemonset["spec"]["template"]["spec"]["containers"][0]
     worker_script = worker["args"][0]
     assert (
@@ -3266,6 +3928,9 @@ def test_kubectl_prerequisite_manifest_matches_product_constraints():
     assert worker["ports"] == [
         {"name": "status", "containerPort": 1611, "protocol": "TCP"}
     ]
+    readiness_script = worker["readinessProbe"]["exec"]["command"][-1]
+    assert "read -r -t 2 response" in readiness_script
+    assert "cat <&3" not in readiness_script
     assert daemonset["spec"]["template"]["spec"]["volumes"] == [
         {
             "name": "storage",
@@ -3293,6 +3958,148 @@ def test_kubectl_prerequisite_manifest_matches_product_constraints():
         ]
         == "worker"
     )
+
+
+def test_kubectl_probe_status_detaches_network_io_from_exec(monkeypatch, tmp_path):
+    """Cross-Pod socket lifetime is not coupled to a kubectl exec stream."""
+    # pylint: disable=protected-access
+    config = _config(tmp_path / "state", tmp_path / "export")
+    calls = []
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "0\n", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+    )
+
+    def _probe_exec(_runner, _config_value, pod, container, arguments, **kwargs):
+        calls.append((pod, container, tuple(arguments), kwargs))
+        return next(responses)
+
+    monkeypatch.setattr(
+        _DRIVER.secrets, "token_hex", lambda _length: "0123456789abcdef"
+    )
+    monkeypatch.setattr(_DRIVER, "_kubectl_probe_exec", _probe_exec)
+
+    result = _DRIVER._kubectl_probe_status(
+        object(), config, "coordinator", "coordinator", "10.244.1.2"
+    )
+
+    assert result.returncode == 0
+    assert len(calls) == 4
+    launch = calls[0][2]
+    assert launch[:2] == ("bash", "-ceu")
+    assert "/dev/tcp" not in launch[2]
+    assert launch[4:7] == (
+        "/tmp/storage-scale-kubectl-probe",
+        "0123456789abcdef",
+        "10.244.1.2",
+    )
+    assert calls[-1][2] == (
+        "rm",
+        "-rf",
+        "--",
+        "/tmp/storage-scale-kubectl-probe/0123456789abcdef",
+        "/tmp/storage-scale-kubectl-probe/0123456789abcdef.request",
+        "/tmp/storage-scale-kubectl-probe/0123456789abcdef.request.tmp",
+    )
+
+
+def test_kubectl_probe_status_preserves_detached_failure(monkeypatch, tmp_path):
+    """A denied detached request remains an ordinary nonzero probe result."""
+    # pylint: disable=protected-access
+    config = _config(tmp_path / "state", tmp_path / "export")
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "124\n", ""),
+            subprocess.CompletedProcess([], 0, "timed out\n", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+    )
+    monkeypatch.setattr(
+        _DRIVER,
+        "_kubectl_probe_exec",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    result = _DRIVER._kubectl_probe_status(
+        object(),
+        config,
+        "denied",
+        "denied",
+        "10.244.2.2",
+        check=False,
+    )
+
+    assert result.returncode == 124
+    assert result.stderr == "timed out\n"
+
+
+def test_kubectl_probe_status_clamps_every_exec_to_one_deadline(monkeypatch, tmp_path):
+    """Trigger, polling, diagnostics, and cleanup share one time budget."""
+    # pylint: disable=protected-access
+    config = _config(tmp_path / "state", tmp_path / "export")
+    clock = [100.0]
+    calls = []
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "0\n", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+    )
+
+    def _monotonic():
+        return clock[0]
+
+    def _probe_exec(*_args, timeout, **_kwargs):
+        calls.append((clock[0], timeout))
+        clock[0] += 0.2
+        return next(responses)
+
+    monkeypatch.setattr(_DRIVER.time, "monotonic", _monotonic)
+    monkeypatch.setattr(_DRIVER, "_kubectl_probe_exec", _probe_exec)
+
+    result = _DRIVER._kubectl_probe_status(
+        object(),
+        config,
+        "coordinator",
+        "coordinator",
+        "10.244.1.2",
+        deadline=101.0,
+    )
+
+    assert result.returncode == 0
+    assert len(calls) == 4
+    assert all(timeout <= 101.0 - started for started, timeout in calls)
+    assert clock[0] < 101.0
+
+
+def test_kubectl_probe_waits_pass_their_overall_deadline(monkeypatch, tmp_path):
+    """Nested access and policy probes cannot reset the outer wait budget."""
+    # pylint: disable=protected-access
+    config = _config(tmp_path / "state", tmp_path / "export")
+    clock = [200.0]
+    deadlines = []
+    results = iter((0, 1, 0))
+
+    def _probe_status(*_args, deadline, **_kwargs):
+        deadlines.append(deadline)
+        clock[0] += 1
+        return subprocess.CompletedProcess([], next(results), "", "")
+
+    monkeypatch.setattr(_DRIVER.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(_DRIVER, "_kubectl_probe_status", _probe_status)
+
+    _DRIVER._wait_for_kubectl_probe_denial(
+        object(), config, "coordinator", "denied", "10.244.1.2"
+    )
+
+    assert deadlines == [230.0, 230.0, 230.0]
 
 
 def _yaml_image_references(value):

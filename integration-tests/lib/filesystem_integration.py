@@ -805,13 +805,25 @@ def _asset_url(name: str) -> str:
     return str(matches[0]["url"])
 
 
+def _publish_temporary_file(temporary: Path, destination: Path, mode: int) -> None:
+    """Publish one temporary file and remove it after every failure mode."""
+    try:
+        temporary.chmod(mode)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _download_archive(destination: Path, name: str, expected: str) -> None:
     """Download and verify one pinned elbencho archive atomically."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     url = _asset_url(name)
-    with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as handle:
-        temporary = Path(handle.name)
-        try:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent, delete=False
+        ) as handle:
+            temporary = Path(handle.name)
             with _request(url, "application/octet-stream") as response:
                 content_length = response.headers.get("Content-Length")
                 if content_length and int(content_length) > MAX_ARCHIVE_BYTES:
@@ -827,17 +839,15 @@ def _download_archive(destination: Path, name: str, expected: str) -> None:
                             f"{MAX_ARCHIVE_BYTES} bytes"
                         )
                     handle.write(chunk)
-        except Exception:
+        actual = _sha256(temporary)
+        if actual != expected:
+            raise IntegrationTestError(
+                f"checksum mismatch for {name}: expected {expected}, got {actual}"
+            )
+        _publish_temporary_file(temporary, destination, 0o640)
+    finally:
+        if temporary is not None:
             temporary.unlink(missing_ok=True)
-            raise
-    actual = _sha256(temporary)
-    if actual != expected:
-        temporary.unlink(missing_ok=True)
-        raise IntegrationTestError(
-            f"checksum mismatch for {name}: expected {expected}, got {actual}"
-        )
-    temporary.chmod(0o640)
-    temporary.replace(destination)
 
 
 def _extract_container_elbencho(
@@ -922,14 +932,18 @@ def _sbx_bundle_document(architecture: str, binary_name: str) -> dict[str, objec
 
 def _write_sbx_bundle_marker(path: Path, document: dict[str, object]) -> None:
     """Atomically record a successfully built SBX Elbencho bundle."""
-    with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=path.parent, delete=False
-    ) as handle:
-        json.dump(document, handle, sort_keys=True)
-        handle.write("\n")
-        temporary = Path(handle.name)
-    temporary.chmod(0o640)
-    temporary.replace(path)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(document, handle, sort_keys=True)
+            handle.write("\n")
+        _publish_temporary_file(temporary, path, 0o640)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _sbx_bundle_is_current(
@@ -988,11 +1002,15 @@ def _ensure_elbencho(
         source = tar.extractfile(members[0])
         if source is None:
             raise IntegrationTestError(f"cannot extract elbencho from {archive}")
-        with tempfile.NamedTemporaryFile(dir=cache, delete=False) as handle:
-            temporary = Path(handle.name)
-            shutil.copyfileobj(source, handle)
-    temporary.chmod(0o755)
-    temporary.replace(binary)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=cache, delete=False) as handle:
+                temporary = Path(handle.name)
+                shutil.copyfileobj(source, handle)
+            _publish_temporary_file(temporary, binary, 0o755)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
     return binary, binary_name, None
 
 
@@ -1695,6 +1713,8 @@ def _sync_step_runtime(
     result_base: str,
 ) -> None:
     """Render and install one step's env and support files."""
+    if runtime.selector == "kubectl":
+        runtime.values["kubectl_result_base"] = result_base
     extra_env = step.render_env(runtime.values)
     if runtime.selector == "kubectl" and runtime.scenario.name == "failure-resume":
         # The product copies this integration-only executable into the control
@@ -2695,32 +2715,74 @@ def _run_kubectl_command(
         *arguments,
     ]
     LOG.info("Running kubectl filesystem step: %s", name)
-    result = runner.run(
-        command,
-        cwd=Path(runtime.workspace),
-        check=False,
-        timeout=timeout + 30,
-    )
+    try:
+        result = runner.run(
+            command,
+            cwd=Path(runtime.workspace),
+            check=False,
+            timeout=timeout + 30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        if not any(
+            argument in {"--status", "--cancel", "--collect", "--resume"}
+            for argument in arguments
+        ):
+            _arm_incomplete_kubectl_submit_cleanup(runtime)
+        raise
     output = result.stdout + result.stderr
     log_path = log_dir / f"kubectl-{name}.log"
     log_path.write_text(output, encoding="utf-8")
     log_path.chmod(0o640)
+    if accepted_states:
+        try:
+            observed_state = _kubectl_lifecycle_state(output)
+        except IntegrationTestError as error:
+            raise IntegrationTestError(
+                f"kubectl {name} did not report an accepted terminal state; "
+                f"full output: {log_path}"
+            ) from error
+        if observed_state not in accepted_states or result.returncode == 0:
+            raise IntegrationTestError(
+                f"kubectl {name} must return nonzero with one of "
+                f"{sorted(accepted_states)}, got exit code {result.returncode} and "
+                f"state {observed_state}; full output: {log_path}"
+            )
+        return output
     if expected_failure and result.returncode == 0:
         raise IntegrationTestError(
             f"kubectl {name} unexpectedly succeeded; full output: {log_path}"
         )
     if result.returncode and not expected_failure:
-        if accepted_states:
-            try:
-                if _kubectl_lifecycle_state(output) in accepted_states:
-                    return output
-            except IntegrationTestError:
-                pass
+        if not any(
+            argument in {"--status", "--cancel", "--collect", "--resume"}
+            for argument in arguments
+        ):
+            _arm_incomplete_kubectl_submit_cleanup(runtime)
         raise IntegrationTestError(
             f"kubectl {name} failed with exit code {result.returncode}; full "
             f"output: {log_path}\n{output.strip()[-8000:]}"
         )
     return output
+
+
+def _arm_incomplete_kubectl_submit_cleanup(runtime: ScenarioRuntime) -> None:
+    """Retain the exact local lifecycle root after an interrupted submit."""
+    values = getattr(runtime, "values", None)
+    if not isinstance(values, dict) or values.get("kubectl_result_root"):
+        return
+    result_base = values.get("kubectl_result_base")
+    if not result_base:
+        return
+    base = Path(result_base)
+    candidates = [
+        path
+        for path in base.glob("elbencho-*")
+        if path.is_dir()
+        and not path.is_symlink()
+        and (path / "kubernetes" / "current-attempt").is_file()
+    ]
+    if len(candidates) == 1:
+        values["kubectl_result_root"] = str(candidates[0])
 
 
 def _kubectl_output_value(output: str, key: str) -> str:
@@ -3605,6 +3667,10 @@ def _preserve_scenario_failure_diagnostics(
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "failure.txt").write_text(f"{error!r}\n", encoding="utf-8")
     failures: list[str] = []
+    if runtime.selector == "kubectl":
+        _preserve_kubectl_failure_diagnostics(
+            runner, config, runtime, destination, failures
+        )
     for name in ("logs", "results"):
         source = f"{runtime.workspace}/{name}"
         target = destination / name
@@ -3644,6 +3710,142 @@ def _preserve_scenario_failure_diagnostics(
             runtime.selector,
             destination / "collection-errors.txt",
         )
+
+
+def _preserve_kubectl_failure_diagnostics(
+    runner: Any,
+    config: Any,
+    runtime: ScenarioRuntime,
+    destination: Path,
+    failures: list[str],
+) -> None:
+    """Capture bounded exact-attempt Kubernetes evidence before cleanup."""
+    result_root_value = runtime.values.get("kubectl_result_root")
+    if not result_root_value:
+        return
+    current = Path(result_root_value) / "kubernetes" / "current-attempt"
+    try:
+        attempt = current.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        failures.append(f"could not read kubectl attempt identity: {error!r}")
+        return
+    if not re.fullmatch(r"[0-9a-f]{8}", attempt):
+        failures.append(f"invalid kubectl diagnostic attempt identity: {attempt!r}")
+        return
+    label = f"storage-scale-test.nvidia.com/run={attempt}"
+    commands = {
+        "objects.yaml": _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "get",
+            "job,pod,daemonset,networkpolicy",
+            "-l",
+            label,
+            "-o",
+            "yaml",
+        ),
+        "describe.txt": _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "describe",
+            "job,pod,daemonset",
+            "-l",
+            label,
+        ),
+        "logs.txt": _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "logs",
+            "-l",
+            label,
+            "--all-containers=true",
+            "--prefix=true",
+            "--tail=2000",
+        ),
+        "events.yaml": _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "get",
+            "events",
+            "-o",
+            "yaml",
+        ),
+    }
+    target = destination / "kubernetes"
+    target.mkdir(parents=True, exist_ok=True)
+    for filename, command in commands.items():
+        try:
+            result = runner.run(command, check=False, timeout=30)
+            output = result.stdout + result.stderr
+            (target / filename).write_text(output, encoding="utf-8")
+            if result.returncode:
+                failures.append(
+                    f"kubectl diagnostic {filename} exited {result.returncode}"
+                )
+        except (OSError, subprocess.SubprocessError) as error:
+            failures.append(f"kubectl diagnostic {filename} failed: {error!r}")
+    try:
+        pods = runner.run(
+            _kubectl(
+                config,
+                "-n",
+                config.namespace,
+                "get",
+                "pods",
+                "-l",
+                label,
+                "-o",
+                "json",
+            ),
+            check=False,
+            timeout=30,
+        )
+        items = json.loads(pods.stdout).get("items", []) if not pods.returncode else []
+        names = sorted(
+            item.get("metadata", {}).get("name", "")
+            for item in items
+            if not item.get("metadata", {}).get("deletionTimestamp")
+            and item.get("status", {}).get("phase") == "Running"
+            and any(
+                status.get("ready")
+                for status in item.get("status", {}).get("containerStatuses", [])
+            )
+        )
+        names = [name for name in names if name]
+        if names:
+            remote = f"{KUBECTL_STORAGE_MOUNT}/.storage-scale-test/runs/{attempt}/state"
+            result = runner.run(
+                _kubectl(
+                    config,
+                    "-n",
+                    config.namespace,
+                    "exec",
+                    names[0],
+                    "--",
+                    "/bin/bash",
+                    "-ceu",
+                    "for file in run.status run-summary.tsv publication-manifest.tsv; do "
+                    'printf "===== %s =====\\n" "$file"; '
+                    '[[ ! -f "$1/$file" ]] || cat -- "$1/$file"; done',
+                    "diagnostics",
+                    remote,
+                ),
+                check=False,
+                timeout=30,
+            )
+            (target / "durable-state.txt").write_text(
+                result.stdout + result.stderr, encoding="utf-8"
+            )
+            if result.returncode:
+                failures.append(
+                    f"kubectl durable-state diagnostic exited {result.returncode}"
+                )
+    except (json.JSONDecodeError, OSError, subprocess.SubprocessError) as error:
+        failures.append(f"kubectl durable-state diagnostic failed: {error!r}")
 
 
 def _cleanup_scenario_storage(

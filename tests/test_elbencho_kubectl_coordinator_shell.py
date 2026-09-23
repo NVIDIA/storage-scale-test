@@ -145,9 +145,12 @@ def _write_bundle(tmp_path, execution_count=2):
 
 def _run_coordinator(control, state_dir, scratch, fake, **extra_env):
     environment = os.environ.copy()
+    pvc_root = control.parent.parent / "pvc"
+    pvc_root.mkdir(exist_ok=True)
     environment.update(
         {
             "STORAGE_SCALE_TEST_INTEGRATION": "1",
+            "KUBECTL_INTEGRATION_PVC_ROOT": str(pvc_root),
             "KUBECTL_INTEGRATION_FAKE_ELBENCHO": str(fake),
             "FAKE_ELBENCHO_RECORD": str(control.parent / "fake-record"),
             "PATH": f"{control.parent / 'fake-bin'}:{os.environ['PATH']}",
@@ -175,6 +178,53 @@ def _run_coordinator(control, state_dir, scratch, fake, **extra_env):
     )
 
 
+def _run_recovery(control, state_dir, scratch):
+    environment = os.environ.copy()
+    pvc_root = control.parent.parent / "pvc"
+    pvc_root.mkdir(exist_ok=True)
+    environment.update(
+        {
+            "STORAGE_SCALE_TEST_INTEGRATION": "1",
+            "KUBECTL_INTEGRATION_PVC_ROOT": str(pvc_root),
+            "PATH": f"{control.parent / 'fake-bin'}:{os.environ['PATH']}",
+        }
+    )
+    return subprocess.run(
+        [
+            _BASH,
+            str(_COORDINATOR),
+            "--recover-lost",
+            str(control),
+            str(state_dir),
+            str(scratch),
+            "1234abcd",
+        ],
+        cwd=_REPOSITORY_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=environment,
+    )
+
+
+def test_endpoint_probe_runs_socket_code_from_the_coordinator_file():
+    """The bounded child does not carry socket code as inline shell text."""
+    source = _COORDINATOR.read_text(encoding="utf-8")
+    wrapper = source.split("_coordinator_probe_endpoint() {", maxsplit=1)[1].split(
+        "_coordinator_probe_endpoint_request() {", maxsplit=1
+    )[0]
+    assert 'bash "$0" --probe-endpoint "$endpoint"' in wrapper
+    assert "/dev/tcp" not in wrapper
+    rejected = subprocess.run(
+        [_BASH, str(_COORDINATOR), "--probe-endpoint", "999.10.0.1"],
+        cwd=_REPOSITORY_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert rejected.returncode != 0
+
+
 def test_coordinator_uses_verified_bundle_context_and_manifest_last(tmp_path):
     """Only the durable manifest exposes both fully committed fake cells."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path)
@@ -195,11 +245,12 @@ def test_coordinator_uses_verified_bundle_context_and_manifest_last(tmp_path):
     assert (state_dir / "results" / "0001" / "result-0001.txt").read_text(
         encoding="utf-8"
     ) == "artifact-0001\n"
+    pvc_root = control.parent.parent / "pvc"
     assert (control.parent / "fake-record").read_text(
         encoding="utf-8"
     ).splitlines() == [
-        "0001|1||/mnt/storage-scale-test/benchmark/target-1",
-        "0002|1||/mnt/storage-scale-test/benchmark/target-2",
+        f"0001|1||{pvc_root}/benchmark/target-1",
+        f"0002|1||{pvc_root}/benchmark/target-2",
     ]
 
 
@@ -231,8 +282,9 @@ def test_multinode_cell_persists_worker_selection_before_fake_elbencho(tmp_path)
         "worker-a\tworker-a-pod\tpod-a\t10.10.0.1",
         "worker-b\tworker-b-pod\tpod-b\t10.10.0.2",
     ]
+    pvc_root = control.parent.parent / "pvc"
     assert (control.parent / "fake-record").read_text(encoding="utf-8").strip() == (
-        "0001|0|10.10.0.1,10.10.0.2|/mnt/storage-scale-test/benchmark/target-1"
+        f"0001|0|10.10.0.1,10.10.0.2|{pvc_root}/benchmark/target-1"
     )
 
 
@@ -269,6 +321,52 @@ def test_crash_boundaries_never_advertise_uncommitted_terminal_cells(
         assert "execution\t0001\tSUCCESS" not in (
             manifest.read_text(encoding="utf-8") if manifest.exists() else ""
         )
+
+
+@pytest.mark.parametrize(
+    "boundary", ("after-lock", "after-snapshots", "after-execution-state")
+)
+def test_pre_running_crash_boundaries_recover_to_collectable_failure(
+    tmp_path, boundary
+):
+    """A dead exact Job is recoverable after every durable startup checkpoint."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=2)
+    state_dir.mkdir()
+    (state_dir / "run.status").write_text("PREPARED\n", encoding="utf-8")
+    crashed = _run_coordinator(
+        control,
+        state_dir,
+        scratch,
+        fake,
+        KUBECTL_INTEGRATION_CRASH_AFTER=boundary,
+    )
+    assert crashed.returncode != 0
+    assert (state_dir / "run.status").read_text(encoding="utf-8").strip() == (
+        "PREPARED"
+    )
+    recovered = _run_recovery(control, state_dir, scratch)
+    assert recovered.returncode == 0, recovered.stderr
+    assert (state_dir / "run.status").read_text(encoding="utf-8").strip() == "FAILED"
+    assert (state_dir / "executions/0001.status").read_text(
+        encoding="utf-8"
+    ).strip() == "FAILED"
+    assert "observed_status\tPREPARED" in (
+        state_dir / "coordinator-loss.tsv"
+    ).read_text(encoding="utf-8")
+
+
+def test_generated_target_symlink_cannot_escape_pvc(tmp_path):
+    """Every derived workload path is resolved against live PVC symlinks."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
+    pvc_root = tmp_path / "pvc"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    pvc_root.mkdir()
+    (pvc_root / "benchmark").symlink_to(outside, target_is_directory=True)
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode != 0
+    assert "workload path escapes the mounted PVC" in result.stderr
+    assert list(outside.iterdir()) == []
 
 
 def test_lost_coordinator_recovery_publishes_failed_running_cell(tmp_path):
@@ -315,6 +413,114 @@ def test_lost_coordinator_recovery_publishes_failed_running_cell(tmp_path):
         encoding="utf-8"
     ).strip() == "143"
     assert "execution\t0001\tFAILED" in (
+        state_dir / "publication-manifest.tsv"
+    ).read_text(encoding="utf-8")
+
+
+def test_job_loss_before_coordinator_lock_is_recoverable(tmp_path):
+    """A Job that never started cannot strand a PREPARED PVC attempt."""
+    control, state_dir, scratch, _ = _write_bundle(tmp_path, execution_count=1)
+    state_dir.mkdir()
+    (state_dir / "run.status").write_text("PREPARED\n", encoding="utf-8")
+    recovered = _run_recovery(control, state_dir, scratch)
+    assert recovered.returncode == 0, recovered.stderr
+    assert (state_dir / "run.status").read_text(encoding="utf-8").strip() == "FAILED"
+    owner = (state_dir / "coordinator.lock/owner.tsv").read_text(encoding="utf-8")
+    assert "attempt_id\t1234abcd" in owner
+
+
+def test_lost_coordinator_recovery_publishes_all_terminal_success(tmp_path):
+    """A crash after the final cell is terminal still becomes collectable."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
+    crashed = _run_coordinator(
+        control,
+        state_dir,
+        scratch,
+        fake,
+        KUBECTL_INTEGRATION_CRASH_AFTER="after-terminal",
+    )
+    assert crashed.returncode != 0
+    assert (state_dir / "run.status").read_text(encoding="utf-8").strip() == "RUNNING"
+    recovered = _run_recovery(control, state_dir, scratch)
+    assert recovered.returncode == 0, recovered.stderr
+    assert (state_dir / "run.status").read_text(encoding="utf-8").strip() == "SUCCESS"
+    manifest = (state_dir / "publication-manifest.tsv").read_text(encoding="utf-8")
+    assert "execution\t0001\tSUCCESS" in manifest
+    assert "recovered_status\tSUCCESS" in (
+        state_dir / "coordinator-loss.tsv"
+    ).read_text(encoding="utf-8")
+
+
+def test_lost_coordinator_repairs_terminal_status_manifest_window(tmp_path):
+    """A crash after terminal run status can republish complete evidence."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
+    crashed = _run_coordinator(
+        control,
+        state_dir,
+        scratch,
+        fake,
+        KUBECTL_INTEGRATION_CRASH_AFTER="after-terminal",
+    )
+    assert crashed.returncode != 0
+    (state_dir / "run.status").write_text("SUCCESS\n", encoding="utf-8")
+    (state_dir / "publication-manifest.tsv").unlink(missing_ok=True)
+    recovered = _run_recovery(control, state_dir, scratch)
+    assert recovered.returncode == 0, recovered.stderr
+    manifest = (state_dir / "publication-manifest.tsv").read_text(encoding="utf-8")
+    assert "execution\t0001\tSUCCESS" in manifest
+    assert "ledger\trun.status\trun.status" in manifest
+
+
+def test_lost_coordinator_recovery_preserves_all_terminal_failure(tmp_path):
+    """All-terminal recovery retains a failed cell's durable exit code."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
+    crashed = _run_coordinator(
+        control,
+        state_dir,
+        scratch,
+        fake,
+        FAKE_ELBENCHO_FAIL_ID="0001",
+        KUBECTL_INTEGRATION_CRASH_AFTER="after-terminal",
+    )
+    assert crashed.returncode != 0
+    recovered = _run_recovery(control, state_dir, scratch)
+    assert recovered.returncode == 0, recovered.stderr
+    assert (state_dir / "run.status").read_text(encoding="utf-8").strip() == "FAILED"
+    assert "recovered_status\tFAILED" in (state_dir / "coordinator-loss.tsv").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_lost_coordinator_keeps_later_pending_cells_after_terminal_failure(tmp_path):
+    """Recovery does not misattribute a prior failure to the next cell."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=2)
+    crashed = _run_coordinator(
+        control,
+        state_dir,
+        scratch,
+        fake,
+        FAKE_ELBENCHO_FAIL_ID="0001",
+        KUBECTL_INTEGRATION_CRASH_AFTER="after-terminal",
+    )
+    assert crashed.returncode != 0
+    assert (state_dir / "executions/0001.status").read_text(
+        encoding="utf-8"
+    ).strip() == "FAILED"
+    assert (state_dir / "executions/0002.status").read_text(
+        encoding="utf-8"
+    ).strip() == "PENDING"
+    recovered = _run_recovery(control, state_dir, scratch)
+    assert recovered.returncode == 0, recovered.stderr
+    assert (state_dir / "executions/0001.status").read_text(
+        encoding="utf-8"
+    ).strip() == "FAILED"
+    assert (state_dir / "executions/0001.exitcode").read_text(
+        encoding="utf-8"
+    ).strip() == "1"
+    assert (state_dir / "executions/0002.status").read_text(
+        encoding="utf-8"
+    ).strip() == "PENDING"
+    assert "execution\t0002\tPENDING" in (
         state_dir / "publication-manifest.tsv"
     ).read_text(encoding="utf-8")
 
@@ -543,6 +749,27 @@ def test_missing_required_shared_workload_artifact_converts_success_to_failure(
     assert "lacks required artifact 0001.write.json" in result.stderr
 
 
+def test_legacy_worker_directory_success_does_not_require_workload_metadata(tmp_path):
+    """Legacy output remains complete without shared-layout TSV sidecars."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
+    fake_lines = fake.read_text(encoding="utf-8").splitlines()
+    fake.write_text(
+        "\n".join(
+            line
+            for line in fake_lines
+            if "workload-%s" not in line and "workload.tsv" not in line
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode == 0, result.stderr
+    assert (state_dir / "executions" / "0001.status").read_text(
+        encoding="utf-8"
+    ).strip() == "SUCCESS"
+    assert not (state_dir / "results/0001/executions/0001.workload.tsv").exists()
+
+
 def test_same_attempt_never_resets_running_or_retries_failed_cells(tmp_path):
     """Collection, not a second coordinator, is the resume boundary."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
@@ -646,9 +873,12 @@ def test_signal_publishes_terminal_failure_without_erasing_scratch_evidence(tmp_
         """,
     )
     environment = os.environ.copy()
+    pvc_root = tmp_path / "pvc"
+    pvc_root.mkdir()
     environment.update(
         {
             "STORAGE_SCALE_TEST_INTEGRATION": "1",
+            "KUBECTL_INTEGRATION_PVC_ROOT": str(pvc_root),
             "KUBECTL_INTEGRATION_FAKE_ELBENCHO": str(fake),
             "FAKE_ELBENCHO_RECORD": str(control.parent / "fake-record"),
             "PATH": f"{control.parent / 'fake-bin'}:{os.environ['PATH']}",

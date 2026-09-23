@@ -101,6 +101,13 @@ headroom; SBX is a supported local backend.
 
 The kubectl filesystem-sweep design and acceptance boundary are documented in
 [plans/kubernetes-elbencho-filesystem-sweep.md](plans/kubernetes-elbencho-filesystem-sweep.md).
+Attempts publish their local current pointer only after acquiring durable PVC
+ownership and freezing worker evidence; resume uses compare-and-swap against
+the collected predecessor. Collection waits for the exact journaled Job to
+become inactive, uses a transfer-sized deadline, and recovers coordinator loss
+from either PREPARED or RUNNING. Derived workload paths are resolved against
+live PVC symlinks, and endpoint checks freeze Node, Pod, address, architecture,
+and image identity.
 
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
@@ -110,7 +117,7 @@ alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 
 | Path | Responsibility |
 |---|---|
-| `storage-tests/fs/` | Filesystem IO and metadata entry points, Slurm jobs, and SSH scriptlets |
+| `storage-tests/fs/` | Filesystem IO and metadata entry points plus Slurm, SSH, and kubectl orchestration |
 | `storage-tests/object/` | Warp object-storage entry point and substrate-specific dispatchers |
 | `storage-tests/network/` | Elbencho netbench entry point and substrate-specific dispatchers |
 | `lib/env_base.sh` | Derived configuration, substrate selection, executable paths, and Slurm option construction |
@@ -248,10 +255,11 @@ creates a new attempt while preserving successful cells.
 
 Kubernetes uses ordinary Pod networking and attempt-scoped NetworkPolicy,
 not host networking, host ports, or Services. Worker endpoint identity is
-validated before each cell; drift or coordinator loss is recovered only with
-fresh identity evidence. Results are copied from PVC storage to the local
-result tree by collection. A configured namespace, existing PV/PVC, node
-selector, authorized kubectl context, and compatible CNI are prerequisites.
+revalidated by status and collection; the API-independent coordinator probes
+frozen addresses before each cell. Drift or coordinator loss is recovered only
+with fresh identity evidence. Collection copies PVC results to the local result
+tree. A configured namespace, existing PV/PVC, node selector, authorized kubectl
+context, and compatible CNI are prerequisites.
 Docker SBX validates the supported kind profile; dual-architecture NFS CI and
 a separately authorized external-cluster run are release acceptance gates.
 

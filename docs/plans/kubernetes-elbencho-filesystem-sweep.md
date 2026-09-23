@@ -303,10 +303,12 @@ While the Job container is running, status may use `kubectl exec` to read the
 PVC-backed summary. If the container is unavailable or terminal, create a
 short-lived, read-only inspector Pod that mounts the PVC, reads the same
 summary, and is deleted before status returns. While the local lifecycle is
-`SUBMITTED`, status requires the exact journaled Job to exist before trusting
-the PVC ledger. An externally removed Job is a consistency error; cancellation
-reconciles the saved attempt and its durable terminal record. If API and ledger
-evidence disagree, report both and refuse to claim success.
+`SUBMITTED`, status reconciles the exact journaled Job identity before trusting
+the PVC ledger. A failed Job, or verified absence of that exact Job, with a
+nonterminal ledger is bounded coordinator-loss evidence: recover it to a
+collectible failure only when the saved identity and durable control state
+agree. If API and ledger evidence disagree without satisfying that recovery
+rule, report both and refuse to claim success.
 
 On a successful query, status exits zero regardless of active or failed sweep
 state and emits exactly one stable `STORAGE_SCALE_TEST_KUBECTL_STATE=<state>`
@@ -336,10 +338,11 @@ the failed cell's available evidence. It returns nonzero when the remote sweep
 failed, but the local result directory is left ready for `--resume`.
 
 Transfer or verification failure must leave the remote directory, DaemonSet,
-Job, and local pre-collection state intact. Publication is journaled and
-idempotent: if it is interrupted after individual renames begin, retry verifies
-already-published files and completes the merge. Cleanup never begins until the
-entire local publication is verified.
+and Job intact. Local state may remain `COLLECTION_IN_PROGRESS`, with a partial
+archive, staging tree, or publication journal that a retry validates or
+removes. Publication is idempotent: if interrupted after individual renames
+begin, retry verifies already-published files and completes the merge. Cleanup
+never begins until the entire local publication is verified.
 
 If the attempt is already `COLLECTED`, revalidate the local publication and
 return its recorded terminal outcome without recreating Kubernetes resources.
@@ -396,7 +399,7 @@ ledger is authoritative and the disconnected local ledger cannot safely know
 which cells completed. Help and error messages must state the required next
 command, not merely reject resume.
 
-The documented state machine is:
+The user workflow is:
 
 ```text
 submit → status (repeat while running)
@@ -404,6 +407,10 @@ submit → status (repeat while running)
   ├─ failure → collect partial results → resume → new attempt
   └─ active/wedged → cancel → collect partial results → resume or stop
 ```
+
+This workflow is a projection, not one flattened state machine. Local attempt,
+PVC run, and per-cell states have separate authoritative transitions defined in
+the lifecycle and fault contract.
 
 ## Persistent and Local State
 
@@ -779,19 +786,22 @@ later collection/cleanup visible.
 Create a temporary collector Pod in the configured namespace using the selected
 image and PVC mount. Override the entrypoint with an idle command, wait for the
 Pod, and stream a tar archive of exactly the remote attempt directory through
-`kubectl exec`. Compression is optional and must use a codec available both in
-the image and locally.
+`kubectl exec`. The collector is read-only during transfer and verification;
+after verified local publication it performs the explicitly ordered remote-run
+and lock cleanup below. Compression is optional and must use a codec available
+both in the image and locally.
 
 Use an explicit tar stream rather than relying on broad `kubectl cp` behavior.
 Both mechanisms require `tar` in the container, so validate this image
 capability before submission.
 
-Write the stream to a temporary archive adjacent to the result directory.
-Before extraction, inspect its member paths and types; reject absolute paths,
-`..` traversal, links, devices, unexpected run IDs, and anything outside the
-expected layout. Enforce configured byte and member-count bounds while
-streaming and inspecting. Extract only after validation into a new staging
-directory.
+Write the stream to a temporary archive adjacent to the result directory. The
+receiving process counts bytes and terminates transfer as soon as the configured
+archive limit would be exceeded; it does not download an oversized archive and
+check afterward. Before extraction, inspect member paths and types; reject
+absolute paths, `..` traversal, links, devices, unexpected run IDs, anything
+outside the expected layout, and a member count over the configured bound.
+Extract only after validation into a new staging directory.
 
 ### Verification and publication
 

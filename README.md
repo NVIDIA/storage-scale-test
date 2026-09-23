@@ -159,7 +159,8 @@ export SSH_HOST_LIST=/absolute/path/to/host_list
 # export SSH_HOMEDIR_SHARED=1        # any non-empty value
 ```
 
-Setting `SSH_HOST_LIST` disables Slurm settings. Authentication must be
+`SSH_HOST_LIST` is used only when `EXECUTION_SUBSTRATE=ssh`; it does not select
+the substrate or disable Slurm configuration. Authentication must be
 non-interactive. Run `validate_env.sh` to verify connectivity.
 
 ### Slurm options
@@ -189,6 +190,9 @@ export KUBECTL_PV=storage-scale-test-pv
 export KUBECTL_PVC=storage-scale-test-pvc
 export KUBECTL_NODE_SELECTOR='storage-scale-test/worker=true'
 export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+export KUBECTL_IMAGE_PULL_POLICY=IfNotPresent
+export KUBECTL_RUN_AS_USER=2000
+export KUBECTL_RUN_AS_GROUP=2000
 ```
 
 The namespace and the named PV/PVC must already exist and the PVC must be
@@ -198,7 +202,9 @@ connectivity between the coordinator and worker Pods and enforce the
 attempt-scoped network policies; the selected nodes must be able to mount the
 PVC. The configured benchmark image must be usable under the configured pull
 policy, and any registry credentials required by the cluster are a user
-responsibility.
+responsibility. `KUBECTL_IMAGE_PULL_POLICY=Always` requires a digest-qualified
+image reference so the coordinator cannot repull a different build from the
+worker Pods.
 
 `TEST_DIRS` remains a logical filesystem configuration in Kubernetes mode.
 The sweep prepends `/mnt/storage-scale-test/` when it constructs Pod-side
@@ -209,12 +215,13 @@ directory.
 
 A Kubernetes invocation submits one asynchronous Job for the whole sweep.
 Submission stages the verified control bundle and execution definitions on
-the PVC, starts the Job, and prints commands for querying and collecting the
-attempt:
+the PVC, starts the Job, and prints commands for querying, cancelling, and
+collecting the attempt:
 
 ```bash
 ./storage-tests/fs/nv-elbencho-sweep.sh --nodes 1,2,4
 ./storage-tests/fs/nv-elbencho-sweep.sh --status "$RESULTS_DIR"/elbencho-<datestamp>/
+./storage-tests/fs/nv-elbencho-sweep.sh --cancel "$RESULTS_DIR"/elbencho-<datestamp>/
 ./storage-tests/fs/nv-elbencho-sweep.sh --collect "$RESULTS_DIR"/elbencho-<datestamp>/
 ```
 
