@@ -17,7 +17,7 @@ limitations under the License.
 
 # NVIDIA Storage Scale Test — Design Document
 
-**Last Updated**: 2026-08-25\
+**Last Updated**: 2026-09-23\
 **Status**: Documents the design and architecture of the existing implementation.
 
 ---
@@ -43,7 +43,8 @@ limitations under the License.
 The overarching design priorities:
 
 1. **Minimal friction for the end user.** One prepared tarball to transfer, one file to edit, one validation command to run before testing.
-2. **Run anywhere.** Support both Slurm-managed clusters and bare SSH-accessible nodes from a single codebase.
+2. **Run anywhere.** Support Slurm-managed clusters, bare SSH-accessible nodes,
+   and Kubernetes clusters from a single codebase.
 3. **Non-root operation.** No operation requires root or sudo.
 4. **Self-contained benchmark execution.** Once the user has prepared a complete
    deployment tarball with the required benchmark binaries, benchmark execution
@@ -169,7 +170,7 @@ compatibility. This design means:
 | Category | Key Variables | Purpose |
 |----------|--------------|---------|
 | Output | `RESULTS_DIR`, `LOGS_DIR` | Where results and logs are written |
-| Execution | `SSH_HOST_LIST`, Slurm account/partition/reservation | Determines SSH vs. Slurm mode |
+| Execution | `EXECUTION_SUBSTRATE`, `SSH_HOST_LIST`, Slurm account/partition/reservation | Explicitly selects SSH, Slurm, or kubectl mode |
 | Filesystem | `TEST_DIRS` (associative array with weights) | Mount paths and load-balancing weights |
 | Object storage | `OBJ_BUCKET`, `OBJ_HOST`, `OBJ_AUTH_FILE` | S3-compatible endpoint and credentials |
 | Elbencho IO | `ELBENCHO_SCALE_IO_SIZES`, `ELBENCHO_SCALE_THREAD_LIST`, `ELBENCHO_IODEPTH_LIST`, `ELBENCHO_SCALE_READ_WRITE_DURATION` | Filesystem IO sweep parameters |
@@ -179,6 +180,7 @@ compatibility. This design means:
 | Warp | `WARP_THREAD_LIST`, `WARP_OBJ_SIZES`, PUT/GET durations | Object storage sweep parameters |
 | Netbench | `NETBENCH_THREADS`, `NETBENCH_HOST_NIC_GBPS`, `NETBENCH_TARGET_RUNTIME` | Network test parameters |
 | Slurm extras | `SLURM_JOB_NAME_PREFIX`, `SLURM_EXTRA_ARGS`, `SLURM_EXCLUSIVE_USER`, `SLURM_NODE_IGNORES`, `SLURM_NODE_INCLUDES` | Slurm job customization |
+| Kubernetes | `KUBECTL_NAMESPACE`, `KUBECTL_PV`, `KUBECTL_PVC`, `KUBECTL_NODE_SELECTOR`, `KUBECTL_ELBENCHO_IMAGE`, `KUBECTL_RUN_AS_USER`, `KUBECTL_RUN_AS_GROUP` | Existing namespace, RWX storage, eligible nodes, image, and workload identity for kubectl mode |
 
 ### 3.3 Defaults and Compatibility
 
@@ -228,13 +230,21 @@ most effective ergonomic investment.
 
 ## 4. Execution Architecture
 
-### 4.1 Dual Execution Modes
+### 4.1 Execution Substrates
 
-Every benchmark supports both Slurm and SSH execution from a single entry
-point. The mode is determined by `env.sh`:
+Filesystem IO supports three explicitly selected substrates from a single entry
+point. `EXECUTION_SUBSTRATE` is required; there is no implicit default:
 
-- If `SSH_HOST_LIST` is set → SSH mode (`SSH_ENABLED=1`)
-- Otherwise → Slurm mode (`SLURM_ENABLED=1`)
+- `ssh` selects passwordless SSH and requires `SSH_HOST_LIST`.
+- `slurm` submits through the configured scheduler.
+- `kubectl` requires an already authorized `kubectl` context, an existing
+  namespace, and pre-existing bound RWX storage named by `KUBECTL_PV` and
+  `KUBECTL_PVC`.
+
+The Kubernetes substrate does not provision storage or require host-networked
+Pods. It selects Ready nodes with `KUBECTL_NODE_SELECTOR`, uses ordinary Pod
+networking for elbencho's coordination port, and runs the workload as the
+configured non-root UID/GID.
 
 ### 4.2 Common Dispatch Layers
 
@@ -249,11 +259,17 @@ top-level orchestrator (storage-tests/*/nv-*.sh)
                     │
                     └── transmit a checked-in or generated scriptlet to a head host
                             └── source copied libraries and run benchmark phases
+
+    └── kubectl: reserve an attempt on the configured PVC and create owned
+                    │
+                    └── worker DaemonSet + coordinator Job; query or collect
+                        the durable asynchronous sweep later
 ```
 
 The top-level scripts parse their benchmark-specific flags, validate the
-requested sweep, create one datestamped result directory, and choose Slurm or
-SSH. The dispatcher establishes the selected node context. Benchmark logic in
+requested sweep, create one datestamped result directory, and choose the
+explicit substrate. The dispatcher establishes the selected node context.
+Benchmark logic in
 `lib/_elbencho_functions.sh`, `lib/_warp_functions.sh`, and
 `lib/_netbench_functions.sh` is shared between substrates where their execution
 models match.
@@ -267,7 +283,42 @@ The number of dispatches is deliberately benchmark-specific:
 | Object storage | One job per node count | One invocation per node count |
 | Network | One job per node count | One invocation per node count |
 
-### 4.3 Filesystem IO Reification and Resume
+Kubernetes filesystem IO uses one asynchronous Job for the complete reified
+sweep; `--status`, `--cancel`, and `--collect` address that sweep-level attempt
+independently of the submitting process lifetime. Metadata, object, and network
+benchmarks do not use the Kubernetes substrate.
+
+### 4.3 Kubernetes Asynchronous Filesystem IO
+
+Kubernetes submission is asynchronous at the sweep level. The submitting host
+creates an attempt-scoped control bundle, ledger, reservation, and ownership
+metadata on the configured PVC, then starts one elbencho worker per selected
+Ready node in an owned DaemonSet and a single coordinator Job. The coordinator
+has no Kubernetes API credentials: it runs the copied control bundle from the
+PVC, uses frozen Pod IPv4 endpoints, and writes active benchmark output to
+Job-local scratch.
+
+Logical `TEST_DIRS` paths are mapped below `/mnt/storage-scale-test`; the
+reserved `.storage-scale-test` subtree holds control state, locks, completed
+cell publications, and recovery metadata and may not overlap a workload path.
+After each cell reaches a terminal state, its result artifacts are copied from
+scratch to the PVC and an atomic publication manifest records the completed
+cell. This bounds result loss if the submitting `kubectl` credentials expire
+or the coordinator Pod is replaced.
+
+The local lifecycle commands operate on the saved attempt identity rather than
+today's `env.sh`: `--status` reads durable state, `--cancel` stops the exact
+owned Job and publishes cancellation, and `--collect` validates and retrieves
+the published artifacts into the local result directory before releasing the
+PVC reservation and deleting owned Kubernetes resources. `--resume` for a
+Kubernetes attempt is collection-gated: collect first imports partial results,
+then a new sweep can resume the failed cells from the local execution ledger.
+Coordinator loss, endpoint replacement, cancellation, and retry-safe
+collection are treated as recoverable lifecycle events; ownership labels,
+annotations, resource UIDs, and an attempt nonce prevent adopting unrelated
+objects.
+
+### 4.4 Filesystem IO Reification and Resume
 
 Before a new filesystem IO sweep starts, the orchestrator expands the complete
 Cartesian product `(nodes, IO size, threads, IO depth)`. Each cell becomes a
@@ -294,7 +345,7 @@ the same execution directory.
 makes the smallest resumable unit one parameter cell, while a single maximum-sized
 Slurm allocation avoids scheduler churn and repeated service startup.
 
-### 4.4 Remote Scriptlet and Result-Transfer Patterns
+### 4.5 Remote Scriptlet and Result-Transfer Patterns
 
 SSH-mode nodes may not share the repository or output filesystem with the launch
 host. The launch host therefore copies the required benchmark binary, helper

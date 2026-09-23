@@ -21,9 +21,10 @@ limitations under the License.
 
 NVIDIA Storage Scale Test is a benchmark orchestration tool packaged by the user as a single tarball for transfer into a test environment. This repository does not distribute pre-built benchmark binaries; users are responsible for obtaining, building, validating, and complying with license/security requirements for the binaries they include. The architecture has four components:
 
-1. **Orchestration layer.** Shell scripts on an executing host (login node or workstation) drive benchmark execution. A single configuration file (`env.sh`) parameterizes all behavior. The orchestration layer supports two mutually exclusive dispatch mechanisms:
+1. **Orchestration layer.** Shell scripts on an executing host (login node or workstation) drive benchmark execution. A single configuration file (`env.sh`) parameterizes all behavior. The orchestration layer supports three explicitly selected dispatch mechanisms:
    - **Slurm:** Jobs are submitted via `sbatch` to a Slurm controller, which allocates compute nodes and executes benchmark workloads within job allocations.
    - **SSH:** Benchmark code is transmitted as self-contained scriptlets to remote nodes over passwordless SSH. Results are streamed back through SSH, normally as tar archives.
+   - **kubectl:** Filesystem sweeps create an attempt-scoped worker DaemonSet and coordinator Job in an existing Kubernetes namespace. The submitter returns after dispatch; later lifecycle commands query status, cancel, or collect the durable attempt.
 
 2. **Benchmark clients.** One or more nodes run required benchmark and connectivity binaries (for example elbencho, Warp, and s3test) that were supplied by the user or produced by helper build scripts before the tarball was taken into the test environment. These nodes issue IO against the systems under test and write result files to local or shared storage.
 
@@ -34,12 +35,17 @@ NVIDIA Storage Scale Test is a benchmark orchestration tool packaged by the user
 
 4. **Analysis tools.** Python scripts (invoked through shell wrappers that auto-manage a virtualenv) parse result files and produce terminal tables, PNG plots, and optional Markdown reports.
 
-The tool has no always-running daemon or server-side control plane. It does
-intentionally persist run artifacts under `RESULTS_DIR`, including result data,
-configuration snapshots, and reified filesystem-sweep executions with their
-status sentinels. Optional treefile caches are stored alongside staged datasets.
-Together these artifacts support report regeneration, dataset reuse, and
-`nv-elbencho-sweep.sh --resume` after an interrupted run.
+The tool has no always-running daemon or server-side control plane. A
+Kubernetes filesystem sweep does create a finite-lived coordinator Job, but the
+Job is API-independent after start and owns no control-plane credentials. The
+submitter intentionally persists run artifacts under `RESULTS_DIR`, including
+result data, configuration snapshots, and reified filesystem-sweep executions
+with their status sentinels. Kubernetes attempts additionally persist their
+control bundle, ownership identity, endpoint evidence, execution ledger, and
+completed-cell publications under `.storage-scale-test` on the configured PVC.
+Optional treefile caches are stored alongside staged datasets. Together these
+artifacts support report regeneration, asynchronous collection, dataset reuse,
+and `nv-elbencho-sweep.sh --resume` after an interrupted run.
 
 No component requires an inbound connection from outside the cluster or other
 operator-controlled benchmark environment. Within that boundary, benchmark
@@ -52,7 +58,7 @@ model with network access policies and firewalls that deny outside-initiated
 connections while permitting the required internal benchmark traffic and
 explicitly configured outbound traffic.
 
-The diagrams below illustrate the two execution modes.
+The diagrams below illustrate the three execution substrates.
 
 ---
 
@@ -172,3 +178,63 @@ flowchart TB
 
   RES --> ANA
 ```
+
+## Kubernetes Mode (kubectl + Existing RWX PVC)
+
+Kubernetes mode is currently implemented for filesystem Elbencho sweeps. It
+requires an already authorized `kubectl` context, an existing namespace, and a
+bound RWX PVC. The PVC must be visible from the selected nodes; this tool does
+not provision the PV or PVC.
+
+```mermaid
+%%{init: {"flowchart": {"curve": "linear"}}}%%
+flowchart LR
+  %% Kubernetes mode: submit quickly, then observe or collect asynchronously.
+
+  subgraph HOST["Executing Host"]
+    ENV["env.sh<br/>EXECUTION_SUBSTRATE=kubectl"]
+    CLI["nv-elbencho-sweep.sh<br/>submit / status / cancel / collect"]
+    RESULTS["Local results directory<br/>ledger + collected cell artifacts"]
+  end
+
+  subgraph API["Kubernetes API"]
+    NS["Existing namespace"]
+    DS["Owned worker DaemonSet<br/>one Elbencho service per selected node"]
+    JOB["Owned coordinator Job<br/>finite-lived, no API credentials"]
+    HELP["Short-lived owned helper Pods<br/>staging, status, collection"]
+  end
+
+  subgraph PVC["Configured RWX PVC"]
+    CONTROL[".storage-scale-test/<br/>control bundle + locks + ledger"]
+    PUBLISHED["completed-cell publications<br/>result artifacts + manifest"]
+    DATA["Mapped workload paths<br/>/mnt/storage-scale-test/...<br/>(TEST_DIRS) "]
+  end
+
+  subgraph NET["Pod Network"]
+    W["Elbencho worker Pods<br/>frozen Pod IPv4 endpoints"]
+    C["Coordinator Pod<br/>Pod-to-Pod port 1611"]
+  end
+
+  ENV --> CLI
+  CLI -- "create/query/cancel/collect" --> NS
+  CLI --> HELP
+  NS --> DS --> W
+  NS --> JOB --> C
+  NS --> HELP
+  DS --> DATA
+  JOB --> CONTROL
+  C --> W
+  C --> DATA
+  C --> PUBLISHED
+  HELP --> CONTROL
+  HELP --> PUBLISHED
+  PUBLISHED --> CLI --> RESULTS
+```
+
+The attempt identity, ownership nonce, Kubernetes resource UIDs, node
+selection, and worker endpoint evidence are persisted locally and on the PVC.
+Each resource is labeled and annotated for exact ownership. The coordinator
+publishes each completed cell before continuing, so a lost Pod or expired
+kubectl session does not discard already completed results. Collection verifies
+the publication manifest, copies results back to the executing host, and then
+releases the PVC reservation and removes only owned Kubernetes resources.

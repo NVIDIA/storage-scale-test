@@ -139,6 +139,48 @@ evidence, dataset totals, required native flags, relevant scheduling evidence,
 and semantic report rows and plot families without treating incidental output
 or performance values as contracts.
 
+The Kubernetes substrate runs the same filesystem sweep as one asynchronous
+cluster Job. `submit` returns after staging the control bundle and creating
+the attempt; `status` reads its durable state, `collect` copies completed
+cell results into the local result directory, and `cancel` stops the exact
+attempt while preserving collected data. `--resume` is collection-gated:
+collect first, then resume the local partial result tree. The whole sweep,
+not an individual node count, is the asynchronous unit. The remote Job does
+not depend on later kubectl credentials; its control ledger and completed
+cells live under a reserved subtree on the configured PVC. Active benchmark
+output is scratch data, published only between cells.
+
+Kubernetes requires an authorized context plus an existing namespace, PV,
+PVC, and selector-matching worker nodes. It discovers selected nodes and
+freezes their Pod addresses, starts one Elbencho service Pod per node, and
+uses ordinary Pod networking with an attempt-scoped NetworkPolicy. It does
+not use host networking, host ports, or a Service. The coordinator and
+short-lived validation helpers use the configured Elbencho image and PVC
+mount; all remote resources carry the attempt ownership identity and are
+removed only after identity validation. A real external cluster acceptance
+run must still verify its CNI, Pod-to-Pod policy, storage behavior, and
+credential lifetime; the local SBX fixture proves the repository lifecycle
+and networking contract on its supported kind profile.
+
+The K-specific regression cases cover retained read-after-collection,
+cancellation, coordinator loss before and during execution, and worker
+endpoint replacement. The common baseline, direct-I/O, failure/resume, and
+live-capture cases also run through kubectl; the planner keeps substrate-only
+cases separate from the SSH and Slurm catalog.
+
+With `EXECUTION_SUBSTRATE=kubectl` in `env.sh`, the lifecycle commands are:
+
+```bash
+storage-tests/fs/nv-elbencho-sweep.sh --nodes 1,2
+storage-tests/fs/nv-elbencho-sweep.sh --status "$RESULTS_DIR/elbencho-<run>"
+storage-tests/fs/nv-elbencho-sweep.sh --collect "$RESULTS_DIR/elbencho-<run>"
+storage-tests/fs/nv-elbencho-sweep.sh --resume "$RESULTS_DIR/elbencho-<run>"
+```
+
+Use `--cancel` instead of `--status` when stopping an active attempt. The
+submit command is intentionally asynchronous; `--collect` is the operation
+that transfers terminal results from the PVC to the host.
+
 The harness materializes one immutable tracked-source snapshot and builds a
 real deployment archive from it with the zero-argument
 `utils/build_tarball.sh`. It caches the validated archive by snapshot manifest,

@@ -15,8 +15,25 @@
 
 """Shared digest-pinned image identities for the integration fixture."""
 
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class FixtureImage:
+    """One upstream image and its fixture-private containerd alias."""
+
+    upstream: str
+    fixture: str
+    component: str
+
+
 ELBENCHO_UPSTREAM_IMAGE = (
     "breuner/elbencho:v3.1-11@"
     "sha256:719fba92cab57c773ddf7a2776414b358aeb8126a15fbc8e3c52469ce3a5b8b2"
 )
 ELBENCHO_FIXTURE_IMAGE = "docker.io/library/storage-scale-integration-elbencho:v3.1-11"
+ELBENCHO_FIXTURE = FixtureImage(
+    upstream=ELBENCHO_UPSTREAM_IMAGE,
+    fixture=ELBENCHO_FIXTURE_IMAGE,
+    component="elbencho",
+)

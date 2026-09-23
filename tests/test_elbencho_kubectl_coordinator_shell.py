@@ -271,6 +271,160 @@ def test_crash_boundaries_never_advertise_uncommitted_terminal_cells(
         )
 
 
+def test_lost_coordinator_recovery_publishes_failed_running_cell(tmp_path):
+    """A terminal Job can convert durable RUNNING evidence into a resume gate."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
+    crashed = _run_coordinator(
+        control,
+        state_dir,
+        scratch,
+        fake,
+        KUBECTL_INTEGRATION_CRASH_AFTER="after-running",
+    )
+    assert crashed.returncode != 0
+    assert (state_dir / "run.status").read_text(encoding="utf-8").strip() == "RUNNING"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "STORAGE_SCALE_TEST_INTEGRATION": "1",
+            "PATH": f"{control.parent / 'fake-bin'}:{os.environ['PATH']}",
+        }
+    )
+    recovered = subprocess.run(
+        [
+            _BASH,
+            str(_COORDINATOR),
+            "--recover-lost",
+            str(control),
+            str(state_dir),
+            str(scratch),
+            "1234abcd",
+        ],
+        cwd=_REPOSITORY_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=environment,
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert (state_dir / "run.status").read_text(encoding="utf-8").strip() == "FAILED"
+    assert (state_dir / "executions/0001.status").read_text(
+        encoding="utf-8"
+    ).strip() == "FAILED"
+    assert (state_dir / "executions/0001.exitcode").read_text(
+        encoding="utf-8"
+    ).strip() == "143"
+    assert "execution\t0001\tFAILED" in (
+        state_dir / "publication-manifest.tsv"
+    ).read_text(encoding="utf-8")
+
+
+def test_lost_coordinator_before_first_cell_publishes_resumable_failure(tmp_path):
+    """A Job lost after run startup marks the first pending cell resumable."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=2)
+    crashed = _run_coordinator(
+        control,
+        state_dir,
+        scratch,
+        fake,
+        KUBECTL_INTEGRATION_CRASH_AFTER="after-run-status",
+    )
+    assert crashed.returncode != 0
+    assert (state_dir / "run.status").read_text(encoding="utf-8").strip() == "RUNNING"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "STORAGE_SCALE_TEST_INTEGRATION": "1",
+            "PATH": f"{control.parent / 'fake-bin'}:{os.environ['PATH']}",
+        }
+    )
+    recovered = subprocess.run(
+        [
+            _BASH,
+            str(_COORDINATOR),
+            "--recover-lost",
+            str(control),
+            str(state_dir),
+            str(scratch),
+            "1234abcd",
+        ],
+        cwd=_REPOSITORY_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=environment,
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert (state_dir / "executions/0001.status").read_text(
+        encoding="utf-8"
+    ).strip() == "FAILED"
+    assert (state_dir / "executions/0002.status").read_text(
+        encoding="utf-8"
+    ).strip() == "PENDING"
+    assert "execution_observed_status\tPENDING" in (
+        state_dir / "coordinator-loss.tsv"
+    ).read_text(encoding="utf-8")
+
+
+def test_cancel_recovery_publishes_collectable_terminal_ledger(tmp_path):
+    """A deleted Job can still publish its interrupted cell as cancelled."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
+    crashed = _run_coordinator(
+        control,
+        state_dir,
+        scratch,
+        fake,
+        KUBECTL_INTEGRATION_CRASH_AFTER="after-running",
+    )
+    assert crashed.returncode != 0
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "STORAGE_SCALE_TEST_INTEGRATION": "1",
+            "PATH": f"{control.parent / 'fake-bin'}:{os.environ['PATH']}",
+        }
+    )
+    command = [
+        _BASH,
+        str(_COORDINATOR),
+        "--finalize-cancelled",
+        str(control),
+        str(state_dir),
+        str(scratch),
+        "1234abcd",
+    ]
+    finalized = subprocess.run(
+        command,
+        cwd=_REPOSITORY_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=environment,
+    )
+    assert finalized.returncode == 0, finalized.stderr
+    assert (state_dir / "run.status").read_text(encoding="utf-8").strip() == (
+        "CANCELLED"
+    )
+    assert (state_dir / "executions/0001.status").read_text(
+        encoding="utf-8"
+    ).strip() == "FAILED"
+    assert (state_dir / "executions/0001.exitcode").read_text(
+        encoding="utf-8"
+    ).strip() == "143"
+    manifest = (state_dir / "publication-manifest.tsv").read_text(encoding="utf-8")
+    assert "execution\t0001\tFAILED" in manifest
+    assert "ledger\trun.status\trun.status" in manifest
+    repeated = subprocess.run(
+        command,
+        cwd=_REPOSITORY_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=environment,
+    )
+    assert repeated.returncode == 0, repeated.stderr
+
+
 def test_failure_overlay_preserves_first_failure_and_stops_later_cells(tmp_path):
     """The test-only overlay fails one cell without allowing the next cell."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=2)
@@ -280,7 +434,8 @@ def test_failure_overlay_preserves_first_failure_and_stops_later_cells(tmp_path)
         overlay,
         f"""\
         #!/usr/bin/env bash
-        if [[ "$1" == 0001 ]] && mkdir {marker!s}; then
+        if [[ "$1" == 0002 && "$4" == after-benchmark ]] \
+                && mkdir {marker!s}; then
             printf 'injected\n' > "$2/injected.txt"
             exit 97
         fi
@@ -296,18 +451,20 @@ def test_failure_overlay_preserves_first_failure_and_stops_later_cells(tmp_path)
     assert result.returncode == 97
     assert (state_dir / "executions" / "0001.status").read_text(
         encoding="utf-8"
-    ).strip() == "FAILED"
-    assert (state_dir / "executions" / "0001.exitcode").read_text(
-        encoding="utf-8"
-    ).strip() == "97"
+    ).strip() == "SUCCESS"
     assert (state_dir / "executions" / "0002.status").read_text(
         encoding="utf-8"
-    ).strip() == "PENDING"
-    assert not (state_dir / "results" / "0002").exists()
-    assert "execution\t0001\tFAILED" in (
+    ).strip() == "FAILED"
+    assert (state_dir / "executions" / "0002.exitcode").read_text(
+        encoding="utf-8"
+    ).strip() == "97"
+    assert "execution\t0001\tSUCCESS" in (
         state_dir / "publication-manifest.tsv"
     ).read_text(encoding="utf-8")
-    assert (state_dir / "results" / "0001" / "injected.txt").exists()
+    assert "execution\t0002\tFAILED" in (
+        state_dir / "publication-manifest.tsv"
+    ).read_text(encoding="utf-8")
+    assert (state_dir / "results" / "0002" / "injected.txt").exists()
 
 
 def test_bundle_tampering_fails_before_state_or_lock_mutation(tmp_path):

@@ -54,16 +54,16 @@ only: NVIDIA and the project do not publish or deliver benchmark binaries or
 prepared deployment tarballs. Users may create a deployment tarball locally
 and are responsible for every binary they place in it.
 
-`EXECUTION_SUBSTRATE` explicitly selects Slurm or passwordless SSH; there is no
-default, and `SSH_HOST_LIST` no longer selects a mode. Kubernetes benchmark
-execution is not implemented. The `integration-tests/`
-fixture provisions three kind nodes, RWX storage, two SSH workers, and Slinky
-Slurm. Its `nfs` backend uses loop-backed NFSv4 and NFS CSI; `sbx-shared` uses
-static volumes over a repository-shared path. NFS retains pinned Kindnet;
-Docker SBX uses pinned, preloaded Calico because its nested kernel cannot run
-Kindnet's nftables policy path. Setup proves non-root Elbencho DaemonSet
-placement, direct Pod-IPv4 coordination, enforced NetworkPolicy, and PVC access
-before provisioning the existing SSH and Slurm workloads.
+`EXECUTION_SUBSTRATE` explicitly selects Slurm, passwordless SSH, or kubectl;
+there is no default, and `SSH_HOST_LIST` no longer selects a mode. The
+`integration-tests/` fixture provisions three kind nodes, RWX storage, two SSH
+workers, Slinky Slurm, and the Kubernetes sweep prerequisites. Its `nfs`
+backend uses loop-backed NFSv4 and NFS CSI; `sbx-shared` uses static volumes
+over a repository-shared path. NFS retains pinned Kindnet; Docker SBX uses
+pinned, preloaded Calico because its nested kernel cannot run Kindnet's
+nftables policy path. Setup proves non-root Elbencho Pod placement, direct
+Pod-IPv4 coordination, enforced NetworkPolicy, and PVC access before testing
+the SSH, Slurm, and kubectl substrates.
 
 One budget drives PVC capacity and the growable 4 GiB NFS image. Setup publishes
 image tags transactionally, grows retained filesystems, checks fixture and Docker
@@ -99,7 +99,7 @@ sizing, scheduler boundaries, failure contracts, and reporting. CI runs the full
 NFS-backed catalog concurrently on amd64 and arm64 with repeatable-teardown
 headroom; SBX is a supported local backend.
 
-The proposed kubectl addition to filesystem-sweep design is documented in
+The kubectl filesystem-sweep design and acceptance boundary are documented in
 [plans/kubernetes-elbencho-filesystem-sweep.md](plans/kubernetes-elbencho-filesystem-sweep.md).
 
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
@@ -147,8 +147,8 @@ Important configuration relationships:
 
 - `EXECUTION_SUBSTRATE` is required and derives exactly one mode flag. `ssh`
   also requires `SSH_HOST_LIST`; that file accepts comma- or whitespace-separated
-  hosts and ignores comment lines. Other benchmarks reject `kubectl` while its
-  filesystem-sweep implementation is incomplete.
+  hosts and ignores comment lines. Kubectl is supported by the filesystem
+  sweep; metadata, object, and network entry points remain SSH/Slurm-only.
 - In Slurm mode, `SLURM_NODE_INCLUDES`
   and `SLURM_NODE_IGNORES` point to optional files containing valid Slurm
   hostlists, including compressed forms.
@@ -236,6 +236,24 @@ terminal state must be confirmed through Slurm accounting.
 human- and tool-readable run snapshot. Protect the result directory from
 untrusted modification because resume sources both `env_used.sh` and each
 `executions/NNNN.sh`.
+
+In kubectl mode, one submission represents the whole sweep. The launcher
+stages a verified control bundle into the configured PVC, freezes selected
+worker Pod addresses, starts one Elbencho service Pod per worker, and creates
+one long-lived coordinator Job. The Job needs no Kubernetes API credentials
+after startup: it runs from the PVC control tree, durable execution ledger,
+and per-cell publication records. `--status`, `--cancel`, and `--collect`
+operate on that attempt; `--resume` is allowed only after collection and
+creates a new attempt while preserving successful cells.
+
+Kubernetes uses ordinary Pod networking and attempt-scoped NetworkPolicy,
+not host networking, host ports, or Services. Worker endpoint identity is
+validated before each cell; drift or coordinator loss is recovered only with
+fresh identity evidence. Results are copied from PVC storage to the local
+result tree by collection. A configured namespace, existing PV/PVC, node
+selector, authorized kubectl context, and compatible CNI are prerequisites.
+Docker SBX validates the supported kind profile; dual-architecture NFS CI and
+a separately authorized external-cluster run are release acceptance gates.
 
 ## Filesystem IO workload models
 

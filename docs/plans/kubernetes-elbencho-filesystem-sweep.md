@@ -232,10 +232,9 @@ Submit and delete-only source the current configuration. Resume, status,
 cancel, and collect load their versioned, trusted local snapshot instead;
 Kubernetes lifecycle operations use the caller's current `kubectl` credentials.
 They require the saved namespace, PV, and PVC names and UIDs to match the live
-objects. Save context and API-server strings for diagnostics, but do not use
-either as the sole cluster identity because an authentication proxy can expose
-the same server URL for multiple clusters. Kubernetes `--delete-only` fails as
-unsupported in this initial change.
+objects. Namespace, PV, and PVC UIDs are the durable cluster identity; an
+authentication proxy can expose one server URL for multiple clusters.
+Kubernetes `--delete-only` fails as unsupported in this initial change.
 
 Reject missing values, incompatible or repeated options, positional arguments,
 and workload flags with status, cancel, collect, or resume. Preserve SSH and
@@ -288,23 +287,26 @@ Add:
 ./storage-tests/fs/nv-elbencho-sweep.sh --status <results_dir>
 ```
 
-`--status` never mutates the ledger, results, Job, or DaemonSet. It may create
-and delete an attempt-owned, read-only inspector Pod when no attempt Pod can be
-executed.
+`--status` is observational during normal operation. It may create and delete
+an attempt-owned inspector Pod when no attempt Pod can be executed. When exact
+ownership and terminal failure evidence prove coordinator loss or worker
+endpoint drift, status performs bounded recovery: it stops the owned attempt,
+writes durable failure evidence, and advances the lifecycle to a collectable
+terminal state.
 
-It reports local and remote identities, namespace/PVC, Job and Pod state, active
-cell, durable cell counts, last update, terminal outcome, and allowed next
-action. It compares current worker Pod UIDs and IPs with the frozen mapping and
-flags replacement or endpoint drift.
+It validates the saved local and remote identities, reads the durable outcome,
+and compares current worker Pod UIDs and IPs with the frozen mapping. Identity,
+Job, endpoint, and ledger inconsistencies are reported as errors; the stable
+machine-readable output remains the lifecycle state.
 
 While the Job container is running, status may use `kubectl exec` to read the
 PVC-backed summary. If the container is unavailable or terminal, create a
 short-lived, read-only inspector Pod that mounts the PVC, reads the same
-summary, and is deleted before status returns. A durable `SUCCESS`, `FAILED`,
-or `CANCELLED` record is terminal even if the Job was removed externally; Job
-conditions corroborate it. A missing Job without a durable terminal record is
-ambiguous and requires cancellation to quiesce work and publish `CANCELLED`.
-If API and ledger evidence disagree, report both and refuse to claim success.
+summary, and is deleted before status returns. While the local lifecycle is
+`SUBMITTED`, status requires the exact journaled Job to exist before trusting
+the PVC ledger. An externally removed Job is a consistency error; cancellation
+reconciles the saved attempt and its durable terminal record. If API and ledger
+evidence disagree, report both and refuse to claim success.
 
 On a successful query, status exits zero regardless of active or failed sweep
 state and emits exactly one stable `STORAGE_SCALE_TEST_KUBECTL_STATE=<state>`
@@ -448,7 +450,8 @@ Generate a short random operation token for each helper Pod. Record its exact
 name and UID before use so an interrupted or concurrent status or collection
 command cannot adopt another helper. Mutating lifecycle commands also acquire
 an attempt-local lock in the local metadata directory and reject concurrent
-operations; status remains read-only.
+operations; status uses the same lock when bounded fault recovery must mutate
+the attempt.
 
 Generate a candidate ID, reject an existing named object or PVC run directory,
 and retry on collision. Use create-only API operations; never adopt or mutate a
@@ -460,7 +463,7 @@ PVC-directory creation remain authoritative if a check/create race occurs.
 Alongside `env_used.yaml`, `env_used.sh`, and `executions/`, store one immutable,
 schema-versioned metadata directory per attempt plus an atomic pointer to the
 current attempt. Before the first remote mutation, record the attempt ID;
-context and API server; namespace, PV, and PVC names and UIDs; requested image
+namespace, PV, and PVC names and UIDs; requested image
 and pull policy; numeric workload identity; selector, mapped paths, remote path,
 and intended resource names. Save the ownership nonce locally. Journal each
 created object's UID immediately after creation, then add frozen endpoints,
@@ -843,34 +846,34 @@ plain `kubectl` already targets the correct cluster.
 
 Validation must check:
 
-- `kubectl` reaches the API; print/save context and server, then record the
-  namespace, PV, and PVC UIDs used for later identity checks.
-- The namespace exists and `kubectl auth can-i` permits required operations,
-  including node list/get; PV get; PVC get; Job, DaemonSet, NetworkPolicy, and
-  Pod create/get/list/delete; event list; and Pod exec and logs.
+- `kubectl` reaches the API and record the namespace, PV, and PVC UIDs used for
+  later identity checks. Failed real API operations provide the authoritative
+  authorization diagnostic; do not treat `kubectl auth can-i` as proof that
+  admission or execution will succeed.
 - The PVC is in the configured namespace, is `Bound`, has filesystem volume
   mode, advertises `ReadWriteMany`, and names `KUBECTL_PV` in
   `spec.volumeName`.
-- The PV exists, the selector uses supported equality syntax, enough Ready
-  nodes match it, and they report one supported architecture.
-- No active labeled attempt exists in the namespace or reserved PVC tree.
+- The PV exists, the selector uses supported equality syntax, at least one
+  Ready node matches it, and all matched nodes report one supported
+  architecture. Submission compares the requested maximum node count with the
+  discovered capacity before creating workers.
 - A validation Pod starts the image with the configured pull policy and numeric
-  identity, finds Elbencho/Bash/tar/coreutils, mounts the PVC, and atomically
-  creates/removes a unique probe under the reserved root.
-- Mapped benchmark paths are writable and do not overlap orchestration state.
-- A temporary pinned worker DaemonSet receives distinct Pod IPv4 addresses, and
-  a coordinator Pod reaches every worker's Elbencho `/status` endpoint on TCP
-  1611, including across nodes. Apply the attempt-style NetworkPolicies so the
-  probe exercises the actual policy path.
+  identity, finds Elbencho/Bash/tar/coreutils, mounts the PVC, and verifies its
+  read/write permission bits.
+- Mapped benchmark paths are canonically contained below the mount and do not
+  overlap orchestration state. Actual workload writes remain authoritative.
+- Submission waits for one Ready service Pod per selected node, freezes
+  distinct Pod IPv4 addresses, applies attempt NetworkPolicies, and requires
+  coordinator health probes to reach every selected service before a cell.
+  The integration fixture separately proves cross-node Pod connectivity and
+  denial of an unrelated probe under the supported CNI profile.
 
-Validation must remove only its own labeled probe resources and files.
+Validation must remove only its own labeled probe resources.
 Every `kubectl` invocation has both a client request timeout and a local process
 timeout bounded by its operation deadline.
 
-Treat `kubectl auth can-i` as an early diagnostic, not proof that admission,
-quota, policy, scheduling, image pull, networking, or storage mount will
-succeed. Runtime probes remain mandatory and errors must identify the failed
-resource and command.
+Errors must identify the failed resource or command; identity and runtime
+probes do not claim to predict quota, admission, scheduling, or CNI behavior.
 
 ## Regression Framework Integration
 
@@ -1022,6 +1025,12 @@ wrapper-cleanup path above.
 
 ## Implementation Sequence
 
+Items 1 through 8 are implemented on this branch and validated with the fast
+suite plus the retained Docker SBX fixture. Item 9 is the release gate: the
+repository documentation and local three-substrate lifecycle are part of this
+change, while dual-architecture NFS CI runs after publication and
+Teleport-mediated acceptance requires access to the target external cluster.
+
 1. Before product changes, use one retained fixture to prove the pinned image
    under the configured non-root identity, DaemonSet placement, direct
    cross-node Pod-IP coordination, PVC access, and NetworkPolicy behavior on
@@ -1140,10 +1149,9 @@ CNI, admission policy, storage driver, or Teleport session. Before declaring
 the feature operationally supported, run the same baseline, failure/resume,
 cancel, and coordinator-loss cases on a representative Teleport-mediated
 cluster with its real RWX claim. Let the original credential expire, then
-reauthenticate from a new shell for status and collection. Confirm the saved API
-context/server values aid diagnostics while namespace/PV/PVC UID checks prevent
-collection from the wrong cluster. Confirm that no cluster-owned namespace, PV,
-or PVC is modified.
+reauthenticate from a new shell for status and collection. Confirm that saved
+namespace/PV/PVC UID checks prevent collection from the wrong cluster and that
+no cluster-owned namespace, PV, or PVC is modified.
 
 ## Documentation Requirements
 

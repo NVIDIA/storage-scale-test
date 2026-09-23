@@ -39,8 +39,10 @@ recommended.
   which can be installed with `brew install bash coreutils`.
 * Python 3.12 or newer is required on the host that runs the analysis and
   reporting wrappers. The pinned current NumPy release establishes this minimum.
-* Clients must be available through Slurm or passwordless SSH. For Slurm,
-  gather the account, reservation, and partition required to submit jobs.
+* Filesystem clients must be available through exactly one configured
+  execution substrate: Slurm, passwordless SSH, or an authorized Kubernetes
+  cluster. Slurm users need the account, reservation, and partition required
+  to submit jobs.
 * Use tuned clients with enough aggregate network bandwidth to saturate the
   target. A starting count is
   `1.1 * target_Gbps / measured_per_client_Gbps`.
@@ -132,8 +134,11 @@ publish or distribute the resulting tarball or its binaries.
 
 ## Execution Modes
 
-Slurm is the default execution substrate. Setting `SSH_HOST_LIST` switches the
-tool to passwordless SSH mode; the two modes are mutually exclusive.
+Set exactly one `EXECUTION_SUBSTRATE` value in `env.sh`: `slurm`, `ssh`, or
+`kubectl`. There is intentionally no default, and `SSH_HOST_LIST` configures
+SSH mode but does not select it. The selected substrate applies to the
+filesystem sweep; its configuration must be complete before
+`validate_env.sh` is run.
 
 ### Passwordless SSH
 
@@ -170,6 +175,67 @@ SLURM_EXTRA_ARGS=("--constraint=ib" "--comment=storage validation run")
 `SLURM_EXCLUSIVE_USER=1` uses `--exclusive=user` and derives
 `--cpus-per-task` when the target CPU count is available; the default uses
 `--exclusive`.
+
+### Kubernetes filesystem sweeps
+
+Kubernetes mode requires an already authorized `kubectl` context. The tool
+does not provision a cluster, namespace, PV, or PVC. Set all of the following
+in `env.sh`:
+
+```bash
+export EXECUTION_SUBSTRATE=kubectl
+export KUBECTL_NAMESPACE=storage-scale-test
+export KUBECTL_PV=storage-scale-test-pv
+export KUBECTL_PVC=storage-scale-test-pvc
+export KUBECTL_NODE_SELECTOR='storage-scale-test/worker=true'
+export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+```
+
+The namespace and the named PV/PVC must already exist and the PVC must be
+bound to that PV. The node selector must identify enough schedulable worker
+nodes for the requested sweep. The cluster CNI must provide direct Pod IPv4
+connectivity between the coordinator and worker Pods and enforce the
+attempt-scoped network policies; the selected nodes must be able to mount the
+PVC. The configured benchmark image must be usable under the configured pull
+policy, and any registry credentials required by the cluster are a user
+responsibility.
+
+`TEST_DIRS` remains a logical filesystem configuration in Kubernetes mode.
+The sweep prepends `/mnt/storage-scale-test/` when it constructs Pod-side
+paths, so users must not add that prefix themselves. The PVC is mounted at
+that path. The tool reserves `.storage-scale-test` below the mount for its
+control, ownership, and completed-cell data; do not use that name in a test
+directory.
+
+A Kubernetes invocation submits one asynchronous Job for the whole sweep.
+Submission stages the verified control bundle and execution definitions on
+the PVC, starts the Job, and prints commands for querying and collecting the
+attempt:
+
+```bash
+./storage-tests/fs/nv-elbencho-sweep.sh --nodes 1,2,4
+./storage-tests/fs/nv-elbencho-sweep.sh --status "$RESULTS_DIR"/elbencho-<datestamp>/
+./storage-tests/fs/nv-elbencho-sweep.sh --collect "$RESULTS_DIR"/elbencho-<datestamp>/
+```
+
+The Job runs without depending on the submitting process's later `kubectl`
+credentials. `--status` reads durable remote state and may report a running,
+successful, failed, or cancelled attempt. `--cancel` stops the exact saved
+attempt and preserves its durable state. `--collect` is required after a
+terminal attempt: it copies completed results, snapshots, and diagnostics
+from the PVC into the local results directory and performs owned-resource
+cleanup. Collection of a failed or cancelled attempt returns a failure status
+after publishing the partial results, so callers must inspect the collected
+state before deciding whether to continue.
+
+Kubernetes `--resume` is collection-gated. After collecting a failed attempt,
+run `--resume <results-dir>` with the same Kubernetes configuration to submit
+only the uncompleted cells; successful cells and their results are retained.
+Do not run concurrent operations on one result directory or concurrent
+resumes. Active measured output is Pod-local scratch, while completed-cell
+publication and the control ledger are copied to the PVC between cells. A
+failure before publication can lose that cell's partial output, but cannot
+silently claim it succeeded.
 
 ## Heterogeneous Client Fleets
 

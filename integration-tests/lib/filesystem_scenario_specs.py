@@ -55,6 +55,7 @@ class ExecutionStatus(StrEnum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
     PENDING = "PENDING"
+    RUNNING = "RUNNING"
 
 
 class WorkloadPhase(StrEnum):
@@ -194,6 +195,8 @@ _NORMAL_PHASES = (
 )
 
 _BOTH_SUBSTRATES = frozenset({"ssh", "slurm"})
+_BASELINE_SUBSTRATES = frozenset({"ssh", "slurm", "kubectl"})
+_KUBECTL_ONLY = frozenset({"kubectl"})
 _SSH_ONLY = frozenset({"ssh"})
 _SLURM_ONLY = frozenset({"slurm"})
 
@@ -309,7 +312,7 @@ def _step(
 def _baseline() -> FilesystemScenarioSpec:
     return FilesystemScenarioSpec(
         "baseline",
-        _BOTH_SUBSTRATES,
+        _BASELINE_SUBSTRATES,
         (
             _step(
                 "buffered-sweep",
@@ -325,7 +328,7 @@ def _baseline() -> FilesystemScenarioSpec:
 def _default_dio() -> FilesystemScenarioSpec:
     return FilesystemScenarioSpec(
         "default-dio",
-        _BOTH_SUBSTRATES,
+        _BASELINE_SUBSTRATES,
         (
             _step(
                 "direct-worker-directories",
@@ -387,7 +390,9 @@ def _failure_resume() -> FilesystemScenarioSpec:
         requires=("failed_results_dir",),
         preserve_failure_staging=True,
     )
-    return FilesystemScenarioSpec("failure-resume", _BOTH_SUBSTRATES, (first, resume))
+    return FilesystemScenarioSpec(
+        "failure-resume", _BASELINE_SUBSTRATES, (first, resume)
+    )
 
 
 def _retained_lifecycle() -> FilesystemScenarioSpec:
@@ -450,7 +455,7 @@ def _live_capture() -> FilesystemScenarioSpec:
     ) + ("export ELBENCHO_LIVEINT=10",)
     return FilesystemScenarioSpec(
         "live-capture",
-        _BOTH_SUBSTRATES,
+        _BASELINE_SUBSTRATES,
         (
             _step(
                 "extended-live-csv",
@@ -466,6 +471,120 @@ def _live_capture() -> FilesystemScenarioSpec:
             ),
         ),
     )
+
+
+def _kubectl_retained_read() -> FilesystemScenarioSpec:
+    """Exercise retained data across independently collected attempts."""
+    coordinate = _coordinates((1,), ("4K",), (1,), (1,))
+    write = _step(
+        "write-only",
+        ("--write-only", "--nodes", "1"),
+        _SHARED_ENV,
+        coordinate,
+        (WorkloadPhase.DIRECTORY_CREATE, WorkloadPhase.WRITE),
+        DatasetExpectation.PRESERVED,
+        exports=("retained_data_dir",),
+    )
+    read = _step(
+        "read-from",
+        ("--read-from", "{retained_data_dir}", "--nodes", "1"),
+        _SHARED_ENV,
+        coordinate,
+        (WorkloadPhase.TREE_SCAN, WorkloadPhase.READ),
+        DatasetExpectation.PRESERVED,
+        requires=("retained_data_dir",),
+    )
+    return FilesystemScenarioSpec("kubectl-retained-read", _KUBECTL_ONLY, (write, read))
+
+
+def _kubectl_cancel() -> FilesystemScenarioSpec:
+    """Describe a long enough run for the adapter to cancel while active."""
+    env_lines = _override_env(
+        _SHARED_ENV,
+        {
+            "ELBENCHO_SCALE_READ_WRITE_DURATION": (
+                "export ELBENCHO_SCALE_READ_WRITE_DURATION=30"
+            ),
+        },
+    )
+    step = _step(
+        "cancel-running",
+        ("--write-no-read", "--nodes", "2"),
+        env_lines,
+        _coordinates(
+            (2,),
+            ("4K",),
+            (1,),
+            (1,),
+            statuses={(ExecutionCoordinate(2, "4K", 1, 1)): ExecutionStatus.PENDING},
+        ),
+        (WorkloadPhase.DIRECTORY_CREATE, WorkloadPhase.WRITE),
+        DatasetExpectation.CLEANED,
+        timeout_seconds=300,
+    )
+    return FilesystemScenarioSpec("kubectl-cancel", _KUBECTL_ONLY, (step,))
+
+
+def _kubectl_coordinator_loss() -> FilesystemScenarioSpec:
+    """Describe coordinator loss with a collected, resumable attempt."""
+    env_lines = _override_env(
+        _SHARED_ENV,
+        {
+            "ELBENCHO_SCALE_READ_WRITE_DURATION": (
+                "export ELBENCHO_SCALE_READ_WRITE_DURATION=30"
+            ),
+        },
+    )
+    coordinate = ExecutionCoordinate(2, "4K", 1, 1)
+    interrupted = _step(
+        "delete-coordinator",
+        ("--write-no-read", "--nodes", "2"),
+        env_lines,
+        (ExpectedExecution(coordinate, ExecutionStatus.RUNNING),),
+        (WorkloadPhase.DIRECTORY_CREATE, WorkloadPhase.WRITE),
+        DatasetExpectation.CLEANED,
+        timeout_seconds=300,
+        exports=("failed_results_dir",),
+    )
+    resume = ScenarioStep(
+        name="resume",
+        kind=CommandKind.RESUME,
+        arguments=("--resume", "{failed_results_dir}"),
+        env_lines=(),
+        support_files=(),
+        generated_inputs=(),
+        timeout_seconds=300,
+        executions=(ExpectedExecution(coordinate),),
+        required_phases=(WorkloadPhase.WRITE, WorkloadPhase.REMOVE_FILES),
+        dataset=DatasetExpectation.CLEANED,
+        requires=("failed_results_dir",),
+    )
+    return FilesystemScenarioSpec(
+        "kubectl-coordinator-loss", _KUBECTL_ONLY, (interrupted, resume)
+    )
+
+
+def _kubectl_endpoint_drift() -> FilesystemScenarioSpec:
+    """Describe replacement of a worker after endpoint freezing."""
+    env_lines = _override_env(
+        _SHARED_ENV,
+        {
+            "ELBENCHO_SCALE_READ_WRITE_DURATION": (
+                "export ELBENCHO_SCALE_READ_WRITE_DURATION=15"
+            ),
+        },
+    )
+    coordinate = ExecutionCoordinate(2, "4K", 1, 1)
+    step = _step(
+        "replace-worker",
+        ("--write-no-read", "--nodes", "2"),
+        env_lines,
+        (ExpectedExecution(coordinate, ExecutionStatus.SUCCESS),),
+        (WorkloadPhase.DIRECTORY_CREATE, WorkloadPhase.WRITE),
+        DatasetExpectation.CLEANED,
+        timeout_seconds=300,
+    )
+    return FilesystemScenarioSpec("kubectl-endpoint-drift", _KUBECTL_ONLY, (step,))
 
 
 def _slurm_cartesian() -> FilesystemScenarioSpec:
@@ -650,6 +769,10 @@ SCENARIO_SPECS = (
     _failure_resume(),
     _retained_lifecycle(),
     _live_capture(),
+    _kubectl_retained_read(),
+    _kubectl_cancel(),
+    _kubectl_coordinator_loss(),
+    _kubectl_endpoint_drift(),
     _slurm_cartesian(),
     _ssh_single_big_file(),
     _ssh_weighted_roots(),
@@ -676,7 +799,8 @@ def _validate_spec(spec: FilesystemScenarioSpec) -> None:
     """Validate one scenario and its sequence dependencies."""
     if not spec.name or not spec.steps:
         raise ScenarioSpecError("scenario names and step sequences must be nonempty")
-    if not spec.substrates or not spec.substrates <= _BOTH_SUBSTRATES:
+    allowed_substrates = _BOTH_SUBSTRATES | {"kubectl"}
+    if not spec.substrates or not spec.substrates <= allowed_substrates:
         raise ScenarioSpecError(f"{spec.name}: invalid substrates")
     available: set[str] = set()
     step_names: set[str] = set()

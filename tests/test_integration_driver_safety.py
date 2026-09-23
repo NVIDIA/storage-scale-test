@@ -132,6 +132,21 @@ _remote_staging_operations = getattr(_FILESYSTEM, "_remote_staging_operations")
 _reset_result_base = getattr(_FILESYSTEM, "_reset_result_base")
 _pods_with_container = getattr(_FILESYSTEM, "_pods_with_container")
 _require_pods = getattr(_FILESYSTEM, "_require_pods")
+_kubectl_output_value = getattr(_FILESYSTEM, "_kubectl_output_value")
+_kubectl_submission = getattr(_FILESYSTEM, "_kubectl_submission")
+_kubectl_lifecycle_state = getattr(_FILESYSTEM, "_kubectl_lifecycle_state")
+_create_generated_inputs = getattr(_FILESYSTEM, "_create_generated_inputs")
+_kubectl_utility_manifest = getattr(_FILESYSTEM, "_kubectl_utility_manifest")
+_kubectl_execution_node = getattr(_FILESYSTEM, "_kubectl_execution_node")
+_override_block = getattr(_FILESYSTEM, "_override_block")
+_require_kubectl_nodes = getattr(_FILESYSTEM, "_require_kubectl_nodes")
+_cleanup_kubectl_attempt = getattr(_FILESYSTEM, "_cleanup_kubectl_attempt")
+_cleanup_scenario_storage = getattr(_FILESYSTEM, "_cleanup_scenario_storage")
+_make_scenario_runtime = getattr(_FILESYSTEM, "_make_scenario_runtime")
+_run_kubectl_command = getattr(_FILESYSTEM, "_run_kubectl_command")
+_wait_for_kubectl_terminal_state = getattr(
+    _FILESYSTEM, "_wait_for_kubectl_terminal_state"
+)
 
 
 def test_scenario_listing_short_circuits_before_privileged_state(monkeypatch, capsys):
@@ -162,6 +177,379 @@ def test_integration_timeouts_control_command_process_groups(tmp_path):
 
     assert "--foreground" not in pod
     assert "--foreground" not in ssh
+
+
+def _kubectl_fixture() -> object:
+    """Return only the fixture fields used by Kubernetes-only helpers."""
+    return SimpleNamespace(
+        architecture="x86_64",
+        kubectl_nodes=("worker-a", "worker-b"),
+        kubectl_namespace="test-namespace",
+        kubectl_pv="storage-pv",
+        kubectl_pvc="storage-test-rwx",
+        kubectl_image="docker.io/example/elbencho@sha256:" + "a" * 64,
+    )
+
+
+def test_kubectl_renderer_uses_logical_roots_and_private_fixture_values():
+    """Kubernetes rendering cannot inherit SSH or Slurm configuration by fallthrough."""
+    overrides, support = _override_block(
+        "kubectl", "/tmp/workspace", _kubectl_fixture(), timeout_seconds=120
+    )
+
+    assert "declare -A TEST_DIRS=([primary]=1)" in overrides
+    assert "KUBECTL_NAMESPACE=test-namespace" in overrides
+    assert "KUBECTL_PV=storage-pv" in overrides
+    assert "KUBECTL_PVC=storage-test-rwx" in overrides
+    assert "KUBECTL_NODE_SELECTOR=storage-scale-test/target=true" in overrides
+    assert "KUBECTL_IMAGE_PULL_POLICY=Never" in overrides
+    assert "unset SSH_HOST_LIST SSH_USER SSH_HOMEDIR_SHARED" in overrides
+    assert "unset SLURM_NODE_INCLUDES SLURM_NODE_IGNORES" in overrides
+    assert support == {}
+
+    overrides, _ = _override_block(
+        "kubectl",
+        "/tmp/workspace",
+        _kubectl_fixture(),
+        logical_test_root="integration-regression/run-1-baseline-kubectl/primary",
+    )
+    assert (
+        "declare -A TEST_DIRS=([integration-regression/run-1-baseline-kubectl/primary]=1)"
+        in overrides
+    )
+
+
+def test_kubectl_lifecycle_output_is_strict_and_machine_readable():
+    """The adapter accepts one safe stable value for every product handoff."""
+    output = "\n".join(
+        (
+            "STORAGE_SCALE_TEST_RESULTS_DIR=/tmp/results/elbencho-1",
+            "STORAGE_SCALE_TEST_ATTEMPT_ID=1234abcd",
+            "STORAGE_SCALE_TEST_KUBECTL_STATE=RUNNING",
+        )
+    )
+
+    root, attempt = _kubectl_submission(output)
+    assert root == Path("/tmp/results/elbencho-1")
+    assert attempt == "1234abcd"
+    assert _kubectl_lifecycle_state(output) == "RUNNING"
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="one safe"):
+        _kubectl_output_value(
+            output + "\nSTORAGE_SCALE_TEST_ATTEMPT_ID=deadbeef",
+            "STORAGE_SCALE_TEST_ATTEMPT_ID",
+        )
+    assert (
+        _kubectl_output_value(
+            "STORAGE_SCALE_TEST_RESULTS_DIR=/tmp/result with spaces",
+            "STORAGE_SCALE_TEST_RESULTS_DIR",
+        )
+        == "/tmp/result with spaces"
+    )
+
+
+def test_kubectl_utility_manifest_is_nonroot_tokenless_and_uses_private_image():
+    """PVC utility Pods do not borrow LoginSet identity or registry pulls."""
+    document = json.loads(
+        _kubectl_utility_manifest("utility-1234abcd", _kubectl_fixture())
+    )
+    spec = document["spec"]
+    container = spec["containers"][0]
+
+    assert spec["automountServiceAccountToken"] is False
+    assert spec["securityContext"]["runAsUser"] == 2000
+    assert container["imagePullPolicy"] == "Never"
+    assert container["image"] == _kubectl_fixture().kubectl_image
+    assert container["volumeMounts"][0]["mountPath"] == "/mnt/storage-scale-test"
+    assert spec["nodeSelector"] == {"storage-scale-test/login": "true"}
+
+    pinned = json.loads(
+        _kubectl_utility_manifest("utility-1234abcd", _kubectl_fixture(), "worker-a")
+    )["spec"]
+    assert pinned["nodeName"] == "worker-a"
+    assert "nodeSelector" not in pinned
+
+
+def test_kubectl_retained_probe_requires_owned_worker_evidence(tmp_path):
+    """A retained-data probe cannot schedule from untrusted result metadata."""
+    result = tmp_path / "result"
+    (result / "executions").mkdir(parents=True)
+    workers = result / "executions" / "0001.workers.tsv"
+    workers.write_text(
+        "worker-a\tworker-pod\t01234567-89ab-cdef-0123-456789abcdef\t10.0.0.2\n",
+        encoding="utf-8",
+    )
+    fixture = _kubectl_fixture()
+    fixture.kubectl_nodes = ("worker-a", "worker-b")
+    assert _kubectl_execution_node(fixture, result) == "worker-a"
+
+    workers.write_text(
+        "control-plane\tworker-pod\t01234567-89ab-cdef-0123-456789abcdef\t10.0.0.2\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="malformed"):
+        _kubectl_execution_node(fixture, result)
+
+
+def test_kubectl_target_discovery_rejects_platform_drift():
+    """A private pinned image is never sent to targets of another architecture."""
+    nodes = [
+        {
+            "metadata": {"name": name, "labels": {"storage-scale-test/target": "true"}},
+            "status": {"nodeInfo": {"architecture": "amd64"}},
+        }
+        for name in ("worker-a", "worker-b")
+    ]
+
+    assert _require_kubectl_nodes(nodes, "x86_64") == ("worker-a", "worker-b")
+    nodes[1]["status"]["nodeInfo"]["architecture"] = "arm64"
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="architecture mismatch"):
+        _require_kubectl_nodes(nodes, "x86_64")
+
+
+def test_kubectl_fixture_preflight_needs_no_login_or_ssh_pods():
+    """Kubernetes-only diagnosis remains possible during SSH/Slurm outages."""
+    login, ssh = _require_pods([], {"kubectl"})
+
+    assert login is None
+    assert ssh == []
+
+
+def test_kubectl_cleanup_uses_idempotent_product_lifecycle_operations(tmp_path):
+    """Interrupted work is stopped through product cancel/collect, not raw deletes."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    runtime = SimpleNamespace(
+        workspace=str(tmp_path / "workspace"),
+        values={"kubectl_result_root": "/tmp/results with spaces"},
+    )
+    commands = []
+
+    class _Runner:
+        def run(self, arguments, **_kwargs):
+            commands.append([str(item) for item in arguments])
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    _cleanup_kubectl_attempt(_Runner(), config, runtime)
+
+    assert [command[-2:] for command in commands] == [
+        ["--cancel", "/tmp/results with spaces"],
+        ["--collect", "/tmp/results with spaces"],
+    ]
+    assert all(f"KUBECONFIG={config.kubeconfig}" in command for command in commands)
+
+
+def test_kubectl_adapter_drives_submit_status_and_collect_handoffs(tmp_path):
+    """The adapter uses the public submit, status, and collect operations."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    runtime = SimpleNamespace(workspace=str(workspace))
+    calls = []
+
+    class _Runner:
+        def run(self, arguments, **_kwargs):
+            command = [str(item) for item in arguments]
+            calls.append(command)
+            if "--status" in command:
+                output = "STORAGE_SCALE_TEST_KUBECTL_STATE=SUCCESS\n"
+            elif "--collect" in command:
+                output = "STORAGE_SCALE_TEST_KUBECTL_STATE=SUCCESS\n"
+            else:
+                output = "\n".join(
+                    (
+                        "STORAGE_SCALE_TEST_RESULTS_DIR=/tmp/results/elbencho-1",
+                        "STORAGE_SCALE_TEST_ATTEMPT_ID=1234abcd",
+                    )
+                )
+            return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    runner = _Runner()
+    submit = _run_kubectl_command(
+        runner, config, runtime, "submit", ("--nodes", "1,2"), log_dir, 30
+    )
+    result_root, attempt = _kubectl_submission(submit)
+    assert result_root == Path("/tmp/results/elbencho-1")
+    assert attempt == "1234abcd"
+    state = _wait_for_kubectl_terminal_state(
+        runner, config, runtime, result_root, log_dir, 30
+    )
+    assert state == "SUCCESS"
+    collected = _run_kubectl_command(
+        runner,
+        config,
+        runtime,
+        "collect",
+        ("--collect", str(result_root)),
+        log_dir,
+        30,
+    )
+    assert _kubectl_lifecycle_state(collected) == "SUCCESS"
+    assert any("--status" in command for command in calls)
+    assert any("--collect" in command for command in calls)
+
+
+def test_kubectl_status_poll_retries_transient_command_failure(tmp_path, monkeypatch):
+    """One failed API observation does not fail an otherwise healthy attempt."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    runtime = SimpleNamespace(workspace=str(workspace))
+    calls = 0
+
+    class _Runner:
+        def run(self, _arguments, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return SimpleNamespace(returncode=1, stdout="", stderr="timeout")
+            return SimpleNamespace(
+                returncode=0,
+                stdout="STORAGE_SCALE_TEST_KUBECTL_STATE=SUCCESS\n",
+                stderr="",
+            )
+
+    monkeypatch.setattr(_FILESYSTEM.time, "sleep", lambda _seconds: None)
+    state = _wait_for_kubectl_terminal_state(
+        _Runner(), config, runtime, Path("/tmp/results/attempt"), log_dir, 30
+    )
+    assert state == "SUCCESS"
+    assert calls == 2
+
+
+def test_kubectl_command_accepts_only_declared_terminal_failure(tmp_path):
+    """Failed collect is accepted only with its machine-readable state."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    runtime = SimpleNamespace(workspace=str(workspace))
+
+    class _Runner:
+        def run(self, _arguments, **_kwargs):
+            return SimpleNamespace(
+                returncode=1,
+                stdout="STORAGE_SCALE_TEST_KUBECTL_STATE=FAILED\n",
+                stderr="",
+            )
+
+    output = _run_kubectl_command(
+        _Runner(),
+        config,
+        runtime,
+        "collect",
+        ("--collect", "/tmp/results"),
+        logs,
+        30,
+        accepted_states=frozenset({"FAILED"}),
+    )
+    assert _kubectl_lifecycle_state(output) == "FAILED"
+
+
+def test_kubectl_generated_inputs_are_created_under_the_storage_mount(monkeypatch):
+    """Generated input paths use logical roots only after PVC mapping."""
+    commands = []
+    monkeypatch.setattr(
+        _FILESYSTEM,
+        "_storage_utility_shell",
+        lambda _runner, _config, _fixture, command, **_kwargs: commands.append(command),
+    )
+    generated = SimpleNamespace(relative_path="staged/input", size_bytes=4096)
+    step = SimpleNamespace(generated_inputs=(generated,))
+    runtime = SimpleNamespace(
+        selector="kubectl", values={"test_root": "integration-regression/run/primary"}
+    )
+    fixture = SimpleNamespace(login_pod=None, login_container=None)
+    _create_generated_inputs(object(), object(), fixture, runtime, step)
+    assert "/mnt/storage-scale-test/integration-regression/run/primary" in commands[0]
+
+
+def test_kubectl_cleanup_reports_lifecycle_failure(tmp_path):
+    """An incomplete attempt cannot silently pass when cleanup fails."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    runtime = SimpleNamespace(
+        workspace=str(tmp_path / "workspace"),
+        values={"kubectl_result_root": "/tmp/results/elbencho-1"},
+    )
+    commands = []
+
+    class _Runner:
+        def run(self, arguments, **_kwargs):
+            commands.append([str(item) for item in arguments])
+            return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="cleanup --cancel"):
+        _cleanup_kubectl_attempt(_Runner(), config, runtime)
+    assert len(commands) == 1
+
+
+def test_kubectl_cleanup_skips_already_collected_attempt(tmp_path):
+    """Successful collection makes later scenario cleanup a no-op."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    runtime = SimpleNamespace(
+        workspace=str(tmp_path / "workspace"),
+        values={
+            "kubectl_result_root": "/tmp/results/elbencho-1",
+            "kubectl_collected": "1",
+        },
+    )
+
+    class _Runner:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("collected Kubernetes attempt was operated on again")
+
+    _cleanup_kubectl_attempt(_Runner(), config, runtime)
+
+
+def test_kubectl_scenario_runtime_owns_a_unique_logical_storage_root(tmp_path):
+    """Kubernetes scenarios do not share the benchmark root between runs."""
+    fixture = SimpleNamespace(slurm_nodes=())
+    scenario = _FILESYSTEM.SCENARIO_SPECS_BY_NAME["baseline"]
+    runtime = _make_scenario_runtime(
+        fixture,
+        scenario,
+        "kubectl",
+        tmp_path / "build",
+        tmp_path / "artifacts",
+        "run-1",
+    )
+
+    assert runtime.data_root.startswith("integration-regression/")
+    assert runtime.data_root != "primary"
+    assert runtime.values["test_root"] == f"{runtime.data_root}/primary"
+
+
+def test_kubectl_storage_cleanup_targets_only_owned_root(tmp_path, monkeypatch):
+    """Kubernetes cleanup removes only the scenario's mapped PVC subtree."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    runtime = SimpleNamespace(
+        selector="kubectl",
+        scenario=SimpleNamespace(name="baseline"),
+        data_root="integration-regression/run-1-baseline-kubectl",
+    )
+    fixture = _kubectl_fixture()
+    fixture.login_pod = "login"
+    fixture.login_container = "login"
+    commands = []
+    monkeypatch.setattr(
+        _FILESYSTEM,
+        "_storage_utility_shell",
+        lambda _runner, _config, _fixture, command, **_kwargs: commands.append(command),
+    )
+
+    _cleanup_scenario_storage(object(), config, fixture, runtime)
+    assert any(
+        "/mnt/storage-scale-test/integration-regression/run-1-baseline-kubectl"
+        in command
+        for command in commands
+    )
+
+    runtime.data_root = "primary"
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="unexpected"):
+        _cleanup_scenario_storage(object(), config, fixture, runtime)
 
 
 def test_root_lifecycle_is_rejected_before_state_resolution(monkeypatch):
@@ -2786,7 +3174,7 @@ def test_kubectl_probe_image_is_verified_and_imported_privately(tmp_path, monkey
         "_ensure_pinned_image",
         lambda _runner, image: (
             image
-            if image == _DRIVER.ELBENCHO_UPSTREAM_IMAGE
+            if image == _DRIVER.ELBENCHO_FIXTURE.upstream
             else pytest.fail(f"unexpected image {image}")
         ),
     )
@@ -2804,7 +3192,7 @@ def test_kubectl_probe_image_is_verified_and_imported_privately(tmp_path, monkey
         command for command in commands if command[:3] == ["docker", "image", "tag"]
     )
     temporary = tag[-1]
-    assert tag[-2] == _DRIVER.ELBENCHO_UPSTREAM_IMAGE
+    assert tag[-2] == _DRIVER.ELBENCHO_FIXTURE.upstream
     assert loaded == [
         (
             temporary,

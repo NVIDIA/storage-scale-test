@@ -15,18 +15,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Roadmap Items (last updated 2026-09-04)
+# Roadmap Items (last updated 2026-09-23)
+
+## Completed
+
+- Add kubectl as the filesystem Elbencho execution substrate. It uses an
+  existing authorized cluster, namespace, and bound RWX PVC; submits a
+  durable asynchronous sweep, and supports status, cancel, collect, and
+  collection-gated resume.
 
 ## P0
 
 - Integrate with AI Cloud Validation
 (https://github.com/NVIDIA/ai-cloud-validation).
-    - Add kubectl as an execution substrate (bringing total list to: SSH,
-      Slurm, kubectl).
+    - Exercise the implemented kubectl substrate in the validation suite.
     - Add sweep across multiple storage targets.
     - Allow accumulation of different "sweep" executions that all get
-      executed by an orchestrator process with resume capability.  For the
-      kubectl execution substrate, that orchestrator will run async in a pod.
+      executed by an orchestrator process with resume capability.
     - Watch out for (current) 10m AI Cloud Validation test timeout--figure
       out the appropriate enhancement for that test suite to allow storage
       tests that may take some time to complete.

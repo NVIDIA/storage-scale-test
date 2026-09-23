@@ -24,9 +24,9 @@ metadata:
     app.kubernetes.io/component: workers
     app.kubernetes.io/managed-by: storage-scale-test
     storage-scale-test.nvidia.com/benchmark: elbencho
-    storage-scale-test.nvidia.com/run: @@ATTEMPT_ID@@
+    storage-scale-test.nvidia.com/run: "@@ATTEMPT_ID@@"
   annotations:
-    storage-scale-test.nvidia.com/ownership: @@OWNERSHIP_NONCE@@
+    storage-scale-test.nvidia.com/ownership: "@@OWNERSHIP_NONCE@@"
 spec:
   selector:
     matchLabels:
@@ -40,19 +40,20 @@ spec:
         app.kubernetes.io/component: workers
         app.kubernetes.io/managed-by: storage-scale-test
         storage-scale-test.nvidia.com/benchmark: elbencho
-        storage-scale-test.nvidia.com/run: @@ATTEMPT_ID@@
+        storage-scale-test.nvidia.com/run: "@@ATTEMPT_ID@@"
       annotations:
-        storage-scale-test.nvidia.com/ownership: @@OWNERSHIP_NONCE@@
+        storage-scale-test.nvidia.com/ownership: "@@OWNERSHIP_NONCE@@"
     spec:
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 5
       nodeSelector:
 @@NODE_SELECTOR_BLOCK@@
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
-              - matchFields:
-                  - key: metadata.name
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
                     operator: In
                     values:
 @@NODE_AFFINITY_VALUES@@

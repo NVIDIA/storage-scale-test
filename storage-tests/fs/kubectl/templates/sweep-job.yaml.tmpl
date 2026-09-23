@@ -27,9 +27,9 @@ metadata:
     app.kubernetes.io/component: coordinator
     app.kubernetes.io/managed-by: storage-scale-test
     storage-scale-test.nvidia.com/benchmark: elbencho
-    storage-scale-test.nvidia.com/run: @@ATTEMPT_ID@@
+    storage-scale-test.nvidia.com/run: "@@ATTEMPT_ID@@"
   annotations:
-    storage-scale-test.nvidia.com/ownership: @@OWNERSHIP_NONCE@@
+    storage-scale-test.nvidia.com/ownership: "@@OWNERSHIP_NONCE@@"
 spec:
   backoffLimit: 0
   template:
@@ -40,9 +40,9 @@ spec:
         app.kubernetes.io/component: coordinator
         app.kubernetes.io/managed-by: storage-scale-test
         storage-scale-test.nvidia.com/benchmark: elbencho
-        storage-scale-test.nvidia.com/run: @@ATTEMPT_ID@@
+        storage-scale-test.nvidia.com/run: "@@ATTEMPT_ID@@"
       annotations:
-        storage-scale-test.nvidia.com/ownership: @@OWNERSHIP_NONCE@@
+        storage-scale-test.nvidia.com/ownership: "@@OWNERSHIP_NONCE@@"
     spec:
       automountServiceAccountToken: false
       restartPolicy: Never

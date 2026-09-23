@@ -24,12 +24,13 @@ metadata:
     app.kubernetes.io/component: transfer
     app.kubernetes.io/managed-by: storage-scale-test
     storage-scale-test.nvidia.com/benchmark: elbencho
-    storage-scale-test.nvidia.com/run: @@ATTEMPT_ID@@
-    storage-scale-test.nvidia.com/operation: @@OPERATION_TOKEN@@
+    storage-scale-test.nvidia.com/run: "@@ATTEMPT_ID@@"
+    storage-scale-test.nvidia.com/operation: "@@OPERATION_TOKEN@@"
   annotations:
-    storage-scale-test.nvidia.com/ownership: @@OWNERSHIP_NONCE@@
+    storage-scale-test.nvidia.com/ownership: "@@OWNERSHIP_NONCE@@"
 spec:
   automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
   restartPolicy: Never
   nodeName: @@NODE_NAME@@
   securityContext:

@@ -32,6 +32,7 @@ class Substrate(StrEnum):
     ALL = "all"
     SSH = "ssh"
     SLURM = "slurm"
+    KUBECTL = "kubectl"
 
 
 SUBSTRATES = tuple(item.value for item in Substrate)
@@ -49,6 +50,7 @@ class SchedulePhase(IntEnum):
 
     BEFORE_SHARED_HOME = 10
     SHARED_HOME = 20
+    KUBECTL = 25
     AFTER_SHARED_HOME = 30
 
 
@@ -98,21 +100,21 @@ SCENARIO_CATALOG = (
     Scenario(
         "baseline",
         "Shared-directory buffered-I/O baseline and report extraction",
-        frozenset({Substrate.SSH, Substrate.SLURM}),
+        frozenset({Substrate.SSH, Substrate.SLURM, Substrate.KUBECTL}),
         10,
         ssh_home_mode=SshHomeMode.SEPARATE,
     ),
     Scenario(
         "default-dio",
         "Default worker-directory direct-I/O lifecycle",
-        frozenset({Substrate.SSH, Substrate.SLURM}),
+        frozenset({Substrate.SSH, Substrate.SLURM, Substrate.KUBECTL}),
         20,
         ssh_home_mode=SshHomeMode.SEPARATE,
     ),
     Scenario(
         "failure-resume",
         "Real failure, cleanup, and resume lifecycle",
-        frozenset({Substrate.SSH, Substrate.SLURM}),
+        frozenset({Substrate.SSH, Substrate.SLURM, Substrate.KUBECTL}),
         30,
         ssh_home_mode=SshHomeMode.SEPARATE,
     ),
@@ -126,7 +128,7 @@ SCENARIO_CATALOG = (
     Scenario(
         "live-capture",
         "Extended live-data collection and reporting",
-        frozenset({Substrate.SSH, Substrate.SLURM}),
+        frozenset({Substrate.SSH, Substrate.SLURM, Substrate.KUBECTL}),
         50,
         ssh_home_mode=SshHomeMode.SEPARATE,
     ),
@@ -165,6 +167,34 @@ SCENARIO_CATALOG = (
         100,
         phase=SchedulePhase.AFTER_SHARED_HOME,
     ),
+    Scenario(
+        "kubectl-retained-read",
+        "Kubernetes write, collected read-from, and retained data lifecycle",
+        frozenset({Substrate.KUBECTL}),
+        110,
+        phase=SchedulePhase.KUBECTL,
+    ),
+    Scenario(
+        "kubectl-cancel",
+        "Kubernetes cancellation and repeated collection lifecycle",
+        frozenset({Substrate.KUBECTL}),
+        120,
+        phase=SchedulePhase.KUBECTL,
+    ),
+    Scenario(
+        "kubectl-coordinator-loss",
+        "Kubernetes coordinator loss, collection, and resume lifecycle",
+        frozenset({Substrate.KUBECTL}),
+        130,
+        phase=SchedulePhase.KUBECTL,
+    ),
+    Scenario(
+        "kubectl-endpoint-drift",
+        "Kubernetes worker endpoint replacement and health handling",
+        frozenset({Substrate.KUBECTL}),
+        140,
+        phase=SchedulePhase.KUBECTL,
+    ),
 )
 
 SCENARIOS = SCENARIO_CATALOG
@@ -173,7 +203,7 @@ SCENARIOS = SCENARIO_CATALOG
 def _concrete_substrates(substrate: Substrate) -> frozenset[Substrate]:
     """Return concrete substrates selected by *substrate*."""
     if substrate is Substrate.ALL:
-        return frozenset({Substrate.SSH, Substrate.SLURM})
+        return frozenset({Substrate.SSH, Substrate.SLURM, Substrate.KUBECTL})
     return frozenset({substrate})
 
 
@@ -296,6 +326,18 @@ def _work_items(
     )
 
 
+def _schedule_phase(item: WorkItem) -> SchedulePhase:
+    """Return the phase for one concrete substrate work item.
+
+    The scenario catalog describes the SSH home-pool transition.  A Kubernetes
+    item has no SSH home mode and must run after that pool is restored, even
+    when it shares a scenario definition with SSH and Slurm.
+    """
+    if item.substrate is Substrate.KUBECTL:
+        return SchedulePhase.KUBECTL
+    return item.scenario.phase
+
+
 def plan_scenarios(
     *,
     substrate: Substrate | str = Substrate.ALL,
@@ -311,19 +353,23 @@ def plan_scenarios(
     before = [
         item
         for item in items
-        if item.scenario.phase is SchedulePhase.BEFORE_SHARED_HOME
+        if _schedule_phase(item) is SchedulePhase.BEFORE_SHARED_HOME
     ]
     shared = [
-        item for item in items if item.scenario.phase is SchedulePhase.SHARED_HOME
+        item for item in items if _schedule_phase(item) is SchedulePhase.SHARED_HOME
     ]
+    kubectl = [item for item in items if _schedule_phase(item) is SchedulePhase.KUBECTL]
     after = [
-        item for item in items if item.scenario.phase is SchedulePhase.AFTER_SHARED_HOME
+        item
+        for item in items
+        if _schedule_phase(item) is SchedulePhase.AFTER_SHARED_HOME
     ]
     steps: list[PlanStep] = list(before)
     if shared:
         steps.append(SshHomeTransition(SshHomeMode.SHARED))
         steps.extend(shared)
         steps.append(SshHomeTransition(SshHomeMode.SEPARATE))
+    steps.extend(kubectl)
     steps.extend(after)
     return tuple(steps)
 

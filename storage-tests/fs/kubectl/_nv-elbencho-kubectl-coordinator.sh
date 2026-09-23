@@ -425,6 +425,8 @@ _coordinator_publish_manifest() {
     _coordinator_append_manifest_file "$tmp" ledger run-summary.tsv run-summary.tsv || return 1
     [[ ! -f "$STATE_DIR/startup-error.txt" ]] || \
         _coordinator_append_manifest_file "$tmp" ledger startup-error.txt startup-error.txt || return 1
+    [[ ! -f "$STATE_DIR/coordinator-loss.tsv" ]] || \
+        _coordinator_append_manifest_file "$tmp" ledger coordinator-loss.tsv coordinator-loss.tsv || return 1
     _coordinator_append_manifest_file "$tmp" snapshot env_used.sh env_used.sh || return 1
     _coordinator_append_manifest_file "$tmp" snapshot env_used.yaml env_used.yaml || return 1
     mv -f -- "$tmp" "$STATE_DIR/publication-manifest.tsv" || return 1
@@ -463,6 +465,12 @@ _coordinator_write_summary() {
 _coordinator_result_publication_hook() {
     local benchmark_rc="$1" scratch="$2" _ignored_durable="$3"
     local id="$ELBENCHO_RUN_EXECUTION_ID"
+    local overlay_rc=0
+    if [[ "$benchmark_rc" -eq 0 ]]; then
+        _coordinator_run_overlay after-benchmark "$id" "$scratch" \
+            "$_ignored_durable" || overlay_rc=$?
+        [[ "$overlay_rc" -eq 0 ]] || benchmark_rc="$overlay_rc"
+    fi
     if [[ "$benchmark_rc" -eq 0 ]] \
             && ! _coordinator_require_success_artifacts "$id" "$scratch"; then
         benchmark_rc=1
@@ -478,7 +486,8 @@ _coordinator_result_publication_hook() {
         _coordinator_write_summary FAILED "$id" "$benchmark_rc" || return 1
     fi
     _coordinator_integration_crash_after after-terminal
-    _coordinator_publish_manifest
+    _coordinator_publish_manifest || return 1
+    return "$benchmark_rc"
 }
 
 _coordinator_require_success_artifacts() {
@@ -569,7 +578,7 @@ _coordinator_check_integration_overlay() {
         return 1
     fi
     if [[ -n "${KUBECTL_INTEGRATION_CRASH_AFTER:-}" \
-            && ! "${KUBECTL_INTEGRATION_CRASH_AFTER}" =~ ^(after-running|after-copy|after-terminal|after-manifest)$ ]]; then
+            && ! "${KUBECTL_INTEGRATION_CRASH_AFTER}" =~ ^(after-run-status|after-running|after-copy|after-terminal|after-manifest)$ ]]; then
         _coordinator_error "unknown integration crash boundary"
         return 1
     fi
@@ -586,7 +595,9 @@ _coordinator_integration_crash_after() {
 
 _coordinator_run_overlay() {
     [[ -z "${KUBECTL_INTEGRATION_FAILURE_OVERLAY:-}" ]] && return 0
-    "$KUBECTL_INTEGRATION_FAILURE_OVERLAY" "$1" "$2" "$3"
+    local boundary="$1"
+    shift
+    "$KUBECTL_INTEGRATION_FAILURE_OVERLAY" "$@" "$boundary"
 }
 
 _coordinator_run_cell() {
@@ -668,6 +679,19 @@ _coordinator_run_one() {
         _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
         return 1
     }
+    # Reified generated-target ownership is expressed in user-facing logical
+    # paths. The shared workload's deletion safeguards consult these captured
+    # values directly, so freeze their Kubernetes mappings before any phase.
+    ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV="$test_dirs_csv"
+    if [[ -n "$ELBENCHO_RUN_GENERATED_TEST_ROOT" ]]; then
+        ELBENCHO_RUN_GENERATED_TEST_ROOT=$(
+            kubectl_map_logical_path "$ELBENCHO_RUN_GENERATED_TEST_ROOT"
+        ) || {
+            _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
+            return 1
+        }
+    fi
+    export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV ELBENCHO_RUN_GENERATED_TEST_ROOT
     if [[ -n "${ELBENCHO_SWEEP_READ_FROM:-}" ]]; then
         mapped_read_from=$(kubectl_map_read_from_path "$ELBENCHO_SWEEP_READ_FROM") || {
             _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
@@ -693,7 +717,8 @@ _coordinator_run_one() {
                 return 1
             }
     fi
-    _coordinator_run_overlay "$id" "$scratch" "$durable" || rc=$?
+    _coordinator_run_overlay before-benchmark "$id" "$scratch" "$durable" \
+        || rc=$?
     if [[ "$rc" -eq 0 ]]; then
         _coordinator_run_cell "$id" "$scratch" "$durable" || rc=$?
     fi
@@ -720,6 +745,102 @@ _coordinator_finalize_run() {
     [[ "$rc" -eq 0 ]] || final=FAILED
     _coordinator_atomic_write "$STATE_DIR/run.status" "$final" || return 1
     _coordinator_write_summary "$final" "$failed_id" "$rc" || return 1
+    _coordinator_publish_manifest
+}
+
+_coordinator_recover_lost() {
+    _coordinator_validate_arguments "$@" || return 1
+    _coordinator_verify_bundle || return 1
+    _coordinator_load_run_metadata || return 1
+    # shellcheck disable=SC1091,SC1090  # Digest-verified control bundle.
+    source "$CONTROL_DIR/env_used.sh" || return 1
+    # shellcheck disable=SC1091,SC1090  # Digest-verified coordinator helpers.
+    source "$CONTROL_DIR/_nv-elbencho-kubectl-functions.sh" || return 1
+    # shellcheck disable=SC1091,SC1090  # Digest-verified workload library.
+    source "$CONTROL_DIR/_elbencho_functions.sh" || return 1
+    [[ -d "$STATE_DIR/coordinator.lock" && ! -L "$STATE_DIR/coordinator.lock" ]] || {
+        _coordinator_error "lost-coordinator recovery requires the durable coordinator lock"
+        return 1
+    }
+    [[ "$(cat "$STATE_DIR/run.status" 2>/dev/null || true)" == RUNNING ]] || {
+        _coordinator_error "lost-coordinator recovery requires a RUNNING attempt"
+        return 1
+    }
+    local status_file id status failed_id="" first_pending="" changed=0
+    local execution_observed_status=""
+    for status_file in "$STATE_DIR"/executions/[0-9][0-9][0-9][0-9].status; do
+        [[ -f "$status_file" && ! -L "$status_file" ]] || continue
+        id=$(basename "$status_file" .status)
+        status=$(cat "$status_file") || return 1
+        case "$status" in
+            RUNNING)
+                _coordinator_atomic_write "$status_file" FAILED || return 1
+                _coordinator_atomic_write "$STATE_DIR/executions/$id.exitcode" 143 || return 1
+                [[ -n "$failed_id" ]] || failed_id="$id"
+                execution_observed_status=RUNNING
+                changed=1
+                ;;
+            PENDING) [[ -n "$first_pending" ]] || first_pending="$id" ;;
+            SUCCESS|FAILED) ;;
+            *) _coordinator_error "invalid execution state during recovery: $id=$status"; return 1 ;;
+        esac
+    done
+    if [[ "$changed" -eq 0 ]]; then
+        [[ -n "$first_pending" ]] || {
+            _coordinator_error "lost-coordinator recovery found no resumable execution"
+            return 1
+        }
+        failed_id="$first_pending"
+        execution_observed_status=PENDING
+        _coordinator_atomic_write "$STATE_DIR/executions/$failed_id.status" FAILED || return 1
+        _coordinator_atomic_write "$STATE_DIR/executions/$failed_id.exitcode" 143 || return 1
+    fi
+    local recovery_tmp="$STATE_DIR/.coordinator-loss.tmp.${BASHPID:-$$}.${RANDOM}"
+    {
+        printf 'schema\t1\n'
+        printf 'attempt_id\t%s\n' "$ATTEMPT_ID"
+        printf 'execution\t%s\n' "$failed_id"
+        printf 'observed_status\tRUNNING\n'
+        printf 'execution_observed_status\t%s\n' "$execution_observed_status"
+        printf 'recovered_status\tFAILED\n'
+        printf 'exit_code\t143\n'
+    } > "$recovery_tmp" \
+        && mv -f -- "$recovery_tmp" "$STATE_DIR/coordinator-loss.tsv" || return 1
+    _coordinator_atomic_write "$STATE_DIR/run.status" FAILED || return 1
+    _coordinator_write_summary FAILED "$failed_id" 143 || return 1
+    _coordinator_publish_manifest
+}
+
+_coordinator_finalize_cancelled() {
+    _coordinator_validate_arguments "$@" || return 1
+    _coordinator_verify_bundle || return 1
+    _coordinator_load_run_metadata || return 1
+    # shellcheck disable=SC1091,SC1090  # Digest-verified control bundle.
+    source "$CONTROL_DIR/env_used.sh" || return 1
+    # shellcheck disable=SC1091,SC1090  # Digest-verified coordinator helpers.
+    source "$CONTROL_DIR/_nv-elbencho-kubectl-functions.sh" || return 1
+    # shellcheck disable=SC1091,SC1090  # Digest-verified workload library.
+    source "$CONTROL_DIR/_elbencho_functions.sh" || return 1
+    [[ -d "$STATE_DIR/coordinator.lock" && ! -L "$STATE_DIR/coordinator.lock" ]] \
+        || return 1
+    local status_file id status failed_id=""
+    for status_file in "$STATE_DIR"/executions/[0-9][0-9][0-9][0-9].status; do
+        [[ -f "$status_file" && ! -L "$status_file" ]] || continue
+        id=$(basename "$status_file" .status)
+        status=$(cat "$status_file") || return 1
+        case "$status" in
+            RUNNING)
+                _coordinator_atomic_write "$status_file" FAILED || return 1
+                _coordinator_atomic_write "$STATE_DIR/executions/$id.exitcode" 143 \
+                    || return 1
+                [[ -n "$failed_id" ]] || failed_id="$id"
+                ;;
+            PENDING|SUCCESS|FAILED) ;;
+            *) return 1 ;;
+        esac
+    done
+    _coordinator_atomic_write "$STATE_DIR/run.status" CANCELLED || return 1
+    _coordinator_write_summary CANCELLED "$failed_id" 143 || return 1
     _coordinator_publish_manifest
 }
 
@@ -784,6 +905,7 @@ _coordinator_main() {
     COORDINATOR_SELECTED_ENDPOINTS=()
     _coordinator_atomic_write "$STATE_DIR/run.status" RUNNING || return 1
     _coordinator_write_summary RUNNING || return 1
+    _coordinator_integration_crash_after after-run-status
     COORDINATOR_ACTIVE_ID=""
     COORDINATOR_ACTIVE_SCRATCH=""
     trap '_coordinator_signal_handler INT' INT
@@ -827,6 +949,24 @@ _coordinator_main() {
     _coordinator_finalize_run "$rc" "$failed_id" || return 1
     return "$rc"
 }
+
+if [[ "${1:-}" == --recover-lost ]]; then
+    [[ "$#" -eq 5 ]] || {
+        _coordinator_error "usage: $KUBECTL_COORDINATOR_BASENAME --recover-lost CONTROL_DIR STATE_DIR SCRATCH_DIR ID"
+        exit 1
+    }
+    _coordinator_recover_lost "${@:2}"
+    exit $?
+fi
+
+if [[ "${1:-}" == --finalize-cancelled ]]; then
+    [[ "$#" -eq 5 ]] || {
+        _coordinator_error "usage: $KUBECTL_COORDINATOR_BASENAME --finalize-cancelled CONTROL_DIR STATE_DIR SCRATCH_DIR ID"
+        exit 1
+    }
+    _coordinator_finalize_cancelled "${@:2}"
+    exit $?
+fi
 
 if [[ "${1:-}" == --select-collected-resume ]]; then
     [[ "$#" -eq 2 ]] || {

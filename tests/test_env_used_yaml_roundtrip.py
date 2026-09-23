@@ -81,6 +81,8 @@ def _bash_write_env_used_yaml(out_dir: str) -> str:
     """Bash script body: IO sweep env + write_elbencho_env_used."""
     return _bash_script_with_repo(
         """export EXECUTION_SUBSTRATE=slurm
+export ORDER_NODES=yes
+export ORDER_NODES_ENABLED=1
 export ELBENCHO_SCALE_THREAD_LIST=("1" "2" "4" "8" "16")
 export ELBENCHO_SCALE_IO_SIZES=("1M" "r4K" "4K,8K")
 export ELBENCHO_IODEPTH_LIST=("1" "4" "8")
@@ -159,6 +161,7 @@ class TestEnvUsedYamlRoundTrip(unittest.TestCase):
                 loaded["ELBENCHO_SCALE_THREAD_LIST"],
                 ["1", "2", "4", "8", "16"],
             )
+            self.assertEqual(loaded["ORDER_NODES"], "yes")
             self.assertEqual(
                 loaded["ELBENCHO_SCALE_IO_SIZES"],
                 ["1M", "r4K", "4K,8K"],
@@ -191,6 +194,9 @@ class TestEnvUsedYamlRoundTrip(unittest.TestCase):
             self.assertEqual(loaded["sweep_write_no_read"], 0)
             self.assertEqual(loaded["sweep_read_from"], "")
             self.assertEqual(loaded["nodes_spec"], "1-4")
+            shell_snapshot = (Path(tmp) / "env_used.sh").read_text(encoding="utf-8")
+            self.assertIn("export ORDER_NODES=yes\n", shell_snapshot)
+            self.assertIn("export ORDER_NODES_ENABLED=1\n", shell_snapshot)
 
     def test_write_no_read_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:

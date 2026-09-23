@@ -1394,7 +1394,8 @@ write_elbencho_env_used() {
         printf '# env_used.yaml - elbencho sweep configuration snapshot\n'
         printf '# Generated: %s\n\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-        printf 'EXECUTION_SUBSTRATE: "%s"\n\n' "${EXECUTION_SUBSTRATE:?}"
+        printf 'EXECUTION_SUBSTRATE: "%s"\n' "${EXECUTION_SUBSTRATE:?}"
+        printf 'ORDER_NODES: %s\n\n' "$(yaml_double_quote "${ORDER_NODES:-0}")"
 
         if [[ "${EXECUTION_SUBSTRATE:?}" == kubectl ]]; then
             printf 'KUBECTL_NAMESPACE: %s\n' "$(yaml_double_quote "${KUBECTL_NAMESPACE:?}")"
@@ -1532,7 +1533,9 @@ _write_elbencho_env_used_sh() {
         printf '# This file is the canonical artifact for nv-elbencho-sweep.sh --resume.\n'
         printf '# Generated: %s\n\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-        printf 'export EXECUTION_SUBSTRATE=%q\n\n' "${EXECUTION_SUBSTRATE:?}"
+        printf 'export EXECUTION_SUBSTRATE=%q\n' "${EXECUTION_SUBSTRATE:?}"
+        printf 'export ORDER_NODES=%q\n' "${ORDER_NODES:-0}"
+        printf 'export ORDER_NODES_ENABLED=%q\n\n' "${ORDER_NODES_ENABLED:-}"
 
         if [[ "${EXECUTION_SUBSTRATE:?}" == kubectl ]]; then
             printf 'export KUBECTL_NAMESPACE=%q\n' "${KUBECTL_NAMESPACE:?}"

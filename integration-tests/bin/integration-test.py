@@ -42,7 +42,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 INTEGRATION_LIB = Path(__file__).resolve().parents[1] / "lib"
 sys.path.insert(0, str(INTEGRATION_LIB))
@@ -59,8 +59,8 @@ from fixture_capacity import (  # pylint: disable=wrong-import-position
     STORAGE_TEST_CAPACITY,
 )
 from fixture_images import (  # pylint: disable=wrong-import-position
+    ELBENCHO_FIXTURE,
     ELBENCHO_FIXTURE_IMAGE,
-    ELBENCHO_UPSTREAM_IMAGE,
 )
 from scenario_planner import (  # pylint: disable=wrong-import-position
     SUBSTRATES,
@@ -3433,8 +3433,10 @@ def _stage_pinned_node_alias(
         runner.run(["docker", "image", "rm", temporary], check=False)
 
 
-def _prepare_kubectl_prerequisite_image(runner: Runner, config: Config) -> None:
-    """Load the verified Elbencho image under a fixture-private node alias."""
+def _prepare_fixture_node_image(
+    runner: Runner, config: Config, fixture_image: Any
+) -> None:
+    """Load one architecture-verified image under a fixture-private node alias."""
     nodes = _kind_containers(runner, config, running_only=True)
     if len(nodes) != 3:
         raise ProvisionError(
@@ -3442,11 +3444,16 @@ def _prepare_kubectl_prerequisite_image(runner: Runner, config: Config) -> None:
         )
     _stage_pinned_node_alias(
         runner,
-        ELBENCHO_UPSTREAM_IMAGE,
-        ELBENCHO_FIXTURE_IMAGE,
+        fixture_image.upstream,
+        fixture_image.fixture,
         nodes,
-        "elbencho",
+        fixture_image.component,
     )
+
+
+def _prepare_kubectl_prerequisite_image(runner: Runner, config: Config) -> None:
+    """Load the verified Elbencho image under its fixture-private node alias."""
+    _prepare_fixture_node_image(runner, config, ELBENCHO_FIXTURE)
 
 
 def _ensure_calico_manifest(runner: Runner, config: Config) -> Path:

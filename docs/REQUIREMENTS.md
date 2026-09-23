@@ -17,7 +17,7 @@ limitations under the License.
 
 # NVIDIA Storage Scale Test — Requirements
 
-**Last Updated**: 2026-09-02\
+**Last Updated**: 2026-09-23\
 **Status**: Accurate as of last update.
 
 ---
@@ -159,6 +159,8 @@ These requirements are driven by the primary use cases of an **NVIDIA Storage Sc
 | UC-9.3 | All benchmark orchestration scripts shall support both SSH and Slurm modes from a single entry point. | Yes |
 | UC-9.4 | The SSH mode shall transmit all necessary code to remote nodes as self-contained scriptlets (no requirement for remote nodes to have the repository). | Yes |
 | UC-9.5 | The tool shall support environments where remote nodes share a home directory (e.g., NFS) and environments where they do not. | Yes |
+| UC-9.6 | Filesystem sweeps shall support an explicitly selected Kubernetes substrate using an already authorized cluster, a pre-existing bound PVC, and a configured node selector. | Yes |
+| UC-9.7 | Kubernetes sweeps shall submit one asynchronous attempt for the whole sweep and shall support durable status, cancellation, collection, and collection-gated resume operations. | Yes |
 
 ---
 
@@ -188,6 +190,7 @@ These requirements address the infrastructure and runtime constraints the tool m
 | EE-3.1 | Multi-node benchmarks shall use a coordinator/service pattern: services run on all participating nodes and a coordinator drives the test. Bidirectional netbench may use two coordinators, one per direction. | Yes |
 | EE-3.2 | In SSH mode, services and the coordinator shall be started and stopped by the orchestration scripts; the user shall not need to manage them manually. | Yes |
 | EE-3.3 | Results produced by an SSH remote coordinator shall be streamed back to the executing host; Slurm results shall be written to the configured shared results location. | Yes |
+| EE-3.4 | Kubernetes filesystem sweeps shall run one coordinator Job and one service Pod per selected worker over ordinary Pod networking, with the PVC mounted at the fixed Pod path `/mnt/storage-scale-test`. | Yes |
 
 ### EE-4: Python Environment
 
@@ -209,6 +212,7 @@ These requirements address the infrastructure and runtime constraints the tool m
 | CV-1.4 | The configuration file shall support SSH-specific settings (host list file, SSH user, shared homedir flag). | Yes |
 | CV-1.5 | Benchmark parameters shall support configurable sweep lists (IO sizes, thread counts, IO depths, and object sizes), while node and task counts shall be supplied through the entry-point CLI. | Yes |
 | CV-1.6 | The tool shall support backward compatibility when new configuration variables are introduced (fall back to old variable names or hardcoded defaults). | Yes |
+| CV-1.7 | The configuration shall support Kubernetes namespace, PV, PVC, node-selector, benchmark-image, image-pull-policy, and workload UID/GID settings when `EXECUTION_SUBSTRATE=kubectl`. | Yes |
 
 ### CV-2: Configuration Validation
 
@@ -224,6 +228,7 @@ These requirements address the infrastructure and runtime constraints the tool m
 | CV-2.8 | Validation shall warn if the target S3 bucket contains existing objects (warp deletes all objects). | Yes |
 | CV-2.9 | Validation shall validate elbencho configuration parameters (thread list contains integers, IO sizes are valid, duration is valid). | Yes |
 | CV-2.10 | Validation shall accumulate all errors and report them together at the end, rather than stopping at the first error. | Yes |
+| CV-2.11 | Kubernetes validation shall verify API access, namespace and PV/PVC identity, PVC binding and mount usability, selected Ready-node compatibility, and benchmark runtime prerequisites. Submission shall verify requested capacity, service readiness, and coordinator connectivity before executing a cell. | Yes |
 
 ### CV-3: Slurm Advanced Configuration
 
@@ -286,6 +291,7 @@ These requirements address the infrastructure and runtime constraints the tool m
 | BM-5.4 | Filesystem IO, filesystem metadata, and network sweep entry points shall require explicit `--nodes` (and `--tasks` where applicable). The Warp sweep shall retain its documented legacy positional node-count syntax. | Yes |
 | BM-5.5 | The Warp sweep shall produce a clear error when `--nodes` is mixed with its legacy positional arguments. Other sweep entry points shall reject unexpected positional arguments. | Yes |
 | BM-5.6 | All sweep scripts shall provide a usage message accessible via `-h` or `--help`. | Yes |
+| BM-5.7 | The filesystem sweep shall support Kubernetes submission, status, cancellation, collection, and collection-gated resume while preserving successful cells and publishing completed results from durable PVC state. | Yes |
 
 ---
 
@@ -391,6 +397,7 @@ This repository does not include or distribute third-party benchmark binaries. U
 | `env.sh` / `env.sh.template` | EE-2, CV-1 |
 | `lib/env_base.sh` | EE-2, CV-1 |
 | `lib/env_functions.sh` | UC-9, EE-3, EE-4, CV-3 |
+| `storage-tests/fs/kubectl/` | UC-5, UC-9, EE-3, CV-1, CV-2, BM-1, BM-5 |
 | `lib/_elbencho_functions.sh` | BM-1, BM-2, EE-3 |
 | `lib/_warp_functions.sh` | BM-3, EE-3 |
 | `lib/_netbench_functions.sh` | BM-4, EE-3 |
