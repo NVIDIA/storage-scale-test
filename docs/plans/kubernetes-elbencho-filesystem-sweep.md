@@ -34,6 +34,12 @@ and moves to the PVC only between measured cells.
 
 One Kubernetes submission is one **whole-pending-sweep attempt**, not one cell.
 
+The normative lifecycle, fault boundaries, recovery obligations, and release
+gate are defined in
+[Kubernetes Elbencho Lifecycle and Fault Contract](../KUBERNETES_ELBENCHO_LIFECYCLE.md).
+This implementation plan supplies design context but does not redefine that
+contract.
+
 Extend the existing three-node kind/RWX/SSH/Slinky fixture, scenario catalog,
 deployment cache, diagnostics, cleanup, and amd64/arm64 CI; do not add another
 harness or lifecycle entrypoint.
@@ -1077,9 +1083,13 @@ Teleport-mediated acceptance requires access to the target external cluster.
    parity and all existing assertions. Use focused
    `--substrate kubectl --scenario ...` runs against one retained fixture, then
    run the complete Docker SBX lifecycle.
-9. Run the full NFS-backed catalog on amd64 and arm64, perform external-cluster
-   acceptance, adjust only measured deadlines, and update user, requirement,
-   design, architecture, integration, roadmap, and context documentation.
+9. Satisfy closure criteria 1–8 in the normative lifecycle and fault contract,
+   run the full NFS-backed catalog on amd64 and arm64, perform the documented
+   external credential-expiry acceptance, adjust only measured deadlines, and
+   update user, requirement, design, architecture, integration, roadmap, and
+   context documentation. A final adversarial review against that frozen
+   contract is the release gate rather than an opportunity to expand it
+   implicitly.
 
 Every phase lands with passing tests and leaves SSH and Slurm usable. Every new
 text file carries the NVIDIA Apache-2.0 header.
@@ -1101,7 +1111,8 @@ boundary interactions, not the Cartesian product of every setting:
   Pod-IP discovery; capacity failure; safe template rendering; labels; and the
   no-RBAC/no-token manifest invariants.
 - Attempt-ID and lock collision, ambiguous creation, every pre-Job rollback
-  boundary, duplicate coordinator exclusion, and exact ownership checks.
+  boundary, the exact local lifecycle transition graph, duplicate coordinator
+  exclusion, and exact ownership checks.
 - Running and terminal status through both Pod and inspector paths, Job/ledger
   disagreement, endpoint UID/IP drift, same-Pod restart, and same- versus
   changed-IP replacement decisions.
@@ -1109,8 +1120,11 @@ boundary interactions, not the Cartesian product of every setting:
   partial coordinator state, exact-attempt cleanup, no orphan local process or
   Job, and refusal to delete mismatched resources.
 - Collection gates, hostile tar members, interrupted download/publication,
+  streaming byte/member limits, local capacity and ENOSPC, stale owned staging,
   conflicting local files, failed/cancelled partial results, cleanup journaling,
   and retry after every cleanup boundary.
+- The normalized diagnostic envelope and safe next action for every
+  required-diagnosis fault class in the normative matrix.
 - Execution order, deterministic and randomized worker subsets, one-node local
   execution, multi-node `--hosts`, phase exit codes, first-failure stop,
   scratch isolation, durable commit ordering, and coordinator loss.
@@ -1139,7 +1153,8 @@ dual-architecture CI. Require:
   result publication, analyzer-compatible collected results, and persistence
   across Job/Pod loss.
 - Correct async return points and transitions for submit, status, cancel,
-  collect, and resume, including nonzero failure propagation.
+  collect, and resume, including nonzero failure propagation and an interrupted
+  collection that resumes without losing its remote source.
 - Preservation of namespace, PV, PVC, unrelated fixture Pods, and retained
   write-only data; removal only of exact attempt objects, locks, and run trees.
 - Successful repeated setup, stop/start, full catalog, teardown twice, and no
@@ -1156,12 +1171,9 @@ Run the complete repository checks after focused and full fixture validation:
 
 Kind proves repository-controlled Kubernetes behavior but not every production
 CNI, admission policy, storage driver, or Teleport session. Before declaring
-the feature operationally supported, run the same baseline, failure/resume,
-cancel, and coordinator-loss cases on a representative Teleport-mediated
-cluster with its real RWX claim. Let the original credential expire, then
-reauthenticate from a new shell for status and collection. Confirm that saved
-namespace/PV/PVC UID checks prevent collection from the wrong cluster and that
-no cluster-owned namespace, PV, or PVC is modified.
+the feature operationally supported, execute the complete credential-expiry
+workflow in the normative lifecycle and fault contract on a representative
+Teleport-mediated cluster and retain its dated environment and result evidence.
 
 ## Documentation Requirements
 

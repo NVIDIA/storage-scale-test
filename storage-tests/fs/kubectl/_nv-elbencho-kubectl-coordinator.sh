@@ -932,10 +932,11 @@ _coordinator_recover_lost() {
             [[ "$recovery_exit_code" =~ ^[0-9]+$ && "$recovery_exit_code" -ne 0 ]] \
                 || recovery_exit_code=1
         elif [[ -n "$first_pending" ]]; then
-            failed_id="$first_pending"
+            # No cell started. Keep every cell PENDING so collection preserves
+            # the exact ledger and resume retries all unfinished work. The
+            # attempt-level startup record carries the failure evidence.
+            failed_id=""
             execution_observed_status=PENDING
-            _coordinator_atomic_write "$STATE_DIR/executions/$failed_id.status" FAILED || return 1
-            _coordinator_atomic_write "$STATE_DIR/executions/$failed_id.exitcode" 143 || return 1
             recovery_terminal=FAILED
             recovery_exit_code=143
         else

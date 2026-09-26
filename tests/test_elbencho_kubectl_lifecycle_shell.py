@@ -17,6 +17,8 @@
 
 from pathlib import Path
 import hashlib
+import os
+import pty
 import shutil
 import subprocess
 import tarfile
@@ -50,8 +52,86 @@ def _identity(root: Path) -> str:
     """
 
 
+def test_ordinary_pvc_exec_does_not_attach_interactive_terminal(
+    tmp_path: Path,
+) -> None:
+    """A human terminal cannot make a non-streaming PVC command wait on stdin."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake = fake_bin / "kubectl"
+    fake.write_text(
+        "#!/bin/bash\n"
+        'for arg in "$@"; do\n'
+        '  if [[ "$arg" == -i ]]; then read -r _; fi\n'
+        "done\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    master, slave = pty.openpty()
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["KUBECTL_PROCESS_TIMEOUT_SECONDS"] = "1"
+    process = subprocess.Popen(
+        [
+            _BASH,
+            "-c",
+            f"source {_FUNCTIONS!s}; kubectl_pvc_exec test-ns helper true",
+        ],
+        cwd=_ROOT,
+        stdin=slave,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+    )
+    os.close(slave)
+    try:
+        stdout, stderr = process.communicate(timeout=3)
+    finally:
+        os.close(master)
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    assert process.returncode == 0, f"stdout={stdout!r} stderr={stderr!r}"
+
+
+def test_streaming_pvc_exec_is_the_only_adapter_that_attaches_stdin(
+    tmp_path: Path,
+) -> None:
+    """Finite control-bundle input reaches the explicitly streaming adapter."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake = fake_bin / "kubectl"
+    fake.write_text(
+        "#!/bin/bash\n"
+        "saw_i=0\n"
+        'for arg in "$@"; do [[ "$arg" != -i ]] || saw_i=1; done\n'
+        '[[ "$saw_i" == 1 ]] || exit 64\n'
+        "cat\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    result = subprocess.run(
+        [
+            _BASH,
+            "-c",
+            f"source {_FUNCTIONS!s}; kubectl_pvc_exec_stdin test-ns helper cat",
+        ],
+        cwd=_ROOT,
+        input="control-bundle\n",
+        text=True,
+        capture_output=True,
+        check=False,
+        env=environment,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "control-bundle\n"
+
+
 def test_identity_is_complete_atomic_and_path_bound(tmp_path: Path) -> None:
-    """A partial or moved identity cannot be mistaken for an owned attempt."""
+    """[S-02] [R-19] Partial identity cannot become an owned attempt."""
     result = _bash(_identity(tmp_path / "state") + """
         kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
         kubectl_attempt_load_metadata "$root/attempts/1234abcd"
@@ -169,7 +249,7 @@ def test_pod_ipv4_validation_rejects_invalid_addresses(address: str) -> None:
 
 
 def test_hostile_collection_archives_never_extract(tmp_path: Path) -> None:
-    """Traversal and symbolic-link tar members fail before local publication."""
+    """[R-07] Traversal and link members fail before local publication."""
     archive = tmp_path / "hostile.tar"
     with tarfile.open(archive, "w") as stream:
         info = tarfile.TarInfo("1234abcd/../../outside")
@@ -196,6 +276,31 @@ def test_collection_accepts_only_regular_files_and_directories(tmp_path: Path) -
         f"kubectl_extract_attempt_archive {str(archive)!r} 1234abcd {str(tmp_path)!r} {str(output)!r}; "
         f'test "$(cat {str(output / "1234abcd/state/run.status")!r})" = SUCCESS'
     )
+    assert result.returncode == 0, result.stderr
+
+
+def test_collection_archive_metadata_is_streamed_and_member_bounded(
+    tmp_path: Path,
+) -> None:
+    """[R-06] Archive validation streams metadata and enforces member limits."""
+    source = tmp_path / "1234abcd"
+    source.mkdir()
+    (source / "one").write_text("one\n", encoding="utf-8")
+    archive = tmp_path / "valid.tar"
+    with tarfile.open(archive, "w") as stream:
+        stream.add(source, arcname="1234abcd")
+    unusable_tmp = tmp_path / "not-a-directory"
+    unusable_tmp.write_text("occupied\n", encoding="utf-8")
+    result = _bash(f"""
+        TMPDIR={str(unusable_tmp)!r} kubectl_validate_attempt_archive \
+            {str(archive)!r} 1234abcd
+        ! _kubectl_validate_archive_names_stream 1234abcd 2 \
+            <<< $'1234abcd\n1234abcd/one\n1234abcd/two'
+        _kubectl_validate_archive_types_stream 2 \
+            <<< $'-rw-r--r-- file\ndrwxr-xr-x directory'
+        ! _kubectl_validate_archive_types_stream 2 \
+            <<< $'-rw-r--r-- one\n-rw-r--r-- two\n-rw-r--r-- three'
+        """)
     assert result.returncode == 0, result.stderr
 
 
@@ -242,7 +347,7 @@ def test_collected_manifest_paths_cannot_escape_staged_state(tmp_path: Path) -> 
 
 
 def test_collected_manifest_rejects_duplicate_semantic_rows(tmp_path: Path) -> None:
-    """A publication cannot redefine identity, executions, or destinations."""
+    """[R-08] A manifest cannot redefine identity, cells, or destinations."""
     state = tmp_path / "state"
     state.mkdir()
     definitions = tmp_path / "definitions"
@@ -420,7 +525,7 @@ def test_legacy_execution_does_not_require_workload_metadata(tmp_path: Path) -> 
 
 
 def test_collection_merges_manifest_declared_execution_ledgers(tmp_path: Path) -> None:
-    """Collection publishes exit-code and worker evidence beside cell status."""
+    """[R-11] Merge publishes only manifest-declared cell evidence."""
     state = tmp_path / "state"
     executions = state / "executions"
     executions.mkdir(parents=True)
@@ -431,6 +536,8 @@ def test_collection_merges_manifest_declared_execution_ledgers(tmp_path: Path) -
     )
     results = tmp_path / "results"
     (results / "executions").mkdir(parents=True)
+    stale = results / "executions" / ".0001.exitcode.kubectl-collect-1234abcd.tmp"
+    stale.write_text("interrupted\n", encoding="utf-8")
     manifest = state / "publication-manifest.tsv"
     rows = []
     for name in ("0001.status", "0001.exitcode", "0001.workers.tsv"):
@@ -441,7 +548,10 @@ def test_collection_merges_manifest_declared_execution_ledgers(tmp_path: Path) -
             f"{source.stat().st_size}\t{digest}"
         )
     manifest.write_text("\n".join(rows) + "\n", encoding="utf-8")
-    result = _bash(f"_kubectl_merge_collected_results {str(state)!r} {str(results)!r}")
+    result = _bash(
+        f"_kubectl_merge_collected_results {str(state)!r} {str(results)!r} 1234abcd reason; "
+        f"[[ $reason == LEDGER_INCONSISTENT ]]"
+    )
     assert result.returncode == 0, result.stderr
     assert (results / "executions/0001.status").read_text(encoding="utf-8") == (
         "SUCCESS\n"
@@ -450,6 +560,7 @@ def test_collection_merges_manifest_declared_execution_ledgers(tmp_path: Path) -
     assert "node-a" in (results / "executions/0001.workers.tsv").read_text(
         encoding="utf-8"
     )
+    assert not stale.exists()
 
 
 def test_collection_never_follows_result_parent_symlinks(tmp_path: Path) -> None:
@@ -470,10 +581,36 @@ def test_collection_never_follows_result_parent_symlinks(tmp_path: Path) -> None
     outside.mkdir()
     (results / "linked").symlink_to(outside, target_is_directory=True)
     result = _bash(
-        f"! _kubectl_merge_collected_results {str(state)!r} {str(results)!r}"
+        f"! _kubectl_merge_collected_results {str(state)!r} {str(results)!r} "
+        "1234abcd reason; [[ $reason == LEDGER_INCONSISTENT ]]"
     )
     assert result.returncode == 0, result.stderr
     assert not (outside / "output.txt").exists()
+
+
+def test_collection_classifies_parent_creation_failure_as_local_io(
+    tmp_path: Path,
+) -> None:
+    """A failed local mkdir is not mislabeled as a corrupt remote ledger."""
+    state = tmp_path / "state"
+    source = state / "results/0001/output.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("collected\n", encoding="utf-8")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    (state / "publication-manifest.tsv").write_text(
+        f"result\tresults/0001/output.txt\tnew/output.txt\t"
+        f"{source.stat().st_size}\t{digest}\n",
+        encoding="utf-8",
+    )
+    results = tmp_path / "results"
+    results.mkdir()
+    result = _bash(f"""
+        mkdir() {{ return 1; }}
+        ! _kubectl_merge_collected_results {str(state)!r} {str(results)!r} \
+            1234abcd reason
+        [[ "$reason" == LOCAL_IO ]]
+        """)
+    assert result.returncode == 0, result.stderr
 
 
 def test_resume_cleanup_never_follows_result_parent_symlinks(tmp_path: Path) -> None:
@@ -575,7 +712,10 @@ def test_resume_replaces_only_digest_verified_non_success_artifacts(
     (state / "publication-manifest.tsv").write_text(
         "\n".join(manifest_rows) + "\n", encoding="utf-8"
     )
-    result = _bash(f"_kubectl_merge_collected_results {str(state)!r} {str(results)!r}")
+    result = _bash(
+        f"_kubectl_merge_collected_results {str(state)!r} {str(results)!r} "
+        "1234abcd reason"
+    )
     assert result.returncode == 0, result.stderr
     assert retained_success.read_text(encoding="utf-8") == "success\n"
     assert not old_failed.exists()
@@ -610,7 +750,7 @@ def test_fake_kubectl_discovers_only_ready_nonterminating_workers(
 
 
 def test_terminal_job_evidence_preserves_empty_active_field() -> None:
-    """A failed Job with no active count reaches coordinator recovery."""
+    """[T-03] Terminal PVC evidence still waits for Job quiescence."""
     result = _bash("""
         kubectl_verify_object_identity() { :; }
         kubectl_run_bounded() { printf '|0|1||True'; }
@@ -621,7 +761,7 @@ def test_terminal_job_evidence_preserves_empty_active_field() -> None:
 
 
 def test_collection_stream_uses_its_operation_sized_deadline(tmp_path: Path) -> None:
-    """A large archive never inherits the short status-command deadline."""
+    """[R-04] A large archive never inherits the status-command deadline."""
     archive = tmp_path / "attempt.tar"
     result = _bash(f"""
         export KUBECTL_COLLECTION_TIMEOUT_SECONDS=123
@@ -635,8 +775,104 @@ def test_collection_stream_uses_its_operation_sized_deadline(tmp_path: Path) -> 
     assert result.returncode == 0, result.stderr
 
 
+def test_collection_stream_failure_removes_partial_and_reports_auth(
+    tmp_path: Path,
+) -> None:
+    """[R-03] Failed API stream keeps remote truth and no partial archive."""
+    archive = tmp_path / "attempt.tar"
+    result = _bash(f"""
+        KUBECTL_NAMESPACE=test-ns
+        KUBECTL_LIFECYCLE_STATE=TERMINAL
+        kubectl_pvc_exec() {{
+            printf partial
+            printf 'Unauthorized: expired token\n' >&2
+            return 1
+        }}
+        ! kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(archive)!r} /local/state.sh /remote/state/run.status \
+            Job sweep test-ns job-uid ACTIVE
+        test ! -e {str(archive)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=AUTH" in result.stderr
+    assert "remote\\ results\\ were\\ retained" in result.stderr
+    assert (
+        "STORAGE_SCALE_TEST_DIAGNOSTIC_LOCAL_STATE_PATH=/local/state.sh"
+        in result.stderr
+    )
+    assert (
+        "STORAGE_SCALE_TEST_DIAGNOSTIC_REMOTE_STATE_PATH=/remote/state/run.status"
+        in result.stderr
+    )
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_RESOURCE_NAME=sweep" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_JOB_EVIDENCE=ACTIVE" in result.stderr
+
+
+def test_collection_stream_bounds_producer_error_capture(tmp_path: Path) -> None:
+    """A noisy failed exec cannot fill local storage through diagnostic stderr."""
+    archive = tmp_path / "attempt.tar"
+    observed = tmp_path / "observed-bytes"
+    result = _bash(f"""
+        kubectl_pvc_exec() {{
+            head -c 2097152 /dev/zero | tr '\\0' E >&2
+            return 1
+        }}
+        _kubectl_classify_observation_failure() {{
+            printf '%s\n' "${{#3}}" > {str(observed)!r}
+            printf -v "$1" API_UNAVAILABLE
+        }}
+        ! kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(archive)!r}
+        [[ $(cat {str(observed)!r}) -le 131072 ]]
+        test ! -e {str(archive)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_noisy_successful_collection_stream_is_not_killed(tmp_path: Path) -> None:
+    """Discarded diagnostic overflow cannot SIGPIPE an otherwise valid stream."""
+    archive = tmp_path / "attempt.tar"
+    result = _bash(f"""
+        kubectl_pvc_exec() {{
+            printf archive-data
+            head -c 2097152 /dev/zero | tr '\\0' E >&2
+        }}
+        kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(archive)!r}
+        [[ $(cat {str(archive)!r}) == archive-data ]]
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_integration_collection_hold_is_an_explicit_pre_stream_boundary(
+    tmp_path: Path,
+) -> None:
+    """The real-fixture interruption handshake precedes archive receipt."""
+    work = tmp_path / ".kubernetes-collect-work-1234abcd.A1"
+    work.mkdir()
+    archive = work / "attempt.tar"
+    hold = tmp_path / ".integration-kubectl-collection-ready"
+    result = _bash(f"""
+        STORAGE_SCALE_TEST_INTEGRATION=1
+        KUBECTL_INTEGRATION_COLLECTION_HOLD_FILE={str(hold)!r}
+        kubectl_pvc_exec() {{ printf archive-data; }}
+        kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(archive)!r} &
+        pid=$!
+        for _ in $(seq 1 100); do
+            [[ -f {str(hold)!r} ]] && break
+            sleep 0.01
+        done
+        [[ -f {str(hold)!r} && ! -e {str(archive)!r} ]]
+        rm -- {str(hold)!r}
+        wait "$pid"
+        [[ $(cat {str(archive)!r}) == archive-data ]]
+        """)
+    assert result.returncode == 0, result.stderr
+
+
 def test_collection_byte_limit_is_enforced_while_streaming(tmp_path: Path) -> None:
-    """The receiver stops an oversized stream before it fills local storage."""
+    """[R-05] Receive stops an oversized stream before filling local storage."""
     archive = tmp_path / "attempt.tar"
     result = _bash(f"""
         printf 12345678 | _kubectl_write_bounded_collection_stream \
@@ -653,7 +889,7 @@ def test_collection_byte_limit_is_enforced_while_streaming(tmp_path: Path) -> No
 
 
 def test_collection_capacity_checks_the_results_filesystem(tmp_path: Path) -> None:
-    """Collection fails before transfer when its local working set will not fit."""
+    """[R-09] Collection checks capacity on its actual local filesystem."""
     result = _bash(f"""
         calls={str(tmp_path / 'df-calls')!r}
         df() {{
@@ -677,7 +913,7 @@ def test_collection_capacity_checks_the_results_filesystem(tmp_path: Path) -> No
 
 
 def test_collection_scavenges_only_owned_staging_paths(tmp_path: Path) -> None:
-    """A retry removes stale working trees without following hostile links."""
+    """[R-10] Retry removes owned staging without following hostile links."""
     stale = tmp_path / ".kubernetes-collect-1234abcd.A1"
     stale_work = tmp_path / ".kubernetes-collect-work-1234abcd.B2"
     unrelated = tmp_path / ".kubernetes-collect-not-ours"
@@ -785,7 +1021,7 @@ def test_fake_kubectl_rejects_malformed_worker_endpoint_fields(
 def test_worker_endpoint_comparison_reports_replacement_and_ip_drift(
     tmp_path: Path, rows: str, expected_rc: int, expected_status: str
 ) -> None:
-    """Frozen worker identities reject changed addresses but tolerate same-IP replacement."""
+    """[C-10] Frozen workers tolerate only same-IP semantic replacement."""
     nodes = tmp_path / "nodes.tsv"
     nodes.write_text("node-a\tuid-node\tamd64\n", encoding="utf-8")
     frozen = tmp_path / "frozen.tsv"
@@ -856,7 +1092,7 @@ def test_worker_endpoint_comparison_refreshes_existing_evidence(tmp_path: Path) 
 def test_worker_endpoint_comparison_checks_all_frozen_identity_fields(
     tmp_path: Path, node_row: str, pod_image: str, expected_status: str
 ) -> None:
-    """Node recreation, architecture, and image drift all fail closed."""
+    """[C-11] Node recreation, architecture, and image drift fail closed."""
     nodes = tmp_path / "nodes.tsv"
     nodes.write_text("node-a\tuid-node\tamd64\n", encoding="utf-8")
     frozen = tmp_path / "frozen.tsv"
@@ -912,7 +1148,7 @@ def test_worker_discovery_rejects_each_malformed_endpoint_field(
 
 
 def test_helper_template_is_rendered_and_removed_when_readiness_fails() -> None:
-    """A helper cannot leak after an unsuccessful readiness wait."""
+    """[R-02] An unready collector helper is removed with diagnosis."""
     result = _bash("""
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
         export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
@@ -953,16 +1189,139 @@ def test_helper_creation_returns_uid_to_common_caller_variable_names() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_runtime_configuration_rejects_every_invalid_field() -> None:
-    """Validation must not let a bad later field bypass a valid namespace."""
-    result = _bash("""
+@pytest.mark.parametrize(
+    ("variable", "invalid"),
+    (
+        ("KUBECTL_NAMESPACE", "Bad_Name"),
+        ("KUBECTL_PV", "bad/pv"),
+        ("KUBECTL_PVC", "bad/pvc"),
+        ("KUBECTL_NODE_SELECTOR", "bad selector"),
+        ("KUBECTL_ELBENCHO_IMAGE", "bad image"),
+        ("KUBECTL_IMAGE_PULL_POLICY", "Sometimes"),
+        ("KUBECTL_RUN_AS_USER", "0"),
+        ("KUBECTL_RUN_AS_GROUP", "group"),
+    ),
+)
+def test_runtime_configuration_rejects_every_invalid_field(
+    variable: str, invalid: str
+) -> None:
+    """[S-01] Every independent runtime configuration field is validated."""
+    result = _bash(f"""
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV='bad/pv' KUBECTL_PVC=test-pvc
         export KUBECTL_NODE_SELECTOR=storage-test=true
         export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
+        export KUBECTL_PV=test-pv
+        export {variable}={invalid!r}
         ! kubectl_validate_runtime_configuration
         """)
     assert result.returncode == 0, result.stderr
+
+
+def test_prepare_failure_classification_preserves_local_capacity_and_path_causes() -> (
+    None
+):
+    """[S-03] Preparation reports the actual local, capacity, and path boundary."""
+    result = _bash("""
+        kubectl_classify_prepare_failure reason local-identity 1 ''
+        [[ "$reason" == LOCAL_IO ]]
+        kubectl_classify_prepare_failure reason node-capacity 1 \
+          'required=2 eligible=1'
+        [[ "$reason" == INSUFFICIENT_CAPACITY ]]
+        kubectl_classify_prepare_failure reason pvc-paths 1 \
+          'path escapes PVC mount through a symlink'
+        [[ "$reason" == PATH_REJECTED ]]
+        [[ $(_kubectl_observation_safe_action PATH_REJECTED) == \
+          *'correct the configured PVC path'* ]]
+        [[ $(_kubectl_observation_safe_action INSUFFICIENT_CAPACITY) == \
+          *'add eligible worker capacity'* ]]
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("mode", "required", "phase", "reason"),
+    (
+        ("capacity", 2, "node-capacity", "INSUFFICIENT_CAPACITY"),
+        ("path", 1, "pvc-paths", "PATH_REJECTED"),
+    ),
+)
+def test_prepare_reports_specific_capacity_and_path_failures(
+    tmp_path: Path, mode: str, required: int, phase: str, reason: str
+) -> None:
+    """Preparation preserves actionable phase and cause through rollback."""
+    result = _bash(f"""
+        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NODE_SELECTOR=storage-test=true
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000
+        export KUBECTL_RUN_AS_GROUP=2000
+        declare -A mapped=([/mnt/storage-scale-test/bench]=1)
+        mode={mode!r}
+        kubectl_validate_cluster_identity() {{
+            printf 'namespace-uid\tpv-uid\tpvc-uid\n'
+        }}
+        kubectl_discover_candidate_nodes() {{
+            printf 'node-a\tuid-a\tamd64\n' > "$2"
+        }}
+        kubectl_choose_coordinator_node() {{ printf node-a; }}
+        kubectl_create_helper_pod() {{ printf -v "$1" uid-transfer; }}
+        kubectl_validate_pvc_paths() {{
+            [[ "$mode" != path ]] || {{
+                printf 'path escapes PVC mount through a symlink\n' >&2
+                return 1
+            }}
+        }}
+        kubectl_preserve_attempt_diagnostics() {{ :; }}
+        kubectl_cleanup_journaled_resources() {{ :; }}
+        ! kubectl_prepare_attempt_lifecycle attempt {str(tmp_path)!r} \
+          {required} mapped
+    """)
+    assert result.returncode == 0, result.stderr
+    assert f"STORAGE_SCALE_TEST_DIAGNOSTIC_PHASE={phase}" in result.stderr
+    assert f"STORAGE_SCALE_TEST_DIAGNOSTIC_REASON={reason}" in result.stderr
+
+
+def test_r20_cluster_uid_mismatch_emits_structured_diagnosis() -> None:
+    """[R-20] A replacement cluster is refused with exact UID evidence."""
+    result = _bash("""
+        export KUBECTL_NAMESPACE=test-ns KUBECTL_NAMESPACE_UID=namespace-old
+        export KUBECTL_PV=test-pv KUBECTL_PV_UID=pv-old
+        export KUBECTL_PVC=test-pvc KUBECTL_PVC_UID=pvc-old
+        export KUBECTL_LIFECYCLE_STATE=SUBMITTED
+        kubectl_validate_cluster_identity() {
+            printf 'namespace-new\tpv-old\tpvc-old\n'
+        }
+        ! _kubectl_verify_saved_cluster_identity /tmp/kubernetes 1234abcd
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=IDENTITY_MISMATCH" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_RESOURCE_KIND=Namespace" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_EXPECTED_UID=namespace-old" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_OBSERVED_UID=namespace-new" in result.stderr
+    assert "do\\ not\\ adopt" in result.stderr
+
+
+def test_c15_permanent_pvc_loss_is_detected_without_adoption() -> None:
+    """[C-15] Missing durable storage fails closed with identity diagnosis."""
+    result = _bash("""
+        export KUBECTL_NAMESPACE=test-ns KUBECTL_NAMESPACE_UID=namespace-old
+        export KUBECTL_PV=test-pv KUBECTL_PV_UID=pv-old
+        export KUBECTL_PVC=test-pvc KUBECTL_PVC_UID=pvc-old
+        export KUBECTL_LIFECYCLE_STATE=SUBMITTED
+        kubectl_validate_cluster_identity() {
+            printf 'persistentvolumeclaim "test-pvc" not found\n' >&2
+            return 1
+        }
+        ! _kubectl_verify_saved_cluster_identity /tmp/kubernetes 1234abcd
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=IDENTITY_MISMATCH" in result.stderr
+    assert (
+        "STORAGE_SCALE_TEST_DIAGNOSTIC_RESOURCE_KIND=PersistentVolumeClaim"
+        in result.stderr
+    )
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_EXPECTED_UID=pvc-old" in result.stderr
 
 
 def test_always_pull_policy_requires_an_immutable_image_reference() -> None:
@@ -1277,7 +1636,7 @@ def test_remote_release_executes_guards_before_owner_read_and_deletion(
 def test_intended_reservation_does_not_touch_competing_pvc_owner(
     tmp_path: Path,
 ) -> None:
-    """A losing reservation rolls back without waiting for or deleting its winner."""
+    """[S-05] A losing reservation cannot delete its competing winner."""
     mount = tmp_path / "mount"
     result = _bash(_identity(tmp_path / "state") + f"""
         mount={str(mount)!r}
@@ -1312,7 +1671,7 @@ def test_intended_reservation_does_not_touch_competing_pvc_owner(
 def test_collection_recovery_retries_every_cleanup_stage(
     tmp_path: Path, failed_stage: str
 ) -> None:
-    """A durable import remains recoverable across each cleanup failure."""
+    """[R-12] [R-13] Durable import survives each cleanup interruption."""
     results = tmp_path / "results"
     metadata = results / "kubernetes" / "attempts" / "1234abcd"
     (metadata / "collected-state").mkdir(parents=True)
@@ -1398,7 +1757,7 @@ def test_fake_pre_job_lifecycle_orders_identity_reservation_and_workers(
 def test_prepare_failure_terminalizes_only_after_successful_rollback(
     tmp_path: Path,
 ) -> None:
-    """A failed pre-Job handoff becomes SUBMISSION_FAILED after exact cleanup."""
+    """[S-03] [S-14] Failed handoff terminalizes after exact cleanup."""
     result = _bash(f"""
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
         export KUBECTL_NODE_SELECTOR=storage-test=true
@@ -1424,8 +1783,12 @@ def test_prepare_failure_terminalizes_only_after_successful_rollback(
         kubectl_attempt_load_metadata {str(tmp_path)!r}/kubernetes/attempts/"$attempt"
         [[ "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED ]]
         [[ $(cat "$events") == policiesreleasecleanup ]]
-        """)
+    """)
     assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_OPERATION=prepare" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_PHASE=network-policy" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=API_UNAVAILABLE" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_MAY_STILL_BE_RUNNING=no" in result.stderr
 
 
 def test_prepare_rollback_failure_keeps_prepared_attempt_recoverable(
@@ -1513,7 +1876,7 @@ def test_submission_rollback_failure_keeps_prepared_attempt_recoverable(
 def test_interrupted_bundle_upload_never_starts_job_and_rolls_back(
     tmp_path: Path,
 ) -> None:
-    """A partial control transfer is removed before any coordinator can run."""
+    """[S-13] Partial control transfer cannot start a coordinator."""
     results = tmp_path / "results"
     state = results / "kubernetes"
     bundle = tmp_path / "bundle"
@@ -1614,7 +1977,7 @@ def test_prepared_recovery_retains_remote_state_until_job_is_quiescent(
 def test_clean_failed_resume_restores_collected_predecessor_pointer(
     tmp_path: Path,
 ) -> None:
-    """A clean B rollback leaves collected A discoverable for the next resume."""
+    """[R-18] Failed successor rollback restores the collected predecessor."""
     results = tmp_path / "results"
     state = results / "kubernetes"
     result = _bash(_identity(state) + f"""
@@ -1735,7 +2098,7 @@ def test_submission_failed_status_retries_predecessor_restore(tmp_path: Path) ->
 def test_creation_intent_cleans_object_left_before_resource_journal(
     tmp_path: Path,
 ) -> None:
-    """Rollback discovers and deletes an object whose UID journal was interrupted."""
+    """[S-07] Rollback removes an object left before UID journaling."""
     result = _bash(
         _identity(tmp_path / "state")
         + """
@@ -1772,7 +2135,7 @@ def test_repeated_owned_delete_treats_proven_absence_quietly() -> None:
 
 
 def test_creation_intent_rechecks_absence_after_create_deadline(tmp_path: Path) -> None:
-    """A delayed accepted create remains discoverable before intent removal."""
+    """[S-08] Delayed create gets a second bounded absence observation."""
     calls = tmp_path / "calls"
     events = tmp_path / "events"
     result = _bash(_identity(tmp_path / "state") + f"""
@@ -1799,7 +2162,7 @@ def test_creation_intent_rechecks_absence_after_create_deadline(tmp_path: Path) 
 def test_creation_absence_retains_possible_late_object_identity(
     tmp_path: Path,
 ) -> None:
-    """Rollback keeps diagnostic identity after its bounded absence proof."""
+    """[S-09] Ambiguous create retains its possible late identity."""
     state = tmp_path / "state"
     result = _bash(_identity(state) + """
         kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
@@ -1865,7 +2228,7 @@ def test_cleanup_step_journal_is_safe_and_idempotent(tmp_path: Path) -> None:
 
 
 def test_remote_lock_is_published_only_after_ownership() -> None:
-    """The canonical PVC lock never exists without its recovery identity."""
+    """[S-06] PVC lock publication follows durable ownership identity."""
     source = _FUNCTIONS.read_text(encoding="utf-8")
     body = source.split("kubectl_reserve_remote_attempt() {", 1)[1].split(
         "\n}\n\nkubectl_attempt_journal_remote_reservation", 1
@@ -1879,7 +2242,7 @@ def test_remote_lock_is_published_only_after_ownership() -> None:
 def test_cancel_retries_after_job_delete_was_already_journaled(
     tmp_path: Path,
 ) -> None:
-    """A crash after delete-sweep publication cannot strand cancellation."""
+    """[T-08] Cancellation resumes after exact Job deletion was journaled."""
     result = _bash(_identity(tmp_path / "state") + """
         kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
         kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
@@ -1897,6 +2260,30 @@ def test_cancel_retries_after_job_delete_was_already_journaled(
         kubectl_local_lock_release "$fd"
         """)
     assert result.returncode == 0, result.stderr
+
+
+def test_cancel_rejects_missing_exact_job_journal(tmp_path: Path) -> None:
+    """Cancellation cannot finalize while an unowned Job may still be active."""
+    result = _bash(_identity(tmp_path / "state") + """
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_read_remote_status() { printf RUNNING; }
+        finalized=0
+        kubectl_finalize_cancelled_attempt() { finalized=1; }
+        ! kubectl_cancel_journaled_attempt "$root" "$fd" test-ns helper \
+          1234abcd 0123456789abcdef0123456789abcdef
+        kubectl_attempt_load_metadata "$root/attempts/1234abcd"
+        [[ "$KUBECTL_LIFECYCLE_STATE" == CANCEL_REQUESTED ]]
+        [[ "$finalized" -eq 0 ]]
+        kubectl_attempt_journal_step "$root" "$fd" 1234abcd delete-sweep
+        ! kubectl_cancel_journaled_attempt "$root" "$fd" test-ns helper \
+          1234abcd 0123456789abcdef0123456789abcdef
+        [[ "$finalized" -eq 0 ]]
+        kubectl_local_lock_release "$fd"
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=LEDGER_INCONSISTENT" in result.stderr
+    assert "do\\ not\\ cancel\\ by\\ label" in result.stderr
 
 
 def test_no_clobber_journals_remove_unpublished_temporary_files(
@@ -1926,7 +2313,7 @@ def test_no_clobber_journals_remove_unpublished_temporary_files(
 def test_stale_resume_contender_cannot_replace_successful_attempt(
     tmp_path: Path,
 ) -> None:
-    """Resume publication is a compare-and-swap against the collected attempt."""
+    """[R-17] Resume is a compare-and-swap against its predecessor."""
     state = tmp_path / "results" / "kubernetes"
     results = tmp_path / "results"
     result = _bash(_identity(state) + f"""
@@ -1967,7 +2354,7 @@ def test_stale_resume_contender_cannot_replace_successful_attempt(
 
 
 def test_submission_prints_status_cancel_and_collect_commands(tmp_path: Path) -> None:
-    """Every asynchronous control operation is copy-pasteable after submit."""
+    """[S-15] Every lifecycle operation is copy-pasteable after submit."""
     results = tmp_path / "results with spaces"
     results.mkdir()
     result = _bash(f"kubectl_emit_lifecycle_commands {str(results)!r}")
@@ -1975,6 +2362,140 @@ def test_submission_prints_status_cancel_and_collect_commands(tmp_path: Path) ->
     assert "STORAGE_SCALE_TEST_STATUS_COMMAND=" in result.stdout
     assert "STORAGE_SCALE_TEST_CANCEL_COMMAND=" in result.stdout
     assert "STORAGE_SCALE_TEST_COLLECT_COMMAND=" in result.stdout
+
+
+@pytest.mark.parametrize("terminal", ("FAILED", "CANCELLED"))
+def test_collected_terminal_status_is_a_successful_query(
+    tmp_path: Path, terminal: str
+) -> None:
+    """[R-15] Collected status is local, repeatable, and outcome-neutral."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        for next in SUBMITTED TERMINAL COLLECTION_IN_PROGRESS COLLECTED; do
+            kubectl_attempt_transition "$root" "$fd" 1234abcd "$next"
+        done
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        mkdir -p "$root/attempts/1234abcd/collected-state" \
+          "$root/attempts/1234abcd/control-bundle/executions"
+        : > "$root/attempts/1234abcd/configuration.sh"
+        kubectl_local_lock_release "$fd"
+        kubectl_cleanup_ephemeral_helpers() {{ :; }}
+        _kubectl_validate_collected_publication() {{ printf -v "$3" {terminal}; }}
+        _kubectl_verify_saved_cluster_identity() {{ return 99; }}
+        kubectl_lifecycle_operation status {str(results)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert f"STORAGE_SCALE_TEST_KUBECTL_STATE={terminal}" in result.stdout
+
+
+def test_repeated_collect_preserves_failed_benchmark_exit_semantics(
+    tmp_path: Path,
+) -> None:
+    """Only status is outcome-neutral; collect still signals a failed run."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        for next in SUBMITTED TERMINAL COLLECTION_IN_PROGRESS COLLECTED; do
+            kubectl_attempt_transition "$root" "$fd" 1234abcd "$next"
+        done
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        mkdir -p "$root/attempts/1234abcd/collected-state" \
+          "$root/attempts/1234abcd/control-bundle/executions"
+        : > "$root/attempts/1234abcd/configuration.sh"
+        kubectl_local_lock_release "$fd"
+        kubectl_cleanup_ephemeral_helpers() {{ :; }}
+        _kubectl_validate_collected_publication() {{ printf -v "$3" FAILED; }}
+        ! kubectl_lifecycle_operation collect {str(results)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_KUBECTL_STATE=FAILED" in result.stdout
+
+
+def test_status_projects_published_collection_after_remote_cleanup(
+    tmp_path: Path,
+) -> None:
+    """[R-14] Post-publication status names the cleanup state and next command."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        for next in SUBMITTED TERMINAL COLLECTION_IN_PROGRESS; do
+            kubectl_attempt_transition "$root" "$fd" 1234abcd "$next"
+        done
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        mkdir -p "$root/attempts/1234abcd/collected-state" \
+          "$root/attempts/1234abcd/control-bundle/executions"
+        : > "$root/attempts/1234abcd/configuration.sh"
+        kubectl_local_lock_release "$fd"
+        kubectl_cleanup_ephemeral_helpers() {{ :; }}
+        _kubectl_validate_collected_publication() {{ printf -v "$3" FAILED; }}
+        _kubectl_verify_saved_cluster_identity() {{ return 99; }}
+        kubectl_lifecycle_operation status {str(results)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_KUBECTL_STATE=FAILED" in result.stdout
+    assert (
+        "STORAGE_SCALE_TEST_KUBECTL_LOCAL_STATE=COLLECTION_IN_PROGRESS" in result.stdout
+    )
+    assert "STORAGE_SCALE_TEST_COLLECT_COMMAND=" in result.stdout
+
+
+def test_collect_active_attempt_reports_terminal_gate_and_next_action(
+    tmp_path: Path,
+) -> None:
+    """[R-01] Active collection refusal names the terminal prerequisite."""
+    result = _bash(f"""
+        export KUBECTL_NAMESPACE=test-ns
+        kubectl_attempt_load_metadata() {{
+            KUBECTL_LIFECYCLE_STATE=SUBMITTED
+            KUBECTL_ATTEMPT_ID=1234abcd
+        }}
+        _kubectl_scavenge_collection_staging() {{ :; }}
+        _kubectl_create_inspector() {{ printf -v "$1" helper; printf -v "$2" uid; }}
+        kubectl_read_remote_status() {{ printf RUNNING; }}
+        kubectl_attempt_load_resource() {{
+            KUBECTL_RESOURCE_KIND=Job KUBECTL_RESOURCE_NAME=sweep
+            KUBECTL_RESOURCE_NAMESPACE=test-ns KUBECTL_RESOURCE_UID=job-uid
+            KUBECTL_RESOURCE_NONCE=0123456789abcdef0123456789abcdef
+        }}
+        kubectl_job_terminal_state() {{ return 2; }}
+        _kubectl_remove_inspector() {{ :; }}
+        ! kubectl_collect_attempt {str(tmp_path)!r} {str(tmp_path / 'kubernetes')!r} \
+          9 1234abcd
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_PHASE=terminal-gate" in result.stderr
+    assert (
+        "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=INVALID_LIFECYCLE_OPERATION"
+        in result.stderr
+    )
+    assert r"retry\ --collect" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_MAY_STILL_BE_RUNNING=yes" in result.stderr
+
+
+def test_resume_before_collection_prints_exact_collect_command(tmp_path: Path) -> None:
+    """[R-16] Resume rejection prints the exact collection prerequisite."""
+    results = tmp_path / "results with spaces"
+    state = results / "kubernetes"
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        : > "$root/attempts/1234abcd/configuration.sh"
+        kubectl_local_lock_release "$fd"
+        ! kubectl_resume_collected_sweep {str(results)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_COLLECT_COMMAND=" in result.stdout
+    assert "--collect" in result.stdout
+    assert str(results).replace(" ", "\\ ") in result.stdout
+    assert (
+        "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=INVALID_LIFECYCLE_OPERATION"
+        in result.stderr
+    )
 
 
 def test_prepared_attempt_recovery_releases_intended_reservation(
@@ -2012,7 +2533,7 @@ def test_prepared_attempt_recovery_releases_intended_reservation(
 def test_public_status_recovers_coordinator_loss_before_running(
     tmp_path: Path,
 ) -> None:
-    """A failed exact Job makes a PREPARED PVC ledger collectible."""
+    """[T-04] [T-06] Exact Job loss makes PREPARED state collectible."""
     results = tmp_path / "results"
     state = results / "kubernetes"
     calls = tmp_path / "status-calls"
@@ -2050,10 +2571,65 @@ EOF
     assert "STATE=FAILED" in result.stdout
 
 
+def test_status_reports_incomplete_cancellation_as_retryable_failure(
+    tmp_path: Path,
+) -> None:
+    """[T-09] Status reports interrupted cancellation with retry guidance."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd CANCEL_REQUESTED
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
+          Job sweep test-ns job-uid 0123456789abcdef0123456789abcdef
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        cat > "$root/attempts/1234abcd/configuration.sh" <<'EOF'
+export KUBECTL_NAMESPACE=test-ns
+EOF
+        kubectl_local_lock_release "$fd"
+        kubectl_cleanup_ephemeral_helpers() {{ :; }}
+        _kubectl_verify_saved_cluster_identity() {{ :; }}
+        ! kubectl_lifecycle_operation status {str(results)!r}
+    """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_KUBECTL_STATE=CANCEL_REQUESTED" in result.stdout
+    assert (
+        "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=CANCELLATION_INCOMPLETE" in result.stderr
+    )
+    assert "retry\\ --cancel" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_RESOURCE_NAME=sweep" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_EXPECTED_UID=job-uid" in result.stderr
+
+
+def test_status_rejects_cancellation_without_exact_job_journal(
+    tmp_path: Path,
+) -> None:
+    """A corrupt cancellation cannot fall back to label-based ownership."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd CANCEL_REQUESTED
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        cat > "$root/attempts/1234abcd/configuration.sh" <<'EOF'
+export KUBECTL_NAMESPACE=test-ns
+EOF
+        kubectl_local_lock_release "$fd"
+        kubectl_cleanup_ephemeral_helpers() {{ :; }}
+        _kubectl_verify_saved_cluster_identity() {{ :; }}
+        ! kubectl_lifecycle_operation status {str(results)!r}
+    """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=LEDGER_INCONSISTENT" in result.stderr
+    assert "do\\ not\\ cancel\\ by\\ label" in result.stderr
+
+
 def test_completed_job_with_nonterminal_ledger_is_diagnosed(
     tmp_path: Path,
 ) -> None:
-    """Contradictory Job and PVC evidence never degrades to a generic error."""
+    """[T-05] Complete Job plus nonterminal PVC state is diagnosed."""
     results = tmp_path / "results"
     state = results / "kubernetes"
     result = _bash(_identity(state) + f"""
@@ -2081,7 +2657,7 @@ EOF
 
 
 def test_missing_worker_daemonset_emits_identity_diagnostics(tmp_path: Path) -> None:
-    """External worker deletion fails closed with an actionable diagnosis."""
+    """[C-12] [T-10] Missing or replaced workers emit identity evidence."""
     state = tmp_path / "results" / "kubernetes"
     result = _bash(_identity(state) + """
         kubectl_attempt_journal_resource "$root" "$fd" 1234abcd workers \

@@ -70,7 +70,8 @@ Resume (continue an interrupted prior sweep run):
                           with all other flags.
 
 Kubernetes lifecycle (kubectl substrate only):
-  --status <results_dir>   Query an asynchronous sweep without changing it.
+  --status <results_dir>   Inspect an asynchronous sweep and perform bounded,
+                          exact-identity reconciliation when recovery is required.
   --cancel <results_dir>   Stop the exact saved attempt and preserve results.
   --collect <results_dir>  Publish a terminal attempt into the local result tree.
 

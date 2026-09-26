@@ -300,7 +300,7 @@ def test_multinode_cell_persists_worker_selection_before_fake_elbencho(tmp_path)
 def test_crash_boundaries_never_advertise_uncommitted_terminal_cells(
     tmp_path, boundary, status, manifest_present
 ):
-    """A killed Job leaves only manifest-backed terminal work collectible."""
+    """[C-07] Crash boundaries expose only manifest-backed terminal work."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
     result = _run_coordinator(
         control,
@@ -329,7 +329,7 @@ def test_crash_boundaries_never_advertise_uncommitted_terminal_cells(
 def test_pre_running_crash_boundaries_recover_to_collectable_failure(
     tmp_path, boundary
 ):
-    """A dead exact Job is recoverable after every durable startup checkpoint."""
+    """[C-02] A dead Job is recoverable at each durable startup checkpoint."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=2)
     state_dir.mkdir()
     (state_dir / "run.status").write_text("PREPARED\n", encoding="utf-8")
@@ -349,10 +349,25 @@ def test_pre_running_crash_boundaries_recover_to_collectable_failure(
     assert (state_dir / "run.status").read_text(encoding="utf-8").strip() == "FAILED"
     assert (state_dir / "executions/0001.status").read_text(
         encoding="utf-8"
-    ).strip() == "FAILED"
+    ).strip() == "PENDING"
     assert "observed_status\tPREPARED" in (
         state_dir / "coordinator-loss.tsv"
     ).read_text(encoding="utf-8")
+
+
+def test_duplicate_coordinator_cannot_mutate_an_owned_attempt(tmp_path):
+    """[C-01] A duplicate Job Pod exits behind the durable coordinator lock."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
+    state_dir.mkdir()
+    lock = state_dir / "coordinator.lock"
+    lock.mkdir()
+    (lock / "owner.tsv").write_text(
+        "schema\t1\nattempt_id\t1234abcd\npid\t1\n", encoding="utf-8"
+    )
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode != 0
+    assert "another coordinator owns this attempt" in result.stderr
+    assert not (state_dir / "run.status").exists()
 
 
 def test_generated_target_symlink_cannot_escape_pvc(tmp_path):
@@ -370,7 +385,7 @@ def test_generated_target_symlink_cannot_escape_pvc(tmp_path):
 
 
 def test_lost_coordinator_recovery_publishes_failed_running_cell(tmp_path):
-    """A terminal Job can convert durable RUNNING evidence into a resume gate."""
+    """[C-06] Lost coordinator converts RUNNING evidence into a resume gate."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
     crashed = _run_coordinator(
         control,
@@ -452,7 +467,7 @@ def test_lost_coordinator_recovery_publishes_all_terminal_success(tmp_path):
 
 
 def test_lost_coordinator_repairs_terminal_status_manifest_window(tmp_path):
-    """A crash after terminal run status can republish complete evidence."""
+    """[C-08] Terminal status without its manifest is repaired."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
     crashed = _run_coordinator(
         control,
@@ -526,7 +541,7 @@ def test_lost_coordinator_keeps_later_pending_cells_after_terminal_failure(tmp_p
 
 
 def test_lost_coordinator_before_first_cell_publishes_resumable_failure(tmp_path):
-    """A Job lost after run startup marks the first pending cell resumable."""
+    """A Job lost before the first cell leaves every unstarted cell pending."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=2)
     crashed = _run_coordinator(
         control,
@@ -563,7 +578,7 @@ def test_lost_coordinator_before_first_cell_publishes_resumable_failure(tmp_path
     assert recovered.returncode == 0, recovered.stderr
     assert (state_dir / "executions/0001.status").read_text(
         encoding="utf-8"
-    ).strip() == "FAILED"
+    ).strip() == "PENDING"
     assert (state_dir / "executions/0002.status").read_text(
         encoding="utf-8"
     ).strip() == "PENDING"
@@ -573,7 +588,7 @@ def test_lost_coordinator_before_first_cell_publishes_resumable_failure(tmp_path
 
 
 def test_cancel_recovery_publishes_collectable_terminal_ledger(tmp_path):
-    """A deleted Job can still publish its interrupted cell as cancelled."""
+    """[T-07] Deleted Job publishes a collectable cancelled ledger."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
     crashed = _run_coordinator(
         control,
@@ -632,7 +647,7 @@ def test_cancel_recovery_publishes_collectable_terminal_ledger(tmp_path):
 
 
 def test_failure_overlay_preserves_first_failure_and_stops_later_cells(tmp_path):
-    """The test-only overlay fails one cell without allowing the next cell."""
+    """[C-04] Failure preserves its cell and prevents later execution."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=2)
     overlay = tmp_path / "fail-once"
     marker = tmp_path / "overlay-marker"
@@ -673,6 +688,28 @@ def test_failure_overlay_preserves_first_failure_and_stops_later_cells(tmp_path)
     assert (state_dir / "results" / "0002" / "injected.txt").exists()
 
 
+def test_worker_service_failure_stops_current_cell_without_retry(tmp_path):
+    """[C-09] Worker-service failure fails once and leaves later cells pending."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=2)
+    record = control.parent / "fake-record"
+    result = _run_coordinator(
+        control,
+        state_dir,
+        scratch,
+        fake,
+        FAKE_ELBENCHO_FAIL_ID="0001",
+    )
+    assert result.returncode != 0
+    assert record.read_text(encoding="utf-8").count("0001|") == 1
+    assert "0002|" not in record.read_text(encoding="utf-8")
+    assert (state_dir / "executions/0001.status").read_text(
+        encoding="utf-8"
+    ).strip() == "FAILED"
+    assert (state_dir / "executions/0002.status").read_text(
+        encoding="utf-8"
+    ).strip() == "PENDING"
+
+
 def test_bundle_tampering_fails_before_state_or_lock_mutation(tmp_path):
     """The coordinator never adopts an altered control plan."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
@@ -684,7 +721,7 @@ def test_bundle_tampering_fails_before_state_or_lock_mutation(tmp_path):
 
 
 def test_startup_endpoint_failure_publishes_a_collectible_terminal_ledger(tmp_path):
-    """Failure after the durable lock never strands an active-looking attempt."""
+    """[C-03] Startup convergence failure publishes a terminal ledger."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
     (control / "worker-endpoints.tsv").write_text(
         "broken\tbroken-pod\tpod\t999.10.0.1\n"
@@ -859,7 +896,7 @@ def test_coordinator_local_context_allows_only_the_one_node_hostless_case(tmp_pa
 
 
 def test_signal_publishes_terminal_failure_without_erasing_scratch_evidence(tmp_path):
-    """A terminating Job leaves a collector-visible FAILED cell and run."""
+    """[C-05] TERM leaves collector-visible failed cell and run evidence."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
     _make_executable(
         fake,

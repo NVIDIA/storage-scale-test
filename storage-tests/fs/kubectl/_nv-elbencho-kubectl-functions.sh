@@ -38,6 +38,11 @@ readonly KUBECTL_CREATION_AMBIGUITY_SECONDS_DEFAULT=30
 readonly KUBECTL_CREATION_ABSENCE_RECHECK_SECONDS_DEFAULT=2
 readonly KUBECTL_OBSERVATION_ATTEMPTS_DEFAULT=3
 readonly KUBECTL_OBSERVATION_BACKOFF_SECONDS_DEFAULT=1
+readonly KUBECTL_DIAGNOSTIC_SCHEMA_VERSION=1
+readonly KUBECTL_DIAGNOSTIC_MAX_BUNDLES=8
+readonly KUBECTL_DIAGNOSTIC_MAX_BYTES=$((4 * 1024 * 1024))
+readonly KUBECTL_DIAGNOSTIC_MAX_PODS=4
+readonly KUBECTL_COLLECTION_ERROR_MAX_BYTES=$((128 * 1024))
 declare -gA KUBECTL_LOCAL_LOCK_ROOTS=()
 
 kubectl_normalize_logical_path() {
@@ -493,7 +498,7 @@ kubectl_emit_lifecycle_commands() {
 
 kubectl_emit_state() {
     local state="$1"
-    [[ "$state" =~ ^(PREPARED|SUBMITTED|RUNNING|SUCCESS|FAILED|CANCELLED|SUBMISSION_FAILED|COLLECTED)$ ]] \
+    [[ "$state" =~ ^(PREPARED|SUBMITTED|RUNNING|SUCCESS|FAILED|CANCELLED|CANCEL_REQUESTED|SUBMISSION_FAILED|COLLECTED)$ ]] \
         || return 1
     printf 'STORAGE_SCALE_TEST_KUBECTL_STATE=%s\n' "$state"
 }
@@ -569,10 +574,10 @@ kubectl_report_lifecycle_error() {
     local operation="$1" phase="$2" reason="$3" safe_next_action="$4"
     local may_still_be_running="$5" kind="${6:-}" name="${7:-}"
     local namespace="${8:-}" expected_uid="${9:-}" observed_uid="${10:-}"
-    local diagnostic_path="${11:-}"
+    local diagnostic_path="${11:-}" job_evidence="${12:-}"
     [[ "$operation" =~ ^[a-z][a-z0-9-]*$ \
         && "$phase" =~ ^[a-z][a-z0-9-]*$ \
-        && "$reason" =~ ^(AUTH|TIMEOUT|API_THROTTLED|API_UNAVAILABLE|IDENTITY_MISMATCH|POD_UNSCHEDULABLE|IMAGE_PULL|PVC_MOUNT|PVC_IO|ENOSPC|LOCAL_IO|LEDGER_INCONSISTENT|OWNERSHIP_AMBIGUOUS)$ \
+        && "$reason" =~ ^(AUTH|TIMEOUT|API_THROTTLED|API_UNAVAILABLE|IDENTITY_MISMATCH|POD_UNSCHEDULABLE|IMAGE_PULL|PVC_MOUNT|PVC_IO|ENOSPC|LOCAL_IO|PATH_REJECTED|INSUFFICIENT_CAPACITY|ARCHIVE_INVALID|LEDGER_INCONSISTENT|OWNERSHIP_AMBIGUOUS|CANCELLATION_INCOMPLETE|INVALID_LIFECYCLE_OPERATION)$ \
         && "$may_still_be_running" =~ ^(yes|no|unknown)$ ]] || return 1
     {
         printf 'STORAGE_SCALE_TEST_DIAGNOSTIC_OPERATION=%q\n' "$operation"
@@ -583,6 +588,7 @@ kubectl_report_lifecycle_error() {
             "${KUBECTL_LIFECYCLE_STATE:-unknown}"
         printf 'STORAGE_SCALE_TEST_DIAGNOSTIC_REMOTE_STATE=%q\n' \
             "${KUBECTL_REMOTE_STATE:-unknown}"
+        printf 'STORAGE_SCALE_TEST_DIAGNOSTIC_JOB_EVIDENCE=%q\n' "$job_evidence"
         printf 'STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=%q\n' "$reason"
         printf 'STORAGE_SCALE_TEST_DIAGNOSTIC_RESOURCE_KIND=%q\n' "$kind"
         printf 'STORAGE_SCALE_TEST_DIAGNOSTIC_RESOURCE_NAME=%q\n' "$name"
@@ -599,6 +605,20 @@ kubectl_report_lifecycle_error() {
         printf 'STORAGE_SCALE_TEST_DIAGNOSTIC_SAFE_NEXT_ACTION=%q\n' \
             "$safe_next_action"
     } >&2
+}
+
+kubectl_report_collection_failure() {
+    local attempt_id="$1" phase="$2" reason="$3" action="$4"
+    local local_path="$5" remote_path="$6" diagnostic_path="${7:-}"
+    local kind="${8:-}" name="${9:-}" namespace="${10:-}"
+    local expected_uid="${11:-}" observed_uid="${12:-}" job_evidence="${13:-}"
+    KUBECTL_ATTEMPT_ID="$attempt_id" \
+        KUBECTL_DIAGNOSTIC_LOCAL_STATE_PATH="$local_path" \
+        KUBECTL_DIAGNOSTIC_REMOTE_STATE_PATH="$remote_path" \
+        kubectl_report_lifecycle_error collect "$phase" "$reason" "$action" no \
+            "$kind" "$name" "${namespace:-${KUBECTL_NAMESPACE:-}}" \
+            "$expected_uid" "$observed_uid" "$diagnostic_path" \
+            "$job_evidence" || true
 }
 
 _kubectl_observation_failure_is_transient() {
@@ -632,6 +652,13 @@ _kubectl_observation_safe_action() {
         AUTH) printf '%s' 'authenticate kubectl and retry the same lifecycle command' ;;
         IDENTITY_MISMATCH)
             printf '%s' 'inspect the expected resource identity before retrying'
+            ;;
+        LOCAL_IO) printf '%s' 'repair local storage or permissions and retry submission' ;;
+        PATH_REJECTED)
+            printf '%s' 'correct the configured PVC path or unsafe symlink and retry submission'
+            ;;
+        INSUFFICIENT_CAPACITY)
+            printf '%s' 'adjust the node selector or add eligible worker capacity and retry submission'
             ;;
         *) printf '%s' 'retry the same lifecycle command' ;;
     esac
@@ -695,6 +722,153 @@ kubectl_run_observational() {
     return 1
 }
 
+kubectl_run_prepare_phase() {
+    local phase="$1"
+    shift
+    local stderr_path rc=0 output=""
+    [[ "$phase" =~ ^[a-z][a-z0-9-]*$ ]] || return 1
+    stderr_path=$(mktemp "${TMPDIR:-/tmp}/storage-scale-test-prepare.XXXXXX") \
+        || return 1
+    "$@" 2> "$stderr_path" || rc=$?
+    output=$(head -c 524288 -- "$stderr_path" 2>/dev/null) || output=""
+    cat -- "$stderr_path" >&2 || rc=1
+    rm -f -- "$stderr_path" || rc=1
+    if [[ "$rc" -ne 0 ]]; then
+        KUBECTL_PREPARE_FAILURE_PHASE="$phase"
+        KUBECTL_PREPARE_FAILURE_REASON=""
+        KUBECTL_PREPARE_FAILURE_RC="$rc"
+        KUBECTL_PREPARE_FAILURE_OUTPUT="$output"
+    fi
+    return "$rc"
+}
+
+kubectl_run_prepare_phase_capture() {
+    local output_variable="$1" phase="$2"
+    shift 2
+    [[ "$output_variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    local output_path stderr_path rc=0 output="" error_output=""
+    output_path=$(mktemp "${TMPDIR:-/tmp}/storage-scale-test-prepare-out.XXXXXX") \
+        || return 1
+    stderr_path=$(mktemp "${TMPDIR:-/tmp}/storage-scale-test-prepare-err.XXXXXX") \
+        || { rm -f -- "$output_path"; return 1; }
+    "$@" > "$output_path" 2> "$stderr_path" || rc=$?
+    output=$(cat -- "$output_path") || rc=1
+    error_output=$(head -c 524288 -- "$stderr_path" 2>/dev/null) || error_output=""
+    cat -- "$stderr_path" >&2 || rc=1
+    rm -f -- "$output_path" "$stderr_path" || rc=1
+    printf -v "$output_variable" '%s' "$output"
+    if [[ "$rc" -ne 0 ]]; then
+        KUBECTL_PREPARE_FAILURE_PHASE="$phase"
+        KUBECTL_PREPARE_FAILURE_REASON=""
+        KUBECTL_PREPARE_FAILURE_RC="$rc"
+        KUBECTL_PREPARE_FAILURE_OUTPUT="$error_output$output"
+    fi
+    return "$rc"
+}
+
+kubectl_classify_prepare_failure() {
+    local output_variable="$1" phase="$2" rc="$3" output="$4"
+    [[ "$output_variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    local reason=""
+    if [[ "$phase" == local-* ]]; then
+        reason=LOCAL_IO
+    else
+        _kubectl_classify_observation_failure reason "$rc" "$output" \
+            || reason=API_UNAVAILABLE
+    fi
+    if grep -Eqi 'no space left|enospc' <<< "$output"; then
+        reason=ENOSPC
+    elif [[ "$phase" == node-capacity ]]; then
+        reason=INSUFFICIENT_CAPACITY
+    elif grep -Eqi 'path escapes PVC mount|overlaps orchestration state|unsafe symlink|symlink containment' \
+            <<< "$output"; then
+        reason=PATH_REJECTED
+    elif [[ "$phase" =~ ^(remote-reservation|remote-control)$ \
+            && "$reason" == API_UNAVAILABLE ]] \
+            && grep -Eqi 'permission denied|read-only file system|input/output error|stale file handle' \
+                <<< "$output"; then
+        reason=PVC_IO
+    elif [[ "$phase" =~ ^(helper-ready|worker-ready)$ \
+            && "$reason" == API_UNAVAILABLE ]]; then
+        reason=POD_UNSCHEDULABLE
+    fi
+    printf -v "$output_variable" '%s' "$reason"
+}
+
+kubectl_record_prepare_failure() {
+    local phase="$1" reason="$2" rc="$3" output="$4"
+    [[ "$phase" =~ ^[a-z][a-z0-9-]*$ \
+        && "$reason" =~ ^(LOCAL_IO|LEDGER_INCONSISTENT|INSUFFICIENT_CAPACITY|PATH_REJECTED)$ \
+        && "$rc" =~ ^[1-9][0-9]*$ ]] || return 1
+    KUBECTL_PREPARE_FAILURE_PHASE="$phase"
+    KUBECTL_PREPARE_FAILURE_REASON="$reason"
+    KUBECTL_PREPARE_FAILURE_RC="$rc"
+    KUBECTL_PREPARE_FAILURE_OUTPUT="$output"
+}
+
+kubectl_capture_retained_resource_identities() {
+    local metadata_dir="$1" run_id="$2" destination="$3"
+    local kubernetes_dir="${metadata_dir%/attempts/"$run_id"}"
+    [[ "$metadata_dir" == "$kubernetes_dir/attempts/$run_id" \
+        && "$run_id" =~ ^[0-9a-f]{8}$ ]] || return 1
+    local key intent_file
+    {
+        printf 'schema\t%s\n' "$KUBECTL_ATTEMPT_RESOURCE_SCHEMA_VERSION"
+        printf 'key\tsource\tkind\tname\tnamespace\tuid\tnonce\n'
+        for key in sweep workers transfer; do
+            if kubectl_attempt_resource_exists "$kubernetes_dir" "$run_id" "$key" \
+                    && kubectl_attempt_load_resource "$kubernetes_dir" "$run_id" "$key"; then
+                printf '%s\tjournal\t%s\t%s\t%s\t%s\t%s\n' "$key" \
+                    "$KUBECTL_RESOURCE_KIND" "$KUBECTL_RESOURCE_NAME" \
+                    "$KUBECTL_RESOURCE_NAMESPACE" "$KUBECTL_RESOURCE_UID" \
+                    "$KUBECTL_RESOURCE_NONCE"
+            fi
+            intent_file="$metadata_dir/creation-intents/$key.sh"
+            if [[ -f "$intent_file" && ! -L "$intent_file" ]] \
+                    && kubectl_attempt_load_creation_intent "$intent_file"; then
+                printf '%s\tintent\t%s\t%s\t%s\t%s\t%s\n' "$key" \
+                    "$KUBECTL_INTENT_KIND" "$KUBECTL_INTENT_NAME" \
+                    "$KUBECTL_INTENT_NAMESPACE" \
+                    "${KUBECTL_INTENT_UID:-unknown}" "$KUBECTL_INTENT_NONCE"
+            fi
+        done
+    } > "$destination"
+}
+
+kubectl_capture_control_state_evidence() {
+    local namespace="$1" pod="$2" run_id="$3" destination="$4"
+    local remote_run guard_script
+    remote_run=$(kubectl_attempt_remote_root "$run_id") || return 1
+    guard_script=$(kubectl_remote_tree_guard_script) || return 1
+    KUBECTL_REQUEST_TIMEOUT_SECONDS=5 KUBECTL_PROCESS_TIMEOUT_SECONDS=5 \
+        kubectl_pvc_exec "$namespace" "$pod" /bin/bash -ceu \
+            "$guard_script
+            state=\"\$run/state\"
+            [[ -d \"\$state\" && ! -L \"\$state\" ]] || exit 1
+            state_real=\$(realpath -e -- \"\$state\") || exit 1
+            [[ \"\$state_real\" == \"\$run_real/state\" ]] || exit 1
+            emit_file() {
+                local relative=\"\$1\" path=\"\$state/\$1\"
+                [[ -f \"\$path\" && ! -L \"\$path\" ]] || return 0
+                printf '===== %s =====\\n' \"\$relative\"
+                head -c 65536 -- \"\$path\"
+                printf '\\n'
+            }
+            emit_file run.status
+            emit_file run-summary.tsv
+            emit_file publication-manifest.tsv
+            emit_file coordinator-loss.tsv
+            if [[ -d \"\$state/executions\" && ! -L \"\$state/executions\" ]]; then
+                while IFS= read -r path; do
+                    relative=\${path#\"\$state/\"}
+                    emit_file \"\$relative\"
+                done < <(find -P \"\$state/executions\" -maxdepth 1 -type f \
+                    \\( -name '*.status' -o -name '*.exitcode' -o -name '*.workers.tsv' \\) \
+                    -print | sort | head -n 512)
+            fi" bash "$remote_run" "$run_id" \
+            2>&1 | head -c 524288 > "$destination"
+}
+
 kubectl_capture_resource_diagnostics() {
     local metadata_dir="$1" operation="$2" namespace="$3" kind="$4" name="$5"
     local run_id="$6"
@@ -705,49 +879,105 @@ kubectl_capture_resource_diagnostics() {
         && "$run_id" =~ ^[0-9a-f]{8}$ ]] \
         && kubectl_validate_namespace_name "$namespace" \
         && kubectl_validate_object_name "$name" || return 1
-    local root="$metadata_dir/diagnostics" destination
+    local root="$metadata_dir/diagnostics" destination temporary candidate
     if [[ -e "$root" || -L "$root" ]]; then
         [[ -d "$root" && ! -L "$root" ]] || return 1
     else
         mkdir -- "$root" || return 1
     fi
+    for candidate in "$root"/.diagnostic-tmp-*; do
+        [[ -e "$candidate" || -L "$candidate" ]] || continue
+        [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
+        rm -rf -- "$candidate" || return 1
+    done
     destination="$root/${operation}-$(date -u +%Y%m%dT%H%M%SZ)-${BASHPID:-$$}-$RANDOM"
-    mkdir -- "$destination" || return 1
+    temporary=$(mktemp -d "$root/.diagnostic-tmp-XXXXXXXX") || return 1
+    {
+        printf 'schema\t%s\n' "$KUBECTL_DIAGNOSTIC_SCHEMA_VERSION"
+        printf 'operation\t%s\n' "$operation"
+        printf 'attempt_id\t%s\n' "$run_id"
+        printf 'namespace\t%s\n' "$namespace"
+        printf 'resource_kind\t%s\n' "$kind"
+        printf 'resource_name\t%s\n' "$name"
+        printf 'captured_at\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$temporary/bundle.tsv" || {
+        rm -rf -- "$temporary"
+        return 1
+    }
     KUBECTL_REQUEST_TIMEOUT_SECONDS=5 KUBECTL_PROCESS_TIMEOUT_SECONDS=5 \
         kubectl_run_bounded -n "$namespace" get "$kind" "$name" -o yaml \
-            2>&1 | head -c 524288 > "$destination/resource.yaml" || true
+            2>&1 | head -c 524288 > "$temporary/resource.yaml" || true
     KUBECTL_REQUEST_TIMEOUT_SECONDS=5 KUBECTL_PROCESS_TIMEOUT_SECONDS=5 \
         kubectl_run_bounded -n "$namespace" describe "$kind" "$name" \
-            2>&1 | head -c 524288 > "$destination/resource.describe" || true
+            2>&1 | head -c 524288 > "$temporary/resource.describe" || true
     KUBECTL_REQUEST_TIMEOUT_SECONDS=5 KUBECTL_PROCESS_TIMEOUT_SECONDS=5 \
         kubectl_run_bounded -n "$namespace" get pods \
             -l "storage-scale-test.nvidia.com/run=$run_id" -o yaml \
-            2>&1 | head -c 524288 > "$destination/pods.yaml" || true
+            2>&1 | head -c 524288 > "$temporary/pods.yaml" || true
     KUBECTL_REQUEST_TIMEOUT_SECONDS=5 KUBECTL_PROCESS_TIMEOUT_SECONDS=5 \
         kubectl_run_bounded -n "$namespace" logs \
             -l "storage-scale-test.nvidia.com/run=$run_id" \
             --all-containers=true --prefix=true --tail=200 \
-            2>&1 | head -c 1048576 > "$destination/pods.log" || true
-    local pod_names="" pod_ref pod_name
+            2>&1 | head -c 1048576 > "$temporary/pods.log" || true
+    local pod_names="" pod_ref pod_name evidence_pod=""
     pod_names=$(KUBECTL_REQUEST_TIMEOUT_SECONDS=5 KUBECTL_PROCESS_TIMEOUT_SECONDS=5 \
         kubectl_run_bounded -n "$namespace" get pods \
             -l "storage-scale-test.nvidia.com/run=$run_id" -o name 2>/dev/null \
             | head -c 65536) \
         || pod_names=""
     local pod_count=0
-    : > "$destination/events.txt" || return 1
+    : > "$temporary/events.txt" || {
+        rm -rf -- "$temporary"
+        return 1
+    }
     while IFS= read -r pod_ref; do
         [[ "$pod_ref" == pod/* ]] || continue
         pod_count=$((pod_count + 1))
-        (( pod_count <= 4 )) || break
+        (( pod_count <= KUBECTL_DIAGNOSTIC_MAX_PODS )) || break
         pod_name=${pod_ref#pod/}
         kubectl_validate_object_name "$pod_name" || continue
+        [[ -n "$evidence_pod" ]] || evidence_pod="$pod_name"
+        KUBECTL_REQUEST_TIMEOUT_SECONDS=3 KUBECTL_PROCESS_TIMEOUT_SECONDS=3 \
+            kubectl_run_bounded -n "$namespace" describe pod "$pod_name" \
+                2>&1 | head -c 65536 \
+                > "$temporary/pod-${pod_count}.describe" || true
         KUBECTL_REQUEST_TIMEOUT_SECONDS=3 KUBECTL_PROCESS_TIMEOUT_SECONDS=3 \
             kubectl_run_bounded -n "$namespace" get events \
                 --field-selector "involvedObject.name=$pod_name" \
                 --sort-by=.metadata.creationTimestamp \
-                2>&1 | head -c 131072 >> "$destination/events.txt" || true
+                2>&1 | head -c 131072 >> "$temporary/events.txt" || true
     done <<< "$pod_names"
+    kubectl_capture_retained_resource_identities "$metadata_dir" "$run_id" \
+        "$temporary/retained-resource-identities.tsv" || true
+    if [[ -n "$evidence_pod" ]]; then
+        kubectl_capture_control_state_evidence "$namespace" "$evidence_pod" \
+            "$run_id" "$temporary/pvc-control-state.txt" || true
+    fi
+    local diagnostic_bytes
+    diagnostic_bytes=$(du -sb -- "$temporary" | awk '{print $1}') || {
+        rm -rf -- "$temporary"
+        return 1
+    }
+    if [[ ! "$diagnostic_bytes" =~ ^[0-9]+$ \
+            || "$diagnostic_bytes" -gt "$KUBECTL_DIAGNOSTIC_MAX_BYTES" ]]; then
+        rm -rf -- "$temporary"
+        return 1
+    fi
+    mv -- "$temporary" "$destination" || {
+        rm -rf -- "$temporary"
+        return 1
+    }
+    local -a bundles=()
+    while IFS= read -r candidate; do
+        bundles+=("$candidate")
+    done < <(find -P "$root" -mindepth 1 -maxdepth 1 -type d \
+        ! -name '.diagnostic-tmp-*' -printf '%T@\t%p\n' | sort -rn | cut -f2-)
+    for ((pod_count = KUBECTL_DIAGNOSTIC_MAX_BUNDLES; \
+            pod_count < ${#bundles[@]}; pod_count++)); do
+        candidate="${bundles[$pod_count]}"
+        [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
+        rm -rf -- "$candidate" || return 1
+    done
     printf '%s\n' "$destination"
 }
 
@@ -832,19 +1062,23 @@ kubectl_capture_attempt_diagnostics() {
     if [[ -e "$diagnostic_root" || -L "$diagnostic_root" ]]; then
         [[ -d "$diagnostic_root" && ! -L "$diagnostic_root" ]] || return 1
     fi
-    local key intent_file diagnostic_path=""
+    local key intent_file diagnostic_path="" identity captured=0
     local -a resource_keys=(sweep workers transfer)
+    local -A captured_identities=()
     for key in "${resource_keys[@]}"; do
         if kubectl_attempt_resource_exists "$kubernetes_dir" "$attempt_id" "$key"; then
             kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" "$key" \
                 || continue
+            identity="$KUBECTL_RESOURCE_NAMESPACE/$KUBECTL_RESOURCE_KIND/$KUBECTL_RESOURCE_NAME"
+            [[ -z "${captured_identities[$identity]:-}" ]] || continue
             diagnostic_path=$(kubectl_capture_resource_diagnostics "$metadata_dir" \
                 "$operation" "$KUBECTL_RESOURCE_NAMESPACE" \
                 "$KUBECTL_RESOURCE_KIND" "$KUBECTL_RESOURCE_NAME" "$attempt_id") \
                 || diagnostic_path=""
             if [[ -n "$diagnostic_path" ]]; then
                 printf '%s\n' "$diagnostic_path"
-                return 0
+                captured=1
+                captured_identities[$identity]=1
             fi
         fi
     done
@@ -852,23 +1086,38 @@ kubectl_capture_attempt_diagnostics() {
         intent_file="$metadata_dir/creation-intents/$key.sh"
         [[ -e "$intent_file" || -L "$intent_file" ]] || continue
         kubectl_attempt_load_creation_intent "$intent_file" || continue
+        identity="$KUBECTL_INTENT_NAMESPACE/$KUBECTL_INTENT_KIND/$KUBECTL_INTENT_NAME"
+        [[ -z "${captured_identities[$identity]:-}" ]] || continue
         diagnostic_path=$(kubectl_capture_resource_diagnostics "$metadata_dir" \
             "$operation" "$KUBECTL_INTENT_NAMESPACE" "$KUBECTL_INTENT_KIND" \
             "$KUBECTL_INTENT_NAME" "$attempt_id") || diagnostic_path=""
         if [[ -n "$diagnostic_path" ]]; then
             printf '%s\n' "$diagnostic_path"
-            return 0
+            captured=1
+            captured_identities[$identity]=1
         fi
     done
-    return 1
+    [[ "$captured" -eq 1 ]]
 }
 
 kubectl_preserve_attempt_diagnostics() {
-    local kubernetes_dir="$1" attempt_id="$2" operation="$3" diagnostic_path=""
-    diagnostic_path=$(kubectl_capture_attempt_diagnostics "$kubernetes_dir" \
-        "$attempt_id" "$operation") || diagnostic_path=""
-    [[ -z "$diagnostic_path" ]] \
-        || printf 'Kubernetes failure diagnostics: %s\n' "$diagnostic_path" >&2
+    local kubernetes_dir="$1" attempt_id="$2" operation="$3"
+    local diagnostic_paths="" diagnostic_path=""
+    diagnostic_paths=$(kubectl_capture_attempt_diagnostics "$kubernetes_dir" \
+        "$attempt_id" "$operation") || diagnostic_paths=""
+    if [[ -n "$diagnostic_paths" ]]; then
+        while IFS= read -r diagnostic_path; do
+            [[ -n "$diagnostic_path" ]] || continue
+            printf 'Kubernetes failure diagnostics: %s\n' "$diagnostic_path" >&2
+        done <<< "$diagnostic_paths"
+    else
+        printf 'Warning: automatic Kubernetes diagnostic capture failed.\n' >&2
+        printf 'Inspect retained resources with:\n' >&2
+        printf '  kubectl -n %q get job,daemonset,pod,networkpolicy -l %q -o wide\n' \
+            "${KUBECTL_NAMESPACE:-unknown}" \
+            "storage-scale-test.nvidia.com/run=$attempt_id" >&2
+        printf 'The last proven local and PVC state was retained for retry.\n' >&2
+    fi
     return 0
 }
 
@@ -877,25 +1126,31 @@ kubectl_classify_readiness_failure() {
     [[ "$output_variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ \
         && "$run_id" =~ ^[0-9a-f]{8}$ ]] \
         && kubectl_validate_namespace_name "$namespace" || return 1
-    local evidence="" pod_names="" pod_ref pod_name pod_events
-    evidence=$(KUBECTL_OBSERVATION_ATTEMPTS=1 \
+    local evidence="" pod_names="" pod_ref pod_name pod_events pod_count=0
+    evidence=$(KUBECTL_OBSERVATION_ATTEMPTS=1 KUBECTL_REQUEST_TIMEOUT_SECONDS=3 \
+        KUBECTL_PROCESS_TIMEOUT_SECONDS=3 \
         kubectl_run_observational -n "$namespace" get pods \
             -l "storage-scale-test.nvidia.com/run=$run_id" \
             -o 'jsonpath={range .items[*]}{range .status.containerStatuses[*]}{.state.waiting.reason}{"\n"}{end}{range .status.conditions[?(@.type=="PodScheduled")]}{.reason}{"\n"}{.message}{"\n"}{end}{end}' \
-            2>/dev/null) || evidence=""
-    pod_names=$(KUBECTL_OBSERVATION_ATTEMPTS=1 \
+            2>/dev/null | head -c 524288) || evidence=""
+    pod_names=$(KUBECTL_OBSERVATION_ATTEMPTS=1 KUBECTL_REQUEST_TIMEOUT_SECONDS=3 \
+        KUBECTL_PROCESS_TIMEOUT_SECONDS=3 \
         kubectl_run_observational -n "$namespace" get pods \
-            -l "storage-scale-test.nvidia.com/run=$run_id" -o name 2>/dev/null) \
+            -l "storage-scale-test.nvidia.com/run=$run_id" -o name 2>/dev/null \
+            | head -c 65536) \
         || pod_names=""
     while IFS= read -r pod_ref; do
         [[ "$pod_ref" == pod/* ]] || continue
         pod_name=${pod_ref#pod/}
         kubectl_validate_object_name "$pod_name" || continue
-        pod_events=$(KUBECTL_OBSERVATION_ATTEMPTS=1 \
+        pod_count=$((pod_count + 1))
+        (( pod_count <= KUBECTL_DIAGNOSTIC_MAX_PODS )) || break
+        pod_events=$(KUBECTL_OBSERVATION_ATTEMPTS=1 KUBECTL_REQUEST_TIMEOUT_SECONDS=3 \
+            KUBECTL_PROCESS_TIMEOUT_SECONDS=3 \
             kubectl_run_observational -n "$namespace" get events \
                 --field-selector "involvedObject.name=$pod_name" \
                 -o 'jsonpath={range .items[*]}{.reason}{"\t"}{.message}{"\n"}{end}' \
-                2>/dev/null) || pod_events=""
+                2>/dev/null | head -c 131072) || pod_events=""
         evidence+=$'\n'"$pod_events"
     done <<< "$pod_names"
     local classified_reason=TIMEOUT
@@ -1658,8 +1913,19 @@ kubectl_pvc_exec() {
     shift 2
     kubectl_validate_namespace_name "$namespace" && kubectl_validate_object_name "$pod_name" \
         || return 1
-    # Keep stdin attached: control bundles and result archives use the same
-    # bounded exec adapter as ordinary status commands.
+    # Ordinary remote commands must not inherit an interactive caller's
+    # terminal. kubectl exec -i waits for terminal input even when the remote
+    # command consumes none, which can strand submission until its deadline.
+    kubectl_run_bounded -n "$namespace" exec "$pod_name" -- "$@"
+}
+
+kubectl_pvc_exec_stdin() {
+    local namespace="$1" pod_name="$2"
+    shift 2
+    kubectl_validate_namespace_name "$namespace" && kubectl_validate_object_name "$pod_name" \
+        || return 1
+    # Only callers that intentionally stream a finite payload may attach
+    # stdin. They retain the same bounded kubectl process deadline.
     kubectl_run_bounded -n "$namespace" exec -i "$pod_name" -- "$@"
 }
 
@@ -2325,7 +2591,8 @@ kubectl_wait_journaled_job_quiescent() {
         kubectl_report_lifecycle_error collect job-quiescence TIMEOUT \
             "wait for the exact Job to become terminal, then retry collection" \
             yes Job "$KUBECTL_RESOURCE_NAME" "$KUBECTL_RESOURCE_NAMESPACE" \
-            "$KUBECTL_RESOURCE_UID" "$observed_uid" "" || true
+            "$KUBECTL_RESOURCE_UID" "$observed_uid" "" \
+            "${terminal_state:-ACTIVE}" || true
     return 1
 }
 
@@ -2410,14 +2677,46 @@ kubectl_read_remote_status() {
 
 kubectl_stream_remote_attempt() {
     local namespace="$1" pod_name="$2" attempt_id="$3" archive_path="$4"
+    local local_state_path="${5:-}" remote_state_path="${6:-}"
+    local job_kind="${7:-}" job_name="${8:-}" job_namespace="${9:-}"
+    local job_uid="${10:-}" job_evidence="${11:-}"
     [[ "$attempt_id" =~ ^[0-9a-f]{8}$ && -n "$archive_path" && ! -e "$archive_path" ]] || return 1
     local collection_timeout="${KUBECTL_COLLECTION_TIMEOUT_SECONDS:-$KUBECTL_COLLECTION_TIMEOUT_SECONDS_DEFAULT}"
     [[ "$collection_timeout" =~ ^[1-9][0-9]*$ ]] || return 1
-    local remote_run
+    local remote_run error_path
     remote_run=$(kubectl_attempt_remote_root "$attempt_id") || return 1
     local guard_script
     guard_script=$(kubectl_remote_tree_guard_script) || return 1
+    error_path=$(mktemp "${archive_path%/*}/.kubectl-collect-stream.XXXXXXXX") \
+        || return 1
+    if [[ "${STORAGE_SCALE_TEST_INTEGRATION:-}" == 1 \
+            && -n "${KUBECTL_INTEGRATION_COLLECTION_HOLD_FILE:-}" ]]; then
+        local hold_file="$KUBECTL_INTEGRATION_COLLECTION_HOLD_FILE"
+        local results_real hold_parent hold_temporary
+        results_real=$(realpath -e -- "${archive_path%/*}/..") || return 1
+        hold_parent=$(realpath -e -- "${hold_file%/*}") || return 1
+        [[ "$hold_parent" == "$results_real" \
+            && "${hold_file##*/}" == .integration-kubectl-collection-ready \
+            && ! -e "$hold_file" && ! -L "$hold_file" ]] || return 1
+        hold_temporary="$hold_file.${BASHPID:-$$}.tmp"
+        (umask 077; printf 'ready\n' > "$hold_temporary") \
+            && mv -- "$hold_temporary" "$hold_file" || return 1
+        while [[ -f "$hold_file" && ! -L "$hold_file" ]]; do
+            sleep 0.1
+        done
+        [[ ! -e "$hold_file" && ! -L "$hold_file" ]] || return 1
+    fi
     umask 077
+    local error_fifo="$error_path.fifo" error_reader_pid
+    mkfifo -m 600 -- "$error_fifo" || {
+        rm -f -- "$error_path"
+        return 1
+    }
+    {
+        head -c "$KUBECTL_COLLECTION_ERROR_MAX_BYTES" > "$error_path"
+        cat > /dev/null
+    } < "$error_fifo" &
+    error_reader_pid=$!
     # A valid collection can contain up to two GiB. Do not inherit the short
     # API-probe deadline used for status and object inspection. Keep at most
     # one byte beyond the limit so an oversized or unbounded producer is
@@ -2426,14 +2725,38 @@ kubectl_stream_remote_attempt() {
         KUBECTL_PROCESS_TIMEOUT_SECONDS=$((collection_timeout + 60)) \
         kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu "$guard_script
             exec tar -C \"\${run%/*}\" -cf - \"\${run##*/}\"" \
-            bash "$remote_run" "$attempt_id" \
+            bash "$remote_run" "$attempt_id" 2> "$error_fifo" \
         | _kubectl_write_bounded_collection_stream "$archive_path" \
             "$KUBECTL_COLLECTION_MAX_BYTES"
     local -a stream_status=("${PIPESTATUS[@]}")
+    wait "$error_reader_pid" || true
+    rm -f -- "$error_fifo" || return 1
     if [[ "${stream_status[0]:-1}" -ne 0 || "${stream_status[1]:-1}" -ne 0 ]]; then
+        local reason=API_UNAVAILABLE action="retry --collect; remote results were retained"
+        if [[ "${stream_status[1]:-1}" -eq 65 ]]; then
+            reason=ARCHIVE_INVALID
+            action="inspect the remote attempt size before retrying --collect"
+        elif [[ "${stream_status[1]:-1}" -eq 74 ]]; then
+            reason=LOCAL_IO
+            action="repair local result storage and retry --collect"
+        else
+            local producer_output=""
+            producer_output=$(cat -- "$error_path") || producer_output=""
+            _kubectl_classify_observation_failure reason \
+                "${stream_status[0]:-1}" "$producer_output" || reason=API_UNAVAILABLE
+            action=$(_kubectl_observation_safe_action "$reason")
+            action="$action; remote results were retained"
+        fi
         rm -f -- "$archive_path"
+        kubectl_report_collection_failure "$attempt_id" archive-stream "$reason" \
+            "$action" "$local_state_path" \
+            "${remote_state_path:-$remote_run/state/run.status}" "" \
+            "$job_kind" "$job_name" "$job_namespace" "$job_uid" "" \
+            "$job_evidence"
+        rm -f -- "$error_path"
         return 1
     fi
+    rm -f -- "$error_path" || return 1
 }
 
 _kubectl_write_bounded_collection_stream() {
@@ -2443,17 +2766,17 @@ _kubectl_write_bounded_collection_stream() {
     if ! head -c "$((max_bytes + 1))" > "$archive_path"; then
         rm -f -- "$archive_path"
         echo "Error: failed to write the Kubernetes collection archive; check local free space" >&2
-        return 1
+        return 74
     fi
     local archive_bytes
     archive_bytes=$(wc -c < "$archive_path") || {
         rm -f -- "$archive_path"
-        return 1
+        return 74
     }
     if [[ ! "$archive_bytes" =~ ^[0-9]+$ || "$archive_bytes" -gt "$max_bytes" ]]; then
         rm -f -- "$archive_path"
         echo "Error: Kubernetes collection archive exceeded its byte limit while streaming" >&2
-        return 1
+        return 65
     fi
 }
 
@@ -2537,10 +2860,54 @@ _kubectl_safe_relative_file_path() {
     [[ "$path" != */ ]] && _kubectl_safe_archive_member "$path"
 }
 
+_kubectl_validate_archive_names_stream() {
+    local attempt_id="$1" max_members="${2:-$KUBECTL_COLLECTION_MAX_MEMBERS}"
+    [[ "$attempt_id" =~ ^[0-9a-f]{8}$ \
+        && "$max_members" =~ ^[1-9][0-9]*$ ]] || return 1
+    local member member_count=0
+    while IFS= read -r member; do
+        _kubectl_safe_archive_member "$member" || {
+            echo "Error: unsafe member in Kubernetes collection archive" >&2
+            return 1
+        }
+        [[ "$member" == "$attempt_id" || "$member" == "$attempt_id/"* ]] || {
+            echo "Error: collection archive contains another attempt" >&2
+            return 1
+        }
+        member_count=$((member_count + 1))
+        if (( member_count > max_members )); then
+            echo "Error: Kubernetes collection archive exceeds its member limit" >&2
+            return 1
+        fi
+    done
+    (( member_count > 0 ))
+}
+
+_kubectl_validate_archive_types_stream() {
+    local max_members="${1:-$KUBECTL_COLLECTION_MAX_MEMBERS}"
+    [[ "$max_members" =~ ^[1-9][0-9]*$ ]] || return 1
+    local listing type member_count=0
+    while IFS= read -r listing; do
+        type="${listing:0:1}"
+        [[ "$type" == - || "$type" == d ]] || {
+            echo "Error: collection archive contains a nonregular member" >&2
+            return 1
+        }
+        member_count=$((member_count + 1))
+        (( member_count <= max_members )) || return 1
+    done
+    (( member_count > 0 ))
+}
+
 _kubectl_result_destination() {
     local output_name="$1" results_dir="$2" relative="$3" create_parents="$4"
+    local reason_output="${5:-}"
     [[ "$output_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ \
-        && "$create_parents" =~ ^[01]$ ]] || return 1
+        && "$create_parents" =~ ^[01]$ \
+        && ( -z "$reason_output" \
+            || "$reason_output" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ) ]] || return 1
+    [[ -z "$reason_output" ]] \
+        || printf -v "$reason_output" '%s' LEDGER_INCONSISTENT
     _kubectl_safe_relative_file_path "$relative" \
         && _kubectl_validate_local_directory_path "$results_dir" \
         && [[ -d "$results_dir" && ! -L "$results_dir" ]] || return 1
@@ -2555,7 +2922,11 @@ _kubectl_result_destination() {
         if [[ -e "$current" || -L "$current" ]]; then
             [[ -d "$current" && ! -L "$current" ]] || return 1
         elif [[ "$create_parents" -eq 1 ]]; then
-            mkdir -- "$current" || return 1
+            if ! mkdir -- "$current"; then
+                [[ -z "$reason_output" ]] \
+                    || printf -v "$reason_output" '%s' LOCAL_IO
+                return 1
+            fi
         else
             printf -v "$output_name" '%s' "$results_dir/$relative"
             return 0
@@ -2579,61 +2950,23 @@ kubectl_validate_attempt_archive() {
         echo "Error: Kubernetes collection archive exceeds its byte limit" >&2
         return 1
     }
-    local listing_path
-    listing_path=$(mktemp "${TMPDIR:-/tmp}/storage-scale-test-kubectl-list.XXXXXX") || return 1
-    if ! tar -tf "$archive_path" > "$listing_path"; then
-        rm -f -- "$listing_path"
+    # Validate metadata as streams. A hostile archive cannot consume local
+    # temporary storage by forcing complete name or verbose listings to disk.
+    if ! (set -o pipefail
+            tar -tf "$archive_path" \
+                | _kubectl_validate_archive_names_stream "$attempt_id"); then
         return 1
     fi
-    local member_count=0 member archive_error=0
-    while IFS= read -r member; do
-        _kubectl_safe_archive_member "$member" || {
-            echo "Error: unsafe member in Kubernetes collection archive" >&2
-            archive_error=1
-            break
-        }
-        [[ "$member" == "$attempt_id" || "$member" == "$attempt_id/"* ]] || {
-            echo "Error: collection archive contains another attempt" >&2
-            archive_error=1
-            break
-        }
-        member_count=$((member_count + 1))
-        [[ "$member_count" -le "$KUBECTL_COLLECTION_MAX_MEMBERS" ]] || {
-            echo "Error: Kubernetes collection archive exceeds its member limit" >&2
-            archive_error=1
-            break
-        }
-    done < "$listing_path"
-    [[ "$archive_error" -eq 0 && "$member_count" -gt 0 ]] || {
-        rm -f -- "$listing_path"
-        return 1
-    }
     # Do not extract links, devices, or other special files into the local
     # results tree. Safe member spelling alone is not sufficient for tar.
-    local verbose_path listing type
-    verbose_path=$(mktemp "${TMPDIR:-/tmp}/storage-scale-test-kubectl-verbose.XXXXXX") || {
-        rm -f -- "$listing_path"
-        return 1
-    }
-    if ! LC_ALL=C tar -tvf "$archive_path" > "$verbose_path"; then
-        rm -f -- "$listing_path" "$verbose_path"
-        return 1
-    fi
-    while IFS= read -r listing; do
-        type="${listing:0:1}"
-        [[ "$type" == - || "$type" == d ]] || {
-            echo "Error: collection archive contains a nonregular member" >&2
-            archive_error=1
-            break
-        }
-    done < "$verbose_path"
-    rm -f -- "$listing_path" "$verbose_path"
-    [[ "$archive_error" -eq 0 ]]
+    (set -o pipefail
+        LC_ALL=C tar -tvf "$archive_path" \
+            | _kubectl_validate_archive_types_stream)
 }
 
 kubectl_extract_attempt_archive() {
     local archive_path="$1" attempt_id="$2" results_dir="$3" output_dir="$4"
-    kubectl_validate_attempt_archive "$archive_path" "$attempt_id" || return 1
+    kubectl_validate_attempt_archive "$archive_path" "$attempt_id" || return 65
     [[ -d "$results_dir" && ! -L "$results_dir" && -n "$output_dir" && ! -e "$output_dir" \
         && "${output_dir##*/}" =~ ^\.kubernetes-collect-[0-9a-f]{8}\.[A-Za-z0-9]+$ ]] || return 1
     _kubectl_validate_local_directory_path "$results_dir" \
@@ -2645,19 +2978,20 @@ kubectl_extract_attempt_archive() {
         echo "Error: Kubernetes collection staging must reside below results" >&2
         return 1
     }
-    mkdir -p "$output_dir" || return 1
+    mkdir -p "$output_dir" || return 74
     tar -C "$output_dir" --no-same-owner --no-same-permissions -xf "$archive_path" || {
         rm -rf -- "$output_dir"
-        return 1
+        return 74
     }
     local extracted_bytes
-    extracted_bytes=$(du -sb -- "$output_dir" | awk '{print $1}') || return 1
+    extracted_bytes=$(du -sb -- "$output_dir" | awk '{print $1}') || return 74
     [[ "$extracted_bytes" =~ ^[0-9]+$ && "$extracted_bytes" -le "$KUBECTL_COLLECTION_MAX_BYTES" ]] || {
         rm -rf -- "$output_dir"
         echo "Error: extracted Kubernetes collection exceeds its byte limit" >&2
-        return 1
+        return 65
     }
-    [[ -d "$output_dir/$attempt_id" && ! -L "$output_dir/$attempt_id" ]]
+    [[ -d "$output_dir/$attempt_id" && ! -L "$output_dir/$attempt_id" ]] \
+        || return 65
 }
 
 kubectl_create_attempt_policies() {
@@ -2839,7 +3173,7 @@ kubectl_upload_control_bundle() {
         return 1
     fi
     # shellcheck disable=SC2016  # The quoted script executes in the helper Pod.
-    if ! kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu "$guard_script
+    if ! kubectl_pvc_exec_stdin "$namespace" "$pod_name" /bin/bash -ceu "$guard_script
             control=\"\$run/control\"
             [[ -d \"\$control\" && ! -L \"\$control\" ]] || exit 1
             control_real=\$(realpath -e -- \"\$control\") || exit 1
@@ -2972,7 +3306,19 @@ kubectl_cancel_journaled_attempt() {
     esac
     # The exact Job is deleted through its journal. Its absence is not inferred
     # from a broad label query, and an ownership mismatch always stops cleanup.
-    if kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" sweep; then
+    if ! kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" sweep; then
+        KUBECTL_ATTEMPT_ID="$attempt_id" \
+            KUBECTL_DIAGNOSTIC_LOCAL_STATE_PATH="$kubernetes_dir/attempts/$attempt_id/state.sh" \
+            KUBECTL_DIAGNOSTIC_REMOTE_STATE_PATH="$(kubectl_attempt_remote_root "$attempt_id")/state/run.status" \
+            kubectl_report_lifecycle_error cancel job-journal \
+                LEDGER_INCONSISTENT \
+                "inspect the missing or corrupt sweep Job journal; do not cancel by label" \
+                unknown || true
+        return 1
+    fi
+    if kubectl_attempt_step_done "$kubernetes_dir" "$attempt_id" delete-sweep; then
+        : # The valid journal plus step prove which exact Job was deleted.
+    else
         kubectl_delete_owned_object "$KUBECTL_RESOURCE_KIND" "$KUBECTL_RESOURCE_NAME" \
             "$KUBECTL_RESOURCE_NAMESPACE" "$KUBECTL_RESOURCE_NONCE" "$attempt_id" \
             "$KUBECTL_RESOURCE_UID" || return 1
@@ -2997,7 +3343,12 @@ kubectl_prepare_attempt_lifecycle() {
     kubectl_local_lock_acquire "$kubernetes_dir" lock_fd || return 1
     local primary_rc=0 namespace_uid pv_uid pvc_uid candidate_nodes coordinator_node
     local helper_name helper_uid operation_token remote_reserved=0
+    local KUBECTL_PREPARE_FAILURE_PHASE=local-initialization
+    local KUBECTL_PREPARE_FAILURE_REASON=LOCAL_IO
+    local KUBECTL_PREPARE_FAILURE_RC=1 KUBECTL_PREPARE_FAILURE_OUTPUT=""
     if [[ -e "$kubernetes_dir/current-attempt" ]]; then
+        kubectl_record_prepare_failure local-predecessor LEDGER_INCONSISTENT 1 \
+            "current attempt metadata is inconsistent" || return 1
         current_attempt=$(kubectl_attempt_current_id "$kubernetes_dir") || primary_rc=1
         if [[ "$primary_rc" -eq 0 ]]; then
             [[ -n "$expected_current" && "$current_attempt" == "$expected_current" ]] \
@@ -3008,14 +3359,23 @@ kubectl_prepare_attempt_lifecycle() {
                 || primary_rc=1
         fi
     elif [[ -n "$expected_current" ]]; then
-        primary_rc=1
-    fi
-    if [[ "$primary_rc" -eq 0 ]] \
-            && ! IFS=$'\t' read -r namespace_uid pv_uid pvc_uid \
-                < <(kubectl_validate_cluster_identity); then
+        kubectl_record_prepare_failure local-predecessor LEDGER_INCONSISTENT 1 \
+            "expected collected predecessor is absent" || return 1
         primary_rc=1
     fi
     if [[ "$primary_rc" -eq 0 ]]; then
+        local cluster_identity=""
+        if kubectl_run_prepare_phase_capture cluster_identity cluster-identity \
+                kubectl_validate_cluster_identity; then
+            IFS=$'\t' read -r namespace_uid pv_uid pvc_uid <<< "$cluster_identity" \
+                || primary_rc=1
+        else
+            primary_rc=1
+        fi
+    fi
+    if [[ "$primary_rc" -eq 0 ]]; then
+        kubectl_record_prepare_failure local-attempt-id LOCAL_IO 1 \
+            "could not allocate a unique local attempt ID" || return 1
         for _ in {1..16}; do
             generated_attempt_id=$(kubectl_generate_attempt_id) || break
             [[ ! -e "$kubernetes_dir/attempts/$generated_attempt_id" ]] && break
@@ -3024,16 +3384,22 @@ kubectl_prepare_attempt_lifecycle() {
         [[ "$generated_attempt_id" =~ ^[0-9a-f]{8}$ ]] || primary_rc=1
     fi
     if [[ "$primary_rc" -eq 0 ]]; then
+        kubectl_record_prepare_failure local-identity LOCAL_IO 1 \
+            "could not publish local attempt identity" || return 1
         nonce=$(kubectl_generate_ownership_nonce) || primary_rc=1
         kubectl_attempt_create_identity "$kubernetes_dir" "$lock_fd" "$generated_attempt_id" "$nonce" \
             "$KUBECTL_NAMESPACE" "$namespace_uid" "$KUBECTL_PV" "$pv_uid" \
             "$KUBECTL_PVC" "$pvc_uid" || primary_rc=1
         if [[ "$primary_rc" -eq 0 && -n "$current_attempt" ]]; then
+            kubectl_record_prepare_failure local-predecessor LEDGER_INCONSISTENT 1 \
+                "could not publish collected predecessor" || return 1
             kubectl_attempt_write_predecessor "$kubernetes_dir" "$lock_fd" \
                 "$generated_attempt_id" "$current_attempt" || primary_rc=1
         fi
     fi
     if [[ "$primary_rc" -eq 0 ]]; then
+        kubectl_record_prepare_failure local-configuration LOCAL_IO 1 \
+            "could not publish local attempt state or configuration" || return 1
         kubectl_attempt_write_state "$kubernetes_dir" "$lock_fd" "$generated_attempt_id" PREPARED \
             && kubectl_attempt_write_configuration "$kubernetes_dir" "$lock_fd" "$generated_attempt_id" \
                 "$mapped_dirs_name" "$mapped_read_from" \
@@ -3042,20 +3408,36 @@ kubectl_prepare_attempt_lifecycle() {
     if [[ "$primary_rc" -eq 0 ]]; then
         # Publish the PREPARED pointer before any Kubernetes or PVC mutation.
         # A killed submitter can then be found and retried by status/cancel.
+        kubectl_record_prepare_failure local-current-pointer LOCAL_IO 1 \
+            "could not publish the current attempt pointer" || return 1
         kubectl_attempt_write_current "$kubernetes_dir" "$lock_fd" \
             "$generated_attempt_id" || primary_rc=1
     fi
     candidate_nodes="$kubernetes_dir/attempts/${generated_attempt_id:-invalid}/nodes.tsv"
     if [[ "$primary_rc" -eq 0 ]]; then
-        kubectl_discover_candidate_nodes "$KUBECTL_NODE_SELECTOR" "$candidate_nodes" || primary_rc=1
-        [[ $(wc -l < "$candidate_nodes" 2>/dev/null || printf 0) -ge "$required_nodes" ]] \
-            || primary_rc=1
+        kubectl_run_prepare_phase node-discovery kubectl_discover_candidate_nodes \
+            "$KUBECTL_NODE_SELECTOR" "$candidate_nodes" || primary_rc=1
+        if [[ "$primary_rc" -eq 0 ]]; then
+            local eligible_nodes
+            eligible_nodes=$(wc -l < "$candidate_nodes" 2>/dev/null) \
+                || eligible_nodes=0
+            if (( eligible_nodes < required_nodes )); then
+                kubectl_record_prepare_failure node-capacity INSUFFICIENT_CAPACITY 1 \
+                    "required=$required_nodes eligible=$eligible_nodes selector=$KUBECTL_NODE_SELECTOR" \
+                    || return 1
+                primary_rc=1
+            fi
+        fi
     fi
     if [[ "$primary_rc" -eq 0 ]]; then
+        kubectl_record_prepare_failure local-coordinator LOCAL_IO 1 \
+            "could not select the coordinator or generate its operation token" \
+            || return 1
         coordinator_node=$(kubectl_choose_coordinator_node "$candidate_nodes") || primary_rc=1
         operation_token=$(_kubectl_random_hex 4) || primary_rc=1
         helper_name="sst-elb-$generated_attempt_id-upload-$operation_token"
-        kubectl_create_helper_pod helper_uid transfer "$KUBECTL_NAMESPACE" "$helper_name" \
+        kubectl_run_prepare_phase helper-ready kubectl_create_helper_pod \
+            helper_uid transfer "$KUBECTL_NAMESPACE" "$helper_name" \
             "$nonce" "$generated_attempt_id" "$coordinator_node" "$operation_token" \
             "$kubernetes_dir" "$lock_fd" transfer || primary_rc=1
     fi
@@ -3063,20 +3445,27 @@ kubectl_prepare_attempt_lifecycle() {
         local -n mapped_dirs_ref="$mapped_dirs_name"
         local -a pvc_paths=("${!mapped_dirs_ref[@]}")
         [[ -z "$mapped_read_from" ]] || pvc_paths+=("$mapped_read_from")
-        kubectl_validate_pvc_paths "$KUBECTL_NAMESPACE" "$helper_name" "${pvc_paths[@]}" || primary_rc=1
+        kubectl_run_prepare_phase pvc-paths kubectl_validate_pvc_paths \
+            "$KUBECTL_NAMESPACE" "$helper_name" "${pvc_paths[@]}" || primary_rc=1
     fi
     if [[ "$primary_rc" -eq 0 ]]; then
+        kubectl_record_prepare_failure local-reservation-journal LOCAL_IO 1 \
+            "could not publish durable PVC reservation intent" || return 1
         if kubectl_attempt_journal_remote_reservation "$kubernetes_dir" "$lock_fd" \
                 "$generated_attempt_id" "$nonce"; then
             # Persist deterministic ownership intent before touching the PVC.
             # The idempotent release path can then recover a killed reserve.
             remote_reserved=1
-            if kubectl_reserve_remote_attempt "$KUBECTL_NAMESPACE" "$helper_name" \
+            if kubectl_run_prepare_phase remote-reservation \
+                    kubectl_reserve_remote_attempt "$KUBECTL_NAMESPACE" "$helper_name" \
                     "$generated_attempt_id" "$nonce"; then
+                kubectl_record_prepare_failure local-reservation-state LOCAL_IO 1 \
+                    "could not publish acquired PVC reservation state" || return 1
                 kubectl_attempt_mark_remote_reservation_acquired "$kubernetes_dir" "$lock_fd" \
                     "$generated_attempt_id" \
-                    && kubectl_initialize_remote_control_tree "$KUBECTL_NAMESPACE" "$helper_name" \
-                        "$generated_attempt_id" \
+                    && kubectl_run_prepare_phase remote-control \
+                        kubectl_initialize_remote_control_tree "$KUBECTL_NAMESPACE" \
+                        "$helper_name" "$generated_attempt_id" \
                     || primary_rc=1
             else
                 primary_rc=1
@@ -3086,15 +3475,21 @@ kubectl_prepare_attempt_lifecycle() {
         fi
     fi
     if [[ "$primary_rc" -eq 0 ]]; then
-        kubectl_create_attempt_policies "$kubernetes_dir" "$lock_fd" "$KUBECTL_NAMESPACE" \
-            "$generated_attempt_id" "$nonce" \
-            && kubectl_create_worker_daemonset "$kubernetes_dir" "$lock_fd" "$KUBECTL_NAMESPACE" \
-                "$generated_attempt_id" "$nonce" "$candidate_nodes" \
-            && kubectl_wait_worker_endpoints "$KUBECTL_NAMESPACE" "$generated_attempt_id" "$candidate_nodes" \
-                "$kubernetes_dir/attempts/$generated_attempt_id/worker-endpoints.tsv" \
-                "${KUBECTL_WORKER_READY_TIMEOUT_SECONDS:-180}" \
-                "$kubernetes_dir/attempts/$generated_attempt_id" \
-            || primary_rc=1
+        kubectl_run_prepare_phase network-policy kubectl_create_attempt_policies \
+            "$kubernetes_dir" "$lock_fd" "$KUBECTL_NAMESPACE" \
+            "$generated_attempt_id" "$nonce" || primary_rc=1
+    fi
+    if [[ "$primary_rc" -eq 0 ]]; then
+        kubectl_run_prepare_phase worker-create kubectl_create_worker_daemonset \
+            "$kubernetes_dir" "$lock_fd" "$KUBECTL_NAMESPACE" \
+            "$generated_attempt_id" "$nonce" "$candidate_nodes" || primary_rc=1
+    fi
+    if [[ "$primary_rc" -eq 0 ]]; then
+        kubectl_run_prepare_phase worker-ready kubectl_wait_worker_endpoints \
+            "$KUBECTL_NAMESPACE" "$generated_attempt_id" "$candidate_nodes" \
+            "$kubernetes_dir/attempts/$generated_attempt_id/worker-endpoints.tsv" \
+            "${KUBECTL_WORKER_READY_TIMEOUT_SECONDS:-180}" \
+            "$kubernetes_dir/attempts/$generated_attempt_id" || primary_rc=1
     fi
     if [[ "$primary_rc" -ne 0 ]]; then
         local rollback_rc=0
@@ -3129,6 +3524,26 @@ kubectl_prepare_attempt_lifecycle() {
             kubectl_attempt_restore_predecessor "$kubernetes_dir" "$lock_fd" \
                 "$generated_attempt_id" || rollback_rc=1
         fi
+        local prepare_reason="${KUBECTL_PREPARE_FAILURE_REASON:-}"
+        local prepare_action="inspect the diagnostic bundle and retry submission"
+        local prepare_may_run=unknown diagnostic_root=""
+        if [[ -z "$prepare_reason" ]]; then
+            kubectl_classify_prepare_failure prepare_reason \
+                "$KUBECTL_PREPARE_FAILURE_PHASE" "$KUBECTL_PREPARE_FAILURE_RC" \
+                "$KUBECTL_PREPARE_FAILURE_OUTPUT" || prepare_reason=LOCAL_IO
+        fi
+        prepare_action=$(_kubectl_observation_safe_action "$prepare_reason") \
+            || prepare_action="inspect the diagnostic bundle and retry submission"
+        [[ "$rollback_rc" -ne 0 ]] || prepare_may_run=no
+        [[ -z "$generated_attempt_id" ]] \
+            || diagnostic_root="$kubernetes_dir/attempts/$generated_attempt_id/diagnostics"
+        KUBECTL_ATTEMPT_ID="${generated_attempt_id:-unknown}" \
+            KUBECTL_DIAGNOSTIC_LOCAL_STATE_PATH="${generated_attempt_id:+$kubernetes_dir/attempts/$generated_attempt_id/state.sh}" \
+            KUBECTL_DIAGNOSTIC_REMOTE_STATE_PATH="${generated_attempt_id:+$(kubectl_attempt_remote_root "$generated_attempt_id")/state/run.status}" \
+            kubectl_report_lifecycle_error prepare \
+                "$KUBECTL_PREPARE_FAILURE_PHASE" "$prepare_reason" \
+                "$prepare_action" "$prepare_may_run" "" "" \
+                "${KUBECTL_NAMESPACE:-}" "" "" "$diagnostic_root" || true
         kubectl_local_lock_release "$lock_fd" || true
         return 1
     fi
@@ -3229,10 +3644,82 @@ _kubectl_load_saved_attempt() {
 }
 
 _kubectl_verify_saved_cluster_identity() {
-    local namespace_uid pv_uid pvc_uid
-    IFS=$'\t' read -r namespace_uid pv_uid pvc_uid < <(kubectl_validate_cluster_identity) || return 1
-    [[ "$namespace_uid" == "$KUBECTL_NAMESPACE_UID" && "$pv_uid" == "$KUBECTL_PV_UID" \
-        && "$pvc_uid" == "$KUBECTL_PVC_UID" ]]
+    local kubernetes_dir="${1:-}" attempt_id="${2:-${KUBECTL_ATTEMPT_ID:-unknown}}"
+    local cluster_identity="" namespace_uid="" pv_uid="" pvc_uid=""
+    local validation_error rc=0 reason=API_UNAVAILABLE
+    validation_error=$(mktemp "${TMPDIR:-/tmp}/storage-scale-test-cluster-identity.XXXXXX") \
+        || return 1
+    cluster_identity=$(kubectl_validate_cluster_identity 2> "$validation_error") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        local evidence=""
+        local failure_kind="" failure_name="" failure_namespace=""
+        local failure_expected_uid="" failure_action=""
+        evidence=$(head -c 524288 -- "$validation_error" 2>/dev/null) || evidence=""
+        cat -- "$validation_error" >&2 || true
+        rm -f -- "$validation_error" || true
+        _kubectl_classify_observation_failure reason "$rc" "$evidence" \
+            || reason=API_UNAVAILABLE
+        failure_action=$(_kubectl_observation_safe_action "$reason") \
+            || failure_action="retry the same lifecycle command"
+        if [[ "$reason" == IDENTITY_MISMATCH ]]; then
+            failure_action="restore access to the original resource; do not adopt or clean up a replacement"
+            if grep -Eqi 'persistentvolumeclaims?|(^|[^a-z])pvc([^a-z]|$)' \
+                    <<< "$evidence"; then
+                failure_kind=PersistentVolumeClaim
+                failure_name="${KUBECTL_PVC:-unknown}"
+                failure_namespace="${KUBECTL_NAMESPACE:-}"
+                failure_expected_uid="${KUBECTL_PVC_UID:-}"
+            elif grep -Eqi 'persistentvolumes?|(^|[^a-z])pv([^a-z]|$)' \
+                    <<< "$evidence"; then
+                failure_kind=PersistentVolume
+                failure_name="${KUBECTL_PV:-unknown}"
+                failure_expected_uid="${KUBECTL_PV_UID:-}"
+            elif grep -Eqi 'namespaces?' <<< "$evidence"; then
+                failure_kind=Namespace
+                failure_name="${KUBECTL_NAMESPACE:-unknown}"
+                failure_expected_uid="${KUBECTL_NAMESPACE_UID:-}"
+            fi
+        fi
+        KUBECTL_ATTEMPT_ID="$attempt_id" \
+            KUBECTL_DIAGNOSTIC_LOCAL_STATE_PATH="${kubernetes_dir:+$kubernetes_dir/attempts/$attempt_id/state.sh}" \
+            KUBECTL_DIAGNOSTIC_REMOTE_STATE_PATH="$(kubectl_attempt_remote_root "$attempt_id" 2>/dev/null || true)/state/run.status" \
+            kubectl_report_lifecycle_error verify-cluster cluster-identity \
+                "$reason" "$failure_action" unknown "$failure_kind" \
+                "$failure_name" "$failure_namespace" "$failure_expected_uid" \
+                "" || true
+        return 1
+    fi
+    rm -f -- "$validation_error" || return 1
+    IFS=$'\t' read -r namespace_uid pv_uid pvc_uid <<< "$cluster_identity" \
+        || return 1
+    local kind="" name="" namespace="" expected="" observed=""
+    if [[ "$namespace_uid" != "$KUBECTL_NAMESPACE_UID" ]]; then
+        kind=Namespace
+        name="$KUBECTL_NAMESPACE"
+        expected="$KUBECTL_NAMESPACE_UID"
+        observed="$namespace_uid"
+    elif [[ "$pv_uid" != "$KUBECTL_PV_UID" ]]; then
+        kind=PersistentVolume
+        name="$KUBECTL_PV"
+        expected="$KUBECTL_PV_UID"
+        observed="$pv_uid"
+    elif [[ "$pvc_uid" != "$KUBECTL_PVC_UID" ]]; then
+        kind=PersistentVolumeClaim
+        name="$KUBECTL_PVC"
+        namespace="$KUBECTL_NAMESPACE"
+        expected="$KUBECTL_PVC_UID"
+        observed="$pvc_uid"
+    else
+        return 0
+    fi
+    KUBECTL_ATTEMPT_ID="$attempt_id" \
+        KUBECTL_DIAGNOSTIC_LOCAL_STATE_PATH="${kubernetes_dir:+$kubernetes_dir/attempts/$attempt_id/state.sh}" \
+        KUBECTL_DIAGNOSTIC_REMOTE_STATE_PATH="$(kubectl_attempt_remote_root "$attempt_id" 2>/dev/null || true)/state/run.status" \
+        kubectl_report_lifecycle_error verify-cluster cluster-identity \
+            IDENTITY_MISMATCH \
+            "use credentials for the original cluster; do not adopt or clean up replacement resources" \
+            unknown "$kind" "$name" "$namespace" "$expected" "$observed" || true
+    return 1
 }
 
 _kubectl_verify_saved_worker_endpoints() {
@@ -3533,8 +4020,28 @@ kubectl_lifecycle_operation() {
         kubectl_local_lock_release "$lock_fd" || rc=1
         [[ "$rc" -eq 0 ]] || return "$rc"
         kubectl_emit_state "$collected_terminal"
-        [[ "$collected_terminal" == SUCCESS ]]
+        [[ "$operation" == status || "$collected_terminal" == SUCCESS ]]
         return
+    fi
+    if [[ "$rc" -eq 0 && "$operation" == status \
+            && "$KUBECTL_LIFECYCLE_STATE" == COLLECTION_IN_PROGRESS \
+            && -d "$kubernetes_dir/attempts/$attempt_id/collected-state" ]]; then
+        # Local publication is the linearization point for result import. If
+        # the client died after remote cleanup, status must still project the
+        # durable outcome without requiring cluster access. A later collect
+        # resumes any remaining exact cleanup and advances to COLLECTED.
+        local published_terminal=""
+        _kubectl_validate_collected_publication \
+            "$kubernetes_dir/attempts/$attempt_id/collected-state" "$attempt_id" \
+            published_terminal \
+            "$kubernetes_dir/attempts/$attempt_id/control-bundle/executions" \
+            >/dev/null || rc=1
+        kubectl_local_lock_release "$lock_fd" || rc=1
+        [[ "$rc" -eq 0 ]] || return "$rc"
+        kubectl_emit_state "$published_terminal"
+        printf 'STORAGE_SCALE_TEST_KUBECTL_LOCAL_STATE=COLLECTION_IN_PROGRESS\n'
+        kubectl_emit_lifecycle_commands "$results_dir"
+        return 0
     fi
     if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED ]]; then
         # This repair is local durable state and must not be blocked by a
@@ -3543,7 +4050,8 @@ kubectl_lifecycle_operation() {
         kubectl_attempt_restore_predecessor "$kubernetes_dir" "$lock_fd" \
             "$attempt_id" || rc=1
     fi
-    [[ "$rc" -ne 0 ]] || _kubectl_verify_saved_cluster_identity || rc=1
+    [[ "$rc" -ne 0 ]] || _kubectl_verify_saved_cluster_identity \
+        "$kubernetes_dir" "$attempt_id" || rc=1
     if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == PREPARED ]]; then
         kubectl_recover_prepared_attempt "$kubernetes_dir" "$lock_fd" \
             "$attempt_id" || rc=1
@@ -3554,6 +4062,38 @@ kubectl_lifecycle_operation() {
     elif [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED ]]; then
         kubectl_emit_state SUBMISSION_FAILED
         [[ "$operation" != collect ]] || rc=1
+    elif [[ "$rc" -eq 0 && "$operation" == status \
+            && "$KUBECTL_LIFECYCLE_STATE" == CANCEL_REQUESTED ]]; then
+        local cancel_kind="" cancel_name="" cancel_namespace=""
+        local cancel_uid=""
+        if kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" sweep; then
+            cancel_kind="$KUBECTL_RESOURCE_KIND"
+            cancel_name="$KUBECTL_RESOURCE_NAME"
+            cancel_namespace="$KUBECTL_RESOURCE_NAMESPACE"
+            cancel_uid="$KUBECTL_RESOURCE_UID"
+        else
+            kubectl_emit_state CANCEL_REQUESTED
+            KUBECTL_ATTEMPT_ID="$attempt_id" \
+                KUBECTL_DIAGNOSTIC_LOCAL_STATE_PATH="$kubernetes_dir/attempts/$attempt_id/state.sh" \
+                KUBECTL_DIAGNOSTIC_REMOTE_STATE_PATH="$(kubectl_attempt_remote_root "$attempt_id")/state/run.status" \
+                kubectl_report_lifecycle_error status cancellation-journal \
+                    LEDGER_INCONSISTENT \
+                    "inspect the missing or corrupt sweep Job journal; do not cancel by label" \
+                    unknown || true
+            rc=1
+        fi
+        if [[ "$rc" -eq 0 ]]; then
+            kubectl_emit_state CANCEL_REQUESTED
+            KUBECTL_ATTEMPT_ID="$attempt_id" \
+            KUBECTL_DIAGNOSTIC_LOCAL_STATE_PATH="$kubernetes_dir/attempts/$attempt_id/state.sh" \
+            KUBECTL_DIAGNOSTIC_REMOTE_STATE_PATH="$(kubectl_attempt_remote_root "$attempt_id")/state/run.status" \
+            kubectl_report_lifecycle_error status cancellation \
+                CANCELLATION_INCOMPLETE \
+                "retry --cancel for the same results directory" unknown \
+                "$cancel_kind" "$cancel_name" "$cancel_namespace" \
+                "$cancel_uid" "" "" NOT_OBSERVED || true
+            rc=1
+        fi
     elif [[ "$rc" -eq 0 && "$operation" == status ]]; then
         [[ "$rc" -ne 0 ]] || _kubectl_create_inspector inspector inspector_uid status \
             "$kubernetes_dir" "$lock_fd" "$attempt_id" || rc=1
@@ -3616,7 +4156,7 @@ kubectl_lifecycle_operation() {
                         LEDGER_INCONSISTENT \
                         "inspect the exact Job and PVC ledger; do not collect or delete resources" \
                         no "$job_kind" "$job_name" "$job_namespace" \
-                        "$job_uid" "$job_uid" "" || true
+                        "$job_uid" "$job_uid" "" "$job_state" || true
                 rc=1
             fi
         elif [[ "$rc" -eq 0 && "$remote_state" =~ ^(SUCCESS|FAILED|CANCELLED)$ \
@@ -3824,9 +4364,13 @@ _kubectl_execution_requires_workload_metadata() (
 )
 
 _kubectl_merge_collected_results() {
-    local state_dir="$1" results_dir="$2"
+    local state_dir="$1" results_dir="$2" attempt_id="$3" reason_output="$4"
+    [[ "$reason_output" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    printf -v "$reason_output" '%s' LEDGER_INCONSISTENT
+    [[ "$attempt_id" =~ ^[0-9a-f]{8}$ ]] || return 1
     local manifest="$state_dir/publication-manifest.tsv" kind remote local_path bytes digest extra
     _kubectl_remove_superseded_collection_paths "$state_dir" "$results_dir" \
+        "$reason_output" \
         || return 1
     while IFS=$'\t' read -r kind remote local_path bytes digest extra; do
         [[ "$kind" == result || "$kind" == ledger ]] || continue
@@ -3843,20 +4387,31 @@ _kubectl_merge_collected_results() {
         local source="$state_dir/$remote" destination parent temporary
         [[ -f "$source" && ! -L "$source" ]] || return 1
         _kubectl_result_destination destination "$results_dir" "$local_path" 1 \
+            "$reason_output" \
             || return 1
         parent=$(dirname "$destination")
+        temporary="$parent/.${destination##*/}.kubectl-collect-$attempt_id.tmp"
+        if [[ -e "$temporary" || -L "$temporary" ]]; then
+            [[ -f "$temporary" && ! -L "$temporary" ]] || return 1
+            if ! rm -f -- "$temporary"; then
+                printf -v "$reason_output" '%s' LOCAL_IO
+                return 1
+            fi
+        fi
         if [[ -e "$destination" ]]; then
             [[ -f "$destination" && ! -L "$destination" \
                 && "$(sha256sum -- "$destination" | awk '{print $1}')" == "$digest" ]] || return 1
             continue
         fi
-        temporary="$parent/.${destination##*/}.collect.${BASHPID:-$$}.${RANDOM}"
-        if ! cp -- "$source" "$temporary" \
+        printf -v "$reason_output" '%s' LOCAL_IO
+        if ! (umask 077; set -o noclobber; : > "$temporary") 2>/dev/null \
+                || ! cp -- "$source" "$temporary" \
                 || ! mv -n -- "$temporary" "$destination" \
                 || [[ -e "$temporary" ]]; then
             rm -f -- "$temporary"
             return 1
         fi
+        printf -v "$reason_output" '%s' LEDGER_INCONSISTENT
     done < "$manifest"
     # Reporting and a later resume consume the ordinary result-side execution
     # ledger.  Publish terminal cells atomically after digest verification;
@@ -3866,7 +4421,15 @@ _kubectl_merge_collected_results() {
         [[ -f "$source_status" && ! -L "$source_status" ]] || continue
         id=$(basename "$source_status" .status)
         _kubectl_result_destination destination_status "$results_dir" \
-            "executions/$id.status" 1 || return 1
+            "executions/$id.status" 1 "$reason_output" || return 1
+        temporary="$results_dir/executions/.${id}.status.kubectl-collect-$attempt_id.tmp"
+        if [[ -e "$temporary" || -L "$temporary" ]]; then
+            [[ -f "$temporary" && ! -L "$temporary" ]] || return 1
+            if ! rm -f -- "$temporary"; then
+                printf -v "$reason_output" '%s' LOCAL_IO
+                return 1
+            fi
+        fi
         if [[ -e "$destination_status" ]]; then
             [[ -f "$destination_status" && ! -L "$destination_status" ]] || return 1
             if [[ "$(cat "$destination_status")" == SUCCESS ]]; then
@@ -3876,16 +4439,23 @@ _kubectl_merge_collected_results() {
                 continue
             fi
         fi
-        temporary="$results_dir/executions/.${id}.status.collect.${BASHPID:-$$}.${RANDOM}"
-        if ! cp -- "$source_status" "$temporary" || ! mv -f -- "$temporary" "$destination_status"; then
+        printf -v "$reason_output" '%s' LOCAL_IO
+        if ! (umask 077; set -o noclobber; : > "$temporary") 2>/dev/null \
+                || ! cp -- "$source_status" "$temporary" \
+                || ! mv -f -- "$temporary" "$destination_status"; then
             rm -f -- "$temporary"
             return 1
         fi
+        printf -v "$reason_output" '%s' LEDGER_INCONSISTENT
     done
 }
 
 _kubectl_remove_superseded_collection_paths() {
-    local state_dir="$1" results_dir="$2"
+    local state_dir="$1" results_dir="$2" reason_output="${3:-}"
+    [[ -z "$reason_output" \
+        || "$reason_output" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    [[ -z "$reason_output" ]] \
+        || printf -v "$reason_output" '%s' LEDGER_INCONSISTENT
     local current_manifest="$state_dir/publication-manifest.tsv"
     local kind first second _rest prior_manifest remote local_path bytes digest extra
     local -A resumed_ids=()
@@ -3917,12 +4487,17 @@ _kubectl_remove_superseded_collection_paths() {
             [[ "$replace" -eq 1 ]] || continue
             local destination
             _kubectl_result_destination destination "$results_dir" "$local_path" 0 \
+                "$reason_output" \
                 || return 1
             [[ -e "$destination" ]] || continue
             [[ -f "$destination" && ! -L "$destination" \
                 && "$(sha256sum -- "$destination" | awk '{print $1}')" == "$digest" ]] \
                 || return 1
-            rm -f -- "$destination" || return 1
+            if ! rm -f -- "$destination"; then
+                [[ -z "$reason_output" ]] \
+                    || printf -v "$reason_output" '%s' LOCAL_IO
+                return 1
+            fi
         done < "$prior_manifest"
     done
     [[ "$restore_nullglob" -eq 1 ]] || shopt -u nullglob
@@ -3932,7 +4507,14 @@ kubectl_collect_attempt() {
     local results_dir="$1" kubernetes_dir="$2" lock_fd="$3" attempt_id="$4"
     local metadata_dir="$kubernetes_dir/attempts/$attempt_id" inspector inspector_uid
     local archive_root archive staging state_dir remote_state rc=0
+    local collect_job_state="" collect_job_rc=0 collect_job_uid=""
+    local collect_job_kind="" collect_job_name="" collect_job_namespace=""
+    local collect_expected_uid=""
     kubectl_attempt_load_metadata "$metadata_dir" || return 1
+    local local_state_path="$metadata_dir/state.sh"
+    local remote_state_path
+    remote_state_path="$(kubectl_attempt_remote_root "$attempt_id")/state/run.status" \
+        || return 1
     case "$KUBECTL_LIFECYCLE_STATE" in SUBMITTED|TERMINAL|COLLECTION_IN_PROGRESS) ;; *) return 1 ;; esac
     _kubectl_scavenge_collection_staging "$results_dir" || return 1
     if [[ "$KUBECTL_LIFECYCLE_STATE" == COLLECTION_IN_PROGRESS \
@@ -3966,9 +4548,6 @@ kubectl_collect_attempt() {
         # A coordinator Pod can be killed after acquiring its durable lock and
         # either before or after publishing RUNNING. The Job's exact journaled
         # identity is the authority for deciding that no coordinator remains.
-        local collect_job_state="" collect_job_rc=0 collect_job_uid=""
-        local collect_job_kind="" collect_job_name="" collect_job_namespace=""
-        local collect_expected_uid=""
         kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" sweep || rc=1
         if [[ "$rc" -eq 0 ]]; then
             collect_job_kind="$KUBECTL_RESOURCE_KIND"
@@ -3997,7 +4576,18 @@ kubectl_collect_attempt() {
                 "$KUBECTL_NAMESPACE" "$inspector" "$attempt_id") || rc=1
         fi
     fi
-    [[ "$rc" -ne 0 || "$remote_state" =~ ^(SUCCESS|FAILED|CANCELLED)$ ]] || rc=1
+    if [[ "$rc" -eq 0 && ! "$remote_state" =~ ^(SUCCESS|FAILED|CANCELLED)$ ]]; then
+        KUBECTL_ATTEMPT_ID="$attempt_id" KUBECTL_REMOTE_STATE="$remote_state" \
+            KUBECTL_DIAGNOSTIC_LOCAL_STATE_PATH="$local_state_path" \
+            KUBECTL_DIAGNOSTIC_REMOTE_STATE_PATH="$remote_state_path" \
+            kubectl_report_lifecycle_error collect terminal-gate \
+                INVALID_LIFECYCLE_OPERATION \
+                "wait for terminal status or run --cancel, then retry --collect" \
+                yes "$collect_job_kind" "$collect_job_name" \
+                "$collect_job_namespace" "$collect_expected_uid" \
+                "$collect_job_uid" "" "$collect_job_state" || true
+        rc=1
+    fi
     if [[ "$rc" -eq 0 ]]; then
         local terminal_endpoint_rc=0
         _kubectl_verify_saved_worker_endpoints "$kubernetes_dir" "$attempt_id" \
@@ -4022,49 +4612,135 @@ kubectl_collect_attempt() {
     [[ "$rc" -ne 0 ]] || kubectl_wait_journaled_job_quiescent \
         "$kubernetes_dir" "$attempt_id" \
         "$KUBECTL_JOB_QUIESCENCE_TIMEOUT_SECONDS_DEFAULT" 1 || rc=1
+    if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == SUBMITTED ]]; then
+        kubectl_attempt_transition "$kubernetes_dir" "$lock_fd" "$attempt_id" \
+            TERMINAL || rc=1
+        kubectl_attempt_load_metadata "$metadata_dir" || rc=1
+    fi
     if [[ "$rc" -eq 0 ]]; then
         local remote_apparent_bytes=""
         kubectl_remote_attempt_apparent_bytes "$KUBECTL_NAMESPACE" "$inspector" \
             "$attempt_id" remote_apparent_bytes || rc=1
-        [[ "$rc" -ne 0 ]] || _kubectl_require_collection_capacity "$results_dir" \
-            "$remote_apparent_bytes" || rc=1
+        if [[ "$rc" -eq 0 ]] && ! _kubectl_require_collection_capacity \
+                "$results_dir" "$remote_apparent_bytes"; then
+            kubectl_report_collection_failure "$attempt_id" local-capacity ENOSPC \
+                "free local result storage and retry --collect" \
+                "$local_state_path" "$remote_state_path" "" \
+                "$collect_job_kind" "$collect_job_name" \
+                "$collect_job_namespace" "$collect_expected_uid" \
+                "$collect_job_uid" "$collect_job_state"
+            rc=1
+        fi
     fi
     if [[ "$rc" -eq 0 ]]; then
-        archive_root=$(mktemp -d \
-            "$results_dir/.kubernetes-collect-work-$attempt_id.XXXXXXXX") || rc=1
-        archive="$archive_root/attempt.tar"
+        if archive_root=$(mktemp -d \
+                "$results_dir/.kubernetes-collect-work-$attempt_id.XXXXXXXX"); then
+            archive="$archive_root/attempt.tar"
+        else
+            kubectl_report_collection_failure "$attempt_id" archive-staging \
+                LOCAL_IO "repair local result storage and retry --collect" \
+                "$local_state_path" "$remote_state_path" "" \
+                "$collect_job_kind" "$collect_job_name" \
+                "$collect_job_namespace" "$collect_expected_uid" \
+                "$collect_job_uid" "$collect_job_state"
+            rc=1
+        fi
     fi
     [[ "$rc" -ne 0 ]] || kubectl_stream_remote_attempt "$KUBECTL_NAMESPACE" "$inspector" \
-        "$attempt_id" "$archive" || rc=1
-    if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == SUBMITTED ]]; then
-        kubectl_attempt_transition "$kubernetes_dir" "$lock_fd" "$attempt_id" TERMINAL || rc=1
-        kubectl_attempt_load_metadata "$metadata_dir" || rc=1
-    fi
+        "$attempt_id" "$archive" "$local_state_path" "$remote_state_path" \
+        "$collect_job_kind" "$collect_job_name" "$collect_job_namespace" \
+        "$collect_expected_uid" "$collect_job_state" || rc=1
     if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == TERMINAL ]]; then
         kubectl_attempt_transition "$kubernetes_dir" "$lock_fd" "$attempt_id" \
             COLLECTION_IN_PROGRESS || rc=1
     fi
     staging="$results_dir/.kubernetes-collect-$attempt_id.${RANDOM}"
-    [[ "$rc" -ne 0 ]] || kubectl_extract_attempt_archive "$archive" "$attempt_id" \
-        "$results_dir" "$staging" || rc=1
+    if [[ "$rc" -eq 0 ]]; then
+        local extract_rc=0 extract_reason=LOCAL_IO
+        kubectl_extract_attempt_archive "$archive" "$attempt_id" \
+            "$results_dir" "$staging" || extract_rc=$?
+        if [[ "$extract_rc" -ne 0 ]]; then
+            [[ "$extract_rc" -ne 65 ]] || extract_reason=ARCHIVE_INVALID
+            kubectl_report_collection_failure "$attempt_id" archive-extract \
+                "$extract_reason" \
+                "repair local storage or inspect the retained remote attempt, then retry --collect" \
+                "$local_state_path" "$remote_state_path" "" \
+                "$collect_job_kind" "$collect_job_name" \
+                "$collect_job_namespace" "$collect_expected_uid" \
+                "$collect_job_uid" "$collect_job_state"
+            rc=1
+        fi
+    fi
     state_dir="$staging/$attempt_id/state"
     local verified_terminal=""
-    [[ "$rc" -ne 0 ]] || _kubectl_validate_collected_publication "$state_dir" \
-        "$attempt_id" verified_terminal "$metadata_dir/control-bundle/executions" \
-        >/dev/null || rc=1
-    [[ "$rc" -ne 0 ]] || [[ "$verified_terminal" == "$remote_state" ]] || rc=1
-    [[ "$rc" -ne 0 ]] || _kubectl_merge_collected_results "$state_dir" "$results_dir" || rc=1
+    if [[ "$rc" -eq 0 ]] && ! _kubectl_validate_collected_publication "$state_dir" \
+            "$attempt_id" verified_terminal "$metadata_dir/control-bundle/executions" \
+            >/dev/null; then
+        kubectl_report_collection_failure "$attempt_id" publication-validate \
+            LEDGER_INCONSISTENT \
+            "inspect the retained PVC ledger and publication manifest before retrying" \
+            "$local_state_path" "$remote_state_path" "" \
+            "$collect_job_kind" "$collect_job_name" "$collect_job_namespace" \
+            "$collect_expected_uid" "$collect_job_uid" "$collect_job_state"
+        rc=1
+    fi
+    if [[ "$rc" -eq 0 && "$verified_terminal" != "$remote_state" ]]; then
+        kubectl_report_collection_failure "$attempt_id" outcome-validate \
+            LEDGER_INCONSISTENT \
+            "inspect the retained PVC ledger and local staging before retrying" \
+            "$local_state_path" "$remote_state_path" "" \
+            "$collect_job_kind" "$collect_job_name" "$collect_job_namespace" \
+            "$collect_expected_uid" "$collect_job_uid" "$collect_job_state"
+        rc=1
+    fi
+    local merge_reason=LEDGER_INCONSISTENT
+    if [[ "$rc" -eq 0 ]] && ! _kubectl_merge_collected_results "$state_dir" \
+            "$results_dir" "$attempt_id" merge_reason; then
+        local merge_action="inspect conflicting local results and the retained manifest"
+        [[ "$merge_reason" != LOCAL_IO ]] \
+            || merge_action="repair local result storage and retry --collect"
+        kubectl_report_collection_failure "$attempt_id" result-merge "$merge_reason" \
+            "$merge_action; remote results were retained" \
+            "$local_state_path" "$remote_state_path" "" \
+            "$collect_job_kind" "$collect_job_name" "$collect_job_namespace" \
+            "$collect_expected_uid" "$collect_job_uid" "$collect_job_state"
+        rc=1
+    fi
     if [[ "$rc" -eq 0 ]]; then
         local collected="$metadata_dir/collected-state"
-        [[ ! -e "$collected" ]] || rm -rf -- "$collected"
-        mv -- "$state_dir" "$collected" || rc=1
+        if { [[ ! -e "$collected" && ! -L "$collected" ]] \
+                || { [[ -d "$collected" && ! -L "$collected" ]] \
+                    && rm -rf -- "$collected"; }; } \
+                && mv -- "$state_dir" "$collected"; then
+            :
+        else
+            kubectl_report_collection_failure "$attempt_id" collected-state-publish \
+                LOCAL_IO "repair local metadata storage and retry --collect" \
+                "$local_state_path" "$remote_state_path" "" \
+                "$collect_job_kind" "$collect_job_name" \
+                "$collect_job_namespace" "$collect_expected_uid" \
+                "$collect_job_uid" "$collect_job_state"
+            rc=1
+        fi
     fi
     if [[ -n "${archive_root:-}" ]] && ! rm -rf -- "$archive_root"; then
         echo "Error: failed to remove Kubernetes collection archive staging" >&2
+        kubectl_report_collection_failure "$attempt_id" archive-staging-cleanup \
+            LOCAL_IO "remove the named local staging path and retry --collect" \
+            "$local_state_path" "$remote_state_path" "" \
+            "$collect_job_kind" "$collect_job_name" \
+            "$collect_job_namespace" "$collect_expected_uid" \
+            "$collect_job_uid" "$collect_job_state"
         rc=1
     fi
     if [[ -n "${staging:-}" ]] && ! rm -rf -- "$staging"; then
         echo "Error: failed to remove Kubernetes collection extraction staging" >&2
+        kubectl_report_collection_failure "$attempt_id" extraction-staging-cleanup \
+            LOCAL_IO "remove the named local staging path and retry --collect" \
+            "$local_state_path" "$remote_state_path" "" \
+            "$collect_job_kind" "$collect_job_name" \
+            "$collect_job_namespace" "$collect_expected_uid" \
+            "$collect_job_uid" "$collect_job_state"
         rc=1
     fi
     if [[ "$rc" -eq 0 ]]; then
@@ -4074,6 +4750,10 @@ kubectl_collect_attempt() {
             "$KUBECTL_NAMESPACE" "$inspector" "$attempt_id" || rc=1
         [[ "$rc" -ne 0 ]] || kubectl_cleanup_journaled_resources "$kubernetes_dir" \
             "$lock_fd" "$attempt_id" || rc=1
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        kubectl_preserve_attempt_diagnostics "$kubernetes_dir" "$attempt_id" \
+            collect-failed
     fi
     _kubectl_remove_inspector "$kubernetes_dir" "$lock_fd" "$inspector" \
         "$inspector_uid" "$attempt_id" || rc=1
@@ -4090,7 +4770,17 @@ kubectl_resume_collected_sweep() {
     local rc=0
     _kubectl_load_saved_attempt "$results_dir" attempt_id || rc=1
     [[ "$rc" -ne 0 ]] || kubectl_attempt_load_metadata "$kubernetes_dir/attempts/$attempt_id" || rc=1
-    [[ "$rc" -ne 0 || "$KUBECTL_LIFECYCLE_STATE" == COLLECTED ]] || rc=1
+    if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" != COLLECTED ]]; then
+        kubectl_emit_lifecycle_commands "$results_dir" || true
+        KUBECTL_ATTEMPT_ID="$attempt_id" \
+            KUBECTL_DIAGNOSTIC_LOCAL_STATE_PATH="$kubernetes_dir/attempts/$attempt_id/state.sh" \
+            KUBECTL_DIAGNOSTIC_REMOTE_STATE_PATH="$(kubectl_attempt_remote_root "$attempt_id")/state/run.status" \
+            kubectl_report_lifecycle_error resume collection-gate \
+                INVALID_LIFECYCLE_OPERATION \
+                "run the STORAGE_SCALE_TEST_COLLECT_COMMAND printed above before --resume" \
+                unknown || true
+        rc=1
+    fi
     state_dir="$kubernetes_dir/attempts/$attempt_id/collected-state"
     # The coordinator provides the authoritative, collection-gated decision.
     # A new attempt receives only non-SUCCESS definitions; old successful

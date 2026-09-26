@@ -257,7 +257,7 @@ def test_kubectl_commands_have_request_and_process_timeouts():
 
 
 def test_observational_calls_retry_only_transient_api_failures(tmp_path):
-    """Safe observations retry throttling but fail fast on authorization."""
+    """[S-10] [T-01] Observations retry throttling, not authorization."""
     calls = tmp_path / "calls"
     output = tmp_path / "result"
     result = _run_bash(f"""
@@ -288,7 +288,7 @@ def test_observational_calls_retry_only_transient_api_failures(tmp_path):
 
 
 def test_exhausted_observation_emits_actionable_diagnostic_envelope():
-    """Transient API exhaustion reports stable fields and preserves failure."""
+    """[S-11] [T-02] API exhaustion reports stable actionable evidence."""
     result = _run_bash("""
         kubectl_run_bounded() {
             printf 'Service Unavailable (503)\n' >&2
@@ -339,7 +339,7 @@ def test_helper_readiness_timeout_captures_diagnostics_without_masking_failure()
 
 
 def test_worker_readiness_timeout_captures_daemonset_diagnostics(tmp_path):
-    """DaemonSet convergence failure names the exact owned worker resource."""
+    """[S-12] DaemonSet readiness failure names the exact resource."""
     nodes = tmp_path / "nodes.tsv"
     nodes.write_text("node-a\tuid-a\tamd64\n", encoding="utf-8")
     result = _run_bash(f"""
@@ -359,9 +359,9 @@ def test_worker_readiness_timeout_captures_daemonset_diagnostics(tmp_path):
 
 
 def test_resource_diagnostics_are_bounded_and_best_effort(tmp_path):
-    """Diagnostic failure never hides the path or queries unrelated events."""
-    attempt = tmp_path / "attempt"
-    attempt.mkdir()
+    """[S-12] Diagnostics include bounded Pod, ledger, and identity evidence."""
+    attempt = tmp_path / "state" / "attempts" / "1234abcd"
+    attempt.mkdir(parents=True)
     calls = tmp_path / "calls"
     result = _run_bash(f"""
         calls={str(calls)!r}
@@ -376,6 +376,13 @@ def test_resource_diagnostics_are_bounded_and_best_effort(tmp_path):
                 printf 'evidence\n'
             fi
         }}
+        kubectl_capture_retained_resource_identities() {{
+            printf 'key\tsource\tkind\tname\tnamespace\tuid\tnonce\n' > "$3"
+            printf 'workers\tjournal\tDaemonSet\tworkers\ttest-ns\tuid\tnonce\n' >> "$3"
+        }}
+        kubectl_capture_control_state_evidence() {{
+            printf '===== publication-manifest.tsv =====\nmanifest\n' > "$4"
+        }}
         path=$(kubectl_capture_resource_diagnostics {str(attempt)!r} \
             workers-not-ready test-ns DaemonSet sst-elb-1234abcd-workers \
             1234abcd)
@@ -383,8 +390,51 @@ def test_resource_diagnostics_are_bounded_and_best_effort(tmp_path):
         [[ -f "$path/resource.yaml" && -f "$path/resource.describe" ]]
         [[ -f "$path/pods.yaml" && -f "$path/pods.log" ]]
         [[ -f "$path/events.txt" ]]
+        [[ -f "$path/pod-1.describe" ]]
+        grep -F publication-manifest.tsv "$path/pvc-control-state.txt"
+        grep -F $'workers\tjournal\tDaemonSet' \
+          "$path/retained-resource-identities.tsv"
+        grep -F $'schema\t1' "$path/bundle.tsv"
+        grep -F $'attempt_id\t1234abcd' "$path/bundle.tsv"
+        grep -F $'resource_kind\tDaemonSet' "$path/bundle.tsv"
         grep -F -- '--field-selector involvedObject.name=worker-a' "$calls"
+        grep -F -- 'describe pod worker-a' "$calls"
         ! grep -F -- 'get events --sort-by' "$calls"
+    """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_diagnostic_capture_failure_prints_manual_inspection(tmp_path):
+    """Supplemental failure retains the primary path and a safe operator command."""
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    result = _run_bash(f"""
+        KUBECTL_NAMESPACE=test-ns
+        kubectl_capture_attempt_diagnostics() {{ return 1; }}
+        kubectl_preserve_attempt_diagnostics {str(attempt)!r} 1234abcd collect-failed
+    """)
+    assert result.returncode == 0, result.stderr
+    assert "automatic Kubernetes diagnostic capture failed" in result.stderr
+    assert "kubectl -n test-ns get job" in result.stderr
+    assert "last proven local and PVC state was retained" in result.stderr
+
+
+def test_readiness_diagnosis_bounds_event_queries(tmp_path):
+    """A large failed Pod set cannot turn diagnosis into another long outage."""
+    calls = tmp_path / "calls"
+    result = _run_bash(f"""
+        calls={str(calls)!r}
+        kubectl_run_observational() {{
+            printf '%s\n' "$*" >> "$calls"
+            if [[ "$*" == *'-o name'* ]]; then
+                for i in $(seq 1 20); do printf 'pod/worker-%s\n' "$i"; done
+            elif [[ "$*" == *'get events'* ]]; then
+                printf 'FailedScheduling\tno capacity\n'
+            fi
+        }}
+        kubectl_classify_readiness_failure reason test-ns 1234abcd
+        [[ "$reason" == POD_UNSCHEDULABLE ]]
+        [[ $(grep -c 'get events' "$calls") -eq 4 ]]
     """)
     assert result.returncode == 0, result.stderr
 
@@ -405,8 +455,28 @@ def test_resource_diagnostics_truncate_large_outputs(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+def test_control_state_diagnostics_use_guarded_bounded_pvc_reads(tmp_path):
+    """[C-13] Durable ledger evidence is guarded, selected, and size bounded."""
+    captured = tmp_path / "script"
+    destination = tmp_path / "evidence"
+    result = _run_bash(f"""
+        kubectl_pvc_exec() {{
+            printf '%s' "$5" > {str(captured)!r}
+            printf 'durable evidence\n'
+        }}
+        kubectl_capture_control_state_evidence test-ns helper 1234abcd \
+          {str(destination)!r}
+        grep -F 'realpath -e -- "$run"' {str(captured)!r}
+        grep -F 'publication-manifest.tsv' {str(captured)!r}
+        grep -F 'run-summary.tsv' {str(captured)!r}
+        grep -F '*.workers.tsv' {str(captured)!r}
+        [[ $(wc -c < {str(destination)!r}) -le 524288 ]]
+    """)
+    assert result.returncode == 0, result.stderr
+
+
 def test_remote_pvc_enospc_has_distinct_diagnostics(tmp_path):
-    """Remote storage exhaustion is not confused with local collection space."""
+    """[C-14] Remote ENOSPC is distinct from local collection space."""
     attempt = tmp_path / "attempt"
     attempt.mkdir()
     diagnostic = tmp_path / "diagnostic"
@@ -460,6 +530,9 @@ def test_attempt_diagnostics_prefer_exact_journaled_workload(tmp_path):
         kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
             Job sst-elb-1234abcd-sweep test-ns job-uid \
             0123456789abcdef0123456789abcdef
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd workers \
+            DaemonSet sst-elb-1234abcd-workers test-ns workers-uid \
+            0123456789abcdef0123456789abcdef
         kubectl_capture_resource_diagnostics() {{
             printf '%s|%s|%s|%s|%s|%s\n' "$@" >> {str(tmp_path / 'capture')!r}
             mkdir -p "$1/diagnostics"
@@ -468,12 +541,17 @@ def test_attempt_diagnostics_prefer_exact_journaled_workload(tmp_path):
         }}
         first=$(kubectl_capture_attempt_diagnostics "$root" 1234abcd submit-failed)
         second=$(kubectl_capture_attempt_diagnostics "$root" 1234abcd submit-failed)
-        [[ "$first" == "$root/attempts/1234abcd/diagnostics/exact."* ]]
-        [[ "$second" == "$root/attempts/1234abcd/diagnostics/exact."* ]]
+        [[ $(wc -l <<< "$first") -eq 2 ]]
+        [[ $(wc -l <<< "$second") -eq 2 ]]
+        [[ "$first" == *"$root/attempts/1234abcd/diagnostics/exact."* ]]
+        [[ "$second" == *"$root/attempts/1234abcd/diagnostics/exact."* ]]
         [[ "$second" != "$first" ]]
-        [[ $(wc -l < {str(tmp_path / 'capture')!r}) -eq 2 ]]
+        [[ $(wc -l < {str(tmp_path / 'capture')!r}) -eq 4 ]]
         grep -F -- \
           'submit-failed|test-ns|Job|sst-elb-1234abcd-sweep|1234abcd' \
+          {str(tmp_path / 'capture')!r}
+        grep -F -- \
+          'submit-failed|test-ns|DaemonSet|sst-elb-1234abcd-workers|1234abcd' \
           {str(tmp_path / 'capture')!r}
         kubectl_local_lock_release "$fd"
     """)

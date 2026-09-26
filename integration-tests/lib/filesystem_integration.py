@@ -27,6 +27,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import tarfile
 import tempfile
@@ -106,7 +107,7 @@ KUBERNETES_UID = re.compile(
 )
 KUBECTL_TERMINAL_STATES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 KUBECTL_STATUS_STATES = KUBECTL_TERMINAL_STATES | frozenset(
-    {"PREPARED", "SUBMITTED", "RUNNING"}
+    {"PREPARED", "SUBMITTED", "RUNNING", "CANCEL_REQUESTED"}
 )
 KUBECTL_SUPPORTED_SCENARIOS = frozenset(
     {
@@ -2703,11 +2704,12 @@ def _run_kubectl_command(
     *,
     expected_failure: bool = False,
     accepted_states: frozenset[str] = frozenset(),
+    kubeconfig: Path | None = None,
 ) -> str:
     """Run one local kubectl-sweep command with the fixture kubeconfig."""
     command: list[str | Path] = [
         "env",
-        f"KUBECONFIG={config.kubeconfig}",
+        f"KUBECONFIG={kubeconfig or config.kubeconfig}",
         "timeout",
         "--kill-after=15s",
         f"{timeout}s",
@@ -2907,6 +2909,180 @@ def _assert_kubectl_ordered_workers(fixture: Fixture, result: Path) -> None:
         )
 
 
+def _kubectl_attempt_digest(result_root: Path, attempt_id: str) -> str:
+    """Hash durable attempt metadata, excluding supplemental diagnostics."""
+    attempt = result_root / "kubernetes" / "attempts" / attempt_id
+    digest = hashlib.sha256()
+    for path in sorted(attempt.rglob("*")):
+        relative = path.relative_to(attempt)
+        if relative.parts and relative.parts[0] == "diagnostics":
+            continue
+        if path.is_symlink():
+            raise IntegrationTestError(f"unexpected lifecycle symlink: {path}")
+        if path.is_file():
+            digest.update(str(relative).encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _make_unauthorized_kubeconfig(runner: Any, config: Any, destination: Path) -> None:
+    """Preserve cluster trust while replacing the client credential."""
+    result = runner.run(
+        _kubectl(
+            config, "config", "view", "--raw", "--minify", "--flatten", "-o", "json"
+        ),
+        check=True,
+        timeout=30,
+    )
+    document = json.loads(result.stdout)
+    users = document.get("users")
+    if not isinstance(users, list) or len(users) != 1:
+        raise IntegrationTestError(
+            "fixture kubeconfig does not select exactly one user"
+        )
+    users[0]["user"] = {"token": "storage-scale-test-intentionally-invalid"}
+    destination.write_text(json.dumps(document), encoding="utf-8")
+    destination.chmod(0o600)
+
+
+def _assert_expired_kubectl_status_is_observational(
+    runner: Any,
+    config: Any,
+    runtime: ScenarioRuntime,
+    result_root: Path,
+    attempt_id: str,
+    log_dir: Path,
+) -> None:
+    """Simulated expired credentials fail consistently without local mutation."""
+    bad_kubeconfig = log_dir / "kubectl-expired-credential.json"
+    _make_unauthorized_kubeconfig(runner, config, bad_kubeconfig)
+    before = _kubectl_attempt_digest(result_root, attempt_id)
+    envelopes: list[tuple[str, str, str]] = []
+    for index in (1, 2):
+        output = _run_kubectl_command(
+            runner,
+            config,
+            runtime,
+            f"expired-status-{index}",
+            ("--status", str(result_root)),
+            log_dir,
+            60,
+            expected_failure=True,
+            kubeconfig=bad_kubeconfig,
+        )
+        fields = tuple(
+            _kubectl_output_value(output, key)
+            for key in (
+                "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON",
+                "STORAGE_SCALE_TEST_DIAGNOSTIC_OPERATION",
+                "STORAGE_SCALE_TEST_DIAGNOSTIC_SAFE_NEXT_ACTION",
+            )
+        )
+        if fields[0] != "AUTH":
+            raise IntegrationTestError(
+                f"expired kubectl credential was classified as {fields[0]}"
+            )
+        envelopes.append(fields)
+    if envelopes[0] != envelopes[1]:
+        raise IntegrationTestError("expired-credential diagnostics were not stable")
+    if _kubectl_attempt_digest(result_root, attempt_id) != before:
+        raise IntegrationTestError(
+            "failed authenticated status mutated attempt metadata"
+        )
+
+
+def _interrupt_kubectl_collection(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    result_root: Path,
+    attempt_id: str,
+    log_dir: Path,
+) -> None:
+    """Interrupt one real collector at its explicit pre-stream test boundary."""
+    environment = os.environ.copy()
+    environment["KUBECONFIG"] = str(config.kubeconfig)
+    environment["STORAGE_SCALE_TEST_INTEGRATION"] = "1"
+    hold_file = result_root / ".integration-kubectl-collection-ready"
+    environment["KUBECTL_INTEGRATION_COLLECTION_HOLD_FILE"] = str(hold_file)
+    interrupted_log = log_dir / "kubectl-collect-interrupted.log"
+    command = [
+        "timeout",
+        "--foreground",
+        "--kill-after=15s",
+        "180s",
+        str(Path(runtime.workspace) / "storage-tests/fs/nv-elbencho-sweep.sh"),
+        "--collect",
+        str(result_root),
+    ]
+    collection: subprocess.Popen[str] | None = None
+    hold_file.unlink(missing_ok=True)
+    with interrupted_log.open("w", encoding="utf-8") as output:
+        try:
+            collection = subprocess.Popen(
+                command,
+                cwd=runtime.workspace,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=environment,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + 90
+            while not hold_file.is_file() and collection.poll() is None:
+                if time.monotonic() >= deadline:
+                    raise IntegrationTestError(
+                        "collector did not reach the pre-stream interruption boundary"
+                    )
+                time.sleep(0.1)
+            if not hold_file.is_file() or collection.poll() is not None:
+                raise IntegrationTestError(
+                    "collector exited before the interruption boundary"
+                )
+            os.killpg(collection.pid, signal.SIGINT)
+            hold_file.unlink(missing_ok=True)
+            try:
+                returncode = collection.wait(timeout=30)
+            except subprocess.TimeoutExpired as error:
+                os.killpg(collection.pid, signal.SIGKILL)
+                collection.wait(timeout=10)
+                raise IntegrationTestError(
+                    "interrupted collector did not honor SIGINT"
+                ) from error
+            if returncode == 0:
+                raise IntegrationTestError("interrupted collection reported success")
+        finally:
+            if collection is not None and collection.poll() is None:
+                os.killpg(collection.pid, signal.SIGINT)
+                try:
+                    collection.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    os.killpg(collection.pid, signal.SIGKILL)
+                    collection.wait(timeout=10)
+            hold_file.unlink(missing_ok=True)
+    interrupted_log.chmod(0o640)
+    state_path = result_root / "kubernetes" / "attempts" / attempt_id / "state.sh"
+    if state_path.read_text(encoding="utf-8").strip() != (
+        "KUBECTL_LIFECYCLE_STATE=TERMINAL"
+    ):
+        raise IntegrationTestError(
+            "interrupted collection did not retain the TERMINAL checkpoint"
+        )
+    if (state_path.parent / "collected-state").exists():
+        raise IntegrationTestError(
+            "interrupted pre-stream collection published collected state"
+        )
+    remote_run = f"{KUBECTL_STORAGE_MOUNT}/.storage-scale-test/runs/{attempt_id}"
+    _storage_utility_shell(
+        runner,
+        config,
+        fixture,
+        f"test -d {shlex.quote(remote_run)}",
+    )
+
+
 def _run_kubectl_baseline(
     runner: Any,
     config: Any,
@@ -2944,6 +3120,12 @@ def _run_kubectl_baseline(
     )
     if terminal != "SUCCESS":
         raise IntegrationTestError(f"kubectl baseline ended in {terminal}")
+    _assert_expired_kubectl_status_is_observational(
+        runner, config, runtime, result_root, attempt_id, log_dir
+    )
+    _interrupt_kubectl_collection(
+        runner, config, fixture, runtime, result_root, attempt_id, log_dir
+    )
     _run_kubectl_command(
         runner,
         config,
@@ -2954,6 +3136,31 @@ def _run_kubectl_baseline(
         180,
     )
     runtime.values["kubectl_collected"] = "1"
+    stale_staging = sorted(result_root.glob(".kubernetes-collect-*"))
+    if stale_staging:
+        raise IntegrationTestError(
+            f"collection retry left staging paths: {stale_staging}"
+        )
+    helpers = runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "get",
+            "pods",
+            "-l",
+            f"storage-scale-test.nvidia.com/run={attempt_id},"
+            "app.kubernetes.io/component=transfer",
+            "-o",
+            "name",
+        ),
+        check=True,
+        timeout=30,
+    )
+    if helpers.stdout.strip():
+        raise IntegrationTestError(
+            f"collection retry left a transfer helper: {helpers.stdout.strip()}"
+        )
     result = _collected_result_root(result_root)
     _assert_execution_contract(runtime.scenario, step, result)
     _assert_semantic_flags(runtime.scenario.name, step, result)
@@ -3603,6 +3810,10 @@ def _cleanup_kubectl_attempt(
         )
         if result.returncode:
             output = result.stdout + result.stderr
+            if "STORAGE_SCALE_TEST_KUBECTL_STATE=SUBMISSION_FAILED" in output:
+                # Submission rollback is terminal and leaves no benchmark
+                # results or remote resources to collect.
+                return
             if operation == "--collect":
                 try:
                     terminal = _kubectl_lifecycle_state(output)

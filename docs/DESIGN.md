@@ -290,6 +290,11 @@ benchmarks do not use the Kubernetes substrate.
 
 ### 4.3 Kubernetes Asynchronous Filesystem IO
 
+The exact attempt, PVC-run, and per-cell state machines; invariants;
+linearization points; supported fault boundaries; and unsupported situations
+are normative in
+[KUBERNETES_ELBENCHO_LIFECYCLE.md](KUBERNETES_ELBENCHO_LIFECYCLE.md).
+
 Kubernetes submission is asynchronous at the sweep level. The submitting host
 creates an attempt-scoped control bundle, ledger, reservation, and ownership
 metadata on the configured PVC, then starts one elbencho worker per selected
