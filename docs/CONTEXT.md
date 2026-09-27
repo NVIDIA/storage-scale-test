@@ -99,14 +99,14 @@ sizing, scheduler boundaries, failure contracts, and reporting. CI runs the full
 NFS-backed catalog concurrently on amd64 and arm64 with repeatable-teardown
 headroom; SBX is a supported local backend.
 
-The kubectl filesystem-sweep design and acceptance boundary are documented in
-[plans/kubernetes-elbencho-filesystem-sweep.md](plans/kubernetes-elbencho-filesystem-sweep.md).
-Its normative state machines, invariants, fault matrix, and unsupported cases
-are frozen in
+The kubectl filesystem sweep's implemented decisions and tradeoffs are retained
+in the historical
+[design record](plans/kubernetes-elbencho-filesystem-sweep.md). Its normative
+state machines, invariants, fault matrix, and unsupported cases are frozen in
 [KUBERNETES_ELBENCHO_LIFECYCLE.md](KUBERNETES_ELBENCHO_LIFECYCLE.md).
-Attempts publish their local current pointer only after acquiring durable PVC
-ownership and freezing worker evidence; resume uses compare-and-swap against
-the collected predecessor. Collection waits for the exact journaled Job to
+Attempts publish their local `PREPARED` pointer before external mutation so an
+interrupted setup remains recoverable; resume uses compare-and-swap against the
+collected predecessor. Collection waits for the exact journaled Job to
 become inactive, uses a transfer-sized deadline, and recovers coordinator loss
 from either PREPARED or RUNNING. Derived workload paths are resolved against
 live PVC symlinks, and endpoint checks freeze Node, Pod, address, architecture,

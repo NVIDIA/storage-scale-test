@@ -21,8 +21,8 @@ This document is the normative lifecycle and failure contract for the
 asynchronous kubectl substrate of the Elbencho filesystem sweep. It freezes
 the states, legal transitions, invariants, linearization points, supported
 fault boundaries, and explicit non-goals against which implementation and
-review are evaluated. The implementation plan explains how the feature was
-built; this document defines the behavior that must remain true.
+review are evaluated. The historical design record explains why the feature
+was built this way; this document defines the behavior that must remain true.
 
 ## Failure policy and boundary
 

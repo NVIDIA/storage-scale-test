@@ -225,24 +225,25 @@ collecting the attempt:
 ./storage-tests/fs/nv-elbencho-sweep.sh --collect "$RESULTS_DIR"/elbencho-<datestamp>/
 ```
 
-The Job runs without depending on the submitting process's later `kubectl`
-credentials. `--status` reads durable remote state and may report a running,
-successful, failed, or cancelled attempt. `--cancel` stops the exact saved
-attempt and preserves its durable state. `--collect` is required after a
-terminal attempt: it copies completed results, snapshots, and diagnostics
-from the PVC into the local results directory and performs owned-resource
-cleanup. Collection of a failed or cancelled attempt returns a failure status
-after publishing the partial results, so callers must inspect the collected
-state before deciding whether to continue.
+The Job does not depend on the submitting process's later `kubectl`
+credentials, although lifecycle commands require current credentials until
+cleanup completes. `--status` inspects durable state and performs only bounded,
+exact-identity reconciliation. A successful status query exits zero regardless
+of the benchmark outcome. `--cancel` stops the exact saved attempt and preserves
+its durable state. `--collect` is required after a terminal attempt: it copies
+completed results, snapshots, and diagnostics into the local result directory
+and performs owned-resource cleanup. Collection of a failed or cancelled
+attempt returns nonzero after publishing the partial results, so callers must
+inspect the collected state before deciding whether to continue.
 
 Kubernetes `--resume` is collection-gated. After collecting a failed attempt,
 run `--resume <results-dir>` with the same Kubernetes configuration to submit
 only the uncompleted cells; successful cells and their results are retained.
-Do not run concurrent operations on one result directory or concurrent
-resumes. Active measured output is Pod-local scratch, while completed-cell
-publication and the control ledger are copied to the PVC between cells. A
-failure before publication can lose that cell's partial output, but cannot
-silently claim it succeeded.
+Concurrent mutating operations on one result directory and concurrent sweeps
+on one PVC are rejected. Active measured output is Pod-local scratch, while
+completed-cell publication and the control ledger are copied to the PVC
+between cells. A failure before publication can lose that cell's partial
+output, but cannot silently claim it succeeded.
 
 ## Heterogeneous Client Fleets
 
