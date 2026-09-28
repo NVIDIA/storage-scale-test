@@ -30,13 +30,14 @@ recommended.
 
 ## Global Prerequisites
 
-* Linux on the orchestration host and on every client. Benchmark execution
-  relies on bash 4.3 or newer and a Linux userland. macOS can run static checks
-  and unit tests that do not require benchmark binaries, but it cannot run the
-  storage benchmarks. In particular, elbencho is not available for Apple
-  silicon; binary-dependent tests are skipped when it is unavailable. Running
-  the developer unit tests on macOS requires a newer Bash and GNU coreutils,
-  which can be installed with `brew install bash coreutils`.
+* Linux on every host where a benchmark process runs. Slurm orchestration also
+  requires a Linux host. macOS may initiate SSH and kubectl filesystem sweeps;
+  the benchmark still runs only on the remote Linux hosts or in Linux Pods.
+  macOS launchers require Bash 4.3 or newer plus GNU coreutils. Kubectl also
+  requires GNU tar and `flock` (`brew install bash coreutils gnu-tar flock`).
+  Put Homebrew's Bash first on `PATH`; `validate_env.sh` checks the prefixed
+  Homebrew tools. Apple-silicon macOS cannot run elbencho locally;
+  binary-dependent developer tests remain skipped there.
 * Python 3.12 or newer is required on the host that runs the analysis and
   reporting wrappers. The pinned current NumPy release establishes this minimum.
 * Filesystem clients must be available through exactly one configured

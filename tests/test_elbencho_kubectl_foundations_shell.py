@@ -404,6 +404,28 @@ def test_resource_diagnostics_are_bounded_and_best_effort(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+def test_local_diagnostic_size_does_not_require_gnu_du(tmp_path):
+    """Launcher-side byte accounting works with BSD/macOS userland tools."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "one").write_bytes(b"12345")
+    (tree / "two").write_bytes(b"678")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "du").write_text(
+        "#!/bin/sh\necho 'du must not be called' >&2\nexit 99\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "du").chmod(0o755)
+    result = _run_bash(f"""
+        PATH={str(fake_bin)!r}:$PATH
+        bytes=$(_kubectl_local_tree_apparent_bytes {str(tree)!r})
+        [[ "$bytes" == 8 ]]
+    """)
+    assert result.returncode == 0, result.stderr
+    assert "du must not be called" not in result.stderr
+
+
 def test_diagnostic_capture_failure_prints_manual_inspection(tmp_path):
     """Supplemental failure retains the primary path and a safe operator command."""
     attempt = tmp_path / "attempt"

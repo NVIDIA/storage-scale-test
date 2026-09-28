@@ -941,8 +941,24 @@ def test_bounded_kubectl_owns_the_child_process_group() -> None:
     """A wedged exec cannot evade timeout through foreground mode."""
     source = _FUNCTIONS.read_text(encoding="utf-8")
     body = source.split("kubectl_run_bounded() {", 1)[1].split("\n}", 1)[0]
-    assert "timeout --kill-after=5s" in body
+    assert "_kubectl_local_timeout --kill-after=5s" in body
     assert "timeout --foreground" not in body
+
+
+def test_macos_uses_homebrew_timeout_and_tar_commands() -> None:
+    """Darwin launchers use GNU tools under Homebrew's prefixed names."""
+    result = _bash("""
+        uname() { printf 'Darwin\n'; }
+        gtimeout() { printf 'timeout:%s\n' "$*"; }
+        gtar() { printf 'tar:%s\n' "$*"; }
+        timeout() { printf 'wrong timeout\n'; return 91; }
+        tar() { printf 'wrong tar\n'; return 92; }
+        timeout_output=$(_kubectl_local_timeout --kill-after=5s 30s true)
+        tar_output=$(_kubectl_local_tar -tf archive.tar)
+        [[ "$timeout_output" == 'timeout:--kill-after=5s 30s true' ]]
+        [[ "$tar_output" == 'tar:-tf archive.tar' ]]
+        """)
+    assert result.returncode == 0, result.stderr
 
 
 def test_collection_waits_for_exact_journaled_job_quiescence(
@@ -1216,6 +1232,61 @@ def test_runtime_configuration_rejects_every_invalid_field(
         ! kubectl_validate_runtime_configuration
         """)
     assert result.returncode == 0, result.stderr
+    assert f"Error: {variable}" in result.stderr
+    assert "invalid Kubernetes filesystem sweep configuration" not in result.stderr
+
+
+def test_runtime_configuration_reports_every_missing_field() -> None:
+    """[S-01] One validation run identifies every missing Kubernetes setting."""
+    variables = (
+        "KUBECTL_NAMESPACE",
+        "KUBECTL_PV",
+        "KUBECTL_PVC",
+        "KUBECTL_NODE_SELECTOR",
+        "KUBECTL_ELBENCHO_IMAGE",
+        "KUBECTL_IMAGE_PULL_POLICY",
+        "KUBECTL_RUN_AS_USER",
+        "KUBECTL_RUN_AS_GROUP",
+    )
+    result = _bash("""
+        unset KUBECTL_NAMESPACE KUBECTL_PV KUBECTL_PVC KUBECTL_NODE_SELECTOR
+        unset KUBECTL_ELBENCHO_IMAGE KUBECTL_IMAGE_PULL_POLICY
+        unset KUBECTL_RUN_AS_USER KUBECTL_RUN_AS_GROUP
+        ! kubectl_validate_runtime_configuration
+        """)
+    assert result.returncode == 0, result.stderr
+    for variable in variables:
+        assert f"Error: {variable} is required" in result.stderr
+
+
+def test_cluster_storage_contract_reports_expected_and_observed_values() -> None:
+    """Storage validation identifies the mismatched PVC attribute and values."""
+    result = _bash("""
+        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NODE_SELECTOR=storage-test=true
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_IMAGE_PULL_POLICY=Never
+        export KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
+        kubectl() { :; }
+        kubectl_run_observational() {
+            case "$*" in
+                version) return 0 ;;
+                'get namespace test-ns -o jsonpath={.metadata.uid}')
+                    printf 'namespace-uid' ;;
+                'get pv test-pv -o jsonpath={.metadata.uid}') printf 'pv-uid' ;;
+                '-n test-ns get pvc test-pvc -o jsonpath={.metadata.uid}')
+                    printf 'pvc-uid' ;;
+                '-n test-ns get pvc test-pvc -o jsonpath='*)
+                    printf 'another-pv\tPending\tBlock\tReadWriteOnce' ;;
+                *) printf 'unexpected command: %s\n' "$*" >&2; return 90 ;;
+            esac
+        }
+        ! kubectl_validate_cluster_identity
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "PVC test-ns/test-pvc does not satisfy" in result.stderr
+    assert "expected: volumeName=test-pv" in result.stderr
+    assert "observed: volumeName=another-pv phase=Pending" in result.stderr
 
 
 def test_prepare_failure_classification_preserves_local_capacity_and_path_causes() -> (
@@ -1432,7 +1503,7 @@ def test_runtime_preflight_job_is_bounded_and_self_cleaning() -> None:
     assert result.returncode == 0, result.stderr
     job = yaml.safe_load(result.stdout)
     assert job["kind"] == "Job"
-    assert job["spec"]["activeDeadlineSeconds"] == 180
+    assert job["spec"]["activeDeadlineSeconds"] == 300
     assert job["spec"]["ttlSecondsAfterFinished"] == 60
     pod = job["spec"]["template"]["spec"]
     assert pod["automountServiceAccountToken"] is False
@@ -1442,6 +1513,62 @@ def test_runtime_preflight_job_is_bounded_and_self_cleaning() -> None:
     assert "type -P gstat" in body
     assert "type -P pkill" in body
     assert "type -P killall" in body
+    assert "missing required command" in body
+    assert "cannot write the mounted PVC" in body
+    assert "could not read back its PVC probe" in body
+    for phase in (
+        "identity",
+        "required-tools",
+        "pvc-permissions",
+        "pvc-create",
+        "pvc-write",
+        "pvc-read",
+        "complete",
+    ):
+        assert f"STORAGE_SCALE_TEST_VALIDATION_PHASE={phase}" in body
+
+
+def test_runtime_validation_captures_live_pod_before_controller_deadline() -> None:
+    """The host diagnostic deadline precedes deletion by activeDeadlineSeconds."""
+    functions = _FUNCTIONS.read_text(encoding="utf-8")
+    body = functions.split("kubectl_validate_runtime_pod() {", 1)[1].split(
+        "\n}\n\nkubectl_discover_candidate_nodes", 1
+    )[0]
+    assert "SECONDS + 180" in body
+    assert "_kubectl_print_runtime_validation_diagnostics" in body
+    template = (
+        _ROOT / "storage-tests/fs/kubectl/templates/validation-job.yaml.tmpl"
+    ).read_text(encoding="utf-8")
+    assert "activeDeadlineSeconds: 300" in template
+
+
+def test_runtime_validation_diagnostics_resolve_symlinked_tmpdir(
+    tmp_path: Path,
+) -> None:
+    """Validation diagnostics use a physical path when TMPDIR is a symlink."""
+    physical_temp = tmp_path / "physical-temp"
+    physical_temp.mkdir()
+    linked_temp = tmp_path / "linked-temp"
+    linked_temp.symlink_to(physical_temp, target_is_directory=True)
+    result = _bash(f"""
+        export TMPDIR={str(linked_temp)!r}
+        kubectl_capture_resource_diagnostics() {{
+            local metadata_dir="$1" bundle
+            case "$metadata_dir" in
+                {str(physical_temp)!r}/*) ;;
+                *) printf 'unexpected diagnostic path: %s\n' "$metadata_dir" >&2; return 1 ;;
+            esac
+            bundle="$metadata_dir/diagnostics/runtime-validation"
+            mkdir -p -- "$bundle"
+            printf 'captured validation evidence\n' > "$bundle/resource.describe"
+            printf '%s\n' "$bundle"
+        }}
+        _kubectl_print_runtime_validation_diagnostics \
+          test-ns sst-elb-1234abcd-validation 1234abcd
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "captured validation evidence" in result.stderr
+    assert "may not traverse a symbolic link" not in result.stderr
 
 
 def test_control_bundle_stages_phase_six_contract_once(tmp_path: Path) -> None:

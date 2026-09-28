@@ -15,6 +15,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if (( BASH_VERSINFO[0] < 4 \
+        || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    printf 'Bash 4.3 or newer is required; on macOS run: brew install bash\n' >&2
+    exit 1
+fi
+
 # Boilerplate to find the deployment before parsing the operation. Environment
 # loading is intentionally deferred until argument grammar is known.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd) || {
@@ -406,7 +412,7 @@ case "$SWEEP_OPERATION" in
         ;;
 esac
 
-if ! source_output=$("$SHELL" -c ". '${SCRIPT_DIR}/../../env.sh'" 2>&1); then
+if ! source_output=$("$BASH" -c ". '${SCRIPT_DIR}/../../env.sh'" 2>&1); then
     printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
     exit 1
 fi

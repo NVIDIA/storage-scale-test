@@ -29,7 +29,9 @@ metadata:
     storage-scale-test.nvidia.com/ownership: "@@OWNERSHIP_NONCE@@"
 spec:
   backoffLimit: 0
-  activeDeadlineSeconds: 180
+  # The host stops waiting at 180 seconds and captures the still-live Pod.
+  # This later deadline bounds cleanup if the host disappears mid-validation.
+  activeDeadlineSeconds: 300
   ttlSecondsAfterFinished: 60
   template:
     metadata:
@@ -56,23 +58,60 @@ spec:
           command: ["/bin/bash", "-ceu", "--"]
           args:
             - |
-              test "$(id -u)" = "@@RUN_AS_USER@@"
-              test "$(id -g)" = "@@RUN_AS_GROUP@@"
+              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=identity\n'
+              test "$(id -u)" = "@@RUN_AS_USER@@" || {
+                  echo "Error: validation Pod UID does not match KUBECTL_RUN_AS_USER" >&2
+                  exit 1
+              }
+              test "$(id -g)" = "@@RUN_AS_GROUP@@" || {
+                  echo "Error: validation Pod GID does not match KUBECTL_RUN_AS_GROUP" >&2
+                  exit 1
+              }
+              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=required-tools\n'
               for command in elbencho bash tar realpath timeout sha256sum awk find grep mkdir cp cmp date shuf mv wc cat sed rm sort basename dirname sleep mktemp tr xargs rmdir id cut od; do
-                  command -v "$command"
+                  command -v "$command" >/dev/null || {
+                      echo "Error: benchmark image is missing required command: $command" >&2
+                      exit 1
+                  }
               done
               if ! type -P stat >/dev/null 2>&1 && ! type -P gstat >/dev/null 2>&1; then
+                  echo "Error: benchmark image must provide stat or gstat" >&2
                   exit 1
               fi
               if ! type -P pkill >/dev/null 2>&1 && ! type -P killall >/dev/null 2>&1; then
+                  echo "Error: benchmark image must provide pkill or killall" >&2
                   exit 1
               fi
-              test -x /usr/bin/elbencho
-              test -r /mnt/storage-scale-test && test -w /mnt/storage-scale-test
-              probe=$(mktemp /mnt/storage-scale-test/.sst-validation.XXXXXXXX)
+              test -x /usr/bin/elbencho || {
+                  echo "Error: /usr/bin/elbencho is not executable in the benchmark image" >&2
+                  exit 1
+              }
+              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-permissions\n'
+              test -r /mnt/storage-scale-test || {
+                  echo "Error: configured UID/GID cannot read the mounted PVC" >&2
+                  exit 1
+              }
+              test -w /mnt/storage-scale-test || {
+                  echo "Error: configured UID/GID cannot write the mounted PVC" >&2
+                  exit 1
+              }
+              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-create\n'
+              probe=$(mktemp /mnt/storage-scale-test/.sst-validation.XXXXXXXX) || {
+                  echo "Error: configured UID/GID cannot create a file on the mounted PVC" >&2
+                  exit 1
+              }
               trap 'rm -f -- "$probe"' EXIT
-              printf 'storage-scale-test-validation\n' > "$probe"
-              test "$(cat "$probe")" = storage-scale-test-validation
+              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-write\n'
+              printf 'storage-scale-test-validation\n' > "$probe" || {
+                  echo "Error: validation Pod could not write its PVC probe" >&2
+                  exit 1
+              }
+              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-read\n'
+              test "$(cat "$probe")" = storage-scale-test-validation || {
+                  echo "Error: validation Pod could not read back its PVC probe" >&2
+                  exit 1
+              }
+              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=complete\n'
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

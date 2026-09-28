@@ -243,6 +243,10 @@ _kubectl_validate_lifecycle_state() {
 kubectl_local_lock_acquire() {
     local kubernetes_dir="$1" output_variable="$2"
     [[ "$output_variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    if ! command -v flock >/dev/null 2>&1; then
+        echo "Error: flock is required for Kubernetes lifecycle locking (on macOS: brew install flock)" >&2
+        return 1
+    fi
     _kubectl_validate_local_directory_path "$kubernetes_dir" || return 1
     mkdir -p "$kubernetes_dir" || return 1
     [[ ! -L "$kubernetes_dir" && ! -L "$kubernetes_dir/lifecycle.lock" ]] || return 1
@@ -285,6 +289,91 @@ _kubectl_validate_local_directory_path() {
         [[ -d "$current/$component" ]] || return 1
         current="$current/$component"
     done
+}
+
+_kubectl_local_tree_apparent_bytes() {
+    local directory="$1"
+    [[ -d "$directory" && ! -L "$directory" ]] || return 1
+    (set -o pipefail
+        find -P "$directory" -type f -exec sh -c '
+            for path do
+                wc -c < "$path" || exit 1
+            done
+        ' sh {} + | awk '{ total += $1 } END { print total + 0 }')
+}
+
+_kubectl_local_path_mtime() {
+    local path="$1" mtime=""
+    [[ -e "$path" && ! -L "$path" ]] || return 1
+    mtime=$(stat -c %Y -- "$path" 2>/dev/null) \
+        || mtime=$(stat -f %m -- "$path" 2>/dev/null) \
+        || return 1
+    [[ "$mtime" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$mtime"
+}
+
+_kubectl_local_path_link_count() {
+    local path="$1" links=""
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    links=$(stat -c %h -- "$path" 2>/dev/null) \
+        || links=$(stat -f %l -- "$path" 2>/dev/null) \
+        || links=$(gstat -c %h -- "$path" 2>/dev/null) \
+        || return 1
+    [[ "$links" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s\n' "$links"
+}
+
+_kubectl_local_realpath_existing() {
+    local path="$1" resolved=""
+    [[ -e "$path" ]] || return 1
+    resolved=$(realpath -e -- "$path" 2>/dev/null) \
+        || resolved=$(grealpath -e -- "$path" 2>/dev/null) \
+        || resolved=$(realpath "$path" 2>/dev/null) \
+        || return 1
+    [[ "$resolved" == /* ]] || return 1
+    printf '%s\n' "$resolved"
+}
+
+_kubectl_sha256_file() {
+    local path="$1" digest=""
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    if command -v sha256sum >/dev/null 2>&1; then
+        digest=$(sha256sum -- "$path" | awk '{print $1}') || return 1
+    elif command -v gsha256sum >/dev/null 2>&1; then
+        digest=$(gsha256sum -- "$path" | awk '{print $1}') || return 1
+    elif command -v shasum >/dev/null 2>&1; then
+        digest=$(shasum -a 256 -- "$path" | awk '{print $1}') || return 1
+    else
+        echo "Error: SHA-256 requires sha256sum, gsha256sum, or shasum" >&2
+        return 1
+    fi
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$digest"
+}
+
+_kubectl_write_bundle_manifest() {
+    local bundle="$1" manifest="$1/bundle-manifest.tsv"
+    [[ -d "$bundle" && ! -L "$bundle" ]] || return 1
+    local temporary="$manifest.tmp.${BASHPID:-$$}.$RANDOM"
+    local path relative digest
+    : > "$temporary" || return 1
+    for path in "$bundle"/* "$bundle"/executions/*; do
+        [[ -f "$path" && ! -L "$path" && "$path" != "$manifest" \
+            && "$path" != "$temporary" ]] || continue
+        relative=${path#"$bundle/"}
+        digest=$(_kubectl_sha256_file "$path") || {
+            rm -f -- "$temporary"
+            return 1
+        }
+        printf '%s\t%s\n' "$digest" "$relative" >> "$temporary" || {
+            rm -f -- "$temporary"
+            return 1
+        }
+    done
+    if [[ ! -s "$temporary" ]] || ! mv -f -- "$temporary" "$manifest"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
 }
 
 kubectl_local_lock_release() {
@@ -566,8 +655,35 @@ kubectl_run_bounded() {
     local process_timeout="${KUBECTL_PROCESS_TIMEOUT_SECONDS:-30}"
     # Keep kubectl in timeout's child process group. In particular, a wedged
     # exec stream can otherwise survive TERM while timeout waits in foreground.
-    timeout --kill-after=5s "${process_timeout}s" \
+    _kubectl_local_timeout --kill-after=5s "${process_timeout}s" \
         kubectl --request-timeout="${request_timeout}s" "$@"
+}
+
+_kubectl_local_timeout() {
+    local timeout_command=timeout
+    if [[ $(uname -s) == Darwin ]]; then
+        timeout_command=gtimeout
+    elif ! command -v timeout >/dev/null 2>&1 \
+            && command -v gtimeout >/dev/null 2>&1; then
+        timeout_command=gtimeout
+    fi
+    command -v "$timeout_command" >/dev/null 2>&1 || {
+        echo "Error: GNU timeout is required (on macOS: brew install coreutils)" >&2
+        return 127
+    }
+    "$timeout_command" "$@"
+}
+
+_kubectl_local_tar() {
+    local tar_command=tar
+    if [[ $(uname -s) == Darwin ]]; then
+        tar_command=gtar
+    fi
+    command -v "$tar_command" >/dev/null 2>&1 || {
+        echo "Error: GNU tar is required (on macOS: brew install gnu-tar)" >&2
+        return 127
+    }
+    "$tar_command" "$@"
 }
 
 kubectl_report_lifecycle_error() {
@@ -954,7 +1070,7 @@ kubectl_capture_resource_diagnostics() {
             "$run_id" "$temporary/pvc-control-state.txt" || true
     fi
     local diagnostic_bytes
-    diagnostic_bytes=$(du -sb -- "$temporary" | awk '{print $1}') || {
+    diagnostic_bytes=$(_kubectl_local_tree_apparent_bytes "$temporary") || {
         rm -rf -- "$temporary"
         return 1
     }
@@ -968,10 +1084,16 @@ kubectl_capture_resource_diagnostics() {
         return 1
     }
     local -a bundles=()
-    while IFS= read -r candidate; do
+    local candidate_mtime
+    while IFS=$'\t' read -r candidate_mtime candidate; do
         bundles+=("$candidate")
-    done < <(find -P "$root" -mindepth 1 -maxdepth 1 -type d \
-        ! -name '.diagnostic-tmp-*' -printf '%T@\t%p\n' | sort -rn | cut -f2-)
+    done < <(
+        for candidate in "$root"/*; do
+            [[ -d "$candidate" && ! -L "$candidate" ]] || continue
+            candidate_mtime=$(_kubectl_local_path_mtime "$candidate") || exit 1
+            printf '%s\t%s\n' "$candidate_mtime" "$candidate"
+        done | LC_ALL=C sort -rn
+    )
     for ((pod_count = KUBECTL_DIAGNOSTIC_MAX_BUNDLES; \
             pod_count < ${#bundles[@]}; pod_count++)); do
         candidate="${bundles[$pod_count]}"
@@ -1013,9 +1135,14 @@ kubectl_classify_storage_diagnostics() {
     local output_variable="$1" diagnostic_path="$2"
     [[ "$output_variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ \
         && -d "$diagnostic_path" && ! -L "$diagnostic_path" ]] || return 1
-    local evidence
-    evidence=$(find -P "$diagnostic_path" -maxdepth 1 -type f -size -2M \
-        -exec cat -- {} + 2>/dev/null) || evidence=""
+    local evidence="" evidence_path evidence_bytes
+    for evidence_path in "$diagnostic_path"/*; do
+        [[ -f "$evidence_path" && ! -L "$evidence_path" ]] || continue
+        evidence_bytes=$(wc -c < "$evidence_path") || continue
+        [[ "$evidence_bytes" =~ ^[0-9]+$ && "$evidence_bytes" -lt 2097152 ]] \
+            || continue
+        evidence+=$'\n'"$(<"$evidence_path")"
+    done
     local storage_reason=""
     if grep -Eqi 'no space left on device|disk quota exceeded|ENOSPC' \
             <<< "$evidence"; then
@@ -1406,7 +1533,7 @@ kubectl_cleanup_creation_intent() {
         # Do not erase its only recovery identity until the create's process
         # deadline has elapsed and a later linearizable GET also sees absence.
         local intent_epoch now remaining
-        intent_epoch=$(stat -c %Y -- "$intent_file") || return 1
+        intent_epoch=$(_kubectl_local_path_mtime "$intent_file") || return 1
         now=$(date +%s) || return 1
         [[ "$intent_epoch" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ \
             && "$now" -ge "$intent_epoch" ]] || return 1
@@ -1634,31 +1761,71 @@ kubectl_render_attempt_template() {
 }
 
 kubectl_validate_runtime_configuration() {
-    local value
+    local value rc=0
     for value in KUBECTL_NAMESPACE KUBECTL_PV KUBECTL_PVC \
         KUBECTL_NODE_SELECTOR KUBECTL_ELBENCHO_IMAGE KUBECTL_IMAGE_PULL_POLICY \
         KUBECTL_RUN_AS_USER KUBECTL_RUN_AS_GROUP; do
-        [[ -n "${!value:-}" ]] || {
+        if [[ -z "${!value:-}" ]]; then
             echo "Error: $value is required for Kubernetes filesystem sweeps" >&2
-            return 1
-        }
+            rc=1
+        fi
     done
-    if ! kubectl_validate_namespace_name "$KUBECTL_NAMESPACE" \
-            || ! kubectl_validate_object_name "$KUBECTL_PV" \
-            || ! kubectl_validate_object_name "$KUBECTL_PVC" \
-            || ! kubectl_validate_node_selector "$KUBECTL_NODE_SELECTOR" \
-            || ! _kubectl_validate_placeholder IMAGE "$KUBECTL_ELBENCHO_IMAGE" \
-            || ! _kubectl_validate_placeholder IMAGE_PULL_POLICY "$KUBECTL_IMAGE_PULL_POLICY" \
-            || ! _kubectl_validate_placeholder RUN_AS_USER "$KUBECTL_RUN_AS_USER" \
-            || ! _kubectl_validate_placeholder RUN_AS_GROUP "$KUBECTL_RUN_AS_GROUP"; then
-        echo "Error: invalid Kubernetes filesystem sweep configuration" >&2
-        return 1
+    if [[ -n "${KUBECTL_NAMESPACE:-}" ]] \
+            && ! kubectl_validate_namespace_name "$KUBECTL_NAMESPACE"; then
+        printf 'Error: KUBECTL_NAMESPACE=%q must be a lowercase Kubernetes namespace name\n' \
+            "$KUBECTL_NAMESPACE" >&2
+        rc=1
     fi
-    if [[ "$KUBECTL_IMAGE_PULL_POLICY" == Always \
+    if [[ -n "${KUBECTL_PV:-}" ]] \
+            && ! kubectl_validate_object_name "$KUBECTL_PV"; then
+        printf 'Error: KUBECTL_PV=%q must be a valid Kubernetes PersistentVolume name\n' \
+            "$KUBECTL_PV" >&2
+        rc=1
+    fi
+    if [[ -n "${KUBECTL_PVC:-}" ]] \
+            && ! kubectl_validate_object_name "$KUBECTL_PVC"; then
+        printf 'Error: KUBECTL_PVC=%q must be a valid Kubernetes PersistentVolumeClaim name\n' \
+            "$KUBECTL_PVC" >&2
+        rc=1
+    fi
+    if [[ -n "${KUBECTL_NODE_SELECTOR:-}" ]] \
+            && ! kubectl_validate_node_selector "$KUBECTL_NODE_SELECTOR"; then
+        printf '%s\n' \
+            'Error: KUBECTL_NODE_SELECTOR must contain comma-separated key=value labels' >&2
+        rc=1
+    fi
+    if [[ -n "${KUBECTL_ELBENCHO_IMAGE:-}" ]] \
+            && ! _kubectl_validate_placeholder IMAGE "$KUBECTL_ELBENCHO_IMAGE"; then
+        printf 'Error: KUBECTL_ELBENCHO_IMAGE=%q is not a valid container image reference\n' \
+            "$KUBECTL_ELBENCHO_IMAGE" >&2
+        rc=1
+    fi
+    if [[ -n "${KUBECTL_IMAGE_PULL_POLICY:-}" ]] \
+            && ! _kubectl_validate_placeholder IMAGE_PULL_POLICY \
+                "$KUBECTL_IMAGE_PULL_POLICY"; then
+        printf 'Error: KUBECTL_IMAGE_PULL_POLICY=%q must be Always, IfNotPresent, or Never\n' \
+            "$KUBECTL_IMAGE_PULL_POLICY" >&2
+        rc=1
+    fi
+    if [[ -n "${KUBECTL_RUN_AS_USER:-}" ]] \
+            && ! _kubectl_validate_placeholder RUN_AS_USER "$KUBECTL_RUN_AS_USER"; then
+        printf 'Error: KUBECTL_RUN_AS_USER=%q must be a positive numeric UID\n' \
+            "$KUBECTL_RUN_AS_USER" >&2
+        rc=1
+    fi
+    if [[ -n "${KUBECTL_RUN_AS_GROUP:-}" ]] \
+            && ! _kubectl_validate_placeholder RUN_AS_GROUP "$KUBECTL_RUN_AS_GROUP"; then
+        printf 'Error: KUBECTL_RUN_AS_GROUP=%q must be a positive numeric GID\n' \
+            "$KUBECTL_RUN_AS_GROUP" >&2
+        rc=1
+    fi
+    if [[ "${KUBECTL_IMAGE_PULL_POLICY:-}" == Always \
+            && -n "${KUBECTL_ELBENCHO_IMAGE:-}" \
             && ! "$KUBECTL_ELBENCHO_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]]; then
         echo "Error: KUBECTL_IMAGE_PULL_POLICY=Always requires a digest-qualified KUBECTL_ELBENCHO_IMAGE" >&2
-        return 1
+        rc=1
     fi
+    return "$rc"
 }
 
 kubectl_get_object_uid() {
@@ -1678,21 +1845,81 @@ kubectl_get_object_uid() {
 
 kubectl_validate_cluster_identity() {
     kubectl_validate_runtime_configuration || return 1
-    kubectl_run_observational version >/dev/null || return 1
+    if ! command -v kubectl >/dev/null 2>&1; then
+        echo "Error: kubectl is not installed or is not on PATH" >&2
+        return 1
+    fi
+    kubectl_run_observational version >/dev/null || {
+        echo "Error: kubectl could not reach the API server using the active context" >&2
+        return 1
+    }
     local namespace_uid pv_uid pvc_uid volume_name
-    namespace_uid=$(kubectl_get_object_uid namespace "$KUBECTL_NAMESPACE") || return 1
-    pv_uid=$(kubectl_get_object_uid pv "$KUBECTL_PV") || return 1
-    pvc_uid=$(kubectl_get_object_uid pvc "$KUBECTL_PVC" "$KUBECTL_NAMESPACE") || return 1
+    namespace_uid=$(kubectl_get_object_uid namespace "$KUBECTL_NAMESPACE") || {
+        printf 'Error: cannot read Kubernetes namespace %q with the active context\n' \
+            "$KUBECTL_NAMESPACE" >&2
+        return 1
+    }
+    pv_uid=$(kubectl_get_object_uid pv "$KUBECTL_PV") || {
+        printf 'Error: cannot read PersistentVolume %q; verify its name and cluster-scope access\n' \
+            "$KUBECTL_PV" >&2
+        return 1
+    }
+    pvc_uid=$(kubectl_get_object_uid pvc "$KUBECTL_PVC" "$KUBECTL_NAMESPACE") || {
+        printf 'Error: cannot read PersistentVolumeClaim %q in namespace %q\n' \
+            "$KUBECTL_PVC" "$KUBECTL_NAMESPACE" >&2
+        return 1
+    }
     volume_name=$(kubectl_run_observational -n "$KUBECTL_NAMESPACE" get pvc "$KUBECTL_PVC" \
-        -o 'jsonpath={.spec.volumeName}{"\t"}{.status.phase}{"\t"}{.spec.volumeMode}{"\t"}{.spec.accessModes[*]}') || return 1
+        -o 'jsonpath={.spec.volumeName}{"\t"}{.status.phase}{"\t"}{.spec.volumeMode}{"\t"}{.spec.accessModes[*]}') || {
+            printf 'Error: cannot inspect binding details for PersistentVolumeClaim %q in namespace %q\n' \
+                "$KUBECTL_PVC" "$KUBECTL_NAMESPACE" >&2
+            return 1
+        }
     local observed_pv phase mode access
     IFS=$'\t' read -r observed_pv phase mode access <<< "$volume_name"
     [[ "$observed_pv" == "$KUBECTL_PV" && "$phase" == Bound \
         && ( -z "$mode" || "$mode" == Filesystem ) && "$access" == *ReadWriteMany* ]] || {
-        echo "Error: configured Kubernetes PVC is not the expected bound RWX filesystem claim" >&2
+        printf 'Error: PVC %s/%s does not satisfy the configured storage contract\n' \
+            "$KUBECTL_NAMESPACE" "$KUBECTL_PVC" >&2
+        printf '  expected: volumeName=%s phase=Bound volumeMode=Filesystem accessModes includes ReadWriteMany\n' \
+            "$KUBECTL_PV" >&2
+        printf '  observed: volumeName=%s phase=%s volumeMode=%s accessModes=%s\n' \
+            "${observed_pv:-<empty>}" "${phase:-<empty>}" \
+            "${mode:-<empty>}" "${access:-<empty>}" >&2
         return 1
     }
     printf '%s\t%s\t%s\n' "$namespace_uid" "$pv_uid" "$pvc_uid"
+}
+
+_kubectl_print_runtime_validation_diagnostics() {
+    local namespace="$1" helper_name="$2" attempt_id="$3"
+    local temporary_root root metadata_dir bundle file
+    temporary_root=$(cd -P -- "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P) \
+        || return 1
+    root=$(mktemp -d "$temporary_root/storage-scale-test-validation-diag.XXXXXX") \
+        || return 1
+    metadata_dir="$root/attempts/$attempt_id"
+    mkdir -p -- "$metadata_dir" || {
+        rm -rf -- "$root"
+        return 1
+    }
+    bundle=$(kubectl_capture_resource_diagnostics "$metadata_dir" \
+        runtime-validation "$namespace" Job "$helper_name" "$attempt_id") \
+        || bundle=""
+    if [[ -z "$bundle" ]]; then
+        rm -rf -- "$root"
+        return 1
+    fi
+    for file in resource.describe pods.yaml pods.log pod-*.describe events.txt; do
+        local evidence
+        for evidence in "$bundle"/$file; do
+            [[ -s "$evidence" && -f "$evidence" && ! -L "$evidence" ]] || continue
+            printf '\n===== Kubernetes validation diagnostic: %s =====\n' \
+                "$(basename "$evidence")" >&2
+            cat -- "$evidence" >&2 || true
+        done
+    done
+    rm -rf -- "$root"
 }
 
 kubectl_validate_runtime_pod() {
@@ -1724,6 +1951,8 @@ kubectl_validate_runtime_pod() {
         "PVC_NAME=$KUBECTL_PVC" "NODE_NAME=$node") || return 1
     kubectl_create_owned_object helper_uid Job "$helper_name" "$KUBECTL_NAMESPACE" \
         "$nonce" "$attempt_id" "$manifest" || return 1
+    # Stop before the Job's own active deadline so its Pod still exists when
+    # diagnostics inspect scheduling, image pulls, mounts, logs, and events.
     local deadline=$((SECONDS + 180)) terminal="" wait_rc
     while (( SECONDS < deadline )); do
         wait_rc=0
@@ -1736,16 +1965,13 @@ kubectl_validate_runtime_pod() {
     done
     if [[ "$terminal" != COMPLETE ]]; then
         echo "Error: Kubernetes runtime validation Job did not complete successfully" >&2
-        KUBECTL_REQUEST_TIMEOUT_SECONDS=10 KUBECTL_PROCESS_TIMEOUT_SECONDS=20 \
-            kubectl_run_bounded -n "$KUBECTL_NAMESPACE" logs "job/$helper_name" \
-                --all-containers=true --tail=200 >&2 || true
-        KUBECTL_REQUEST_TIMEOUT_SECONDS=10 KUBECTL_PROCESS_TIMEOUT_SECONDS=20 \
-            kubectl_run_bounded -n "$KUBECTL_NAMESPACE" describe Job "$helper_name" \
-                >&2 || true
-        KUBECTL_REQUEST_TIMEOUT_SECONDS=10 KUBECTL_PROCESS_TIMEOUT_SECONDS=20 \
-            kubectl_run_bounded -n "$KUBECTL_NAMESPACE" get events \
-                --field-selector "involvedObject.name=$helper_name" \
-                --sort-by=.metadata.creationTimestamp >&2 || true
+        _kubectl_print_runtime_validation_diagnostics "$KUBECTL_NAMESPACE" \
+            "$helper_name" "$attempt_id" || {
+                echo "Warning: automatic validation diagnostic capture failed" >&2
+                printf 'Inspect before retrying: kubectl -n %q get pods -l %q -o wide\n' \
+                    "$KUBECTL_NAMESPACE" \
+                    "storage-scale-test.nvidia.com/run=$attempt_id" >&2
+            }
         local readiness_reason=TIMEOUT
         kubectl_classify_readiness_failure readiness_reason "$KUBECTL_NAMESPACE" \
             "$attempt_id" || true
@@ -2693,8 +2919,9 @@ kubectl_stream_remote_attempt() {
             && -n "${KUBECTL_INTEGRATION_COLLECTION_HOLD_FILE:-}" ]]; then
         local hold_file="$KUBECTL_INTEGRATION_COLLECTION_HOLD_FILE"
         local results_real hold_parent hold_temporary
-        results_real=$(realpath -e -- "${archive_path%/*}/..") || return 1
-        hold_parent=$(realpath -e -- "${hold_file%/*}") || return 1
+        results_real=$(_kubectl_local_realpath_existing "${archive_path%/*}/..") \
+            || return 1
+        hold_parent=$(_kubectl_local_realpath_existing "${hold_file%/*}") || return 1
         [[ "$hold_parent" == "$results_real" \
             && "${hold_file##*/}" == .integration-kubectl-collection-ready \
             && ! -e "$hold_file" && ! -L "$hold_file" ]] || return 1
@@ -2808,7 +3035,7 @@ _kubectl_require_collection_capacity() {
     # coexist. Reserve all three copies plus tar/filesystem metadata headroom.
     local required_bytes=$((apparent_bytes * 3 + KUBECTL_COLLECTION_HEADROOM_BYTES))
     local available_blocks available_bytes
-    available_blocks=$(df -Pk -- "$results_dir" | awk 'END {print $4}') || return 1
+    available_blocks=$(df -Pk "$results_dir" | awk 'END {print $4}') || return 1
     [[ "$available_blocks" =~ ^[0-9]+$ ]] || return 1
     available_bytes=$((available_blocks * 1024))
     if (( available_bytes < required_bytes )); then
@@ -2912,7 +3139,7 @@ _kubectl_result_destination() {
         && _kubectl_validate_local_directory_path "$results_dir" \
         && [[ -d "$results_dir" && ! -L "$results_dir" ]] || return 1
     local results_real current component index
-    results_real=$(realpath -e -- "$results_dir") || return 1
+    results_real=$(_kubectl_local_realpath_existing "$results_dir") || return 1
     current="$results_dir"
     local -a components=()
     IFS=/ read -ra components <<< "$relative"
@@ -2933,7 +3160,7 @@ _kubectl_result_destination() {
         fi
     done
     local parent_real resolved_destination="$results_dir/$relative"
-    parent_real=$(realpath -e -- "$current") || return 1
+    parent_real=$(_kubectl_local_realpath_existing "$current") || return 1
     [[ "$parent_real" == "$results_real" || "$parent_real" == "$results_real/"* ]] \
         || return 1
     [[ ! -L "$resolved_destination" ]] || return 1
@@ -2953,14 +3180,14 @@ kubectl_validate_attempt_archive() {
     # Validate metadata as streams. A hostile archive cannot consume local
     # temporary storage by forcing complete name or verbose listings to disk.
     if ! (set -o pipefail
-            tar -tf "$archive_path" \
+            _kubectl_local_tar -tf "$archive_path" \
                 | _kubectl_validate_archive_names_stream "$attempt_id"); then
         return 1
     fi
     # Do not extract links, devices, or other special files into the local
     # results tree. Safe member spelling alone is not sufficient for tar.
     (set -o pipefail
-        LC_ALL=C tar -tvf "$archive_path" \
+        LC_ALL=C _kubectl_local_tar -tvf "$archive_path" \
             | _kubectl_validate_archive_types_stream)
 }
 
@@ -2972,19 +3199,20 @@ kubectl_extract_attempt_archive() {
     _kubectl_validate_local_directory_path "$results_dir" \
         && _kubectl_validate_local_directory_path "${output_dir%/*}" || return 1
     local results_real parent_real
-    results_real=$(realpath -e -- "$results_dir") || return 1
-    parent_real=$(realpath -e -- "${output_dir%/*}") || return 1
+    results_real=$(_kubectl_local_realpath_existing "$results_dir") || return 1
+    parent_real=$(_kubectl_local_realpath_existing "${output_dir%/*}") || return 1
     [[ "$parent_real" == "$results_real" || "$parent_real" == "$results_real/"* ]] || {
         echo "Error: Kubernetes collection staging must reside below results" >&2
         return 1
     }
     mkdir -p "$output_dir" || return 74
-    tar -C "$output_dir" --no-same-owner --no-same-permissions -xf "$archive_path" || {
+    _kubectl_local_tar -C "$output_dir" --no-same-owner \
+        --no-same-permissions -xf "$archive_path" || {
         rm -rf -- "$output_dir"
         return 74
     }
     local extracted_bytes
-    extracted_bytes=$(du -sb -- "$output_dir" | awk '{print $1}') || return 74
+    extracted_bytes=$(_kubectl_local_tree_apparent_bytes "$output_dir") || return 74
     [[ "$extracted_bytes" =~ ^[0-9]+$ && "$extracted_bytes" -le "$KUBECTL_COLLECTION_MAX_BYTES" ]] || {
         rm -rf -- "$output_dir"
         echo "Error: extracted Kubernetes collection exceeds its byte limit" >&2
@@ -3109,9 +3337,7 @@ kubectl_prepare_control_bundle() {
             || ! chmod 0700 -- "$destination/coordinator.sh" \
             || ! printf '%s\t%s\n%s\t%s\n' attempt_id "$attempt_id" output_basename \
                 "$output_basename" > "$destination/run-metadata.tsv" \
-            || ! (cd "$destination" && sha256sum _nv-elbencho-kubectl-functions.sh \
-                coordinator.sh run-metadata.tsv | awk '{print $1 "\t" $2}') \
-                > "$destination/bundle-manifest.tsv"; then
+            || ! _kubectl_write_bundle_manifest "$destination"; then
             rm -rf -- "$destination"
             return 1
     fi
@@ -3140,17 +3366,17 @@ kubectl_upload_control_bundle() {
             scan_error=1
             break
         fi
-        if ! type=$(stat -c %F -- "$path"); then
-            scan_error=1
-            break
-        fi
-        if [[ "$type" != "regular file" && "$type" != directory ]]; then
+        if [[ -f "$path" ]]; then
+            type="regular file"
+        elif [[ -d "$path" ]]; then
+            type=directory
+        else
             echo "Error: control bundle may contain only regular files and directories" >&2
             scan_error=1
             break
         fi
         if [[ "$type" == "regular file" ]]; then
-            if ! links=$(stat -c %h -- "$path"); then
+            if ! links=$(_kubectl_local_path_link_count "$path"); then
                 scan_error=1
                 break
             fi
@@ -3168,7 +3394,7 @@ kubectl_upload_control_bundle() {
     # created create-only during reservation; do not recreate it here.
     local archive_path
     archive_path=$(mktemp "${TMPDIR:-/tmp}/storage-scale-test-control.XXXXXX") || return 1
-    if ! tar -C "$source_dir" -cf "$archive_path" .; then
+    if ! _kubectl_local_tar -C "$source_dir" -cf "$archive_path" .; then
         rm -f -- "$archive_path"
         return 1
     fi
@@ -3614,9 +3840,7 @@ kubectl_populate_sweep_control_bundle() {
             >> "$bundle/worker-endpoints.tsv" || return 1
     done < "$endpoints"
     [[ -s "$bundle/worker-endpoints.tsv" ]] || return 1
-    (cd "$bundle" && find -P . -type f ! -name bundle-manifest.tsv -print0 \
-        | LC_ALL=C sort -z | xargs -0 sha256sum | awk '{sub(/^\.\//, "", $2); print $1 "\t" $2}') \
-        > "$bundle/bundle-manifest.tsv" || return 1
+    _kubectl_write_bundle_manifest "$bundle" || return 1
 }
 
 kubectl_attempt_current_id() {
@@ -4246,7 +4470,7 @@ _kubectl_validate_collected_publication() {
                 local source="$state_dir/$first" bytes digest
                 [[ -f "$source" && ! -L "$source" ]] || return 1
                 bytes=$(wc -c < "$source") || return 1
-                digest=$(sha256sum -- "$source" | awk '{print $1}') || return 1
+                digest=$(_kubectl_sha256_file "$source") || return 1
                 [[ "$bytes" == "$third" && "$digest" == "$fourth" ]] || return 1
                 [[ "$kind" != result ]] || result_rows+=("$first"$'\t'"$second")
                 ;;
@@ -4400,7 +4624,7 @@ _kubectl_merge_collected_results() {
         fi
         if [[ -e "$destination" ]]; then
             [[ -f "$destination" && ! -L "$destination" \
-                && "$(sha256sum -- "$destination" | awk '{print $1}')" == "$digest" ]] || return 1
+                && "$(_kubectl_sha256_file "$destination")" == "$digest" ]] || return 1
             continue
         fi
         printf -v "$reason_output" '%s' LOCAL_IO
@@ -4491,7 +4715,7 @@ _kubectl_remove_superseded_collection_paths() {
                 || return 1
             [[ -e "$destination" ]] || continue
             [[ -f "$destination" && ! -L "$destination" \
-                && "$(sha256sum -- "$destination" | awk '{print $1}')" == "$digest" ]] \
+                && "$(_kubectl_sha256_file "$destination")" == "$digest" ]] \
                 || return 1
             if ! rm -f -- "$destination"; then
                 [[ -z "$reason_output" ]] \

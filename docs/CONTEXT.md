@@ -56,8 +56,11 @@ and are responsible for every binary they place in it.
 
 `EXECUTION_SUBSTRATE` explicitly selects Slurm, passwordless SSH, or kubectl;
 there is no default, and `SSH_HOST_LIST` no longer selects a mode. The
-`integration-tests/` fixture provisions three kind nodes, RWX storage, two SSH
-workers, Slinky Slurm, and the Kubernetes sweep prerequisites. Its `nfs`
+benchmark processes require Linux; macOS with Homebrew Bash and coreutils may
+initiate SSH or kubectl sweeps. Kubectl also requires Homebrew GNU tar and
+`flock`; validation checks the prefixed commands before touching the cluster.
+The `integration-tests/` fixture provisions three kind nodes, RWX storage, two
+SSH workers, Slinky Slurm, and the Kubernetes sweep prerequisites. Its `nfs`
 backend uses loop-backed NFSv4 and NFS CSI; `sbx-shared` uses static volumes
 over a repository-shared path. NFS retains pinned Kindnet; Docker SBX uses
 pinned, preloaded Calico because its nested kernel cannot run Kindnet's

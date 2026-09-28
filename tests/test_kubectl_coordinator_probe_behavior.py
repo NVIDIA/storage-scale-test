@@ -48,7 +48,9 @@ _BASH = "/bin/bash"
 
 
 @contextmanager
-def _probe_server(response: bytes | None, delay: float = 0) -> Iterator[None]:
+def _probe_server(
+    host: str, response: bytes | None, delay: float = 0
+) -> Iterator[None]:
     """Serve one status response or hold the connection open for a timeout."""
 
     class _Handler(socketserver.BaseRequestHandler):
@@ -63,7 +65,7 @@ def _probe_server(response: bytes | None, delay: float = 0) -> Iterator[None]:
         allow_reuse_address = True
         daemon_threads = True
 
-    with _Server(("127.0.0.1", 1611), _Handler) as server:
+    with _Server((host, 1611), _Handler) as server:
         acceptor = threading.Thread(target=server.serve_forever, daemon=True)
         acceptor.start()
         try:
@@ -74,20 +76,20 @@ def _probe_server(response: bytes | None, delay: float = 0) -> Iterator[None]:
 
 
 @pytest.mark.parametrize(
-    ("response", "expected_rc"),
+    ("host", "response", "expected_rc"),
     (
-        (b"HTTP/1.0 200 OK\r\n\r\n", 0),
-        (b"HTTP/1.0 503 Busy\r\n\r\n", 1),
-        (b"garbage 200 text\r\n", 1),
+        ("127.0.0.2", b"HTTP/1.0 200 OK\r\n\r\n", 0),
+        ("127.0.0.3", b"HTTP/1.0 503 Busy\r\n\r\n", 1),
+        ("127.0.0.4", b"garbage 200 text\r\n", 1),
     ),
 )
 def test_probe_endpoint_uses_real_http_result(
-    response: bytes, expected_rc: int
+    host: str, response: bytes, expected_rc: int
 ) -> None:
     """The file-resident child accepts 200 and rejects non-200 responses."""
-    with _probe_server(response):
+    with _probe_server(host, response):
         result = subprocess.run(
-            [_BASH, str(_COORDINATOR), "--probe-endpoint", "127.0.0.1"],
+            [_BASH, str(_COORDINATOR), "--probe-endpoint", host],
             cwd=_REPOSITORY_ROOT,
             env={"PATH": "/usr/bin:/bin"},
             text=True,
@@ -100,7 +102,8 @@ def test_probe_endpoint_uses_real_http_result(
 
 def test_probe_endpoint_times_out_a_tarpit_connection() -> None:
     """The child probe is bounded when the worker never sends a status line."""
-    with _probe_server(None, delay=20):
+    host = "127.0.0.5"
+    with _probe_server(host, None, delay=20):
         started = time.monotonic()
         result = subprocess.run(
             [
@@ -110,7 +113,7 @@ def test_probe_endpoint_times_out_a_tarpit_connection() -> None:
                 _BASH,
                 str(_COORDINATOR),
                 "--probe-endpoint",
-                "127.0.0.1",
+                host,
             ],
             cwd=_REPOSITORY_ROOT,
             env={"PATH": "/usr/bin:/bin"},
