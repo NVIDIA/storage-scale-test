@@ -289,7 +289,7 @@ contract change rather than silently expanding the release boundary.
 | R-11 | Client exits during per-file merge | Required recovery | Remove attempt-named incomplete files, accept only identical published digests, and continue. | Covered |
 | R-12 | Client exits after `collected-state` during cleanup | Required recovery | Resume journaled cleanup without retransferring. | Covered |
 | R-13 | Exact cleanup call fails transiently | Required recovery | Remain `COLLECTION_IN_PROGRESS`, report retained identities, and retry. | Covered |
-| R-14 | Client exits after cleanup but before `COLLECTED` | Required recovery | Status reports the publication locally; collect finishes idempotent cleanup and marks collected. | Covered |
+| R-14 | Client exits after cleanup, including Lease deletion, but before its journal or `COLLECTED` | Required recovery | Status reports the publication locally; collect proves all preceding exact cleanup, reconciles only the released Lease identity, and marks collected. | Covered |
 | R-15 | Collect is repeated after `COLLECTED` | Required recovery | Validate local publication without cluster credentials. | Covered |
 | R-16 | Resume is requested before collection | Required recovery | Reject and print the required collect command. | Covered |
 | R-17 | Concurrent resumes | Required recovery | At most one successor becomes current; reject the loser safely. | Covered |
@@ -309,7 +309,7 @@ assertion at the appropriate layer; merely reaching the branch is not evidence.
 | S-03, S-14 | `test_prepare_failure_terminalizes_only_after_successful_rollback` |
 | S-04 | `test_s04_local_lifecycle_lock_rejects_a_concurrent_mutator` |
 | S-05 | `test_intended_reservation_does_not_touch_competing_pvc_owner`, `test_pvc_lease_is_create_only_and_has_no_time_expiry` |
-| S-06 | `test_interrupted_pvc_lease_creation_is_reconciled_by_exact_identity`, `test_pvc_lease_release_uses_uid_precondition_and_is_journaled` |
+| S-06 | `test_interrupted_pvc_lease_creation_is_reconciled_by_exact_identity`, `test_pvc_lease_release_uses_uid_precondition_and_is_journaled`, `test_pvc_lease_release_clears_redundant_matching_creation_intent` |
 | S-07, S-08, S-09 | `test_creation_intent_cleans_object_left_before_resource_journal`, `test_creation_intent_rechecks_absence_after_create_deadline`, `test_creation_absence_retains_possible_late_object_identity`, `test_create_only_verifies_exact_identity_before_returning_uid` |
 | S-10, T-01 | `test_observational_calls_retry_only_transient_api_failures` |
 | S-11, T-02 | `test_exhausted_observation_emits_actionable_diagnostic_envelope` |
@@ -343,7 +343,7 @@ assertion at the appropriate layer; merely reaching the branch is not evidence.
 | R-09, R-10, R-11 | `test_collection_capacity_checks_the_results_filesystem`, `test_collection_scavenges_only_owned_staging_paths`, `test_collection_merges_manifest_declared_execution_ledgers`, `test_collection_classifies_parent_creation_failure_as_local_io` |
 | R-01 | `test_collect_active_attempt_reports_terminal_gate_and_next_action` |
 | R-12, R-13 | `test_collection_recovery_retries_every_cleanup_stage` |
-| R-14 | `test_status_projects_published_collection_after_remote_cleanup` |
+| R-14 | `test_status_projects_published_collection_after_remote_cleanup`, `test_collection_recovers_lease_delete_before_release_journal`, `test_collection_does_not_reconcile_lease_before_exact_cleanup` |
 | R-15 | `test_collected_terminal_status_is_a_successful_query` |
 | R-16 | `test_resume_before_collection_prints_exact_collect_command` |
 | R-17 | `test_stale_resume_contender_cannot_replace_successful_attempt` |

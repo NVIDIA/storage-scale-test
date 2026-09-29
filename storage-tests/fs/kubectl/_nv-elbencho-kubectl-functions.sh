@@ -1566,8 +1566,8 @@ kubectl_release_pvc_lease() {
     _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
     kubectl_attempt_step_done "$kubernetes_dir" "$attempt_id" release-pvc-lease \
         && return 0
+    local intent="$kubernetes_dir/attempts/$attempt_id/creation-intents/pvc-lease.sh"
     if ! kubectl_attempt_resource_exists "$kubernetes_dir" "$attempt_id" pvc-lease; then
-        local intent="$kubernetes_dir/attempts/$attempt_id/creation-intents/pvc-lease.sh"
         if [[ -e "$intent" || -L "$intent" ]]; then
             kubectl_attempt_load_identity "$kubernetes_dir/attempts/$attempt_id" || return 1
             kubectl_attempt_load_creation_intent "$intent" || return 1
@@ -1587,6 +1587,27 @@ kubectl_release_pvc_lease() {
             kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
                 "$attempt_id" pvc-lease || return 1
         fi
+    elif [[ -e "$intent" || -L "$intent" ]]; then
+        # Acquisition publishes the exact UID before removing its create
+        # intent. A crash in that interval leaves both records. The journal is
+        # authoritative, but clear the redundant intent only after proving it
+        # describes that same owned Lease.
+        kubectl_attempt_load_identity "$kubernetes_dir/attempts/$attempt_id" || return 1
+        kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" pvc-lease \
+            || return 1
+        [[ "$KUBECTL_RESOURCE_KIND" == Lease \
+            && "$KUBECTL_RESOURCE_NAME" == "$KUBECTL_PVC_LEASE_NAME" \
+            && "$KUBECTL_RESOURCE_NAMESPACE" == "$KUBECTL_NAMESPACE" \
+            && "$KUBECTL_RESOURCE_NONCE" == "$KUBECTL_OWNERSHIP_NONCE" ]] \
+            || return 1
+        kubectl_attempt_load_creation_intent "$intent" || return 1
+        [[ "$KUBECTL_INTENT_KIND" == "$KUBECTL_RESOURCE_KIND" \
+            && "$KUBECTL_INTENT_NAME" == "$KUBECTL_RESOURCE_NAME" \
+            && "$KUBECTL_INTENT_NAMESPACE" == "$KUBECTL_RESOURCE_NAMESPACE" \
+            && "$KUBECTL_INTENT_NONCE" == "$KUBECTL_RESOURCE_NONCE" ]] \
+            || return 1
+        kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
+            "$attempt_id" pvc-lease || return 1
     fi
     if ! kubectl_attempt_resource_exists "$kubernetes_dir" "$attempt_id" pvc-lease; then
         kubectl_attempt_journal_step "$kubernetes_dir" "$lock_fd" "$attempt_id" \
@@ -1623,9 +1644,14 @@ kubectl_verify_journaled_pvc_lease() {
     kubectl_attempt_load_identity "$kubernetes_dir/attempts/$attempt_id" || return 1
     local observed=""
     if kubectl_attempt_step_done "$kubernetes_dir" "$attempt_id" release-pvc-lease; then
+        kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" pvc-lease \
+            || return 1
         kubectl_observe_pvc_lease observed "$KUBECTL_NAMESPACE" \
             "$KUBECTL_PVC_LEASE_NAME" || return 1
-        [[ -z "$observed" ]]
+        # A later attempt may already own the deterministic Lease name. The
+        # released journaled object is absent when the name is empty or its
+        # current UID differs; never reject or delete that replacement.
+        [[ -z "$observed" || "${observed%%$'\t'*}" != "$KUBECTL_RESOURCE_UID" ]]
         return
     fi
     if ! kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" pvc-lease; then
@@ -1641,6 +1667,58 @@ kubectl_verify_journaled_pvc_lease() {
     kubectl_verify_pvc_lease "$KUBECTL_RESOURCE_NAMESPACE" \
         "$KUBECTL_RESOURCE_NAME" "$attempt_id" "$KUBECTL_RESOURCE_NONCE" \
         "$KUBECTL_RESOURCE_UID" >/dev/null
+}
+
+kubectl_collection_cleanup_precedes_lease_release() {
+    local kubernetes_dir="$1" attempt_id="$2"
+    local metadata_dir="$kubernetes_dir/attempts/$attempt_id"
+    kubectl_attempt_load_metadata "$metadata_dir" || return 1
+    [[ "$KUBECTL_LIFECYCLE_STATE" == COLLECTION_IN_PROGRESS \
+        && -d "$metadata_dir/collected-state" \
+        && ! -L "$metadata_dir/collected-state" ]] || return 1
+    local terminal=""
+    _kubectl_validate_collected_publication "$metadata_dir/collected-state" \
+        "$attempt_id" terminal "$metadata_dir/control-bundle/executions" \
+        >/dev/null || return 1
+    kubectl_attempt_step_done "$kubernetes_dir" "$attempt_id" release-remote-run \
+        || return 1
+    local intent resource key
+    for intent in "$metadata_dir/creation-intents"/*.sh; do
+        [[ -e "$intent" || -L "$intent" ]] || continue
+        [[ -f "$intent" && ! -L "$intent" ]] || return 1
+        [[ "$(basename "$intent")" == pvc-lease.sh ]] || return 1
+    done
+    for resource in "$metadata_dir/resources"/*.sh; do
+        [[ -e "$resource" || -L "$resource" ]] || continue
+        [[ -f "$resource" && ! -L "$resource" ]] || return 1
+        key=$(basename "$resource" .sh)
+        [[ "$key" == pvc-lease ]] && continue
+        [[ "$key" =~ ^[a-z0-9-]+$ ]] || return 1
+        kubectl_attempt_step_done "$kubernetes_dir" "$attempt_id" "delete-$key" \
+            || return 1
+    done
+}
+
+kubectl_reconcile_pvc_lease_release_after_collection_cleanup() {
+    local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3"
+    _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
+    kubectl_collection_cleanup_precedes_lease_release "$kubernetes_dir" \
+        "$attempt_id" || return 1
+    kubectl_attempt_load_identity "$kubernetes_dir/attempts/$attempt_id" || return 1
+    kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" pvc-lease \
+        || return 1
+    [[ "$KUBECTL_RESOURCE_KIND" == Lease \
+        && "$KUBECTL_RESOURCE_NAME" == "$KUBECTL_PVC_LEASE_NAME" \
+        && "$KUBECTL_RESOURCE_NAMESPACE" == "$KUBECTL_NAMESPACE" ]] || return 1
+    local observed=""
+    kubectl_observe_pvc_lease observed "$KUBECTL_RESOURCE_NAMESPACE" \
+        "$KUBECTL_RESOURCE_NAME" || return 1
+    # Only the exact delete-to-journal crash window is recoverable here. If
+    # the journaled UID is still live, normal collection must release it.
+    [[ -z "$observed" || "${observed%%$'\t'*}" != "$KUBECTL_RESOURCE_UID" ]] \
+        || return 1
+    kubectl_attempt_journal_step "$kubernetes_dir" "$lock_fd" "$attempt_id" \
+        release-pvc-lease
 }
 
 # Kubernetes lifecycle helpers below deliberately do not dispatch a benchmark.
@@ -4633,7 +4711,18 @@ kubectl_lifecycle_operation() {
         "$kubernetes_dir" "$attempt_id" || rc=1
     if [[ "$rc" -eq 0 \
             && "$KUBECTL_LIFECYCLE_STATE" =~ ^(SUBMITTED|CANCEL_REQUESTED|TERMINAL|COLLECTION_IN_PROGRESS)$ ]]; then
-        kubectl_verify_journaled_pvc_lease "$kubernetes_dir" "$attempt_id" || rc=1
+        if ! kubectl_verify_journaled_pvc_lease "$kubernetes_dir" "$attempt_id"; then
+            if [[ "$operation" == collect \
+                    && "$KUBECTL_LIFECYCLE_STATE" == COLLECTION_IN_PROGRESS ]]; then
+                # Result publication and every exact cleanup step precede
+                # Lease deletion. Recover only the final delete-to-journal
+                # interruption; active attempts still require the exact Lease.
+                kubectl_reconcile_pvc_lease_release_after_collection_cleanup \
+                    "$kubernetes_dir" "$lock_fd" "$attempt_id" || rc=1
+            else
+                rc=1
+            fi
+        fi
     fi
     if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == PREPARED ]]; then
         kubectl_recover_prepared_attempt "$kubernetes_dir" "$lock_fd" \
@@ -5106,6 +5195,19 @@ kubectl_collect_attempt() {
         _kubectl_validate_collected_publication "$metadata_dir/collected-state" "$attempt_id" \
             recovered_terminal "$metadata_dir/control-bundle/executions" \
             >/dev/null || return 1
+        if kubectl_attempt_step_done "$kubernetes_dir" "$attempt_id" \
+                release-pvc-lease; then
+            # The Lease is the final external resource. Once its exact release
+            # is journaled, recovery must not create new helpers or touch a
+            # replacement Lease owned by a later attempt.
+            kubectl_collection_cleanup_precedes_lease_release "$kubernetes_dir" \
+                "$attempt_id" || return 1
+            kubectl_attempt_transition "$kubernetes_dir" "$lock_fd" \
+                "$attempt_id" COLLECTED || return 1
+            kubectl_emit_state "$recovered_terminal"
+            [[ "$recovered_terminal" == SUCCESS ]]
+            return
+        fi
         # Durable import precedes cleanup. Recover every remaining exact,
         # journaled release/delete step before advertising COLLECTED.
         local recovery_rc=0

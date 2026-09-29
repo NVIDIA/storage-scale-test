@@ -262,8 +262,9 @@ the lexically first normalized `TEST_DIRS` root, freezes worker Pod addresses,
 starts one Elbencho service Pod per worker, and creates one coordinator Job.
 The Job needs no API credentials after startup. `--status`, `--cancel`, and
 `--collect` operate on that attempt; collection releases the Lease last, and
-`--resume` creates a new attempt after collection while preserving successful
-cells.
+recovers its final delete-to-journal interruption only after proving publication
+and all preceding exact cleanup. `--resume` creates a new attempt after
+collection while preserving successful cells.
 
 Kubernetes uses ordinary Pod networking and attempt-scoped NetworkPolicy,
 not host networking, host ports, or Services. Worker endpoint identity is

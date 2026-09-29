@@ -1909,6 +1909,109 @@ def test_interrupted_pvc_lease_creation_is_reconciled_by_exact_identity(
     assert result.returncode == 0, result.stderr
 
 
+def test_pvc_lease_release_clears_redundant_matching_creation_intent(
+    tmp_path: Path,
+) -> None:
+    """A crash after UID publication leaves no stale Lease intent."""
+    result = _bash(_identity(tmp_path / "state") + """
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_write_creation_intent "$root" "$fd" 1234abcd pvc-lease \
+          Lease "$KUBECTL_PVC_LEASE_NAME" test-ns \
+          0123456789abcdef0123456789abcdef
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd pvc-lease \
+          Lease "$KUBECTL_PVC_LEASE_NAME" test-ns lease-uid \
+          0123456789abcdef0123456789abcdef
+        observations=0
+        kubectl_observe_pvc_lease() {
+          observations=$((observations + 1))
+          if [[ "$observations" -eq 1 ]]; then
+            printf -v "$1" '%s' $'lease-uid\t0123456789abcdef0123456789abcdef\t1234abcd\tnamespace-uid\tpv-uid\tpvc-uid\t1234abcd/0123456789abcdef0123456789abcdef'
+          else
+            printf -v "$1" ''
+          fi
+        }
+        kubectl_run_bounded() { cat >/dev/null; }
+        kubectl_release_pvc_lease "$root" "$fd" 1234abcd
+        test ! -e "$root/attempts/1234abcd/creation-intents/pvc-lease.sh"
+        kubectl_attempt_step_done "$root" 1234abcd release-pvc-lease
+        kubectl_local_lock_release "$fd"
+    """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_collection_recovers_lease_delete_before_release_journal(
+    tmp_path: Path,
+) -> None:
+    """Exact cleanup evidence closes the final Lease delete crash window."""
+    results = tmp_path / "results"
+    result = _bash(_identity(results / "kubernetes") + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd TERMINAL
+        kubectl_attempt_transition "$root" "$fd" 1234abcd COLLECTION_IN_PROGRESS
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd pvc-lease \
+          Lease "$KUBECTL_PVC_LEASE_NAME" test-ns lease-uid \
+          0123456789abcdef0123456789abcdef
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
+          Job sweep-job test-ns sweep-uid \
+          0123456789abcdef0123456789abcdef
+        kubectl_attempt_journal_step "$root" "$fd" 1234abcd release-remote-run
+        kubectl_attempt_journal_step "$root" "$fd" 1234abcd delete-sweep
+        mkdir -p "$root/attempts/1234abcd/collected-state" \
+          "$root/attempts/1234abcd/control-bundle/executions"
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        kubectl_local_lock_release "$fd"
+
+        _kubectl_load_saved_attempt() {{
+          kubectl_attempt_load_metadata "$1/kubernetes/attempts/1234abcd"
+          kubectl_attempt_load_identity "$1/kubernetes/attempts/1234abcd"
+          printf -v "$2" 1234abcd
+        }}
+        kubectl_cleanup_ephemeral_helpers() {{ :; }}
+        _kubectl_verify_saved_cluster_identity() {{ :; }}
+        _kubectl_validate_collected_publication() {{ printf -v "$3" SUCCESS; }}
+        kubectl_observe_pvc_lease() {{ printf -v "$1" ''; }}
+        _kubectl_create_inspector() {{
+          echo 'unexpected inspector creation' >&2
+          return 1
+        }}
+        output=$(kubectl_lifecycle_operation collect {str(results)!r})
+        [[ "$output" == *STORAGE_SCALE_TEST_KUBECTL_STATE=SUCCESS* ]]
+        kubectl_attempt_load_metadata "$root/attempts/1234abcd"
+        [[ "$KUBECTL_LIFECYCLE_STATE" == COLLECTED ]]
+        kubectl_attempt_step_done "$root" 1234abcd release-pvc-lease
+    """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_collection_does_not_reconcile_lease_before_exact_cleanup(
+    tmp_path: Path,
+) -> None:
+    """An absent Lease is not enough without all preceding cleanup evidence."""
+    result = _bash(_identity(tmp_path / "state") + """
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd TERMINAL
+        kubectl_attempt_transition "$root" "$fd" 1234abcd COLLECTION_IN_PROGRESS
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd pvc-lease \
+          Lease "$KUBECTL_PVC_LEASE_NAME" test-ns lease-uid \
+          0123456789abcdef0123456789abcdef
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
+          Job sweep-job test-ns sweep-uid \
+          0123456789abcdef0123456789abcdef
+        kubectl_attempt_journal_step "$root" "$fd" 1234abcd release-remote-run
+        mkdir -p "$root/attempts/1234abcd/collected-state" \
+          "$root/attempts/1234abcd/control-bundle/executions"
+        _kubectl_validate_collected_publication() { printf -v "$3" SUCCESS; }
+        kubectl_observe_pvc_lease() { printf -v "$1" ''; }
+        ! kubectl_reconcile_pvc_lease_release_after_collection_cleanup \
+            "$root" "$fd" 1234abcd
+        ! kubectl_attempt_step_done "$root" 1234abcd release-pvc-lease
+        kubectl_local_lock_release "$fd"
+    """)
+    assert result.returncode == 0, result.stderr
+
+
 def test_remote_release_executes_guards_before_owner_read_and_deletion(
     tmp_path: Path,
 ) -> None:

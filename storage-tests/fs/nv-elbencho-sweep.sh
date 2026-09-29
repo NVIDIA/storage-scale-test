@@ -412,7 +412,8 @@ case "$SWEEP_OPERATION" in
         ;;
 esac
 
-if ! source_output=$("$BASH" -c ". '${SCRIPT_DIR}/../../env.sh'" 2>&1); then
+if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
+        "${SCRIPT_DIR}/../../env.sh" 2>&1); then
     printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
     exit 1
 fi

@@ -18,6 +18,7 @@
 """Fast decision-partition tests for the filesystem sweep contract."""
 
 import os
+import shlex
 import shutil
 import subprocess
 import textwrap
@@ -364,10 +365,10 @@ def _make_sweep_fixture(tmp_path: Path) -> Path:
     env = tmp_path / "env.sh"
     env.write_text(
         textwrap.dedent(f"""
-            export SCALE_TEST_BASE={_REPO_ROOT!s}
-            export RESULTS_DIR={tmp_path / 'results'!s}
-            export LOGS_DIR={tmp_path / 'logs'!s}
-            declare -A TEST_DIRS=([{root!s}]=1)
+            export SCALE_TEST_BASE={shlex.quote(str(_REPO_ROOT))}
+            export RESULTS_DIR={shlex.quote(str(tmp_path / 'results'))}
+            export LOGS_DIR={shlex.quote(str(tmp_path / 'logs'))}
+            declare -A TEST_DIRS=([{shlex.quote(str(root))}]=1)
             ELBENCHO_SCALE_THREAD_LIST=(1)
             ELBENCHO_SCALE_IO_SIZES=(4K)
             ELBENCHO_IODEPTH_LIST=(1)
@@ -390,6 +391,25 @@ def _make_sweep_fixture(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return sweep
+
+
+def test_sweep_sources_env_from_checkout_path_containing_apostrophe(tmp_path):
+    """The env syntax probe treats a valid checkout pathname as data."""
+    checkout = tmp_path / "storage-scale-test-a'b"
+    checkout.mkdir()
+    sweep = _make_sweep_fixture(checkout)
+    result = subprocess.run(
+        [str(sweep)],
+        check=False,
+        cwd=checkout,
+        env={**os.environ, "SHELL": _BASH},
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "--nodes is required" in result.stdout + result.stderr
+    assert "Failed to source env.sh" not in result.stdout + result.stderr
+    assert "unexpected EOF" not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(

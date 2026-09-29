@@ -34,7 +34,8 @@ done
 }
 SCALE_TEST_BASE="$dir"
 
-if ! source_output=$("$SHELL" -c ". ${SCALE_TEST_BASE}/env.sh" 2>&1); then
+if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
+        "${SCALE_TEST_BASE}/env.sh" 2>&1); then
     printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
     exit 1
 fi

@@ -27,7 +27,8 @@ if [[ ! -d "${SCRIPT_DIR}" ]]; then
 fi
 readonly SCRIPT_DIR
 
-if ! source_output=$("$SHELL" -c ". '${SCRIPT_DIR}/../env.sh'" 2>&1); then
+if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
+        "${SCRIPT_DIR}/../env.sh" 2>&1); then
     printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
     exit 1
 fi
@@ -41,4 +42,3 @@ python_path=$(setup_python_venv) || exit 1
 echo "Running netbench analysis..." >&2
 echo "$python_path" "$PYTHON_SCRIPT" "$@" >&2
 "$python_path" "$PYTHON_SCRIPT" "$@" || error_exit "Failed to analyze netbench results"
-

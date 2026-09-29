@@ -57,7 +57,7 @@ def test_macos_kubectl_prerequisite_failure_names_tools_and_formulae(tmp_path):
 
 def test_root_workload_identity_and_missing_test_dirs_are_actionable(tmp_path):
     """The validator reports kubectl configuration errors without irrelevant notes."""
-    deployment = tmp_path / "deployment"
+    deployment = tmp_path / "deploy'ment"
     functions_dir = deployment / "storage-tests" / "fs" / "kubectl"
     functions_dir.mkdir(parents=True)
     shutil.copy2(_ROOT / "validate_env.sh", deployment / "validate_env.sh")
