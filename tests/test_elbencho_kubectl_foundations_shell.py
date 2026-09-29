@@ -40,6 +40,9 @@ def _run_bash(body):
             "-c",
             textwrap.dedent(f"""
             source {_FOUNDATIONS!s}
+            KUBECTL_CONTROL_LOGICAL_ROOT=benchmark
+            KUBECTL_CONTROL_TEST_ROOT="$KUBECTL_SWEEP_MOUNT_ROOT/benchmark"
+            KUBECTL_CONTROL_ROOT="$KUBECTL_CONTROL_TEST_ROOT/.storage-scale-test"
             {body}
         """),
         ],
@@ -66,7 +69,16 @@ def test_logical_paths_map_under_the_fixed_mount(logical, expected):
 
 @pytest.mark.parametrize(
     "logical",
-    ("", "/", ".", "a/../b", ".storage-scale-test", "/.storage-scale-test/run"),
+    (
+        "",
+        "/",
+        ".",
+        "a/../b",
+        ".storage-scale-test",
+        "/.storage-scale-test/run",
+        "bench/.storage-scale-test/data",
+        "bench/path with spaces",
+    ),
 )
 def test_logical_paths_reject_escape_and_reserved_state(logical):
     """Mapped benchmark data cannot escape or overlap orchestration state."""
@@ -96,6 +108,33 @@ def test_nested_roots_make_read_from_mapping_ambiguous():
     """)
     assert result.returncode != 0
     assert "exactly one" in result.stderr
+
+
+def test_control_root_is_the_lexically_first_normalized_test_dir():
+    """Associative-array order and weights do not change durable-state placement."""
+    result = _run_bash("""
+        declare -A TEST_DIRS=([zeta]=99 [/alpha/data]=1 [middle]=2)
+        kubectl_select_control_root logical mapped
+        [[ "$logical" == alpha/data ]]
+        [[ "$mapped" == /mnt/storage-scale-test/alpha/data ]]
+        kubectl_set_control_layout "$logical" "$mapped"
+        [[ "$KUBECTL_CONTROL_ROOT" == \
+            /mnt/storage-scale-test/alpha/data/.storage-scale-test ]]
+    """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_read_from_cannot_scan_the_control_test_root():
+    """A read scan cannot ingest orchestration state beneath its selected root."""
+    result = _run_bash("""
+        declare -A TEST_DIRS=([alpha]=1 [zeta]=1)
+        kubectl_select_control_root logical mapped
+        kubectl_set_control_layout "$logical" "$mapped"
+        ! kubectl_map_read_from_path alpha
+        [[ $(kubectl_map_read_from_path alpha/dataset) == \
+            /mnt/storage-scale-test/alpha/dataset ]]
+    """)
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(
@@ -150,6 +189,10 @@ def test_attempt_metadata_and_current_pointer_are_atomic_and_versioned(tmp_path)
     """Identity is create-only while state and current remain mutable."""
     result = _run_bash(f"""
         root={str(tmp_path / 'kubernetes')!r}
+        mv() {{
+            [[ " $* " != *' -T '* ]] || return 64
+            command mv "$@"
+        }}
         kubectl_local_lock_acquire "$root" lock_fd
         kubectl_attempt_create_identity "$root" "$lock_fd" 1234abcd \
             0123456789abcdef0123456789abcdef test-ns ns-uid \
@@ -172,7 +215,7 @@ def test_attempt_metadata_and_current_pointer_are_atomic_and_versioned(tmp_path)
         kubectl_attempt_load_metadata "$root/attempts/1234abcd"
         [[ "$KUBECTL_LIFECYCLE_STATE" == SUBMITTED ]]
         kubectl_local_lock_release "$lock_fd"
-        sed -i.bak 's/KUBECTL_ATTEMPT_SCHEMA=1/KUBECTL_ATTEMPT_SCHEMA=99/' \
+        sed -i.bak 's/KUBECTL_ATTEMPT_SCHEMA=2/KUBECTL_ATTEMPT_SCHEMA=99/' \
             "$identity"
         ! kubectl_attempt_load_metadata "$root/attempts/1234abcd"
     """)
@@ -492,6 +535,8 @@ def test_control_state_diagnostics_use_guarded_bounded_pvc_reads(tmp_path):
         grep -F 'publication-manifest.tsv' {str(captured)!r}
         grep -F 'run-summary.tsv' {str(captured)!r}
         grep -F '*.workers.tsv' {str(captured)!r}
+        grep -F 'control_root=${{run%"$run_suffix"}}' {str(captured)!r}
+        grep -F 'test_root=${{control_root%"$control_suffix"}}' {str(captured)!r}
         [[ $(wc -c < {str(destination)!r}) -le 524288 ]]
     """)
     assert result.returncode == 0, result.stderr

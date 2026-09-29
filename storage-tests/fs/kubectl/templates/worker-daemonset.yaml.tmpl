@@ -62,7 +62,8 @@ spec:
         runAsUser: @@RUN_AS_USER@@
         runAsGroup: @@RUN_AS_GROUP@@
         seccompProfile:
-          type: RuntimeDefault
+          # Elbencho Linux AIO can require syscalls denied by RuntimeDefault.
+          type: Unconfined
       containers:
         - name: elbencho
           image: @@IMAGE@@

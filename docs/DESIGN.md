@@ -244,7 +244,9 @@ point. `EXECUTION_SUBSTRATE` is required; there is no implicit default:
 The Kubernetes substrate does not provision storage or require host-networked
 Pods. It selects Ready nodes with `KUBECTL_NODE_SELECTOR`, uses ordinary Pod
 networking for elbencho's coordination port, and runs the workload as the
-configured non-root UID/GID.
+configured non-root UID/GID. Elbencho validation, worker, and coordinator Pods
+request `seccompProfile.type: Unconfined` so Linux AIO is not rejected by a
+runtime-default filter; administrative helper Pods retain `RuntimeDefault`.
 
 ### 4.2 Common Dispatch Layers
 
@@ -296,16 +298,19 @@ are normative in
 [KUBERNETES_ELBENCHO_LIFECYCLE.md](KUBERNETES_ELBENCHO_LIFECYCLE.md).
 
 Kubernetes submission is asynchronous at the sweep level. The submitting host
-creates an attempt-scoped control bundle, ledger, reservation, and ownership
-metadata on the configured PVC, then starts one elbencho worker per selected
-Ready node in an owned DaemonSet and a single coordinator Job. The coordinator
-has no Kubernetes API credentials: it runs the copied control bundle from the
-PVC, uses frozen Pod IPv4 endpoints, and writes active benchmark output to
-Job-local scratch.
+acquires a deterministic Kubernetes Lease for the namespace/PV/PVC identity,
+creates attempt-scoped ownership metadata, and stages the control bundle and
+ledger on the PVC. It then starts one elbencho worker per selected Ready node
+in an owned DaemonSet and a single coordinator Job. The coordinator has no
+Kubernetes API credentials: it runs the copied control bundle from the PVC,
+uses frozen Pod IPv4 endpoints, and writes active benchmark output to Job-local
+scratch.
 
-Logical `TEST_DIRS` paths are mapped below `/mnt/storage-scale-test`; the
-reserved `.storage-scale-test` subtree holds control state, locks, completed
-cell publications, and recovery metadata and may not overlap a workload path.
+Logical `TEST_DIRS` paths are mapped below `/mnt/storage-scale-test`. Each root
+must be writable by the workload identity, but the PVC mount root need not be.
+The lexically first normalized root contains a reserved `.storage-scale-test`
+subtree for control state, locks, completed-cell publications, and recovery
+metadata; no workload path may overlap it.
 After each cell reaches a terminal state, its result artifacts are copied from
 scratch to the PVC and an atomic publication manifest records the completed
 cell. This bounds result loss if the submitting `kubectl` credentials expire
@@ -315,7 +320,7 @@ The local lifecycle commands operate on the saved attempt identity rather than
 today's `env.sh`: `--status` reads durable state, `--cancel` stops the exact
 owned Job and publishes cancellation, and `--collect` validates and retrieves
 the published artifacts into the local result directory before releasing the
-PVC reservation and deleting owned Kubernetes resources. `--resume` for a
+PVC Lease and deleting owned Kubernetes resources. `--resume` for a
 Kubernetes attempt is collection-gated: collect first imports partial results,
 then a new sweep can resume the failed cells from the local execution ledger.
 Coordinator loss, endpoint replacement, cancellation, and retry-safe

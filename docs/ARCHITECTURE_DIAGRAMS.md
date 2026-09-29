@@ -42,7 +42,8 @@ submitter intentionally persists run artifacts under `RESULTS_DIR`, including
 result data, configuration snapshots, and reified filesystem-sweep executions
 with their status sentinels. Kubernetes attempts additionally persist their
 control bundle, ownership identity, endpoint evidence, execution ledger, and
-completed-cell publications under `.storage-scale-test` on the configured PVC.
+completed-cell publications under `.storage-scale-test` in the canonical
+`TEST_DIRS` root on the configured PVC.
 Optional treefile caches are stored alongside staged datasets. Together these
 artifacts support report regeneration, asynchronous collection, dataset reuse,
 and `nv-elbencho-sweep.sh --resume` after an interrupted run.
@@ -199,13 +200,14 @@ flowchart LR
 
   subgraph API["Kubernetes API"]
     NS["Existing namespace"]
+    LEASE["PVC-wide Lease<br/>namespace/PV/PVC UID key"]
     DS["Owned worker DaemonSet<br/>one Elbencho service per selected node"]
     JOB["Owned coordinator Job<br/>finite-lived, no API credentials"]
     HELP["Short-lived owned helper Pods<br/>staging, status, collection"]
   end
 
   subgraph PVC["Configured RWX PVC"]
-    CONTROL[".storage-scale-test/<br/>control bundle + locks + ledger"]
+    CONTROL["canonical TEST_DIR/.storage-scale-test/<br/>control bundle + locks + ledger"]
     PUBLISHED["completed-cell publications<br/>result artifacts + manifest"]
     DATA["Mapped workload paths<br/>/mnt/storage-scale-test/...<br/>(TEST_DIRS) "]
   end
@@ -217,6 +219,7 @@ flowchart LR
 
   ENV --> CLI
   CLI -- "create/query/cancel/collect" --> NS
+  CLI --> LEASE
   CLI --> HELP
   NS --> DS --> W
   NS --> JOB --> C
@@ -236,5 +239,6 @@ selection, and worker endpoint evidence are persisted locally and on the PVC.
 Each resource is labeled and annotated for exact ownership. The coordinator
 publishes each completed cell before continuing, so a lost Pod or expired
 kubectl session does not discard already completed results. Collection verifies
-the publication manifest, copies results back to the executing host, and then
-releases the PVC reservation and removes only owned Kubernetes resources.
+the publication manifest, copies results back to the executing host, removes
+attempt state and exact owned resources, and releases the UID-journaled PVC
+Lease last.

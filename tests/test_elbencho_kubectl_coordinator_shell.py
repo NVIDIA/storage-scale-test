@@ -41,6 +41,12 @@ _PLATFORM_FUNCTIONS = _REPOSITORY_ROOT / "lib" / "_platform_functions.sh"
 _BASH = shutil.which("bash") or "/bin/bash"
 
 
+def test_deployed_kubectl_shell_avoids_gnu_find_printf() -> None:
+    """The macOS launcher and lean workload images need no GNU find."""
+    for path in (_COORDINATOR, _KUBECTL_FUNCTIONS):
+        assert "-printf" not in path.read_text(encoding="utf-8")
+
+
 def _make_executable(path, text):
     path.write_text(textwrap.dedent(text), encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)

@@ -26,7 +26,7 @@ else
     readonly KUBECTL_SWEEP_MOUNT_ROOT=/mnt/storage-scale-test
 fi
 readonly KUBECTL_SWEEP_RESERVED_ROOT=.storage-scale-test
-readonly KUBECTL_ATTEMPT_SCHEMA_VERSION=1
+readonly KUBECTL_ATTEMPT_SCHEMA_VERSION=2
 readonly KUBECTL_ATTEMPT_RESOURCE_SCHEMA_VERSION=1
 readonly KUBECTL_ATTEMPT_CREATION_INTENT_SCHEMA_VERSION=1
 readonly KUBECTL_COLLECTION_MAX_BYTES=$((2 * 1024 * 1024 * 1024))
@@ -70,6 +70,14 @@ kubectl_normalize_logical_path() {
             echo "Error: Kubernetes logical paths may not contain '.' or '..'" >&2
             return 1
         fi
+        if [[ "$component" == "$KUBECTL_SWEEP_RESERVED_ROOT" ]]; then
+            echo "Error: Kubernetes logical paths may not contain the reserved component $KUBECTL_SWEEP_RESERVED_ROOT" >&2
+            return 1
+        fi
+        if [[ ! "$component" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Error: Kubernetes logical path components may contain only letters, digits, '.', '_', and '-'" >&2
+            return 1
+        fi
         normalized+=("$component")
     done
     if [[ ${#normalized[@]} -eq 0 ]]; then
@@ -78,11 +86,6 @@ kubectl_normalize_logical_path() {
     fi
     local joined
     joined=$(IFS=/; printf '%s' "${normalized[*]}")
-    if [[ "$joined" == "$KUBECTL_SWEEP_RESERVED_ROOT" \
-            || "$joined" == "$KUBECTL_SWEEP_RESERVED_ROOT/"* ]]; then
-        echo "Error: logical path overlaps reserved Kubernetes orchestration state" >&2
-        return 1
-    fi
     printf -v "$output_variable" '%s' "$joined"
     return 0
 }
@@ -113,6 +116,36 @@ kubectl_map_test_dirs() {
     return 0
 }
 
+kubectl_select_control_root() {
+    local logical_output="$1" mapped_output="$2"
+    [[ "$logical_output" =~ ^[A-Za-z_][A-Za-z0-9_]*$ \
+        && "$mapped_output" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    local root normalized_path
+    local -a roots=()
+    for root in "${!TEST_DIRS[@]}"; do
+        kubectl_normalize_logical_path "$root" normalized_path || return 1
+        roots+=("$normalized_path")
+    done
+    [[ ${#roots[@]} -gt 0 ]] || return 1
+    mapfile -t roots < <(printf '%s\n' "${roots[@]}" | LC_ALL=C sort -u)
+    [[ ${#roots[@]} -eq ${#TEST_DIRS[@]} ]] || {
+        echo "Error: multiple TEST_DIRS keys resolve to the same Kubernetes path" >&2
+        return 1
+    }
+    printf -v "$logical_output" '%s' "${roots[0]}"
+    printf -v "$mapped_output" '%s' "$KUBECTL_SWEEP_MOUNT_ROOT/${roots[0]}"
+}
+
+kubectl_set_control_layout() {
+    local logical="$1" mapped="$2"
+    kubectl_normalize_logical_path "$logical" logical || return 1
+    [[ "$mapped" == "$KUBECTL_SWEEP_MOUNT_ROOT/$logical" ]] || return 1
+    KUBECTL_CONTROL_LOGICAL_ROOT="$logical"
+    KUBECTL_CONTROL_TEST_ROOT="$mapped"
+    KUBECTL_CONTROL_ROOT="$mapped/$KUBECTL_SWEEP_RESERVED_ROOT"
+    export KUBECTL_CONTROL_LOGICAL_ROOT KUBECTL_CONTROL_TEST_ROOT KUBECTL_CONTROL_ROOT
+}
+
 kubectl_map_read_from_path() {
     local read_path
     kubectl_normalize_logical_path "$1" read_path || return 1
@@ -133,6 +166,11 @@ kubectl_map_read_from_path() {
     done
     if [[ "$matches" -ne 1 ]]; then
         echo "Error: read-from path must belong to exactly one logical TEST_DIRS root" >&2
+        return 1
+    fi
+    if [[ -n "${KUBECTL_CONTROL_LOGICAL_ROOT:-}" \
+            && "$read_path" == "$KUBECTL_CONTROL_LOGICAL_ROOT" ]]; then
+        echo "Error: read-from may not scan the Kubernetes control-root TEST_DIRS entry" >&2
         return 1
     fi
     printf '%s\n' "$mapped"
@@ -302,6 +340,18 @@ _kubectl_local_tree_apparent_bytes() {
         ' sh {} + | awk '{ total += $1 } END { print total + 0 }')
 }
 
+_kubectl_local_file_bytes() {
+    local path="$1" output_name="$2" _kubectl_file_bytes_raw
+    [[ -f "$path" && ! -L "$path" \
+        && "$output_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    _kubectl_file_bytes_raw=$(wc -c < "$path") || return 1
+    # BSD wc right-aligns counts with leading spaces. Command substitution
+    # removes the trailing newline; remove any remaining display padding.
+    _kubectl_file_bytes_raw=${_kubectl_file_bytes_raw//[[:space:]]/}
+    [[ "$_kubectl_file_bytes_raw" =~ ^[0-9]+$ ]] || return 1
+    printf -v "$output_name" '%s' "$_kubectl_file_bytes_raw"
+}
+
 _kubectl_local_path_mtime() {
     local path="$1" mtime=""
     [[ -e "$path" && ! -L "$path" ]] || return 1
@@ -349,6 +399,32 @@ _kubectl_sha256_file() {
     fi
     [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
     printf '%s\n' "$digest"
+}
+
+_kubectl_sha256_text() {
+    local value="$1" digest=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        digest=$(printf '%s' "$value" | sha256sum | awk '{print $1}') || return 1
+    elif command -v gsha256sum >/dev/null 2>&1; then
+        digest=$(printf '%s' "$value" | gsha256sum | awk '{print $1}') || return 1
+    elif command -v shasum >/dev/null 2>&1; then
+        digest=$(printf '%s' "$value" | shasum -a 256 | awk '{print $1}') || return 1
+    else
+        echo "Error: SHA-256 requires sha256sum, gsha256sum, or shasum" >&2
+        return 1
+    fi
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$digest"
+}
+
+kubectl_pvc_lease_name() {
+    local namespace_uid="$1" pv_uid="$2" pvc_uid="$3" digest
+    kubectl_validate_uid "$namespace_uid" && kubectl_validate_uid "$pv_uid" \
+        && kubectl_validate_uid "$pvc_uid" || return 1
+    digest=$(_kubectl_sha256_text \
+        "lease-v1|${#namespace_uid}:$namespace_uid|${#pv_uid}:$pv_uid|${#pvc_uid}:$pvc_uid") \
+        || return 1
+    printf 'sst-elb-pvc-%s\n' "${digest:0:32}"
 }
 
 _kubectl_write_bundle_manifest() {
@@ -408,16 +484,21 @@ kubectl_attempt_recover_incomplete_metadata() {
 kubectl_attempt_create_identity() {
     local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3"
     local ownership_nonce="$4" namespace="$5" namespace_uid="$6"
-    local pv="$7" pv_uid="$8" pvc="$9" pvc_uid="${10}"
+    local pv="$7" pv_uid="$8" pvc="$9" pvc_uid="${10}" lease_name="${11:-}"
     _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
     [[ "$attempt_id" =~ ^[0-9a-f]{8}$ ]] || return 1
     [[ "$ownership_nonce" =~ ^[0-9a-f]{32}$ ]] || return 1
+    if [[ -z "$lease_name" ]]; then
+        lease_name=$(kubectl_pvc_lease_name "$namespace_uid" "$pv_uid" "$pvc_uid") \
+            || return 1
+    fi
     if ! kubectl_validate_namespace_name "$namespace" \
             || ! kubectl_validate_uid "$namespace_uid" \
             || ! kubectl_validate_object_name "$pv" \
             || ! kubectl_validate_uid "$pv_uid" \
             || ! kubectl_validate_object_name "$pvc" \
-            || ! kubectl_validate_uid "$pvc_uid"; then
+            || ! kubectl_validate_uid "$pvc_uid" \
+            || ! kubectl_validate_object_name "$lease_name"; then
         echo "Error: invalid Kubernetes attempt identity" >&2
         return 1
     fi
@@ -443,6 +524,7 @@ kubectl_attempt_create_identity() {
         printf 'KUBECTL_PV_UID=%q\n' "$pv_uid"
         printf 'KUBECTL_PVC=%q\n' "$pvc"
         printf 'KUBECTL_PVC_UID=%q\n' "$pvc_uid"
+        printf 'KUBECTL_PVC_LEASE_NAME=%q\n' "$lease_name"
     } > "$shell_tmp" || {
         rm -rf -- "$staging_dir"
         return 1
@@ -457,11 +539,15 @@ kubectl_attempt_create_identity() {
         printf 'pv_uid: "%s"\n' "$pv_uid"
         printf 'pvc: "%s"\n' "$pvc"
         printf 'pvc_uid: "%s"\n' "$pvc_uid"
+        printf 'pvc_lease_name: "%s"\n' "$lease_name"
     } > "$yaml_tmp" || {
         rm -rf -- "$staging_dir"
         return 1
     }
-    mv -T -n "$staging_dir" "$metadata_dir" 2>/dev/null || true
+    # The lifecycle lock serializes publishers for this results directory.
+    # Use the create-only option shared by GNU and BSD mv; macOS mv does not
+    # implement GNU's -T option.
+    mv -n "$staging_dir" "$metadata_dir" 2>/dev/null || true
     if [[ -d "$staging_dir" || ! -d "$metadata_dir" ]]; then
         rm -rf -- "$staging_dir"
         return 1
@@ -537,7 +623,7 @@ kubectl_attempt_load_identity() {
         && -f "$yaml_file" && ! -L "$yaml_file" ]] || return 1
     unset KUBECTL_ATTEMPT_SCHEMA KUBECTL_ATTEMPT_ID KUBECTL_OWNERSHIP_NONCE
     unset KUBECTL_NAMESPACE KUBECTL_NAMESPACE_UID KUBECTL_PV KUBECTL_PV_UID
-    unset KUBECTL_PVC KUBECTL_PVC_UID
+    unset KUBECTL_PVC KUBECTL_PVC_UID KUBECTL_PVC_LEASE_NAME
     # shellcheck disable=SC1090  # Trusted, result-directory-local identity.
     source "$identity_file" || return 1
     [[ "${KUBECTL_ATTEMPT_SCHEMA:-}" == "$KUBECTL_ATTEMPT_SCHEMA_VERSION" \
@@ -552,7 +638,9 @@ kubectl_attempt_load_identity() {
         && kubectl_validate_object_name "${KUBECTL_PV:-}" \
         && kubectl_validate_uid "${KUBECTL_PV_UID:-}" \
         && kubectl_validate_object_name "${KUBECTL_PVC:-}" \
-        && kubectl_validate_uid "${KUBECTL_PVC_UID:-}"
+        && kubectl_validate_uid "${KUBECTL_PVC_UID:-}" \
+        && kubectl_validate_object_name "${KUBECTL_PVC_LEASE_NAME:-}" \
+        && grep -Fqx "pvc_lease_name: \"$KUBECTL_PVC_LEASE_NAME\"" "$yaml_file"
 }
 
 kubectl_attempt_load_metadata() {
@@ -619,7 +707,10 @@ _kubectl_validate_placeholder() {
         SELECTOR_KEY) kubectl_validate_label_key "$value" ;;
         SELECTOR_VALUE) kubectl_validate_label_value "$value" ;;
         REMOTE_RUN_DIRECTORY)
-            [[ "$value" =~ ^/mnt/storage-scale-test/\.storage-scale-test/runs/[0-9a-f]{8}(/[A-Za-z0-9._-]+)*$ ]]
+            [[ "$value" =~ ^/mnt/storage-scale-test/([A-Za-z0-9._-]+/)+\.storage-scale-test/runs/[0-9a-f]{8}(/[A-Za-z0-9._-]+)*$ ]]
+            ;;
+        TEST_ROOT)
+            [[ "$value" =~ ^/mnt/storage-scale-test/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$ ]]
             ;;
         *) return 1 ;;
     esac
@@ -1138,7 +1229,7 @@ kubectl_classify_storage_diagnostics() {
     local evidence="" evidence_path evidence_bytes
     for evidence_path in "$diagnostic_path"/*; do
         [[ -f "$evidence_path" && ! -L "$evidence_path" ]] || continue
-        evidence_bytes=$(wc -c < "$evidence_path") || continue
+        _kubectl_local_file_bytes "$evidence_path" evidence_bytes || continue
         [[ "$evidence_bytes" =~ ^[0-9]+$ && "$evidence_bytes" -lt 2097152 ]] \
             || continue
         evidence+=$'\n'"$(<"$evidence_path")"
@@ -1190,7 +1281,7 @@ kubectl_capture_attempt_diagnostics() {
         [[ -d "$diagnostic_root" && ! -L "$diagnostic_root" ]] || return 1
     fi
     local key intent_file diagnostic_path="" identity captured=0
-    local -a resource_keys=(sweep workers transfer)
+    local -a resource_keys=(sweep workers transfer pvc-lease)
     local -A captured_identities=()
     for key in "${resource_keys[@]}"; do
         if kubectl_attempt_resource_exists "$kubernetes_dir" "$attempt_id" "$key"; then
@@ -1350,6 +1441,208 @@ kubectl_create_owned_object() {
     return 0
 }
 
+kubectl_render_pvc_lease() {
+    local name="$1" namespace="$2" attempt_id="$3" nonce="$4"
+    kubectl_validate_object_name "$name" \
+        && kubectl_validate_namespace_name "$namespace" \
+        && [[ "$attempt_id" =~ ^[0-9a-f]{8}$ && "$nonce" =~ ^[0-9a-f]{32}$ ]] \
+        && kubectl_validate_uid "${KUBECTL_NAMESPACE_UID:-}" \
+        && kubectl_validate_uid "${KUBECTL_PV_UID:-}" \
+        && kubectl_validate_uid "${KUBECTL_PVC_UID:-}" || return 1
+    cat <<EOF
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: $name
+  namespace: $namespace
+  labels:
+    app.kubernetes.io/name: storage-scale-test
+    app.kubernetes.io/component: pvc-lock
+    app.kubernetes.io/managed-by: storage-scale-test
+    storage-scale-test.nvidia.com/run: "$attempt_id"
+  annotations:
+    storage-scale-test.nvidia.com/ownership: "$nonce"
+    storage-scale-test.nvidia.com/namespace-uid: "$KUBECTL_NAMESPACE_UID"
+    storage-scale-test.nvidia.com/pv-uid: "$KUBECTL_PV_UID"
+    storage-scale-test.nvidia.com/pvc-uid: "$KUBECTL_PVC_UID"
+spec:
+  holderIdentity: "$attempt_id/$nonce"
+EOF
+}
+
+kubectl_observe_pvc_lease() {
+    local output_variable="$1" namespace="$2" name="$3"
+    [[ "$output_variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+        && kubectl_validate_namespace_name "$namespace" \
+        && kubectl_validate_object_name "$name" || return 1
+    # Keep the implementation variable distinct from every valid caller output
+    # name. Bash locals are dynamically scoped, so a local named "observed"
+    # would intercept printf -v when callers also request that name.
+    local jsonpath _kubectl_observed_pvc_lease
+    jsonpath='{.metadata.uid}{"\t"}{.metadata.annotations.storage-scale-test\.nvidia\.com/ownership}{"\t"}{.metadata.labels.storage-scale-test\.nvidia\.com/run}{"\t"}{.metadata.annotations.storage-scale-test\.nvidia\.com/namespace-uid}{"\t"}{.metadata.annotations.storage-scale-test\.nvidia\.com/pv-uid}{"\t"}{.metadata.annotations.storage-scale-test\.nvidia\.com/pvc-uid}{"\t"}{.spec.holderIdentity}'
+    _kubectl_observed_pvc_lease=$(kubectl_run_observational -n "$namespace" \
+        get Lease "$name" \
+        --ignore-not-found -o "jsonpath=$jsonpath") || return 1
+    printf -v "$output_variable" '%s' "$_kubectl_observed_pvc_lease"
+}
+
+kubectl_verify_pvc_lease() {
+    local namespace="$1" name="$2" attempt_id="$3" nonce="$4" expected_uid="${5:-}"
+    local observed uid observed_nonce observed_attempt namespace_uid pv_uid pvc_uid holder
+    kubectl_observe_pvc_lease observed "$namespace" "$name" || return 1
+    [[ -n "$observed" ]] || return 1
+    IFS=$'\t' read -r uid observed_nonce observed_attempt namespace_uid pv_uid pvc_uid \
+        holder <<< "$observed"
+    if [[ "$observed_nonce" != "$nonce" || "$observed_attempt" != "$attempt_id" \
+            || "$namespace_uid" != "$KUBECTL_NAMESPACE_UID" \
+            || "$pv_uid" != "$KUBECTL_PV_UID" || "$pvc_uid" != "$KUBECTL_PVC_UID" \
+            || "$holder" != "$attempt_id/$nonce" \
+            || ( -n "$expected_uid" && "$uid" != "$expected_uid" ) ]]; then
+        KUBECTL_ATTEMPT_ID="$attempt_id" kubectl_report_lifecycle_error \
+            verify-lease pvc-lease IDENTITY_MISMATCH \
+            "inspect the retained Lease and original attempt; do not delete it by name" \
+            unknown Lease "$name" "$namespace" "$expected_uid" "$uid" "" || true
+        return 1
+    fi
+    kubectl_validate_uid "$uid" || return 1
+    printf '%s\n' "$uid"
+}
+
+kubectl_pvc_lease_observation_matches() {
+    local observed="$1" attempt_id="$2" nonce="$3" expected_uid="${4:-}"
+    local uid observed_nonce observed_attempt namespace_uid pv_uid pvc_uid holder
+    [[ -n "$observed" ]] || return 1
+    IFS=$'\t' read -r uid observed_nonce observed_attempt namespace_uid pv_uid pvc_uid \
+        holder <<< "$observed"
+    [[ "$observed_nonce" == "$nonce" && "$observed_attempt" == "$attempt_id" \
+        && "$namespace_uid" == "$KUBECTL_NAMESPACE_UID" \
+        && "$pv_uid" == "$KUBECTL_PV_UID" && "$pvc_uid" == "$KUBECTL_PVC_UID" \
+        && "$holder" == "$attempt_id/$nonce" \
+        && ( -z "$expected_uid" || "$uid" == "$expected_uid" ) ]] \
+        && kubectl_validate_uid "$uid"
+}
+
+kubectl_acquire_pvc_lease() {
+    local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3"
+    _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
+    kubectl_attempt_load_identity "$kubernetes_dir/attempts/$attempt_id" || return 1
+    local name="$KUBECTL_PVC_LEASE_NAME" namespace="$KUBECTL_NAMESPACE"
+    local nonce="$KUBECTL_OWNERSHIP_NONCE" manifest output="" create_rc=0 uid
+    kubectl_attempt_write_creation_intent "$kubernetes_dir" "$lock_fd" \
+        "$attempt_id" pvc-lease Lease "$name" "$namespace" "$nonce" || return 1
+    manifest=$(kubectl_render_pvc_lease "$name" "$namespace" "$attempt_id" "$nonce") \
+        || return 1
+    output=$(printf '%s' "$manifest" | kubectl_run_bounded -n "$namespace" \
+        create -f - 2>&1) || create_rc=$?
+    local observed="" foreign_uid="" foreign_attempt=""
+    kubectl_observe_pvc_lease observed "$namespace" "$name" || return 1
+    if kubectl_pvc_lease_observation_matches "$observed" "$attempt_id" "$nonce"; then
+        IFS=$'\t' read -r uid _ <<< "$observed"
+        kubectl_attempt_journal_resource "$kubernetes_dir" "$lock_fd" "$attempt_id" \
+            pvc-lease Lease "$name" "$namespace" "$uid" "$nonce" || return 1
+        kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
+            "$attempt_id" pvc-lease || return 1
+        return 0
+    fi
+    if [[ -n "$observed" ]]; then
+        IFS=$'\t' read -r foreign_uid _ foreign_attempt _ <<< "$observed"
+        kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
+            "$attempt_id" pvc-lease || return 1
+        printf 'Error: PVC %s/%s is reserved by Kubernetes attempt %s (Lease %s, UID %s)\n' \
+            "$namespace" "$KUBECTL_PVC" "${foreign_attempt:-unknown}" "$name" \
+            "${foreign_uid:-unknown}" >&2
+        KUBECTL_ATTEMPT_ID="$attempt_id" kubectl_report_lifecycle_error \
+            submit pvc-lease INVALID_LIFECYCLE_OPERATION \
+            "use the owning attempt result directory to run --status, --cancel, or --collect" \
+            unknown Lease "$name" "$namespace" "" "$foreign_uid" "" || true
+        return 1
+    fi
+    [[ "$create_rc" -eq 0 ]] || printf 'Error: failed to create PVC Lease: %s\n' "$output" >&2
+    return 1
+}
+
+kubectl_release_pvc_lease() {
+    local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3"
+    _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
+    kubectl_attempt_step_done "$kubernetes_dir" "$attempt_id" release-pvc-lease \
+        && return 0
+    if ! kubectl_attempt_resource_exists "$kubernetes_dir" "$attempt_id" pvc-lease; then
+        local intent="$kubernetes_dir/attempts/$attempt_id/creation-intents/pvc-lease.sh"
+        if [[ -e "$intent" || -L "$intent" ]]; then
+            kubectl_attempt_load_identity "$kubernetes_dir/attempts/$attempt_id" || return 1
+            kubectl_attempt_load_creation_intent "$intent" || return 1
+            local intent_observed="" intent_uid=""
+            kubectl_observe_pvc_lease intent_observed "$KUBECTL_INTENT_NAMESPACE" \
+                "$KUBECTL_INTENT_NAME" || return 1
+            if [[ -n "$intent_observed" ]]; then
+                if kubectl_pvc_lease_observation_matches "$intent_observed" \
+                        "$attempt_id" "$KUBECTL_INTENT_NONCE"; then
+                    IFS=$'\t' read -r intent_uid _ <<< "$intent_observed"
+                    kubectl_attempt_journal_resource "$kubernetes_dir" "$lock_fd" \
+                        "$attempt_id" pvc-lease Lease "$KUBECTL_INTENT_NAME" \
+                        "$KUBECTL_INTENT_NAMESPACE" "$intent_uid" \
+                        "$KUBECTL_INTENT_NONCE" || return 1
+                fi
+            fi
+            kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
+                "$attempt_id" pvc-lease || return 1
+        fi
+    fi
+    if ! kubectl_attempt_resource_exists "$kubernetes_dir" "$attempt_id" pvc-lease; then
+        kubectl_attempt_journal_step "$kubernetes_dir" "$lock_fd" "$attempt_id" \
+            release-pvc-lease
+        return
+    fi
+    kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" pvc-lease || return 1
+    [[ "$KUBECTL_RESOURCE_KIND" == Lease ]] || return 1
+    local uid="$KUBECTL_RESOURCE_UID" name="$KUBECTL_RESOURCE_NAME"
+    local namespace="$KUBECTL_RESOURCE_NAMESPACE" nonce="$KUBECTL_RESOURCE_NONCE"
+    local observed=""
+    if ! kubectl_observe_pvc_lease observed "$namespace" "$name"; then
+        return 1
+    fi
+    if [[ -n "$observed" ]]; then
+        kubectl_verify_pvc_lease "$namespace" "$name" "$attempt_id" "$nonce" "$uid" \
+            >/dev/null || return 1
+        local delete_options
+        delete_options=$(printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s"}}' \
+            "$uid") || return 1
+        printf '%s' "$delete_options" | KUBECTL_REQUEST_TIMEOUT_SECONDS=30 \
+            KUBECTL_PROCESS_TIMEOUT_SECONDS=45 kubectl_run_bounded -n "$namespace" \
+                delete --raw="/apis/coordination.k8s.io/v1/namespaces/$namespace/leases/$name" \
+                -f - >/dev/null 2>&1 || true
+    fi
+    kubectl_observe_pvc_lease observed "$namespace" "$name" || return 1
+    [[ -z "$observed" ]] || return 1
+    kubectl_attempt_journal_step "$kubernetes_dir" "$lock_fd" "$attempt_id" \
+        release-pvc-lease
+}
+
+kubectl_verify_journaled_pvc_lease() {
+    local kubernetes_dir="$1" attempt_id="$2"
+    kubectl_attempt_load_identity "$kubernetes_dir/attempts/$attempt_id" || return 1
+    local observed=""
+    if kubectl_attempt_step_done "$kubernetes_dir" "$attempt_id" release-pvc-lease; then
+        kubectl_observe_pvc_lease observed "$KUBECTL_NAMESPACE" \
+            "$KUBECTL_PVC_LEASE_NAME" || return 1
+        [[ -z "$observed" ]]
+        return
+    fi
+    if ! kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" pvc-lease; then
+        KUBECTL_ATTEMPT_ID="$attempt_id" kubectl_report_lifecycle_error \
+            verify-lease pvc-lease LEDGER_INCONSISTENT \
+            "inspect the missing Lease journal; do not alter resources by name" \
+            unknown Lease "$KUBECTL_PVC_LEASE_NAME" "$KUBECTL_NAMESPACE" \
+            "" "" "" || true
+        return 1
+    fi
+    [[ "$KUBECTL_RESOURCE_KIND" == Lease \
+        && "$KUBECTL_RESOURCE_NAME" == "$KUBECTL_PVC_LEASE_NAME" ]] || return 1
+    kubectl_verify_pvc_lease "$KUBECTL_RESOURCE_NAMESPACE" \
+        "$KUBECTL_RESOURCE_NAME" "$attempt_id" "$KUBECTL_RESOURCE_NONCE" \
+        "$KUBECTL_RESOURCE_UID" >/dev/null
+}
+
 # Kubernetes lifecycle helpers below deliberately do not dispatch a benchmark.
 # They provide the bounded, ownership-checked substrate operations consumed by
 # the coordinator and the filesystem sweep once its state machine is complete.
@@ -1362,14 +1655,9 @@ kubectl_template_directory() {
 
 kubectl_attempt_remote_root() {
     local attempt_id="$1"
-    [[ "$attempt_id" =~ ^[0-9a-f]{8}$ ]] || return 1
-    printf '%s/%s/runs/%s\n' "$KUBECTL_SWEEP_MOUNT_ROOT" \
-        "$KUBECTL_SWEEP_RESERVED_ROOT" "$attempt_id"
-}
-
-kubectl_attempt_remote_lock_directory() {
-    printf '%s/%s/locks/kubernetes-elbencho-sweep\n' \
-        "$KUBECTL_SWEEP_MOUNT_ROOT" "$KUBECTL_SWEEP_RESERVED_ROOT"
+    [[ "$attempt_id" =~ ^[0-9a-f]{8}$ ]] \
+        && kubectl_validate_saved_control_layout || return 1
+    printf '%s/runs/%s\n' "$KUBECTL_CONTROL_ROOT" "$attempt_id"
 }
 
 # This fragment is embedded in every remote control-tree mutation.  The
@@ -1382,11 +1670,21 @@ kubectl_remote_tree_guard_script() {
 run=$1
 attempt=$2
 mount=/mnt/storage-scale-test
-root=$mount/.storage-scale-test
-[[ "$attempt" =~ ^[0-9a-f]{8}$ && "$run" == "$root/runs/$attempt" ]] || exit 1
+run_suffix=/runs/$attempt
+control_suffix=/.storage-scale-test
+[[ "$run" == *"$run_suffix" ]] || exit 1
+control_root=${run%"$run_suffix"}
+[[ "$control_root" == *"$control_suffix" ]] || exit 1
+test_root=${control_root%"$control_suffix"}
+root=$control_root
+[[ "$attempt" =~ ^[0-9a-f]{8}$ && "$test_root" == "$mount/"* \
+    && "$root" == "$test_root/.storage-scale-test" \
+    && "$run" == "$root/runs/$attempt" ]] || exit 1
 mount_real=$(realpath -e -- "$mount") || exit 1
+test_real=$(realpath -e -- "$test_root") || exit 1
 root_real=$(realpath -e -- "$root") || exit 1
-[[ "$root_real" == "$mount_real/.storage-scale-test" ]] || exit 1
+case "$test_real" in "$mount_real"/*) ;; *) exit 1 ;; esac
+[[ "$root_real" == "$test_real/.storage-scale-test" ]] || exit 1
 [[ -d "$run" && ! -L "$run" ]] || exit 1
 run_real=$(realpath -e -- "$run") || exit 1
 [[ "$run_real" == "$root_real/runs/$attempt" ]] || exit 1
@@ -1648,7 +1946,7 @@ kubectl_attempt_step_done() {
 
 kubectl_attempt_write_configuration() {
     local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3" mapped_dirs_name="$4"
-    local mapped_read_from="${5:-}"
+    local mapped_read_from="${5:-}" control_logical_root="$6" control_test_root="$7"
     _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
     kubectl_validate_runtime_configuration || return 1
     [[ "$mapped_dirs_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
@@ -1660,6 +1958,7 @@ kubectl_attempt_write_configuration() {
     done
     [[ -z "$mapped_read_from" || "$mapped_read_from" == "$KUBECTL_SWEEP_MOUNT_ROOT/"* ]] \
         || return 1
+    kubectl_set_control_layout "$control_logical_root" "$control_test_root" || return 1
     local metadata_dir="$kubernetes_dir/attempts/$attempt_id"
     kubectl_attempt_load_identity "$metadata_dir" || return 1
     local config_file="$metadata_dir/configuration.sh"
@@ -1676,6 +1975,9 @@ kubectl_attempt_write_configuration() {
         printf 'KUBECTL_RUN_AS_USER=%q\n' "$KUBECTL_RUN_AS_USER"
         printf 'KUBECTL_RUN_AS_GROUP=%q\n' "$KUBECTL_RUN_AS_GROUP"
         printf 'KUBECTL_MAPPED_READ_FROM=%q\n' "$mapped_read_from"
+        printf 'KUBECTL_CONTROL_LOGICAL_ROOT=%q\n' "$KUBECTL_CONTROL_LOGICAL_ROOT"
+        printf 'KUBECTL_CONTROL_TEST_ROOT=%q\n' "$KUBECTL_CONTROL_TEST_ROOT"
+        printf 'KUBECTL_CONTROL_ROOT=%q\n' "$KUBECTL_CONTROL_ROOT"
         declare -p "$mapped_dirs_name" \
             | sed "s/^declare -A $mapped_dirs_name=/declare -A KUBECTL_MAPPED_TEST_DIRS=/"
     } > "$tmp" || return 1
@@ -1687,6 +1989,17 @@ kubectl_attempt_write_configuration() {
         rm -f -- "$tmp"
         return 1
     }
+}
+
+kubectl_validate_saved_control_layout() {
+    local logical="${KUBECTL_CONTROL_LOGICAL_ROOT:-}"
+    local test_root="${KUBECTL_CONTROL_TEST_ROOT:-}"
+    local control_root="${KUBECTL_CONTROL_ROOT:-}"
+    local normalized_path
+    kubectl_normalize_logical_path "$logical" normalized_path || return 1
+    [[ "$normalized_path" == "$logical" \
+        && "$test_root" == "$KUBECTL_SWEEP_MOUNT_ROOT/$logical" \
+        && "$control_root" == "$test_root/$KUBECTL_SWEEP_RESERVED_ROOT" ]]
 }
 
 kubectl_render_node_selector() {
@@ -1712,6 +2025,17 @@ kubectl_render_node_affinity_values() {
     printf '%s' "$node_names"
 }
 
+kubectl_render_test_root_arguments() {
+    local path
+    local -a roots=("$@")
+    [[ ${#roots[@]} -gt 0 ]] || return 1
+    mapfile -t roots < <(printf '%s\n' "${roots[@]}" | LC_ALL=C sort -u)
+    for path in "${roots[@]}"; do
+        _kubectl_validate_placeholder TEST_ROOT "$path" || return 1
+        printf '                "%s"\n' "$path"
+    done
+}
+
 _kubectl_validate_multiline_placeholder() {
     local token="$1" value="$2" line
     case "$token" in
@@ -1732,6 +2056,12 @@ _kubectl_validate_multiline_placeholder() {
                 [[ "$line" =~ ^[[:space:]]{22}-[[:space:]][a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || return 1
             done <<< "$value"
             ;;
+        TEST_ROOT_ARGUMENTS)
+            while IFS= read -r line; do
+                [[ "$line" =~ ^[[:space:]]{16}\"/mnt/storage-scale-test/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+\"$ ]] \
+                    || return 1
+            done <<< "$value"
+            ;;
         *) return 1 ;;
     esac
 }
@@ -1749,7 +2079,7 @@ kubectl_render_attempt_template() {
         token="${assignment%%=*}"
         value="${assignment#*=}"
         case "$token" in
-            NODE_SELECTOR_BLOCK|NODE_AFFINITY_VALUES)
+            NODE_SELECTOR_BLOCK|NODE_AFFINITY_VALUES|TEST_ROOT_ARGUMENTS)
                 _kubectl_validate_multiline_placeholder "$token" "$value" || return 1
                 [[ "$rendered" == *"@@$token@@"* ]] || return 1
                 rendered="${rendered//@@$token@@/$value}"
@@ -1853,6 +2183,20 @@ kubectl_validate_cluster_identity() {
         echo "Error: kubectl could not reach the API server using the active context" >&2
         return 1
     }
+    local verb allowed
+    for verb in get create delete; do
+        allowed=$(kubectl_run_observational auth can-i "$verb" \
+            leases.coordination.k8s.io -n "$KUBECTL_NAMESPACE") || {
+                printf 'Error: could not verify Kubernetes Lease permission: %s leases.coordination.k8s.io in namespace %s\n' \
+                    "$verb" "$KUBECTL_NAMESPACE" >&2
+                return 1
+            }
+        if [[ "$allowed" != yes ]]; then
+            printf 'Error: Kubernetes filesystem sweeps require permission to %s leases.coordination.k8s.io in namespace %s\n' \
+                "$verb" "$KUBECTL_NAMESPACE" >&2
+            return 1
+        fi
+    done
     local namespace_uid pv_uid pvc_uid volume_name
     namespace_uid=$(kubectl_get_object_uid namespace "$KUBECTL_NAMESPACE") || {
         printf 'Error: cannot read Kubernetes namespace %q with the active context\n' \
@@ -1927,6 +2271,14 @@ kubectl_validate_runtime_pod() {
     # cannot leave an unjournaled sleeping Pod. The Job validates the image,
     # workload identity, command contract, and actual PVC write/read/remove.
     kubectl_validate_cluster_identity >/dev/null || return 1
+    local control_logical_root control_test_root
+    kubectl_select_control_root control_logical_root control_test_root || return 1
+    kubectl_set_control_layout "$control_logical_root" "$control_test_root" || return 1
+    local -A mapped_test_dirs=()
+    kubectl_map_test_dirs mapped_test_dirs || return 1
+    local test_root_arguments
+    test_root_arguments=$(kubectl_render_test_root_arguments \
+        "${!mapped_test_dirs[@]}") || return 1
     local nodes_dir nodes_path helper_uid attempt_id nonce node helper_name manifest rc=0
     nodes_dir=$(mktemp -d "${TMPDIR:-/tmp}/storage-scale-test-kubectl-nodes.XXXXXX") || return 1
     nodes_path="$nodes_dir/nodes.tsv"
@@ -1948,7 +2300,8 @@ kubectl_validate_runtime_pod() {
         "ATTEMPT_ID=$attempt_id" "OWNERSHIP_NONCE=$nonce" \
         "IMAGE=$KUBECTL_ELBENCHO_IMAGE" "IMAGE_PULL_POLICY=$KUBECTL_IMAGE_PULL_POLICY" \
         "RUN_AS_USER=$KUBECTL_RUN_AS_USER" "RUN_AS_GROUP=$KUBECTL_RUN_AS_GROUP" \
-        "PVC_NAME=$KUBECTL_PVC" "NODE_NAME=$node") || return 1
+        "PVC_NAME=$KUBECTL_PVC" "NODE_NAME=$node" \
+        "TEST_ROOT_ARGUMENTS=$test_root_arguments") || return 1
     kubectl_create_owned_object helper_uid Job "$helper_name" "$KUBECTL_NAMESPACE" \
         "$nonce" "$attempt_id" "$manifest" || return 1
     # Stop before the Job's own active deadline so its Pod still exists when
@@ -2166,12 +2519,13 @@ kubectl_validate_pvc_paths() {
     # Resolve the nearest existing parent as well as the future path. This
     # rejects a symlinked component before benchmark creation can escape the
     # PVC, while preserving support for intentionally not-yet-created paths.
+    kubectl_validate_saved_control_layout || return 1
     # shellcheck disable=SC2016  # The quoted script executes in the helper Pod.
     kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu '
         root=$(realpath -e -- "$1")
-        reserved=$(realpath -m -- "$root/.storage-scale-test")
+        reserved=$(realpath -m -- "$2")
         case "$reserved" in "$root"/*) ;; *) exit 1 ;; esac
-        shift
+        shift 2
         for candidate in "$@"; do
             resolved=$(realpath -m -- "$candidate")
             existing=$candidate
@@ -2196,13 +2550,37 @@ kubectl_validate_pvc_paths() {
                         exit 1
                         ;;
                 esac
-                case "$reserved" in
-                    "$resolved"|"$resolved"/*)
-                        printf "orchestration state overlaps workload path: %s\\n" "$candidate" >&2
-                        exit 1
-                        ;;
-                esac
             fi
+        done
+    ' bash "$KUBECTL_SWEEP_MOUNT_ROOT" "$KUBECTL_CONTROL_ROOT" "$@"
+}
+
+kubectl_validate_test_root_access() {
+    local namespace="$1" pod_name="$2"
+    shift 2
+    [[ $# -gt 0 ]] || return 1
+    local path
+    for path in "$@"; do
+        [[ "$path" == "$KUBECTL_SWEEP_MOUNT_ROOT/"* ]] || return 1
+    done
+    # The configured roots are the only administrator-facing writable paths.
+    # Probe them without creating the durable .storage-scale-test subtree.
+    # shellcheck disable=SC2016  # The quoted script executes in the helper Pod.
+    kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu '
+        mount=$(realpath -e -- "$1") || exit 1
+        shift
+        for candidate in "$@"; do
+            [[ -d "$candidate" && -w "$candidate" ]] || {
+                printf "configured TEST_DIRS path is not a writable directory: %s\\n" \
+                    "$candidate" >&2
+                exit 1
+            }
+            resolved=$(realpath -e -- "$candidate") || exit 1
+            case "$resolved" in "$mount"/*) ;; *) exit 1 ;; esac
+            probe=$(mktemp "$candidate/.sst-validation.XXXXXXXX") || exit 1
+            printf "storage-scale-test-validation\\n" > "$probe" || exit 1
+            [[ $(cat -- "$probe") == storage-scale-test-validation ]] || exit 1
+            rm -f -- "$probe" || exit 1
         done
     ' bash "$KUBECTL_SWEEP_MOUNT_ROOT" "$@"
 }
@@ -2212,29 +2590,27 @@ kubectl_reserve_remote_attempt() {
     kubectl_validate_namespace_name "$namespace" \
         && kubectl_validate_object_name "$pod_name" \
         && [[ "$attempt_id" =~ ^[0-9a-f]{8}$ && "$nonce" =~ ^[0-9a-f]{32}$ ]] || return 1
-    local remote_run lock_dir
+    local remote_run
     remote_run=$(kubectl_attempt_remote_root "$attempt_id") || return 1
-    lock_dir=$(kubectl_attempt_remote_lock_directory) || return 1
     # shellcheck disable=SC2016  # The quoted script executes in the helper Pod.
     kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu '
-        lock=$1 run=$2 attempt=$3 nonce=$4
-        root=${lock%/locks/kubernetes-elbencho-sweep}
-        mount=${root%/.storage-scale-test}
-        [[ "$root" == /mnt/storage-scale-test/.storage-scale-test \
-            && -d "$mount" && ! -L "$mount" ]] || exit 1
+        run=$1 attempt=$2 nonce=$3 root=$4 test_root=$5
+        mount=/mnt/storage-scale-test
+        [[ "$test_root" == "$mount/"* && "$root" == "$test_root/.storage-scale-test" \
+            && "$run" == "$root/runs/$attempt" ]] || exit 1
         mount_real=$(realpath -e -- "$mount") || exit 1
-        root_real=$(realpath -m -- "$root") || exit 1
-        [[ "$root_real" == "$mount_real/.storage-scale-test" ]] || exit 1
+        test_real=$(realpath -e -- "$test_root") || exit 1
+        case "$test_real" in "$mount_real"/*) ;; *) exit 1 ;; esac
+        test -w "$test_root" || exit 1
         umask 077
-        pending="$lock.pending.$attempt.$nonce"
-        made_pending=0 made_lock=0 made_run=0
+        pending="$root/runs/.${attempt}.pending.$nonce"
+        made_pending=0 made_run=0
         cleanup() {
             [[ $made_run -eq 0 ]] || rm -rf -- "$run"
-            [[ $made_lock -eq 0 ]] || rm -rf -- "$lock"
             [[ $made_pending -eq 0 ]] || rm -rf -- "$pending"
         }
         trap cleanup EXIT
-        for path in "$root" "$root/locks" "$root/runs"; do
+        for path in "$root" "$root/runs"; do
             if [[ -e "$path" || -L "$path" ]]; then
                 [[ -d "$path" && ! -L "$path" ]] || exit 1
             else
@@ -2242,22 +2618,18 @@ kubectl_reserve_remote_attempt() {
             fi
         done
         root_real=$(realpath -e -- "$root") || exit 1
-        [[ "$root_real" == "$mount_real/.storage-scale-test" ]] || exit 1
-        # Publish a fully initialized lock directory in one same-filesystem
-        # rename. A killed writer must never leave the canonical lock without
-        # the identity needed by exact recovery.
+        [[ "$root_real" == "$test_real/.storage-scale-test" ]] || exit 1
         [[ ! -e "$pending" && ! -L "$pending" ]] || exit 1
         mkdir -- "$pending"
         made_pending=1
         printf "%s\\t%s\\n" "$attempt" "$nonce" > "$pending/owner"
-        mv -T -n -- "$pending" "$lock"
+        mv -T -n -- "$pending" "$run"
         [[ ! -e "$pending" && ! -L "$pending" ]] || exit 1
         made_pending=0
-        made_lock=1
-        mkdir -- "$run"
         made_run=1
         trap - EXIT
-    ' bash "$lock_dir" "$remote_run" "$attempt_id" "$nonce"
+    ' bash "$remote_run" "$attempt_id" "$nonce" "$KUBECTL_CONTROL_ROOT" \
+        "$KUBECTL_CONTROL_TEST_ROOT"
 }
 
 kubectl_attempt_journal_remote_reservation() {
@@ -2269,16 +2641,16 @@ kubectl_attempt_journal_remote_reservation() {
     [[ "$KUBECTL_OWNERSHIP_NONCE" == "$nonce" ]] || return 1
     local reservation_file="$attempt_dir/remote-reservation.sh"
     [[ ! -e "$reservation_file" && ! -L "$reservation_file" ]] || return 1
-    local remote_run lock_dir tmp
+    local remote_run tmp
     remote_run=$(kubectl_attempt_remote_root "$attempt_id") || return 1
-    lock_dir=$(kubectl_attempt_remote_lock_directory) || return 1
     tmp="$reservation_file.tmp.${BASHPID:-$$}.$RANDOM"
     {
         printf '# Trusted storage-scale-test Kubernetes remote reservation.\n'
         printf 'KUBECTL_REMOTE_ATTEMPT_ID=%q\n' "$attempt_id"
         printf 'KUBECTL_REMOTE_OWNERSHIP_NONCE=%q\n' "$nonce"
         printf 'KUBECTL_REMOTE_RUN_DIRECTORY=%q\n' "$remote_run"
-        printf 'KUBECTL_REMOTE_LOCK_DIRECTORY=%q\n' "$lock_dir"
+        printf 'KUBECTL_REMOTE_CONTROL_ROOT=%q\n' "$KUBECTL_CONTROL_ROOT"
+        printf 'KUBECTL_REMOTE_TEST_ROOT=%q\n' "$KUBECTL_CONTROL_TEST_ROOT"
         printf 'KUBECTL_REMOTE_RESERVATION_PHASE=%q\n' INTENDED
     } > "$tmp" || return 1
     mv -n "$tmp" "$reservation_file" 2>/dev/null || {
@@ -2297,7 +2669,8 @@ kubectl_attempt_load_remote_reservation() {
     local reservation_file="$kubernetes_dir/attempts/$attempt_id/remote-reservation.sh"
     [[ -f "$reservation_file" && ! -L "$reservation_file" ]] || return 1
     unset KUBECTL_REMOTE_ATTEMPT_ID KUBECTL_REMOTE_OWNERSHIP_NONCE
-    unset KUBECTL_REMOTE_RUN_DIRECTORY KUBECTL_REMOTE_LOCK_DIRECTORY
+    unset KUBECTL_REMOTE_RUN_DIRECTORY KUBECTL_REMOTE_CONTROL_ROOT
+    unset KUBECTL_REMOTE_TEST_ROOT
     unset KUBECTL_REMOTE_RESERVATION_PHASE
     # shellcheck disable=SC1090  # Trusted, result-directory-local reservation.
     source "$reservation_file" || return 1
@@ -2305,7 +2678,8 @@ kubectl_attempt_load_remote_reservation() {
         && "$KUBECTL_REMOTE_OWNERSHIP_NONCE" =~ ^[0-9a-f]{32}$ \
         && "$KUBECTL_REMOTE_RESERVATION_PHASE" =~ ^(INTENDED|ACQUIRED)$ ]] || return 1
     [[ "$KUBECTL_REMOTE_RUN_DIRECTORY" == "$(kubectl_attempt_remote_root "$attempt_id")" \
-        && "$KUBECTL_REMOTE_LOCK_DIRECTORY" == "$(kubectl_attempt_remote_lock_directory)" ]]
+        && "$KUBECTL_REMOTE_CONTROL_ROOT" == "$KUBECTL_CONTROL_ROOT" \
+        && "$KUBECTL_REMOTE_TEST_ROOT" == "$KUBECTL_CONTROL_TEST_ROOT" ]]
 }
 
 kubectl_attempt_mark_remote_reservation_acquired() {
@@ -2326,129 +2700,73 @@ kubectl_release_remote_attempt() {
     kubectl_validate_namespace_name "$namespace" \
         && kubectl_validate_object_name "$pod_name" \
         && [[ "$attempt_id" =~ ^[0-9a-f]{8}$ && "$nonce" =~ ^[0-9a-f]{32}$ ]] || return 1
-    local remote_run lock_dir reservation_phase=ACQUIRED
+    local remote_run control_root test_root
     remote_run=$(kubectl_attempt_remote_root "$attempt_id") || return 1
-    lock_dir=$(kubectl_attempt_remote_lock_directory) || return 1
+    control_root="$KUBECTL_CONTROL_ROOT"
+    test_root="$KUBECTL_CONTROL_TEST_ROOT"
     if [[ -n "$kubernetes_dir" || -n "$lock_fd" ]]; then
         _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
         kubectl_attempt_load_remote_reservation "$kubernetes_dir" "$attempt_id" || return 1
         [[ "$KUBECTL_REMOTE_OWNERSHIP_NONCE" == "$nonce" ]] || return 1
         remote_run="$KUBECTL_REMOTE_RUN_DIRECTORY"
-        lock_dir="$KUBECTL_REMOTE_LOCK_DIRECTORY"
-        reservation_phase="$KUBECTL_REMOTE_RESERVATION_PHASE"
+        control_root="$KUBECTL_REMOTE_CONTROL_ROOT"
+        test_root="$KUBECTL_REMOTE_TEST_ROOT"
     fi
     if [[ -z "$kubernetes_dir" ]] || ! kubectl_attempt_step_done \
             "$kubernetes_dir" "$attempt_id" release-remote-run; then
         # shellcheck disable=SC2016  # The quoted script executes in the helper Pod.
         kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu '
-            lock=$1 run=$2 attempt=$3 nonce=$4 phase=$5
+            run=$1 attempt=$2 nonce=$3 root=$4 test_root=$5
             expected=$(printf "%s\\t%s" "$attempt" "$nonce")
-            pending="$lock.pending.$attempt.$nonce"
-            case "$run" in /mnt/storage-scale-test/.storage-scale-test/runs/????????) ;; *) exit 1 ;; esac
+            pending="$root/runs/.${attempt}.pending.$nonce"
             mount=/mnt/storage-scale-test
-            root=$mount/.storage-scale-test
+            [[ "$test_root" == "$mount/"* && "$root" == "$test_root/.storage-scale-test" \
+                && "$run" == "$root/runs/$attempt" ]] || exit 1
             mount_real=$(realpath -e -- "$mount") || exit 1
+            test_real=$(realpath -e -- "$test_root") || exit 1
+            case "$test_real" in "$mount_real"/*) ;; *) exit 1 ;; esac
             if [[ ! -e "$root" && ! -L "$root" ]]; then
-                [[ ! -e "$pending" && ! -L "$pending" \
-                    && ! -e "$lock" && ! -L "$lock" \
-                    && ! -e "$run" && ! -L "$run" ]]
+                [[ ! -e "$pending" && ! -L "$pending" && ! -e "$run" && ! -L "$run" ]]
                 exit
             fi
             [[ -d "$root" && ! -L "$root" ]] || exit 1
             root_real=$(realpath -e -- "$root") || exit 1
-            [[ "$root_real" == "$mount_real/.storage-scale-test" ]] || exit 1
+            [[ "$root_real" == "$test_real/.storage-scale-test" ]] || exit 1
             if [[ -e "$pending" || -L "$pending" ]]; then
                 [[ -d "$pending" && ! -L "$pending" ]] || exit 1
                 if [[ -e "$pending/owner" || -L "$pending/owner" ]]; then
+                    entry_count=0
+                    for entry in "$pending"/* "$pending"/.[!.]* "$pending"/..?*; do
+                        [[ -e "$entry" || -L "$entry" ]] || continue
+                        entry_count=$((entry_count + 1))
+                    done
                     [[ -f "$pending/owner" && ! -L "$pending/owner" \
                         && $(cat -- "$pending/owner") == "$expected" \
-                        && $(find "$pending" -mindepth 1 -maxdepth 1 -printf . | wc -c) -eq 1 ]] \
+                        && "$entry_count" -eq 1 ]] \
                         || exit 1
                     rm -- "$pending/owner" || exit 1
                 fi
                 rmdir -- "$pending"
                 [[ ! -e "$pending" && ! -L "$pending" ]] || exit 1
             fi
-            if [[ ! -e "$lock" && ! -L "$lock" && ! -e "$run" && ! -L "$run" ]]; then
-                exit 0
-            fi
-            if [[ -e "$lock" || -L "$lock" ]]; then
-                [[ -d "$lock" && ! -L "$lock" ]] || exit 1
-                lock_real=$(realpath -e -- "$lock") || exit 1
-                [[ "$lock_real" == "$root_real/locks/kubernetes-elbencho-sweep" ]] || exit 1
-            fi
-            if [[ "$phase" == INTENDED && -d "$lock" && ! -L "$lock" \
-                    && -f "$lock/owner" && ! -L "$lock/owner" \
-                    && $(cat -- "$lock/owner") != "$expected" ]]; then
-                [[ ! -e "$run" && ! -L "$run" ]] || exit 1
+            if [[ ! -e "$run" && ! -L "$run" ]]; then
                 exit 0
             fi
             if [[ -e "$run" || -L "$run" ]]; then
                 [[ -d "$run" && ! -L "$run" ]] || exit 1
                 run_real=$(realpath -e -- "$run") || exit 1
                 [[ "$run_real" == "$root_real/runs/$attempt" ]] || exit 1
+                [[ -f "$run/owner" && ! -L "$run/owner" \
+                    && $(cat -- "$run/owner") == "$expected" ]] || exit 1
             fi
-            [[ -d "$lock" && ! -L "$lock" \
-                && -f "$lock/owner" && ! -L "$lock/owner" \
-                && $(cat -- "$lock/owner") == "$expected" ]] || exit 1
             rm -rf -- "$run"
-            [[ ! -e "$run" && ! -L "$run" ]]
-        ' bash "$lock_dir" "$remote_run" "$attempt_id" "$nonce" \
-            "$reservation_phase" || return 1
+            [[ ! -e "$run" && ! -L "$run" ]] || exit 1
+            rmdir -- "$root/runs" 2>/dev/null || true
+            rmdir -- "$root" 2>/dev/null || true
+        ' bash "$remote_run" "$attempt_id" "$nonce" "$control_root" \
+            "$test_root" || return 1
         [[ -z "$kubernetes_dir" ]] || kubectl_attempt_journal_step \
             "$kubernetes_dir" "$lock_fd" "$attempt_id" release-remote-run || return 1
-    fi
-    if [[ -z "$kubernetes_dir" ]] || ! kubectl_attempt_step_done \
-            "$kubernetes_dir" "$attempt_id" release-remote-lock; then
-        # shellcheck disable=SC2016  # The quoted script executes in the helper Pod.
-        kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu '
-            lock=$1 run=$2 attempt=$3 nonce=$4 phase=$5
-            expected=$(printf "%s\\t%s" "$attempt" "$nonce")
-            pending="$lock.pending.$attempt.$nonce"
-            [[ ! -e "$run" && ! -L "$run" ]] || exit 1
-            if [[ -e "$pending" || -L "$pending" ]]; then
-                [[ -d "$pending" && ! -L "$pending" ]] || exit 1
-                if [[ -e "$pending/owner" || -L "$pending/owner" ]]; then
-                    [[ -f "$pending/owner" && ! -L "$pending/owner" \
-                        && $(cat -- "$pending/owner") == "$expected" \
-                        && $(find "$pending" -mindepth 1 -maxdepth 1 -printf . | wc -c) -eq 1 ]] \
-                        || exit 1
-                    rm -- "$pending/owner" || exit 1
-                fi
-                rmdir -- "$pending"
-                [[ ! -e "$pending" && ! -L "$pending" ]] || exit 1
-            fi
-            if [[ ! -e "$lock" && ! -L "$lock" ]]; then
-                exit 0
-            fi
-            mount=/mnt/storage-scale-test
-            root=$mount/.storage-scale-test
-            mount_real=$(realpath -e -- "$mount") || exit 1
-            if [[ ! -e "$root" && ! -L "$root" ]]; then
-                [[ ! -e "$pending" && ! -L "$pending" \
-                    && ! -e "$lock" && ! -L "$lock" ]]
-                exit
-            fi
-            [[ -d "$root" && ! -L "$root" ]] || exit 1
-            root_real=$(realpath -e -- "$root") || exit 1
-            [[ "$root_real" == "$mount_real/.storage-scale-test" ]] || exit 1
-            [[ -d "$lock" && ! -L "$lock" ]] || exit 1
-            lock_real=$(realpath -e -- "$lock") || exit 1
-            [[ "$lock_real" == "$root_real/locks/kubernetes-elbencho-sweep" ]] || exit 1
-            if [[ "$phase" == INTENDED \
-                    && -f "$lock/owner" && ! -L "$lock/owner" \
-                    && $(cat -- "$lock/owner") != "$expected" ]]; then
-                exit 0
-            fi
-            [[ -d "$lock" && ! -L "$lock" \
-                && -f "$lock/owner" && ! -L "$lock/owner" \
-                && $(cat -- "$lock/owner") == "$expected" ]] || exit 1
-            rm -rf -- "$lock"
-            [[ ! -e "$lock" && ! -L "$lock" ]]
-        ' bash "$lock_dir" "$remote_run" "$attempt_id" "$nonce" \
-            "$reservation_phase" || return 1
-        [[ -z "$kubernetes_dir" ]] || kubectl_attempt_journal_step \
-            "$kubernetes_dir" "$lock_fd" "$attempt_id" release-remote-lock || return 1
     fi
 }
 
@@ -2511,7 +2829,6 @@ kubectl_discover_worker_endpoints() {
             || ! kubectl_validate_object_name "$pod" \
             || ! kubectl_validate_uid "$pod_uid"; then
             rm -f -- "$tmp"
-            echo "Error: worker DaemonSet Pod evidence is incomplete or conflicting" >&2
             return 1
         fi
         seen["$node"]=1
@@ -2522,7 +2839,6 @@ kubectl_discover_worker_endpoints() {
     done <<< "$rows"
     [[ "$count" -eq "${#live_node_uid[@]}" ]] || {
         rm -f -- "$tmp"
-        echo "Error: worker DaemonSet does not have exactly one Ready Pod per recorded node" >&2
         return 1
     }
     LC_ALL=C sort -o "$tmp" "$tmp"
@@ -2996,11 +3312,11 @@ _kubectl_write_bounded_collection_stream() {
         return 74
     fi
     local archive_bytes
-    archive_bytes=$(wc -c < "$archive_path") || {
+    _kubectl_local_file_bytes "$archive_path" archive_bytes || {
         rm -f -- "$archive_path"
         return 74
     }
-    if [[ ! "$archive_bytes" =~ ^[0-9]+$ || "$archive_bytes" -gt "$max_bytes" ]]; then
+    if [[ "$archive_bytes" -gt "$max_bytes" ]]; then
         rm -f -- "$archive_path"
         echo "Error: Kubernetes collection archive exceeded its byte limit while streaming" >&2
         return 65
@@ -3172,8 +3488,8 @@ kubectl_validate_attempt_archive() {
     [[ -f "$archive_path" && ! -L "$archive_path" \
         && "$attempt_id" =~ ^[0-9a-f]{8}$ ]] || return 1
     local archive_bytes
-    archive_bytes=$(wc -c < "$archive_path") || return 1
-    [[ "$archive_bytes" =~ ^[0-9]+$ && "$archive_bytes" -le "$KUBECTL_COLLECTION_MAX_BYTES" ]] || {
+    _kubectl_local_file_bytes "$archive_path" archive_bytes || return 1
+    [[ "$archive_bytes" -le "$KUBECTL_COLLECTION_MAX_BYTES" ]] || {
         echo "Error: Kubernetes collection archive exceeds its byte limit" >&2
         return 1
     }
@@ -3334,7 +3650,7 @@ kubectl_prepare_control_bundle() {
     if ! cp -- "$source/_nv-elbencho-kubectl-functions.sh" \
             "$destination/_nv-elbencho-kubectl-functions.sh" \
             || ! cp -- "$coordinator_source" "$destination/coordinator.sh" \
-            || ! chmod 0700 -- "$destination/coordinator.sh" \
+            || ! chmod 0700 "$destination/coordinator.sh" \
             || ! printf '%s\t%s\n%s\t%s\n' attempt_id "$attempt_id" output_basename \
                 "$output_basename" > "$destination/run-metadata.tsv" \
             || ! _kubectl_write_bundle_manifest "$destination"; then
@@ -3428,6 +3744,7 @@ kubectl_cleanup_journaled_resources() {
             continue
         fi
         key=$(basename "$intent_file" .sh)
+        [[ "$key" != pvc-lease ]] || continue
         if ! kubectl_cleanup_creation_intent "$kubernetes_dir" "$lock_fd" \
                 "$attempt_id" "$key"; then
             printf 'Error: failed to reconcile Kubernetes creation intent for %s\n' \
@@ -3560,15 +3877,16 @@ kubectl_prepare_attempt_lifecycle() {
     # Establish the complete pre-Job state machine through real, exact object
     # operations. Phase 6 intentionally owns the coordinator Job creation.
     local output_variable="$1" results_dir="$2" required_nodes="$3" mapped_dirs_name="$4"
-    local mapped_read_from="${5:-}" expected_current="${6:-}"
+    local mapped_read_from="${5:-}" control_logical_root="$6" control_test_root="$7"
+    local expected_current="${8:-}"
     local kubernetes_dir lock_fd generated_attempt_id nonce current_attempt=""
     [[ "$output_variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ \
         && "$required_nodes" =~ ^[1-9][0-9]*$ && -d "$results_dir" ]] || return 1
     _kubectl_validate_local_directory_path "$results_dir" || return 1
     kubernetes_dir="$results_dir/kubernetes"
     kubectl_local_lock_acquire "$kubernetes_dir" lock_fd || return 1
-    local primary_rc=0 namespace_uid pv_uid pvc_uid candidate_nodes coordinator_node
-    local helper_name helper_uid operation_token remote_reserved=0
+    local primary_rc=0 namespace_uid pv_uid pvc_uid lease_name candidate_nodes coordinator_node
+    local helper_name helper_uid operation_token
     local KUBECTL_PREPARE_FAILURE_PHASE=local-initialization
     local KUBECTL_PREPARE_FAILURE_REASON=LOCAL_IO
     local KUBECTL_PREPARE_FAILURE_RC=1 KUBECTL_PREPARE_FAILURE_OUTPUT=""
@@ -3600,6 +3918,10 @@ kubectl_prepare_attempt_lifecycle() {
         fi
     fi
     if [[ "$primary_rc" -eq 0 ]]; then
+        lease_name=$(kubectl_pvc_lease_name "$namespace_uid" "$pv_uid" "$pvc_uid") \
+            || primary_rc=1
+    fi
+    if [[ "$primary_rc" -eq 0 ]]; then
         kubectl_record_prepare_failure local-attempt-id LOCAL_IO 1 \
             "could not allocate a unique local attempt ID" || return 1
         for _ in {1..16}; do
@@ -3615,7 +3937,7 @@ kubectl_prepare_attempt_lifecycle() {
         nonce=$(kubectl_generate_ownership_nonce) || primary_rc=1
         kubectl_attempt_create_identity "$kubernetes_dir" "$lock_fd" "$generated_attempt_id" "$nonce" \
             "$KUBECTL_NAMESPACE" "$namespace_uid" "$KUBECTL_PV" "$pv_uid" \
-            "$KUBECTL_PVC" "$pvc_uid" || primary_rc=1
+            "$KUBECTL_PVC" "$pvc_uid" "$lease_name" || primary_rc=1
         if [[ "$primary_rc" -eq 0 && -n "$current_attempt" ]]; then
             kubectl_record_prepare_failure local-predecessor LEDGER_INCONSISTENT 1 \
                 "could not publish collected predecessor" || return 1
@@ -3628,7 +3950,8 @@ kubectl_prepare_attempt_lifecycle() {
             "could not publish local attempt state or configuration" || return 1
         kubectl_attempt_write_state "$kubernetes_dir" "$lock_fd" "$generated_attempt_id" PREPARED \
             && kubectl_attempt_write_configuration "$kubernetes_dir" "$lock_fd" "$generated_attempt_id" \
-                "$mapped_dirs_name" "$mapped_read_from" \
+                "$mapped_dirs_name" "$mapped_read_from" "$control_logical_root" \
+                "$control_test_root" \
             || primary_rc=1
     fi
     if [[ "$primary_rc" -eq 0 ]]; then
@@ -3673,15 +3996,19 @@ kubectl_prepare_attempt_lifecycle() {
         [[ -z "$mapped_read_from" ]] || pvc_paths+=("$mapped_read_from")
         kubectl_run_prepare_phase pvc-paths kubectl_validate_pvc_paths \
             "$KUBECTL_NAMESPACE" "$helper_name" "${pvc_paths[@]}" || primary_rc=1
+        [[ "$primary_rc" -ne 0 ]] || kubectl_run_prepare_phase test-dir-access \
+            kubectl_validate_test_root_access "$KUBECTL_NAMESPACE" "$helper_name" \
+                "${!mapped_dirs_ref[@]}" || primary_rc=1
+    fi
+    if [[ "$primary_rc" -eq 0 ]]; then
+        kubectl_run_prepare_phase pvc-lease kubectl_acquire_pvc_lease \
+            "$kubernetes_dir" "$lock_fd" "$generated_attempt_id" || primary_rc=1
     fi
     if [[ "$primary_rc" -eq 0 ]]; then
         kubectl_record_prepare_failure local-reservation-journal LOCAL_IO 1 \
-            "could not publish durable PVC reservation intent" || return 1
+            "could not publish durable PVC run-tree intent" || return 1
         if kubectl_attempt_journal_remote_reservation "$kubernetes_dir" "$lock_fd" \
                 "$generated_attempt_id" "$nonce"; then
-            # Persist deterministic ownership intent before touching the PVC.
-            # The idempotent release path can then recover a killed reserve.
-            remote_reserved=1
             if kubectl_run_prepare_phase remote-reservation \
                     kubectl_reserve_remote_attempt "$KUBECTL_NAMESPACE" "$helper_name" \
                     "$generated_attempt_id" "$nonce"; then
@@ -3727,13 +4054,18 @@ kubectl_prepare_attempt_lifecycle() {
             kubectl_preserve_attempt_diagnostics "$kubernetes_dir" \
                 "$generated_attempt_id" prepare-failed
         fi
-        if [[ "$rollback_rc" -eq 0 && "$remote_reserved" -eq 1 ]]; then
+        if [[ "$rollback_rc" -eq 0 \
+                && -f "$kubernetes_dir/attempts/$generated_attempt_id/remote-reservation.sh" ]]; then
             kubectl_release_journaled_remote_attempt "$kubernetes_dir" "$lock_fd" \
                 "$KUBECTL_NAMESPACE" "$helper_name" "$generated_attempt_id" \
                 || rollback_rc=1
         fi
         [[ -z "$generated_attempt_id" ]] || kubectl_cleanup_journaled_resources \
             "$kubernetes_dir" "$lock_fd" "$generated_attempt_id" || rollback_rc=1
+        if [[ "$rollback_rc" -eq 0 && -n "$generated_attempt_id" ]]; then
+            kubectl_release_pvc_lease "$kubernetes_dir" "$lock_fd" \
+                "$generated_attempt_id" || rollback_rc=1
+        fi
         if [[ -n "$generated_attempt_id" \
                 && -f "$kubernetes_dir/attempts/$generated_attempt_id/state.sh" ]]; then
             kubectl_attempt_load_metadata "$kubernetes_dir/attempts/$generated_attempt_id" >/dev/null 2>&1 \
@@ -3761,10 +4093,19 @@ kubectl_prepare_attempt_lifecycle() {
         prepare_action=$(_kubectl_observation_safe_action "$prepare_reason") \
             || prepare_action="inspect the diagnostic bundle and retry submission"
         [[ "$rollback_rc" -ne 0 ]] || prepare_may_run=no
-        [[ -z "$generated_attempt_id" ]] \
-            || diagnostic_root="$kubernetes_dir/attempts/$generated_attempt_id/diagnostics"
+        if [[ -n "$generated_attempt_id" \
+                && -d "$kubernetes_dir/attempts/$generated_attempt_id" \
+                && ! -L "$kubernetes_dir/attempts/$generated_attempt_id" ]]; then
+            diagnostic_root="$kubernetes_dir/attempts/$generated_attempt_id/diagnostics"
+        fi
+        local diagnostic_local_state=""
+        if [[ -n "$generated_attempt_id" \
+                && -f "$kubernetes_dir/attempts/$generated_attempt_id/state.sh" \
+                && ! -L "$kubernetes_dir/attempts/$generated_attempt_id/state.sh" ]]; then
+            diagnostic_local_state="$kubernetes_dir/attempts/$generated_attempt_id/state.sh"
+        fi
         KUBECTL_ATTEMPT_ID="${generated_attempt_id:-unknown}" \
-            KUBECTL_DIAGNOSTIC_LOCAL_STATE_PATH="${generated_attempt_id:+$kubernetes_dir/attempts/$generated_attempt_id/state.sh}" \
+            KUBECTL_DIAGNOSTIC_LOCAL_STATE_PATH="$diagnostic_local_state" \
             KUBECTL_DIAGNOSTIC_REMOTE_STATE_PATH="${generated_attempt_id:+$(kubectl_attempt_remote_root "$generated_attempt_id")/state/run.status}" \
             kubectl_report_lifecycle_error prepare \
                 "$KUBECTL_PREPARE_FAILURE_PHASE" "$prepare_reason" \
@@ -3864,6 +4205,7 @@ _kubectl_load_saved_attempt() {
     [[ -f "$metadata_dir/configuration.sh" && ! -L "$metadata_dir/configuration.sh" ]] || return 1
     # shellcheck disable=SC1090,SC1091  # Trusted, result-directory-local immutable metadata.
     source "$metadata_dir/configuration.sh" || return 1
+    kubectl_validate_saved_control_layout || return 1
     printf -v "$output_name" '%s' "$loaded_attempt_id"
 }
 
@@ -4088,12 +4430,16 @@ kubectl_submit_sweep() {
     # shellcheck disable=SC2034  # Passed by name to the lifecycle writer.
     local -A mapped_dirs=()
     kubectl_map_test_dirs mapped_dirs || return 1
+    local control_logical_root control_test_root
+    kubectl_select_control_root control_logical_root control_test_root || return 1
+    kubectl_set_control_layout "$control_logical_root" "$control_test_root" || return 1
     local mapped_read_from=""
     [[ -z "${ELBENCHO_SWEEP_READ_FROM:-}" ]] \
         || mapped_read_from=$(kubectl_map_read_from_path "$ELBENCHO_SWEEP_READ_FROM") || return 1
     local attempt_id
     kubectl_prepare_attempt_lifecycle attempt_id "$results_dir" "$required_nodes" mapped_dirs \
-        "$mapped_read_from" "$expected_current" || return 1
+        "$mapped_read_from" "$control_logical_root" "$control_test_root" \
+        "$expected_current" || return 1
     local kubernetes_dir="$results_dir/kubernetes" lock_fd bundle coordinator_node job_name manifest job_uid
     kubectl_local_lock_acquire "$kubernetes_dir" lock_fd || return 1
     local rc=0
@@ -4127,7 +4473,8 @@ kubectl_submit_sweep() {
             "OWNERSHIP_NONCE=$KUBECTL_OWNERSHIP_NONCE" "IMAGE=$KUBECTL_ELBENCHO_IMAGE" \
             "IMAGE_PULL_POLICY=$KUBECTL_IMAGE_PULL_POLICY" "RUN_AS_USER=$KUBECTL_RUN_AS_USER" \
             "RUN_AS_GROUP=$KUBECTL_RUN_AS_GROUP" "PVC_NAME=$KUBECTL_PVC" \
-            "COORDINATOR_NODE=$coordinator_node") || rc=1
+            "COORDINATOR_NODE=$coordinator_node" \
+            "REMOTE_RUN_DIRECTORY=$(kubectl_attempt_remote_root "$attempt_id")") || rc=1
     fi
     if [[ "$rc" -eq 0 ]]; then
         if kubectl_create_owned_object job_uid Job "$job_name" "$KUBECTL_NAMESPACE" \
@@ -4178,6 +4525,8 @@ kubectl_submit_sweep() {
         fi
         kubectl_cleanup_journaled_resources "$kubernetes_dir" "$lock_fd" "$attempt_id" \
             || rollback_rc=1
+        [[ "$rollback_rc" -ne 0 ]] || kubectl_release_pvc_lease \
+            "$kubernetes_dir" "$lock_fd" "$attempt_id" || rollback_rc=1
         kubectl_attempt_load_metadata "$kubernetes_dir/attempts/$attempt_id" >/dev/null 2>&1 \
             && [[ "$KUBECTL_LIFECYCLE_STATE" == PREPARED ]] \
             && [[ "$rollback_rc" -eq 0 ]] \
@@ -4219,6 +4568,8 @@ kubectl_recover_prepared_attempt() {
     fi
     kubectl_cleanup_journaled_resources "$kubernetes_dir" "$lock_fd" \
         "$attempt_id" || rc=1
+    [[ "$rc" -ne 0 ]] || kubectl_release_pvc_lease "$kubernetes_dir" \
+        "$lock_fd" "$attempt_id" || rc=1
     [[ "$rc" -ne 0 ]] || kubectl_attempt_transition "$kubernetes_dir" \
         "$lock_fd" "$attempt_id" SUBMISSION_FAILED || rc=1
     [[ "$rc" -ne 0 ]] || kubectl_attempt_restore_predecessor "$kubernetes_dir" \
@@ -4231,7 +4582,11 @@ kubectl_lifecycle_operation() {
     [[ "$operation" =~ ^(status|cancel|collect)$ && -d "$results_dir" ]] || return 1
     kubernetes_dir="$results_dir/kubernetes"
     kubectl_local_lock_acquire "$kubernetes_dir" lock_fd || return 1
-    _kubectl_load_saved_attempt "$results_dir" attempt_id || rc=1
+    if ! _kubectl_load_saved_attempt "$results_dir" attempt_id; then
+        echo "Error: result directory has no valid current Kubernetes attempt: $results_dir" >&2
+        echo "A submission that failed before publishing attempt identity cannot be inspected, collected, or cancelled." >&2
+        rc=1
+    fi
     [[ "$rc" -ne 0 ]] || kubectl_cleanup_ephemeral_helpers "$kubernetes_dir" "$lock_fd" \
         "$attempt_id" || rc=1
     if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == COLLECTED ]]; then
@@ -4276,6 +4631,10 @@ kubectl_lifecycle_operation() {
     fi
     [[ "$rc" -ne 0 ]] || _kubectl_verify_saved_cluster_identity \
         "$kubernetes_dir" "$attempt_id" || rc=1
+    if [[ "$rc" -eq 0 \
+            && "$KUBECTL_LIFECYCLE_STATE" =~ ^(SUBMITTED|CANCEL_REQUESTED|TERMINAL|COLLECTION_IN_PROGRESS)$ ]]; then
+        kubectl_verify_journaled_pvc_lease "$kubernetes_dir" "$attempt_id" || rc=1
+    fi
     if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == PREPARED ]]; then
         kubectl_recover_prepared_attempt "$kubernetes_dir" "$lock_fd" \
             "$attempt_id" || rc=1
@@ -4469,7 +4828,7 @@ _kubectl_validate_collected_publication() {
                 destination_sources["$second"]="$first"
                 local source="$state_dir/$first" bytes digest
                 [[ -f "$source" && ! -L "$source" ]] || return 1
-                bytes=$(wc -c < "$source") || return 1
+                _kubectl_local_file_bytes "$source" bytes || return 1
                 digest=$(_kubectl_sha256_file "$source") || return 1
                 [[ "$bytes" == "$third" && "$digest" == "$fourth" ]] || return 1
                 [[ "$kind" != result ]] || result_rows+=("$first"$'\t'"$second")
@@ -4981,6 +5340,8 @@ kubectl_collect_attempt() {
     fi
     _kubectl_remove_inspector "$kubernetes_dir" "$lock_fd" "$inspector" \
         "$inspector_uid" "$attempt_id" || rc=1
+    [[ "$rc" -ne 0 ]] || kubectl_release_pvc_lease "$kubernetes_dir" \
+        "$lock_fd" "$attempt_id" || rc=1
     [[ "$rc" -ne 0 ]] || kubectl_attempt_transition "$kubernetes_dir" "$lock_fd" "$attempt_id" COLLECTED || rc=1
     [[ "$rc" -ne 0 ]] || kubectl_emit_state "$remote_state"
     [[ "$remote_state" == SUCCESS ]] || rc=1
@@ -4988,11 +5349,15 @@ kubectl_collect_attempt() {
 }
 
 kubectl_resume_collected_sweep() {
-    local results_dir="$1" attempt_id lock_fd state_dir
+    local results_dir="$1" attempt_id lock_fd state_dir coordinator_source
     local kubernetes_dir="$results_dir/kubernetes"
     kubectl_local_lock_acquire "$kubernetes_dir" lock_fd || return 1
     local rc=0
-    _kubectl_load_saved_attempt "$results_dir" attempt_id || rc=1
+    if ! _kubectl_load_saved_attempt "$results_dir" attempt_id; then
+        echo "Error: result directory has no valid current Kubernetes attempt: $results_dir" >&2
+        echo "A submission that failed before publishing attempt identity cannot be resumed." >&2
+        rc=1
+    fi
     [[ "$rc" -ne 0 ]] || kubectl_attempt_load_metadata "$kubernetes_dir/attempts/$attempt_id" || rc=1
     if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" != COLLECTED ]]; then
         kubectl_emit_lifecycle_commands "$results_dir" || true
@@ -5006,10 +5371,13 @@ kubectl_resume_collected_sweep() {
         rc=1
     fi
     state_dir="$kubernetes_dir/attempts/$attempt_id/collected-state"
-    # The coordinator provides the authoritative, collection-gated decision.
-    # A new attempt receives only non-SUCCESS definitions; old successful
-    # artifacts remain in the ordinary result tree and are never re-run.
-    [[ "$rc" -ne 0 ]] || "$results_dir/kubernetes/attempts/$attempt_id/control-bundle/coordinator.sh" \
+    coordinator_source="$(dirname "${BASH_SOURCE[0]}")/_nv-elbencho-kubectl-coordinator.sh"
+    # Interpret the immutable collected ledger with the current trusted
+    # deployment code. The attempt's bundled coordinator is an execution
+    # snapshot and can contain a bug fixed after collection.
+    [[ "$rc" -ne 0 ]] || [[ -f "$coordinator_source" && ! -L "$coordinator_source" ]] \
+        || rc=1
+    [[ "$rc" -ne 0 ]] || "$BASH" "$coordinator_source" \
         --select-collected-resume "$state_dir" > "$results_dir/executions/.kubectl-resume.tsv" || rc=1
     local selection="$results_dir/executions/.kubectl-resume.tsv"
     local selection_ids="$results_dir/executions/.kubectl-resume-ids.tsv"
@@ -5039,6 +5407,7 @@ kubectl_resume_collected_sweep() {
     # workload snapshot.  A current env.sh is intentionally never consulted.
     # shellcheck disable=SC1090,SC1091
     source "$kubernetes_dir/attempts/$attempt_id/configuration.sh" || return 1
+    kubectl_validate_saved_control_layout || return 1
     export KUBECTL_SUBMIT_EXECUTIONS_FILE="$selection_ids"
     kubectl_submit_sweep "$results_dir" "$max_nodes" "$attempt_id"
 }

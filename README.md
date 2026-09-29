@@ -190,7 +190,7 @@ export KUBECTL_NAMESPACE=storage-scale-test
 export KUBECTL_PV=storage-scale-test-pv
 export KUBECTL_PVC=storage-scale-test-pvc
 export KUBECTL_NODE_SELECTOR='storage-scale-test/worker=true'
-export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+export KUBECTL_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.1-11
 export KUBECTL_IMAGE_PULL_POLICY=IfNotPresent
 export KUBECTL_RUN_AS_USER=2000
 export KUBECTL_RUN_AS_GROUP=2000
@@ -201,18 +201,31 @@ bound to that PV. The node selector must identify enough schedulable worker
 nodes for the requested sweep. The cluster CNI must provide direct Pod IPv4
 connectivity between the coordinator and worker Pods and enforce the
 attempt-scoped network policies; the selected nodes must be able to mount the
-PVC. The configured benchmark image must be usable under the configured pull
-policy, and any registry credentials required by the cluster are a user
-responsibility. `KUBECTL_IMAGE_PULL_POLICY=Always` requires a digest-qualified
-image reference so the coordinator cannot repull a different build from the
-worker Pods.
+PVC. The active identity also needs `get`, `create`, and `delete` permission
+for namespaced `leases.coordination.k8s.io`. The configured benchmark image
+must be usable under the configured pull policy, and any registry credentials
+required by the cluster are a user responsibility.
+`KUBECTL_IMAGE_PULL_POLICY=Always` requires a digest-qualified image reference
+so the coordinator cannot repull a different build from the worker Pods.
+Elbencho validation, worker, and coordinator Pods explicitly request an
+`Unconfined` seccomp profile because `RuntimeDefault` can reject Linux AIO
+operations such as `io_getevents`. Namespace admission policy must allow that
+profile. The Pods still run as the configured non-root UID/GID, disable
+privilege escalation, drop all capabilities, and mount no API token.
+`validate_env.sh` creates a short-lived Job with that profile and verifies the
+running process reports unconfined seccomp mode before submission is allowed.
 
 `TEST_DIRS` remains a logical filesystem configuration in Kubernetes mode.
 The sweep prepends `/mnt/storage-scale-test/` when it constructs Pod-side
 paths, so users must not add that prefix themselves. The PVC is mounted at
-that path. The tool reserves `.storage-scale-test` below the mount for its
-control, ownership, and completed-cell data; do not use that name in a test
-directory.
+that path. Every configured root must already be a directory writable by
+`KUBECTL_RUN_AS_USER:KUBECTL_RUN_AS_GROUP`; the mount root itself need not be
+writable. The tool chooses the lexically first normalized `TEST_DIRS` root and
+creates `.storage-scale-test` beneath it for durable state and completed-cell
+data. Kubernetes path components accept letters, digits, `.`, `_`, and `-`;
+do not use `.storage-scale-test` as a component. A Kubernetes Lease
+keyed by the namespace, PV, and PVC UIDs prevents concurrent sweeps on the same
+claim even when they use different test roots.
 
 A Kubernetes invocation submits one asynchronous Job for the whole sweep.
 Submission stages the verified control bundle and execution definitions on

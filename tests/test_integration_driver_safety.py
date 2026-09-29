@@ -3897,9 +3897,6 @@ def test_kubectl_prerequisite_manifest_matches_product_constraints():
         assert pod_spec["securityContext"]["runAsNonRoot"] is True
         assert pod_spec["securityContext"]["runAsUser"] == 2000
         assert pod_spec["securityContext"]["runAsGroup"] == 2000
-        assert pod_spec["securityContext"]["seccompProfile"] == {
-            "type": "RuntimeDefault"
-        }
         assert "hostNetwork" not in pod_spec
         for container in pod_spec["containers"]:
             assert container["image"] == _DRIVER.ELBENCHO_FIXTURE_IMAGE
@@ -3907,7 +3904,16 @@ def test_kubectl_prerequisite_manifest_matches_product_constraints():
             assert container["securityContext"]["allowPrivilegeEscalation"] is False
             assert container["securityContext"]["capabilities"]["drop"] == ["ALL"]
             assert "hostPort" not in str(container)
+    assert daemonset["spec"]["template"]["spec"]["securityContext"][
+        "seccompProfile"
+    ] == {"type": "Unconfined"}
+    worker_script = daemonset["spec"]["template"]["spec"]["containers"][0]["args"][0]
+    assert '[[ "$key" != Seccomp: ]]' in worker_script
+    assert 'test "$seccomp_mode" = 0' in worker_script
     for client in (coordinator, denied):
+        assert client["spec"]["securityContext"]["seccompProfile"] == {
+            "type": "RuntimeDefault"
+        }
         client_script = client["spec"]["containers"][0]["args"][0]
         assert "command -v timeout >/dev/null" in client_script
         assert "perl -MIO::Socket::INET -e 1" in client_script

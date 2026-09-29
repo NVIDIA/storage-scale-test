@@ -78,7 +78,7 @@ export KUBECTL_NAMESPACE=storage-scale-test
 export KUBECTL_PV=storage-scale-test-pv
 export KUBECTL_PVC=storage-scale-test-pvc
 export KUBECTL_NODE_SELECTOR='storage-scale-test/worker=true'
-export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+export KUBECTL_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.1-11
 export KUBECTL_IMAGE_PULL_POLICY=IfNotPresent
 export KUBECTL_RUN_AS_USER=2000
 export KUBECTL_RUN_AS_GROUP=2000
@@ -87,6 +87,8 @@ export KUBECTL_RUN_AS_GROUP=2000
 The namespace, PV, bound filesystem-mode RWX PVC, matching worker nodes, and
 image access must already exist. The tool neither provisions nor deletes the
 cluster, namespace, PV, PVC, storage class, or registry credentials.
+The active kubectl identity needs `get`, `create`, and `delete` permission for
+namespaced `leases.coordination.k8s.io` in addition to the workload operations.
 
 The selector is a nonempty comma-separated list of equality requirements. The
 selected Ready, schedulable nodes must have one architecture, be able to mount
@@ -98,6 +100,10 @@ port 1611. IPv6-only clusters and set-based selectors are unsupported.
 different build from its workers. The configured numeric UID and GID are used
 by validation, transfer, worker, and coordinator Pods and must be permitted by
 the PVC and cluster policy.
+Elbencho validation, worker, and coordinator Pods explicitly request
+`seccompProfile.type: Unconfined`; the namespace admission policy must permit
+it. This avoids runtime-default filters rejecting Linux AIO while preserving
+the non-root identity, dropped capabilities, and disabled privilege escalation.
 
 ### Logical test paths
 
@@ -117,10 +123,16 @@ bench/fs2          /mnt/storage-scale-test/bench/fs2
 ```
 
 Absolute and relative logical paths therefore describe the same PVC-relative
-location. Empty components, `.` and `..`, control characters, and overlap with
-the reserved `.storage-scale-test` subtree are rejected. The submission and
-coordinator also resolve live PVC paths to reject symlink escapes, including
-generated targets and treefile-cache paths.
+location. Repeated separators are normalized. Components accept letters,
+digits, `.`, `_`, and `-`; `.` and `..` and the reserved
+`.storage-scale-test` component are rejected. Every configured
+root must already be writable by the workload UID/GID; the PVC mount root need
+not be writable. The lexically first normalized root is frozen in attempt
+metadata and receives `.storage-scale-test/runs/<attempt-id>` for durable
+control state and results. The submission and coordinator resolve live PVC
+paths to reject symlink escapes, including generated targets and treefile-cache
+paths. `--read-from` cannot target that canonical root itself because its scan
+would ingest the control subtree; descendants remain valid.
 
 ### Asynchronous commands
 
@@ -178,8 +190,9 @@ The launcher:
    logical workload paths, candidate nodes, and requested capacity;
 4. creates an eight-character attempt ID and a 128-bit ownership nonce;
 5. atomically publishes the local `PREPARED` attempt before external mutation;
-6. acquires the PVC-wide reservation and creates the attempt policies and
-   worker DaemonSet;
+6. create-only acquires the deterministic PVC-wide Lease, creates the hidden
+   run tree below the canonical test root, and creates the attempt policies
+   and worker DaemonSet;
 7. freezes node, Pod, address, architecture, and image evidence after every
    worker is Ready;
 8. uploads one verified control bundle and the execution definitions to the PVC;
@@ -230,11 +243,12 @@ cell's commit marker. Only published cells are reported as durable successes.
 
 ### Durability and recovery
 
-The reserved PVC subtree contains the attempt ledger, ownership records, locks,
-frozen endpoints, bundle, cell publications, and completed result material.
-The user's filesystem targets remain outside that control tree. The local
-result directory contains the immutable configuration snapshot, execution
-ledger, current-attempt pointer, collection journal, and imported results.
+The reserved subtree beneath the canonical test root contains the attempt
+ledger, ownership records, locks, frozen endpoints, bundle, cell publications,
+and completed result material. Generated benchmark targets remain outside that
+control tree. The local result directory contains the immutable configuration
+snapshot, execution ledger, current-attempt pointer, collection journal, and
+imported results.
 
 The design deliberately accepts loss of an active cell's scratch output after
 hard Pod or node loss. A subsequent lifecycle command uses the exact saved Job
@@ -251,15 +265,19 @@ points are defined only in the normative lifecycle contract.
 Kubernetes names are conveniences, not proof of ownership. Every attempt
 records its nonce plus exact resource kind, name, namespace, UID, and expected
 labels/annotations. Namespace, PV, and PVC UIDs freeze the target cluster and
-storage identity. Create-intent and cleanup journals make interrupted creation
-or deletion retryable.
+storage identity and derive the deterministic namespaced Lease name. Lease
+creation is create-only; its exact UID and ownership fields are journaled, it
+has no time-based expiry, and a competing owner is never patched or stolen.
+Create-intent and cleanup journals make interrupted creation or deletion
+retryable.
 
 Cleanup deletes an object only after all recorded identity fields match. It
 never uses a broad label query as deletion authority, and it never deletes the
 namespace, PV, PVC, storage contents outside the reserved attempt tree,
 unrelated workloads, or retained benchmark datasets. Remote release and exact
-resource cleanup begin only after verified local publication; `COLLECTED` is
-published only after both complete.
+resource cleanup begin only after verified local publication. The Lease is
+deleted with a UID precondition after those steps, and `COLLECTED` is published
+only after its absence is verified.
 
 ## Failure and diagnostic boundary
 
@@ -332,10 +350,17 @@ the lifecycle contract rather than duplicated here.
 - **Existing PVC instead of provisioned storage:** keeps storage provisioning
   outside the benchmark tool's scope and makes destructive ownership boundaries
   explicit.
+- **Kubernetes Lease instead of a PVC-root lock:** preserves one active attempt
+  per PVC without requiring write access to an administrator-owned mount root.
+  Exact UID journaling and create-only acquisition avoid timeout-based lock
+  stealing.
 - **Shell-rendered fixed templates:** adds no template-engine dependency;
   strict placeholder validation and checked-in templates bound the format.
 - **Collection-gated resume:** ensures the host has the authoritative partial
   ledger and results before it constructs another attempt.
+- **Unconfined seccomp for Elbencho:** permits Linux AIO operations rejected by
+  some runtime-default profiles. Validation exercises the same profile;
+  administrative helper Pods remain on `RuntimeDefault`.
 
 ## Implementation map
 

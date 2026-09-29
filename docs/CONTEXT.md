@@ -118,6 +118,8 @@ uploads use interactive `kubectl exec`. Successful status queries return zero
 regardless of the recorded benchmark outcome. Preparation distinguishes local,
 capacity, path, API, and PVC failures; bounded diagnostics retain Pod details,
 PVC ledger/publication evidence, and exact resource identities.
+Elbencho validation, worker, and coordinator Pods use `Unconfined` seccomp for
+Linux AIO; non-benchmark helpers retain `RuntimeDefault`.
 
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
@@ -255,13 +257,13 @@ untrusted modification because resume sources both `env_used.sh` and each
 `executions/NNNN.sh`.
 
 In kubectl mode, one submission represents the whole sweep. The launcher
-stages a verified control bundle into the configured PVC, freezes selected
-worker Pod addresses, starts one Elbencho service Pod per worker, and creates
-one long-lived coordinator Job. The Job needs no Kubernetes API credentials
-after startup: it runs from the PVC control tree, durable execution ledger,
-and per-cell publication records. `--status`, `--cancel`, and `--collect`
-operate on that attempt; `--resume` is allowed only after collection and
-creates a new attempt while preserving successful cells.
+acquires a PVC-wide Kubernetes Lease, stages a verified control bundle below
+the lexically first normalized `TEST_DIRS` root, freezes worker Pod addresses,
+starts one Elbencho service Pod per worker, and creates one coordinator Job.
+The Job needs no API credentials after startup. `--status`, `--cancel`, and
+`--collect` operate on that attempt; collection releases the Lease last, and
+`--resume` creates a new attempt after collection while preserving successful
+cells.
 
 Kubernetes uses ordinary Pod networking and attempt-scoped NetworkPolicy,
 not host networking, host ports, or Services. Worker endpoint identity is

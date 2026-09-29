@@ -50,7 +50,8 @@ spec:
         runAsUser: @@RUN_AS_USER@@
         runAsGroup: @@RUN_AS_GROUP@@
         seccompProfile:
-          type: RuntimeDefault
+          # Match the workload Pods so validation proves cluster admission.
+          type: Unconfined
       containers:
         - name: validation
           image: @@IMAGE@@
@@ -65,6 +66,18 @@ spec:
               }
               test "$(id -g)" = "@@RUN_AS_GROUP@@" || {
                   echo "Error: validation Pod GID does not match KUBECTL_RUN_AS_GROUP" >&2
+                  exit 1
+              }
+              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=seccomp\n'
+              seccomp_mode=
+              while read -r key value _; do
+                  if [[ "$key" == Seccomp: ]]; then
+                      seccomp_mode=$value
+                      break
+                  fi
+              done < /proc/self/status
+              test "$seccomp_mode" = 0 || {
+                  echo "Error: validation Pod is not running with the required Unconfined seccomp profile" >&2
                   exit 1
               }
               printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=required-tools\n'
@@ -86,31 +99,38 @@ spec:
                   echo "Error: /usr/bin/elbencho is not executable in the benchmark image" >&2
                   exit 1
               }
+              test_roots=(
+@@TEST_ROOT_ARGUMENTS@@
+              )
               printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-permissions\n'
-              test -r /mnt/storage-scale-test || {
-                  echo "Error: configured UID/GID cannot read the mounted PVC" >&2
-                  exit 1
-              }
-              test -w /mnt/storage-scale-test || {
-                  echo "Error: configured UID/GID cannot write the mounted PVC" >&2
-                  exit 1
-              }
-              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-create\n'
-              probe=$(mktemp /mnt/storage-scale-test/.sst-validation.XXXXXXXX) || {
-                  echo "Error: configured UID/GID cannot create a file on the mounted PVC" >&2
-                  exit 1
-              }
-              trap 'rm -f -- "$probe"' EXIT
-              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-write\n'
-              printf 'storage-scale-test-validation\n' > "$probe" || {
-                  echo "Error: validation Pod could not write its PVC probe" >&2
-                  exit 1
-              }
-              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-read\n'
-              test "$(cat "$probe")" = storage-scale-test-validation || {
-                  echo "Error: validation Pod could not read back its PVC probe" >&2
-                  exit 1
-              }
+              for test_root in "${test_roots[@]}"; do
+                  test -r "$test_root" || {
+                      echo "Error: configured UID/GID cannot read TEST_DIRS root $test_root" >&2
+                      exit 1
+                  }
+                  test -w "$test_root" || {
+                      echo "Error: configured UID/GID cannot write TEST_DIRS root $test_root" >&2
+                      exit 1
+                  }
+                  printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-create path=%s\n' "$test_root"
+                  probe=$(mktemp "$test_root/.sst-validation.XXXXXXXX") || {
+                      echo "Error: configured UID/GID cannot create a file in TEST_DIRS root $test_root" >&2
+                      exit 1
+                  }
+                  trap 'rm -f -- "$probe"' EXIT
+                  printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-write path=%s\n' "$test_root"
+                  printf 'storage-scale-test-validation\n' > "$probe" || {
+                      echo "Error: validation Pod could not write its PVC probe in $test_root" >&2
+                      exit 1
+                  }
+                  printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-read path=%s\n' "$test_root"
+                  test "$(cat "$probe")" = storage-scale-test-validation || {
+                      echo "Error: validation Pod could not read back its PVC probe in $test_root" >&2
+                      exit 1
+                  }
+                  rm -f -- "$probe"
+                  trap - EXIT
+              done
               printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=complete\n'
           securityContext:
             allowPrivilegeEscalation: false

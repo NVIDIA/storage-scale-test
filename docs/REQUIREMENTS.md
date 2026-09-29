@@ -191,6 +191,7 @@ These requirements address the infrastructure and runtime constraints the tool m
 | EE-3.2 | In SSH mode, services and the coordinator shall be started and stopped by the orchestration scripts; the user shall not need to manage them manually. | Yes |
 | EE-3.3 | Results produced by an SSH remote coordinator shall be streamed back to the executing host; Slurm results shall be written to the configured shared results location. | Yes |
 | EE-3.4 | Kubernetes filesystem sweeps shall run one coordinator Job and one service Pod per selected worker over ordinary Pod networking, with the PVC mounted at the fixed Pod path `/mnt/storage-scale-test`. | Yes |
+| EE-3.5 | Kubernetes Pods that execute or validate Elbencho shall request an `Unconfined` seccomp profile so supported Linux AIO workloads are not blocked, while retaining non-root execution, dropped capabilities, and disabled privilege escalation. | Yes |
 
 ### EE-4: Python Environment
 
@@ -228,7 +229,7 @@ These requirements address the infrastructure and runtime constraints the tool m
 | CV-2.8 | Validation shall warn if the target S3 bucket contains existing objects (warp deletes all objects). | Yes |
 | CV-2.9 | Validation shall validate elbencho configuration parameters (thread list contains integers, IO sizes are valid, duration is valid). | Yes |
 | CV-2.10 | Validation shall accumulate all errors and report them together at the end, rather than stopping at the first error. | Yes |
-| CV-2.11 | Kubernetes validation shall verify API access, namespace and PV/PVC identity, PVC binding and mount usability, selected Ready-node compatibility, and benchmark runtime prerequisites. Submission shall verify requested capacity, service readiness, and coordinator connectivity before executing a cell. | Yes |
+| CV-2.11 | Kubernetes validation shall verify API access, namespace and PV/PVC identity, PVC binding and mount usability, selected Ready-node compatibility, admission and use of the required Elbencho seccomp profile, and benchmark runtime prerequisites. Submission shall verify requested capacity, service readiness, and coordinator connectivity before executing a cell. | Yes |
 
 ### CV-3: Slurm Advanced Configuration
 

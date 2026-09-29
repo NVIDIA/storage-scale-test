@@ -69,6 +69,22 @@ _coordinator_hash_file() {
     sha256sum -- "$1" | awk '{print $1}'
 }
 
+_coordinator_execution_ids() {
+    local directory="$1" suffix="$2" path name
+    [[ -d "$directory" && ! -L "$directory" \
+        && "$suffix" =~ ^\.[a-z]+$ ]] || return 1
+    local -a ids=()
+    for path in "$directory"/[0-9][0-9][0-9][0-9]"$suffix"; do
+        [[ -f "$path" && ! -L "$path" ]] || continue
+        name=${path##*/}
+        name=${name%"$suffix"}
+        [[ "$name" =~ ^[0-9]{4}$ ]] || return 1
+        ids+=("$name")
+    done
+    [[ ${#ids[@]} -gt 0 ]] || return 0
+    printf '%s\n' "${ids[@]}" | LC_ALL=C sort
+}
+
 _coordinator_verify_bundle() {
     local manifest="$CONTROL_DIR/bundle-manifest.tsv"
     [[ -f "$manifest" && ! -L "$manifest" ]] || {
@@ -182,8 +198,18 @@ _coordinator_validate_arguments() {
         _coordinator_error "unsafe coordinator scratch directory"
         return 1
     }
+    local coordinator_mount=/mnt/storage-scale-test
+    if [[ "${STORAGE_SCALE_TEST_INTEGRATION:-}" == 1 \
+            && -n "${KUBECTL_INTEGRATION_PVC_ROOT:-}" ]]; then
+        coordinator_mount="$KUBECTL_INTEGRATION_PVC_ROOT"
+    fi
+    local run_root="${CONTROL_DIR%/control}"
+    COORDINATOR_CONTROL_ROOT="${run_root%/runs/"$ATTEMPT_ID"}"
+    COORDINATOR_TEST_ROOT="${COORDINATOR_CONTROL_ROOT%/.storage-scale-test}"
     if [[ "${STORAGE_SCALE_TEST_INTEGRATION:-}" != 1 ]]; then
-        [[ "$CONTROL_DIR" == "/mnt/storage-scale-test/.storage-scale-test/runs/$ATTEMPT_ID/control" \
+        [[ "$run_root" == "$COORDINATOR_CONTROL_ROOT/runs/$ATTEMPT_ID" \
+            && "$COORDINATOR_CONTROL_ROOT" == "$COORDINATOR_TEST_ROOT/.storage-scale-test" \
+            && "$COORDINATOR_TEST_ROOT" == "$coordinator_mount/"* \
             && "$SCRATCH_DIR" == "/tmp/storage-scale-test/$ATTEMPT_ID" ]] || {
                 _coordinator_error "control or scratch path is outside the Kubernetes attempt layout"
                 return 1
@@ -198,6 +224,21 @@ _coordinator_validate_state_tree() {
         return 1
     fi
     mkdir -p "$STATE_DIR/executions" "$STATE_DIR/results" || return 1
+}
+
+_coordinator_set_control_layout() {
+    if [[ "${STORAGE_SCALE_TEST_INTEGRATION:-}" == 1 ]]; then
+        local logical_root mapped_root
+        kubectl_select_control_root logical_root mapped_root || return 1
+        kubectl_set_control_layout "$logical_root" "$mapped_root"
+        return
+    fi
+    KUBECTL_CONTROL_TEST_ROOT="$COORDINATOR_TEST_ROOT"
+    KUBECTL_CONTROL_ROOT="$COORDINATOR_CONTROL_ROOT"
+    KUBECTL_CONTROL_LOGICAL_ROOT="${COORDINATOR_TEST_ROOT#"$KUBECTL_SWEEP_MOUNT_ROOT"/}"
+    export KUBECTL_CONTROL_TEST_ROOT KUBECTL_CONTROL_ROOT \
+        KUBECTL_CONTROL_LOGICAL_ROOT
+    kubectl_validate_saved_control_layout
 }
 
 _coordinator_initialize_snapshots() {
@@ -447,8 +488,7 @@ _coordinator_publish_manifest() {
                     "results/$id/$relative" "$relative" || return 1
             done < <(_coordinator_relative_files "$result_root")
         fi
-    done < <(find -P "$CONTROL_DIR/executions" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9].sh' \
-        -printf '%f\n' | sed 's/\.sh$//' | LC_ALL=C sort)
+    done < <(_coordinator_execution_ids "$CONTROL_DIR/executions" .sh)
     _coordinator_append_manifest_file "$tmp" ledger run.status run.status || return 1
     _coordinator_append_manifest_file "$tmp" ledger run-summary.tsv run-summary.tsv || return 1
     [[ ! -f "$STATE_DIR/startup-error.txt" ]] || \
@@ -474,8 +514,7 @@ _coordinator_write_summary() {
             FAILED) failed=$((failed + 1)) ;;
             *) _coordinator_error "invalid execution state for summary: $id"; return 1 ;;
         esac
-    done < <(find -P "$CONTROL_DIR/executions" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9].sh' \
-        -printf '%f\n' | sed 's/\.sh$//' | LC_ALL=C sort)
+    done < <(_coordinator_execution_ids "$CONTROL_DIR/executions" .sh)
     {
         printf 'schema\t%s\n' "$KUBECTL_COORDINATOR_SCHEMA"
         printf 'attempt_id\t%s\n' "$ATTEMPT_ID"
@@ -781,16 +820,17 @@ kubectl_map_generated_csv() {
 }
 
 _coordinator_validate_pvc_path() {
-    local candidate="$1" root_real resolved
+    local candidate="$1" root_real control_real resolved
     [[ ( "$candidate" == "$KUBECTL_SWEEP_MOUNT_ROOT" \
             || "$candidate" == "$KUBECTL_SWEEP_MOUNT_ROOT/"* ) \
         && "$candidate" != *$'\n'* && "$candidate" != *$'\r'* \
         && "$candidate" != *$'\t'* ]] || return 1
     root_real=$(realpath -e -- "$KUBECTL_SWEEP_MOUNT_ROOT") || return 1
+    control_real=$(realpath -m -- "$KUBECTL_CONTROL_ROOT") || return 1
     resolved=$(realpath -m -- "$candidate") || return 1
     [[ ( "$resolved" == "$root_real" || "$resolved" == "$root_real/"* ) \
-        && "$resolved" != "$root_real/$KUBECTL_SWEEP_RESERVED_ROOT" \
-        && "$resolved" != "$root_real/$KUBECTL_SWEEP_RESERVED_ROOT/"* ]] || {
+        && "$resolved" != "$control_real" \
+        && "$resolved" != "$control_real/"* ]] || {
             _coordinator_error "workload path escapes the mounted PVC: $candidate"
             return 1
         }
@@ -875,6 +915,7 @@ _coordinator_recover_lost() {
     source "$CONTROL_DIR/env_used.sh" || return 1
     # shellcheck disable=SC1091,SC1090  # Digest-verified coordinator helpers.
     source "$CONTROL_DIR/_nv-elbencho-kubectl-functions.sh" || return 1
+    _coordinator_set_control_layout || return 1
     # shellcheck disable=SC1091,SC1090  # Digest-verified workload library.
     source "$CONTROL_DIR/_elbencho_functions.sh" || return 1
     _coordinator_validate_state_tree || return 1
@@ -976,6 +1017,7 @@ _coordinator_finalize_cancelled() {
     source "$CONTROL_DIR/env_used.sh" || return 1
     # shellcheck disable=SC1091,SC1090  # Digest-verified coordinator helpers.
     source "$CONTROL_DIR/_nv-elbencho-kubectl-functions.sh" || return 1
+    _coordinator_set_control_layout || return 1
     # shellcheck disable=SC1091,SC1090  # Digest-verified workload library.
     source "$CONTROL_DIR/_elbencho_functions.sh" || return 1
     _coordinator_validate_state_tree || return 1
@@ -1019,16 +1061,14 @@ _coordinator_select_collected_resume() {
     [[ "$run_status" =~ ^(FAILED|CANCELLED)$ ]] || return 1
     local execution_dir="$collected_state/executions"
     [[ -d "$execution_dir" && ! -L "$execution_dir" ]] || return 1
-    for id in $(find -P "$execution_dir" -maxdepth 1 -type f \
-            -name '[0-9][0-9][0-9][0-9].status' -printf '%f\n' \
-            | sed 's/\.status$//' | LC_ALL=C sort); do
+    while IFS= read -r id; do
         execution_status=$(cat "$execution_dir/$id.status") || return 1
         case "$execution_status" in
             SUCCESS) printf '%s\tSKIP\n' "$id" ;;
             PENDING|RUNNING|FAILED) printf '%s\tRUN\n' "$id" ;;
             *) return 1 ;;
         esac
-    done
+    done < <(_coordinator_execution_ids "$execution_dir" .status)
 }
 
 _coordinator_main() {
@@ -1046,6 +1086,7 @@ _coordinator_main() {
     export ELBENCHO=/usr/bin/elbencho
     # shellcheck disable=SC1091,SC1090  # Digest-verified Kubernetes coordinator helpers.
     source "$CONTROL_DIR/_nv-elbencho-kubectl-functions.sh" || return 1
+    _coordinator_set_control_layout || return 1
     # shellcheck disable=SC1091,SC1090  # Digest-verified, colocated control library.
     source "$CONTROL_DIR/_elbencho_functions.sh" || return 1
     _coordinator_initialize_state || return 1
@@ -1104,8 +1145,7 @@ _coordinator_main() {
         fi
         COORDINATOR_ACTIVE_ID=""
         COORDINATOR_ACTIVE_SCRATCH=""
-    done < <(find -P "$CONTROL_DIR/executions" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9].sh' \
-        -printf '%f\n' | sed 's/\.sh$//' | LC_ALL=C sort)
+    done < <(_coordinator_execution_ids "$CONTROL_DIR/executions" .sh)
     _coordinator_finalize_run "$rc" "$failed_id" || return 1
     return "$rc"
 }

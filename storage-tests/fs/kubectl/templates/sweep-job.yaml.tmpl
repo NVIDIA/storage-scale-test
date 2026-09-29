@@ -52,7 +52,8 @@ spec:
         runAsUser: @@RUN_AS_USER@@
         runAsGroup: @@RUN_AS_GROUP@@
         seccompProfile:
-          type: RuntimeDefault
+          # Elbencho Linux AIO can require syscalls denied by RuntimeDefault.
+          type: Unconfined
       containers:
         - name: coordinator
           image: @@IMAGE@@
@@ -60,9 +61,9 @@ spec:
           command: ["/bin/bash", "-ceu", "--"]
           args:
             - >-
-              exec /mnt/storage-scale-test/.storage-scale-test/runs/@@ATTEMPT_ID@@/control/coordinator.sh
-              /mnt/storage-scale-test/.storage-scale-test/runs/@@ATTEMPT_ID@@/control
-              /mnt/storage-scale-test/.storage-scale-test/runs/@@ATTEMPT_ID@@/state
+              exec @@REMOTE_RUN_DIRECTORY@@/control/coordinator.sh
+              @@REMOTE_RUN_DIRECTORY@@/control
+              @@REMOTE_RUN_DIRECTORY@@/state
               /tmp/storage-scale-test/@@ATTEMPT_ID@@
               @@ATTEMPT_ID@@
           env:

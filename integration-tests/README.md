@@ -84,6 +84,8 @@ Setup also preloads the pinned upstream Elbencho image under a fixture-private
 node reference and runs a temporary Kubernetes prerequisite probe. It requires
 one non-root service Pod on each worker, direct Pod-IPv4 access from a
 coordinator, denial from an unrelated Pod, and bidirectional PVC visibility.
+The Elbencho service Pods request the workload's `Unconfined` seccomp profile;
+non-benchmark probe Pods retain `RuntimeDefault`.
 The probe uses no Service, host networking, host ports, service-account token,
 or external pull from kind nodes, and removes its objects and storage afterward.
 
@@ -147,8 +149,9 @@ attempt while preserving collected data. `--resume` is collection-gated:
 collect first, then resume the local partial result tree. The whole sweep,
 not an individual node count, is the asynchronous unit. The remote Job does
 not depend on later kubectl credentials; its control ledger and completed
-cells live under a reserved subtree on the configured PVC. Active benchmark
-output is scratch data, published only between cells.
+cells live below `.storage-scale-test` in the canonical scenario test root,
+while a namespaced Lease excludes competing attempts on the PVC. Active
+benchmark output is scratch data, published only between cells.
 
 Kubernetes requires an authorized context plus an existing namespace, PV,
 PVC, and selector-matching worker nodes. It discovers selected nodes and
@@ -197,12 +200,12 @@ storage, and launch both commands there.
 The NFS profile uses a size-limited, checksum-verified upstream benchmark
 archive. Docker SBX, where GitHub release assets may be unavailable, extracts
 the binary and runtime libraries from the digest-pinned upstream
-`breuner/elbencho:v3.1-11` image and includes them only in the generated test
-deployment. Timestamped build and step logs are retained below the state
-directory's `test-runs/` directory. The test also requires successful execution
-records, exact one- and two-node workload totals, ordered worker selection,
-nonempty benchmark output, environment snapshots, and cleanup of generated
-data directories. It runs `utils/extract-elbencho.sh` on host-side result
+`docker.io/breuner/elbencho:v3.1-11` image and includes them only in the
+generated test deployment. Timestamped build and step logs are retained below
+the state directory's `test-runs/` directory. The test also requires successful
+execution records, exact one- and two-node workload totals, ordered worker
+selection, nonempty benchmark output, environment snapshots, and cleanup of
+generated data directories. It runs `utils/extract-elbencho.sh` on host-side result
 copies and checks the semantic report content applicable to each scenario.
 
 ## On-demand CI

@@ -96,6 +96,14 @@ PREPARED -> RUNNING -> SUCCESS
 may reconstruct a missing terminal summary or publication manifest from a
 consistent ledger, but may not change one terminal outcome into another.
 
+Durable run state resides at
+`<canonical TEST_DIR>/.storage-scale-test/runs/<attempt-id>`. The canonical
+root is the lexically first normalized `TEST_DIRS` key and is saved in the
+immutable attempt configuration. The hidden directory is created by the
+configured workload identity; the PVC mount root need not be writable. The
+PVC-wide Lease remains discoverable even when competing invocations configure
+different test roots.
+
 ### Per-cell lifecycle
 
 Each reified execution has this lifecycle:
@@ -147,8 +155,9 @@ instead of inventing another state value.
    historical attempt metadata remains immutable.
 3. One mutating lifecycle command may operate on a result tree. Concurrent
    commands are rejected rather than queued.
-4. One active sweep may own the configured PVC. Its global reservation is
-   never stolen.
+4. One active sweep may own the configured PVC. A deterministic namespaced
+   Kubernetes Lease keyed by the namespace, PV, and PVC UIDs is its global
+   reservation; it is never renewed, expired, or stolen.
 5. Every external create follows `durable intent -> create -> exact identity
    observation -> durable UID journal -> intent removal`.
 6. Destructive operations require exact kind, name, namespace, UID, ownership
@@ -156,8 +165,8 @@ instead of inventing another state value.
 7. `PREPARED` may contain partial resources, but every possible resource is
    represented by a creation intent or exact resource journal.
 8. `SUBMITTED` has an exact UID-journaled sweep Job.
-9. The PVC coordinator lock gives one Job Pod authority to mutate the ledger;
-   duplicate Job Pods exit first.
+9. The per-attempt coordinator lock in the PVC run tree gives one Job Pod
+   authority to mutate the ledger; duplicate Job Pods exit first.
 10. Node UID, architecture, resolved image identity, and Pod IPv4 address are
     frozen. A worker Pod name or UID may change only when the same Node and IP
     remain healthy; all other drift fails rather than retargeting the attempt.
@@ -168,7 +177,8 @@ instead of inventing another state value.
     manifest, and exact Job quiescence agree.
 14. Remote cleanup begins only after the complete local publication verifies.
 15. `COLLECTED` means the local publication verifies, the remote run and PVC
-    lock are gone, exact owned resources are gone, and no benchmark work remains.
+    Lease are gone, exact owned resources are gone, and no benchmark work
+    remains.
 16. Resume never reruns a collected successful cell.
 17. Traversing, linked, contradictory, corrupt, or identity-mismatched state
     fails closed.
@@ -182,7 +192,8 @@ instead of inventing another state value.
 | Attempt identity exists | Atomic rename of the complete attempt metadata directory. |
 | Attempt becomes current and recoverable | Atomic replacement of `current-attempt` before external mutation. |
 | Local transition | Atomic replacement of `state.sh`. |
-| PVC ownership | Same-filesystem rename of an initialized pending lock directory to the canonical lock. |
+| PVC ownership | API creation of the deterministic Lease, followed by exact identity observation and durable UID journaling. |
+| PVC ownership release | UID-preconditioned deletion of the exact Lease after remote state and all other owned resources are gone. |
 | A Kubernetes resource may exist | Creation intent is durable before `kubectl create`. |
 | Kubernetes ownership is locally established | Exact UID-bearing resource journal is atomically published. |
 | Submission succeeds | Exact Job UID is journaled and local state becomes `SUBMITTED`. |
@@ -214,7 +225,7 @@ contract change rather than silently expanding the release boundary.
 | S-03 | Exit after current `PREPARED` publication | Required recovery | Later lifecycle command rolls forward or records `SUBMISSION_FAILED`. | Covered |
 | S-04 | Concurrent command for one result tree | Required recovery | One lock owner; loser exits without mutation. | Covered |
 | S-05 | Competing result trees reserve one PVC | Required recovery | One owner; loser rolls back without touching it. | Covered |
-| S-06 | Exit around pending PVC-lock publication | Required recovery | Reconcile exact owner/intent; never steal the lock. | Covered |
+| S-06 | Exit around PVC Lease creation or journaling | Required recovery | Reconcile exact owner/intent; never steal the Lease. | Covered |
 | S-07 | API accepts create but response is lost | Required recovery | Resolve deterministic identity, then journal or delete the exact object. | Covered |
 | S-08 | API visibility is delayed within the documented ambiguity horizon | Required recovery | Wait and perform a later linearizable GET. | Covered |
 | S-09 | Object appears after the ambiguity horizon | Required diagnosis | Retain possible identity and print exact inspection/cleanup guidance. | Covered diagnostically; automatic recovery unsupported |
@@ -230,7 +241,7 @@ contract change rather than silently expanding the release boundary.
 
 | ID | Fault boundary | Class | Required result | Status |
 |---|---|---|---|---|
-| C-01 | Kubernetes starts a duplicate Job Pod | Required recovery | One PVC lock owner; duplicate exits without ledger mutation. | Covered |
+| C-01 | Kubernetes starts a duplicate Job Pod | Required recovery | One coordinator-lock owner; duplicate exits without ledger mutation. | Covered |
 | C-02 | Coordinator exits before or during startup initialization | Required recovery | Exact Job evidence converts the attempt into collectible failure while unstarted cells remain `PENDING`. | Covered |
 | C-03 | Service or policy convergence is delayed | Required recovery | Retry within a fixed deadline, then publish startup failure and diagnostics. | Covered |
 | C-04 | Benchmark cell exits nonzero | Required recovery | Preserve exit/evidence, stop later cells, permit collect and resume. | Covered |
@@ -297,8 +308,8 @@ assertion at the appropriate layer; merely reaching the branch is not evidence.
 | S-02, R-19 | `test_identity_is_complete_atomic_and_path_bound` |
 | S-03, S-14 | `test_prepare_failure_terminalizes_only_after_successful_rollback` |
 | S-04 | `test_s04_local_lifecycle_lock_rejects_a_concurrent_mutator` |
-| S-05 | `test_intended_reservation_does_not_touch_competing_pvc_owner` |
-| S-06 | `test_remote_lock_is_published_only_after_ownership` |
+| S-05 | `test_intended_reservation_does_not_touch_competing_pvc_owner`, `test_pvc_lease_is_create_only_and_has_no_time_expiry` |
+| S-06 | `test_interrupted_pvc_lease_creation_is_reconciled_by_exact_identity`, `test_pvc_lease_release_uses_uid_precondition_and_is_journaled` |
 | S-07, S-08, S-09 | `test_creation_intent_cleans_object_left_before_resource_journal`, `test_creation_intent_rechecks_absence_after_create_deadline`, `test_creation_absence_retains_possible_late_object_identity`, `test_create_only_verifies_exact_identity_before_returning_uid` |
 | S-10, T-01 | `test_observational_calls_retry_only_transient_api_failures` |
 | S-11, T-02 | `test_exhausted_observation_emits_actionable_diagnostic_envelope` |
@@ -393,6 +404,8 @@ The initial contract explicitly excludes:
 - malicious mutation of trusted local snapshots or PVC state;
 - a compromised administrator, CNI, admission controller, service mesh, or
   storage driver that violates validated prerequisites;
+- namespace policy that rejects the `Unconfined` seccomp profile required by
+  Elbencho validation, worker, and coordinator Pods;
 - IPv6-only networking, heterogeneous selected architectures, set-based node
   selectors, and Kubernetes delete-only.
 

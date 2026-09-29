@@ -431,6 +431,11 @@ $TAR_CMD czf "$OUTPUT_TARBALL" \
     --exclude=bin-amd64 \
     --exclude=bin-arm64 \
     --exclude=.ci-cache \
+    --exclude=plans \
+    --exclude=.venv-ci \
+    --exclude=.security-triage.yaml \
+    --exclude=.agents \
+    --exclude=integration-tests \
     --exclude=docs \
     --exclude=tests \
     --exclude=tmp \

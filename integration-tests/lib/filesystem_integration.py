@@ -101,6 +101,7 @@ KUBECTL_UTILITY_PREFIX = "storage-scale-test-utility"
 KUBECTL_TARGET_SELECTOR = "storage-scale-test/target=true"
 KUBECTL_STORAGE_PVC = "storage-test-rwx"
 KUBECTL_STORAGE_MOUNT = "/mnt/storage-scale-test"
+KUBECTL_CONTROL_DIRECTORY = ".storage-scale-test"
 KUBERNETES_DNS_NAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
 KUBERNETES_UID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -2926,6 +2927,57 @@ def _kubectl_attempt_digest(result_root: Path, attempt_id: str) -> str:
     return digest.hexdigest()
 
 
+def _kubectl_remote_control_root(runtime: ScenarioRuntime) -> str:
+    """Return the deterministic control root for an integration scenario."""
+    logical_roots = sorted(
+        (runtime.values["test_root"], runtime.values.get("test_root_secondary", ""))
+    )
+    logical_root = next(root for root in logical_roots if root)
+    return f"{KUBECTL_STORAGE_MOUNT}/{logical_root}/{KUBECTL_CONTROL_DIRECTORY}"
+
+
+def _assert_kubectl_pvc_lease(
+    runner: Any,
+    config: Any,
+    result_root: Path,
+    attempt_id: str,
+    *,
+    present: bool,
+) -> None:
+    """Verify the deterministic PVC Lease exists only while the attempt owns it."""
+    identity = (
+        result_root / "kubernetes" / "attempts" / attempt_id / "identity.sh"
+    ).read_text(encoding="utf-8")
+    match = re.search(
+        r"^KUBECTL_PVC_LEASE_NAME=(sst-elb-pvc-[0-9a-f]{32})$", identity, re.MULTILINE
+    )
+    if match is None:
+        raise IntegrationTestError("kubectl attempt did not persist its PVC Lease name")
+    observed = runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "get",
+            "lease",
+            match.group(1),
+            "--ignore-not-found",
+            "-o",
+            'jsonpath={.metadata.uid}{"\\t"}{.metadata.labels.storage-scale-test\\.nvidia\\.com/run}',
+        ),
+        check=True,
+        timeout=30,
+    ).stdout.strip()
+    if present:
+        fields = observed.split("\t")
+        if len(fields) != 2 or not fields[0] or fields[1] != attempt_id:
+            raise IntegrationTestError(
+                f"kubectl PVC Lease identity is incomplete: {observed!r}"
+            )
+    elif observed:
+        raise IntegrationTestError(f"kubectl collection retained PVC Lease: {observed}")
+
+
 def _make_unauthorized_kubeconfig(runner: Any, config: Any, destination: Path) -> None:
     """Preserve cluster trust while replacing the client credential."""
     result = runner.run(
@@ -3074,7 +3126,7 @@ def _interrupt_kubectl_collection(
         raise IntegrationTestError(
             "interrupted pre-stream collection published collected state"
         )
-    remote_run = f"{KUBECTL_STORAGE_MOUNT}/.storage-scale-test/runs/{attempt_id}"
+    remote_run = f"{_kubectl_remote_control_root(runtime)}/runs/{attempt_id}"
     _storage_utility_shell(
         runner,
         config,
@@ -3120,6 +3172,7 @@ def _run_kubectl_baseline(
     )
     if terminal != "SUCCESS":
         raise IntegrationTestError(f"kubectl baseline ended in {terminal}")
+    _assert_kubectl_pvc_lease(runner, config, result_root, attempt_id, present=True)
     _assert_expired_kubectl_status_is_observational(
         runner, config, runtime, result_root, attempt_id, log_dir
     )
@@ -3136,6 +3189,7 @@ def _run_kubectl_baseline(
         180,
     )
     runtime.values["kubectl_collected"] = "1"
+    _assert_kubectl_pvc_lease(runner, config, result_root, attempt_id, present=False)
     stale_staging = sorted(result_root.glob(".kubernetes-collect-*"))
     if stale_staging:
         raise IntegrationTestError(
@@ -3950,7 +4004,7 @@ def _preserve_kubectl_failure_diagnostics(
             "-n",
             config.namespace,
             "get",
-            "job,pod,daemonset,networkpolicy",
+            "job,pod,daemonset,networkpolicy,lease",
             "-l",
             label,
             "-o",
@@ -3961,7 +4015,7 @@ def _preserve_kubectl_failure_diagnostics(
             "-n",
             config.namespace,
             "describe",
-            "job,pod,daemonset",
+            "job,pod,daemonset,lease",
             "-l",
             label,
         ),
@@ -4028,7 +4082,7 @@ def _preserve_kubectl_failure_diagnostics(
         )
         names = [name for name in names if name]
         if names:
-            remote = f"{KUBECTL_STORAGE_MOUNT}/.storage-scale-test/runs/{attempt}/state"
+            remote = f"{_kubectl_remote_control_root(runtime)}/runs/{attempt}/state"
             result = runner.run(
                 _kubectl(
                     config,
