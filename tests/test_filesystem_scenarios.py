@@ -67,6 +67,7 @@ def test_catalog_exposes_stable_machine_metadata():
 
     assert [item["name"] for item in metadata] == [
         "baseline",
+        "mdtest-sweep",
         "default-dio",
         "failure-resume",
         "retained-lifecycle",
@@ -109,6 +110,7 @@ def test_default_plan_expands_substrates_and_batches_shared_home():
     assert plan[shared_start + 1 : shared_stop] == (("work", "ssh-shared-home", "ssh"),)
     assert plan[shared_stop + 1 :] == (
         ("work", "baseline", "kubectl"),
+        ("work", "mdtest-sweep", "kubectl"),
         ("work", "default-dio", "kubectl"),
         ("work", "failure-resume", "kubectl"),
         ("work", "live-capture", "kubectl"),
@@ -157,6 +159,7 @@ def test_kubectl_selection_has_no_ssh_transition():
     assert all(step.substrate is Substrate.KUBECTL for step in plan)
     assert [step.scenario.name for step in plan] == [
         "baseline",
+        "mdtest-sweep",
         "default-dio",
         "failure-resume",
         "live-capture",

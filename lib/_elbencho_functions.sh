@@ -1178,9 +1178,8 @@ _elbencho_resolve_run_context() {
     }
 }
 
-# Metadata benchmarks are not reified sweep cells. Preserve their existing
-# direct Slurm/SSH invocation contract while the filesystem scale sweep moves
-# to the explicit cell context above.
+# Preserve the direct metadata invocation contract while also accepting the
+# explicit context supplied by reified SSH, Slurm, and Kubernetes cells.
 _elbencho_resolve_metadata_run_context() {
     if [[ -n "${ELBENCHO_RUN_NODE_COUNT:-}" ]]; then
         node_count="$ELBENCHO_RUN_NODE_COUNT"
@@ -1204,6 +1203,31 @@ _elbencho_resolve_metadata_run_context() {
         echo "Error: Unable to create directory" >&2
         return 1
     }
+}
+
+_mdtest_completion_path() {
+    printf '%s/executions/%s.mdtest.complete\n' "$1" "$2"
+}
+
+_mdtest_completion_is_valid() {
+    local path="$1"
+    [[ -f "$path" && -s "$path" && ! -L "$path" ]] || return 1
+    [[ "$(<"$path")" == COMPLETE ]]
+}
+
+# Install the output identity used to collect a core dump for one metadata
+# execution. Metadata cells do not use the IO cell context initializer, but the
+# core wrapper needs the same execution ID and scratch output directory.
+# Usage: _elbencho_set_metadata_core_context <execution_id> <scratch_dir>
+_elbencho_set_metadata_core_context() {
+    local execution_id="$1"
+    local scratch_dir="$2"
+    if [[ ! "$execution_id" =~ ^[0-9]+$ || -z "$scratch_dir" ]]; then
+        echo "Error: invalid metadata core-dump context" >&2
+        return 1
+    fi
+    export ELBENCHO_RUN_EXECUTION_ID="$execution_id"
+    export ELBENCHO_RUN_SCRATCH_OUTPUT_DIR="$scratch_dir"
 }
 
 # Run one initialized cell and let its adapter publish the outcome. Publication
@@ -3516,6 +3540,7 @@ reify_elbencho_execution() {
             "${DS:-?}" "${nodes_spec:-?}" "# "
         printf '#\n'
         printf '# Per-execution coordinates (vary across NNNN.sh files):\n'
+        printf 'export ELBENCHO_EXECUTION_KIND=io\n'
         printf 'export nodes=%s\n' "$nodes"
         printf 'export io_size="%s"\n' "$io_size"
         printf 'export thread_count=%s\n' "$thread_count"
@@ -3661,6 +3686,50 @@ reify_all_elbencho_executions() {
     done
     echo "Reified $((seq - 1)) executions in ${executions_dir}"
     return 0
+}
+
+# Materialize the metadata sweep in the same typed execution ledger as the IO
+# sweep.  The identifier, rather than the selected worker set, owns test paths.
+reify_all_mdtest_executions() {
+    local output_dir="$1" ds="$2"
+    local -n node_counts_ref="$3" task_counts_ref="$4"
+    local target_files="${5:-}" files_per_worker="${6:-}"
+    local executions_dir="${output_dir}/executions" nodes tasks id suffix paths_csv
+    local -a generated_paths=()
+    local sequence=1
+    mkdir -p "$executions_dir" || return 1
+    for nodes in "${node_counts_ref[@]}"; do
+        for tasks in "${task_counts_ref[@]}"; do
+            id=$(printf '%04d' "$sequence")
+            suffix="-${ds}-e${id}"
+            mapfile -t generated_paths < <(
+                FS_TEST_DIR_SUFFIX_OVERRIDE="$suffix" \
+                    generate_fs_test_directories mdtest-elbencho
+            ) || return 1
+            [[ ${#generated_paths[@]} -gt 0 ]] || return 1
+            paths_csv=$(IFS=,; printf '%s' "${generated_paths[*]}")
+            {
+                printf '# Auto-generated mdtest execution: nodes=%s tasks=%s\n' "$nodes" "$tasks"
+                printf 'export ELBENCHO_EXECUTION_KIND=mdtest\n'
+                printf 'export nodes=%q\n' "$nodes"
+                printf 'export tasks_per_node=%q\n' "$tasks"
+                printf 'export MDTEST_BRANCH_FACTOR=%q\n' "$MDTEST_BRANCH_FACTOR"
+                printf 'export MDTEST_ITEMS_PER_DIR=%q\n' "$MDTEST_ITEMS_PER_DIR"
+                printf 'export MDTEST_ITERATIONS=%q\n' "$MDTEST_ITERATIONS"
+                printf 'export MDTEST_LAYOUT=%q\n' "$([[ -n "$target_files" ]] && printf single-dir || printf standard)"
+                printf 'export MDTEST_SINGLE_DIR_TARGET_FILES=%q\n' "$target_files"
+                printf 'export MDTEST_SINGLE_DIR_FILES_PER_WORKER=%q\n' "$files_per_worker"
+                printf 'export ELBENCHO_RUN_TEST_DIR_SUFFIX=%q\n' "$suffix"
+                printf 'export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=%q\n' "$paths_csv"
+                printf 'export ELBENCHO_RUN_GENERATED_TEST_ROOT=%q\n' ''
+                printf 'export ELBENCHO_READ_AFTER_WRITE_PAUSE=%q\n' \
+                    "${ELBENCHO_READ_AFTER_WRITE_PAUSE:-0}"
+            } > "$executions_dir/$id.sh" || return 1
+            _atomic_write_sentinel "$executions_dir/$id.status" PENDING || return 1
+            sequence=$((sequence + 1))
+        done
+    done
+    printf 'Reified %s metadata executions in %s\n' "$((sequence - 1))" "$executions_dir"
 }
 
 # Enumerate execution IDs in NNNN order. Prints one ID per line on stdout.
@@ -3940,9 +4009,50 @@ run_elbencho_metadata_benchmark() {
         return 1
     fi
 
+    # Remove result evidence before any fallible target or layout preflight.
+    # Elbencho appends to existing files, so every iteration is replaced.
+    local ds="${output_dir##*-}"
+    local base_resfile
+    base_resfile=$(printf '%s/mdtest-elbencho-c_%03d-t_%03d_%s' \
+        "$remote_output_dir" "$node_count" "$tasks_per_node" "$ds")
+    local completion_file=""
+    local iter
+    for ((iter = 1; iter <= MDTEST_ITERATIONS; iter++)); do
+        _elbencho_io_cleanup_result_artifacts \
+            "${base_resfile}_iter${iter}.out" \
+            "${base_resfile}_iter${iter}.csv" || return 1
+    done
+    if [[ "${ELBENCHO_EXECUTION_KIND:-}" == mdtest ]]; then
+        [[ "${ELBENCHO_RUN_EXECUTION_ID:-}" =~ ^[0-9]{4}$ ]] || {
+            echo "Error: metadata execution ID is missing or invalid" >&2
+            return 1
+        }
+        completion_file=$(_mdtest_completion_path \
+            "$remote_output_dir" "$ELBENCHO_RUN_EXECUTION_ID") || return 1
+        _elbencho_io_cleanup_result_artifacts "$completion_file" || return 1
+        _elbencho_set_metadata_core_context \
+            "$ELBENCHO_RUN_EXECUTION_ID" "$remote_output_dir" || return 1
+    fi
+
     # Convert base test dirs CSV to array
     local base_test_dirs
     IFS=',' read -ra base_test_dirs <<< "$test_dirs_csv"
+
+    # A reified cell may be retried after interruption. Its frozen target paths
+    # are private to that cell, so remove incomplete trees before CREATE.
+    if [[ "${ELBENCHO_EXECUTION_KIND:-}" == mdtest ]]; then
+        local target basename
+        for target in "${base_test_dirs[@]}"; do
+            basename="${target##*/}"
+            [[ "$target" == /* && "$target" != / \
+                && -n "${ELBENCHO_RUN_TEST_DIR_SUFFIX:-}" \
+                && "$basename" == mdtest-elbencho-target-*"$ELBENCHO_RUN_TEST_DIR_SUFFIX" ]] || {
+                echo "Error: invalid reified metadata target: $target" >&2
+                return 1
+            }
+            rm -rf -- "$target" || return 1
+        done
+    fi
 
     # Set by the layout preparation helpers below
     local elbencho_paths=()
@@ -3960,17 +4070,9 @@ run_elbencho_metadata_benchmark() {
         return 1
     fi
 
-    # Extract datestamp from output_dir
-    local ds="${output_dir##*-}"
-
     _mdtest_print_run_summary "$ds"
 
     # Base output file names (iteration number will be inserted)
-    local base_resfile
-    base_resfile=$(printf "%s/mdtest-elbencho-c_%03d-t_%03d_%s" \
-        "$remote_output_dir" "$node_count" "$tasks_per_node" "$ds")
-    local base_csvfile="$base_resfile"
-
     echo "Output files: ${base_resfile}_iter*.out / .csv"
     echo
 
@@ -3991,14 +4093,13 @@ run_elbencho_metadata_benchmark() {
     )
 
     # External iteration loop - gives fresh state each iteration and per-iteration output
-    local iter
     local overall_rc=0
     for ((iter = 1; iter <= MDTEST_ITERATIONS; iter++)); do
         echo "=== Iteration $iter of $MDTEST_ITERATIONS ==="
 
         # Per-iteration output files
         local resfile="${base_resfile}_iter${iter}.out"
-        local csvfile="${base_csvfile}_iter${iter}.csv"
+        local csvfile="${base_resfile}_iter${iter}.csv"
         local iter_output_args=(
             --resfile="$resfile"
             --csvfile="$csvfile"
@@ -4107,9 +4208,20 @@ run_elbencho_metadata_benchmark() {
     # Only the generated target dirs are removed; the configured TEST_DIRS roots
     # are their parents and are never touched.
     echo "Deleting test dirs ${base_test_dirs[*]}"
-    time find "${base_test_dirs[@]}" -mindepth "$cleanup_mindepth" \
-        -maxdepth "$cleanup_mindepth" -print0 | xargs -0 -P 32 -n 1 rm -rf
-    rm -rf "${base_test_dirs[@]}"
+    local cleanup_rc=0
+    ( set -o pipefail
+      time find "${base_test_dirs[@]}" -mindepth "$cleanup_mindepth" \
+          -maxdepth "$cleanup_mindepth" -print0 | xargs -0 -P 32 -n 1 rm -rf
+    ) || cleanup_rc=$?
+    rm -rf -- "${base_test_dirs[@]}" || cleanup_rc=$?
+    if [[ "$overall_rc" -eq 0 && "$cleanup_rc" -ne 0 ]]; then
+        overall_rc="$cleanup_rc"
+    fi
+
+    if [[ "$overall_rc" -eq 0 && -n "$completion_file" ]]; then
+        mkdir -p "${completion_file%/*}" || return 1
+        _atomic_write_sentinel "$completion_file" COMPLETE || return 1
+    fi
 
     return "$overall_rc"
 }

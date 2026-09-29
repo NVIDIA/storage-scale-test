@@ -56,6 +56,7 @@ validate_scenario_specs = _SCENARIOS.validate_scenario_specs
 
 EXPECTED_NAMES = {
     "baseline",
+    "mdtest-sweep",
     "default-dio",
     "failure-resume",
     "retained-lifecycle",
@@ -150,6 +151,42 @@ def test_basic_real_sweeps_cover_one_and_two_nodes(name):
     assert {execution.coordinate.nodes for execution in step.executions} == {1, 2}
     assert all(
         execution.status is ExecutionStatus.SUCCESS for execution in step.executions
+    )
+
+
+def test_mdtest_sweep_is_small_and_runs_on_each_substrate():
+    """Metadata smoke covers task and node scaling with bounded file counts."""
+    scenario = _scenario("mdtest-sweep")
+    step, resume = scenario.steps
+    environment = "\n".join(step.env_lines)
+
+    assert scenario.substrates == {"ssh", "slurm", "kubectl"}
+    assert step.workload_kind == "mdtest"
+    assert step.arguments == ("--nodes", "1,2", "--tasks", "1,2")
+    assert [
+        (item.coordinate.nodes, item.coordinate.tasks_per_node)
+        for item in step.executions
+    ] == [
+        (1, 1),
+        (1, 2),
+        (2, 1),
+        (2, 2),
+    ]
+    assert "MDTEST_BRANCH_FACTOR=1" in environment
+    assert "MDTEST_ITEMS_PER_DIR=2" in environment
+    assert "MDTEST_ITERATIONS=1" in environment
+    assert [item.status for item in step.executions] == [
+        ExecutionStatus.SUCCESS,
+        ExecutionStatus.FAILED,
+        ExecutionStatus.PENDING,
+        ExecutionStatus.PENDING,
+    ]
+    assert resume.kind is CommandKind.RESUME
+    assert all(item.status is ExecutionStatus.SUCCESS for item in resume.executions)
+    assert resume.requires == ("mdtest_results_dir",)
+    assert resume.render_arguments({"mdtest_results_dir": "/results/mdtest"}) == (
+        "--resume",
+        "/results/mdtest",
     )
 
 

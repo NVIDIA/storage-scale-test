@@ -454,6 +454,17 @@ reuse. Configure `MDTEST_BRANCH_FACTOR`, `MDTEST_ITEMS_PER_DIR`, and
     "$RESULTS_DIR"/mdtest-elbencho-<datestamp>/
 ```
 
+Each `(nodes, tasks)` pair is saved as a numbered execution. SSH and Slurm
+run these executions in order and can continue after interruption:
+
+```bash
+./storage-tests/fs/nv-mdtest-elbencho.sh --resume "$RESULTS_DIR"/mdtest-elbencho-<datestamp>/
+```
+
+With `EXECUTION_SUBSTRATE=kubectl`, submission returns while a coordinator Job
+runs the sweep. Use `--status`, `--cancel`, and `--collect` with the same result
+directory. Collect a terminal attempt before using `--resume`.
+
 **Dense single-directory runs (`--single-dir-file-target`):**
 
 The default layout creates a branched tree. To measure contention in one flat

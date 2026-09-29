@@ -140,12 +140,16 @@ nodelist_expanded_comma_separated="$ALLOC_HOSTS_CSV"
 
 echo "Coordinator started: SLURM_JOB_ID=$SLURM_JOB_ID NODES=$SLURM_JOB_NUM_NODES OUTPUT_DIR=$OUTPUT_DIR"
 echo "Allocation hosts (CSV): $ALLOC_HOSTS_CSV"
-# 3-line compact sweep summary so the user knows what's about to run during
-# the (potentially very long) execution loop. DS comes from the OUTPUT_DIR
-# basename suffix; nodes_spec / dio_or_bio / rand_option etc. are restored
-# from env_used.sh sourced above.
-print_elbencho_sweep_compact_summary \
-    "${OUTPUT_DIR##*-}" "${nodes_spec:-?}"
+# Compact summary so the user knows what's about to run during the (potentially
+# very long) execution loop. Sweep settings come from env_used.sh sourced above.
+if [[ "${OUTPUT_DIR##*/}" == mdtest-elbencho-* ]]; then
+    printf 'mdtest-elbencho-%s nodes_spec: %s tasks_spec: %s iterations: %s\n' \
+        "${OUTPUT_DIR##*-}" "${nodes_spec:-?}" "${tasks_spec:-?}" \
+        "${MDTEST_ITERATIONS:-?}"
+else
+    print_elbencho_sweep_compact_summary \
+        "${OUTPUT_DIR##*-}" "${nodes_spec:-?}"
+fi
 
 # Ownership was acquired before submission and adopted above, before touching
 # RUNNING state.
@@ -220,9 +224,12 @@ _coordinator_finalize_active_execution() {
     fi
     local active_status="${EXECUTIONS_DIR}/${active_id}.status"
     if [[ "$(cat "$active_status" 2>/dev/null)" != SUCCESS ]]; then
-        _elbencho_finalize_shared_failure_from_nnnn \
-            "${EXECUTIONS_DIR}/${active_id}.sh" "$active_id" \
-            "$OUTPUT_DIR" || true
+        # shellcheck disable=SC1090  # Trusted reified execution definition.
+        if [[ "$(unset ELBENCHO_EXECUTION_KIND; source "${EXECUTIONS_DIR}/${active_id}.sh"; printf '%s' "${ELBENCHO_EXECUTION_KIND:-io}")" != mdtest ]]; then
+            _elbencho_finalize_shared_failure_from_nnnn \
+                "${EXECUTIONS_DIR}/${active_id}.sh" "$active_id" \
+                "$OUTPUT_DIR" || true
+        fi
         _atomic_write_sentinel "$active_status" FAILED || \
             echo "Error: unable to record FAILED for active execution ${active_id}" >&2
     fi
@@ -288,8 +295,11 @@ while IFS= read -r -u 3 ID; do
     fi
     if ! _coordinator_refresh_service_pid && [[ "$overall_rc" -eq 0 ]]; then
         overall_rc=1
-        _elbencho_finalize_shared_failure_from_nnnn \
-            "${EXECUTIONS_DIR}/${ID}.sh" "$ID" "$OUTPUT_DIR" || true
+        # shellcheck disable=SC1090  # Trusted reified execution definition.
+        if [[ "$(unset ELBENCHO_EXECUTION_KIND; source "${EXECUTIONS_DIR}/${ID}.sh"; printf '%s' "${ELBENCHO_EXECUTION_KIND:-io}")" != mdtest ]]; then
+            _elbencho_finalize_shared_failure_from_nnnn \
+                "${EXECUTIONS_DIR}/${ID}.sh" "$ID" "$OUTPUT_DIR" || true
+        fi
         _atomic_write_sentinel "${EXECUTIONS_DIR}/${ID}.status" FAILED || true
     fi
     if [[ "$overall_rc" -ne 0 ]]; then

@@ -67,6 +67,7 @@ class WorkloadPhase(StrEnum):
     READ = "read"
     REMOVE_FILES = "remove-files"
     DELETE_PATH = "delete-path"
+    MDTEST_RESULTS = "mdtest-results"
 
 
 class FailureInjection(StrEnum):
@@ -81,9 +82,11 @@ class ExecutionCoordinate:
     """One expected point in an Elbencho sweep."""
 
     nodes: int
-    io_size: str
-    threads: int
-    io_depth: int
+    io_size: str | None = None
+    threads: int | None = None
+    io_depth: int | None = None
+    workload_kind: str = "filesystem"
+    tasks_per_node: int | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,7 @@ class ScenarioStep:
     exports: tuple[str, ...] = ()
     failure_injection: FailureInjection = FailureInjection.NONE
     preserve_failure_staging: bool = False
+    workload_kind: str = "filesystem"
 
     def render_arguments(self, values: Mapping[str, str]) -> tuple[str, ...]:
         """Render driver-controlled placeholders in command arguments."""
@@ -289,6 +293,7 @@ def _step(
     exports: tuple[str, ...] = (),
     failure_injection: FailureInjection = FailureInjection.NONE,
     preserve_failure_staging: bool = False,
+    workload_kind: str = "filesystem",
 ) -> ScenarioStep:
     """Build a sweep step with bounded defaults."""
     return ScenarioStep(
@@ -306,6 +311,7 @@ def _step(
         exports=exports,
         failure_injection=failure_injection,
         preserve_failure_staging=preserve_failure_staging,
+        workload_kind=workload_kind,
     )
 
 
@@ -323,6 +329,63 @@ def _baseline() -> FilesystemScenarioSpec:
             ),
         ),
     )
+
+
+def _mdtest_sweep() -> FilesystemScenarioSpec:
+    """Small metadata workload that exercises all three substrates."""
+    environment = (
+        "unset TEST_DIRS",
+        'declare -A TEST_DIRS=(["{test_root}"]=1)',
+        "export MDTEST_BRANCH_FACTOR=1",
+        "export MDTEST_ITEMS_PER_DIR=2",
+        "export MDTEST_ITERATIONS=1",
+    )
+    executions = tuple(
+        ExpectedExecution(
+            ExecutionCoordinate(nodes, workload_kind="mdtest", tasks_per_node=tasks),
+            (
+                ExecutionStatus.FAILED
+                if (nodes, tasks) == (1, 2)
+                else (
+                    ExecutionStatus.PENDING
+                    if (nodes, tasks) == (2, 1) or (nodes, tasks) == (2, 2)
+                    else ExecutionStatus.SUCCESS
+                )
+            ),
+        )
+        for nodes in (1, 2)
+        for tasks in (1, 2)
+    )
+    successful_executions = tuple(
+        ExpectedExecution(item.coordinate) for item in executions
+    )
+    sweep = _step(
+        "metadata-sweep",
+        ("--nodes", "1,2", "--tasks", "1,2"),
+        environment,
+        executions,
+        (WorkloadPhase.MDTEST_RESULTS,),
+        timeout_seconds=600,
+        exports=("mdtest_results_dir",),
+        failure_injection=FailureInjection.FAIL_AFTER_WRITE_ONCE,
+        preserve_failure_staging=True,
+        workload_kind="mdtest",
+    )
+    resume = ScenarioStep(
+        name="resume-interrupted-metadata-sweep",
+        kind=CommandKind.RESUME,
+        arguments=("--resume", "{mdtest_results_dir}"),
+        env_lines=(),
+        support_files=(),
+        generated_inputs=(),
+        timeout_seconds=600,
+        executions=successful_executions,
+        required_phases=(WorkloadPhase.MDTEST_RESULTS,),
+        dataset=DatasetExpectation.CLEANED,
+        requires=("mdtest_results_dir",),
+        workload_kind="mdtest",
+    )
+    return FilesystemScenarioSpec("mdtest-sweep", _BASELINE_SUBSTRATES, (sweep, resume))
 
 
 def _default_dio() -> FilesystemScenarioSpec:
@@ -765,6 +828,7 @@ def _slurm_scheduling() -> FilesystemScenarioSpec:
 
 SCENARIO_SPECS = (
     _baseline(),
+    _mdtest_sweep(),
     _default_dio(),
     _failure_resume(),
     _retained_lifecycle(),
@@ -825,6 +889,18 @@ def _validate_step(scenario_name: str, step: ScenarioStep) -> None:
     coordinates = [execution.coordinate for execution in step.executions]
     if len(coordinates) != len(set(coordinates)):
         raise ScenarioSpecError(f"{label}: duplicate execution coordinates")
+    for coordinate in coordinates:
+        if coordinate.workload_kind == "mdtest":
+            if coordinate.tasks_per_node is None or coordinate.tasks_per_node < 1:
+                raise ScenarioSpecError(f"{label}: invalid mdtest task coordinate")
+        elif (
+            not coordinate.io_size
+            or coordinate.threads is None
+            or coordinate.threads < 1
+            or coordinate.io_depth is None
+            or coordinate.io_depth < 1
+        ):
+            raise ScenarioSpecError(f"{label}: invalid filesystem coordinate")
     if step.kind is CommandKind.DELETE and step.executions:
         raise ScenarioSpecError(f"{label}: delete steps cannot reify executions")
     if step.kind is not CommandKind.DELETE and not step.executions:

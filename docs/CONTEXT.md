@@ -151,7 +151,7 @@ The checked-in benchmark entry points are:
 | Benchmark | Entry point | Analyzer | Slurm dispatch unit | SSH dispatch unit |
 |---|---|---|---|---|
 | Filesystem IO | `storage-tests/fs/nv-elbencho-sweep.sh` | `utils/extract-elbencho.sh` | One maximum-sized coordinator allocation for the sweep | One local sequential dispatcher for the sweep |
-| Filesystem metadata | `storage-tests/fs/nv-mdtest-elbencho.sh` | `utils/extract-mdtest-elbencho.sh` | One job per node/task pair | One remote invocation per node/task pair |
+| Filesystem metadata | `storage-tests/fs/nv-mdtest-elbencho.sh` | `utils/extract-mdtest-elbencho.sh` | One maximum-sized coordinator allocation for the sweep | One sequential dispatcher for the sweep |
 | Object storage | `storage-tests/object/nv-warp-sweep.sh` | `utils/extract-warp.sh` | One job per node count | One remote invocation per node count |
 | Network | `storage-tests/network/nv-netbench.sh` | `utils/extract-netbench.sh` | One job per node count | One remote invocation per node count |
 
@@ -166,8 +166,8 @@ Important configuration relationships:
 
 - `EXECUTION_SUBSTRATE` is required and derives exactly one mode flag. `ssh`
   also requires `SSH_HOST_LIST`; that file accepts comma- or whitespace-separated
-  hosts and ignores comment lines. Kubectl is supported by the filesystem
-  sweep; metadata, object, and network entry points remain SSH/Slurm-only.
+  hosts and ignores comment lines. Kubectl is supported by the filesystem IO
+  and metadata sweeps; object and network entry points remain SSH/Slurm-only.
 - In Slurm mode, `SLURM_NODE_INCLUDES`
   and `SLURM_NODE_IGNORES` point to optional files containing valid Slurm
   hostlists, including compressed forms.
@@ -390,6 +390,26 @@ invocations for each iteration. Host assignment rotates between phases to
 reduce client metadata-cache reuse. Files are zero length so the reported work
 isolates metadata operations.
 
+Metadata sweeps reify every `(nodes, tasks_per_node)` pair into the same
+numbered execution ledger used by filesystem IO. Each definition records its
+workload kind, parameters, and distinct generated target paths. SSH and Slurm
+resume non-successful cells from `env_used.sh` while retaining successful
+results; Kubernetes uses the asynchronous status/cancel/collect lifecycle and
+requires collection before resume. The shared dispatch protocol accepts both
+workload kinds; adding cells to an existing run is not yet supported.
+Because elbencho appends to existing result files, a metadata retry removes
+all per-iteration `.out`/`.csv` pairs before target preparation. Every
+substrate requires nonempty, nonsymlink result pairs and an atomic completion
+marker written after all phases and cleanup before marking a cell successful.
+The analyzer includes only `SUCCESS` cells when a reified metadata ledger is
+present, including through symlinked input paths; legacy result directories
+remain readable without a ledger.
+Result discovery pairs CSV and OUT files within one input directory and skips
+duplicate logical results across directories, so data from separate runs
+cannot be combined silently.
+Metadata cells set their execution ID and scratch directory so core dumps are
+saved and attributed consistently across all three substrates.
+
 The default layout pre-creates a wide branched tree and gives each thread
 `MDTEST_BRANCH_FACTOR²` directories. `--single-dir-file-target <count>` instead
 uses elbencho `-n 0`, placing uniquely named worker files directly in one flat
@@ -404,8 +424,15 @@ latency histograms. It reports rates, last-worker phase elapsed times,
 percentiles, variance, scaling efficiency, and configuration provenance across
 iterations. Conflicting provenance values are displayed together with a
 warning rather than silently selecting one.
+Metadata histogram buckets may be decimal microseconds; CSV-cache import
+restores numeric bucket keys before plotting and rejects colliding keys. Raw
+Elbencho histograms sum repeated buckets so observations are preserved.
 
 ### Object storage
+
+Warp histogram cache import rejects numeric bucket collisions in both overall
+and per-client reports. Live Warp histograms sum repeated buckets before
+serialization so duplicate observations retain their counts.
 
 `nv-warp-sweep.sh` performs bucket cleanup, PUT until the configured aggregate
 minimum object count, a GET sweep over thread counts, and final DELETE cleanup

@@ -281,14 +281,14 @@ The number of dispatches is deliberately benchmark-specific:
 | Benchmark | Slurm dispatch boundary | SSH dispatch boundary |
 |-----------|--------------------------|-----------------------|
 | Filesystem IO | One coordinator job for the entire sweep, sized to the largest remaining node count | One local dispatcher loop for the entire sweep |
-| Filesystem metadata | One job per `(node count, tasks per node)` pair | One invocation per `(node count, tasks per node)` pair |
+| Filesystem metadata | One coordinator job for the remaining sweep | One sequential dispatcher for the remaining sweep |
 | Object storage | One job per node count | One invocation per node count |
 | Network | One job per node count | One invocation per node count |
 
-Kubernetes filesystem IO uses one asynchronous Job for the complete reified
-sweep; `--status`, `--cancel`, and `--collect` address that sweep-level attempt
-independently of the submitting process lifetime. Metadata, object, and network
-benchmarks do not use the Kubernetes substrate.
+Kubernetes filesystem IO and metadata each use one asynchronous Job for the
+complete reified sweep; `--status`, `--cancel`, and `--collect` address that
+sweep-level attempt independently of the submitting process lifetime. Object
+and network benchmarks do not use the Kubernetes substrate.
 
 ### 4.3 Kubernetes Asynchronous Filesystem IO
 
@@ -399,7 +399,7 @@ SSH workers are started with `spawn_N_ssh`, and the coordinator is invoked with
 | Benchmark | Lifecycle |
 |-----------|-----------|
 | Filesystem IO | Slurm starts elbencho services once on the maximum-sized allocation; SSH starts them once on the usable host pool. Health checks can restart unhealthy services between phases. All services stop when the sweep dispatcher exits. |
-| Filesystem metadata | Each `(nodes, tasks)` Slurm job or SSH invocation starts an elbencho service per participating node, runs its configured iterations, then stops the services. |
+| Filesystem metadata | Slurm and SSH reuse sweep-wide elbencho services across numbered `(nodes, tasks)` executions; Kubernetes uses an attempt-scoped worker fleet. |
 | Object storage | Each node-count dispatch starts Warp clients, runs the object-size/thread work, then terminates the clients. |
 | Network | Each node-count dispatch starts elbencho services and reuses them for the iteration/thread sweep, checking health between Slurm runs. |
 
@@ -419,7 +419,7 @@ differs:
 | Benchmark | Sweep order and execution unit |
 |-----------|--------------------------------|
 | Filesystem IO | Reify `nodes → IO size → threads → IO depth`; each Cartesian cell is one sequential, resumable execution. |
-| Filesystem metadata | Dispatch each `nodes → tasks-per-node` pair; inside it, loop over `MDTEST_ITERATIONS`. |
+| Filesystem metadata | Reify `nodes → tasks-per-node`; each sequential execution loops over `MDTEST_ITERATIONS` and can be retried. |
 | Object storage | Dispatch each node count; inside it, loop over object sizes. PUT reaches the configured minimum object count at the last configured thread value, then GET sweeps all thread values before cleanup. |
 | Network | Dispatch each node count; inside it, loop over iterations and then thread values. Each unidirectional cell runs A→B and B→A; bidirectional runs both concurrently. |
 
@@ -443,11 +443,10 @@ mixing positional arguments with `--nodes`.
 
 ### 6.3 Dispatch and Failure Boundaries
 
-Filesystem metadata, object, and network sweeps retain separate dispatches at
-the boundaries shown in Section 4.2, and their scheduler walltime covers only
-the inner work assigned to one job. Filesystem IO is different: its single Slurm
-coordinator allocation or SSH dispatcher covers the full Cartesian product.
-Scheduler walltime for that workload must cover every remaining cell, including
+Object and network sweeps retain separate dispatches at the boundaries shown
+in Section 4.2. Filesystem IO and metadata each use one Slurm coordinator
+allocation or SSH dispatcher for the full remaining Cartesian product.
+Scheduler walltime for each workload must cover every remaining cell, including
 service checks, configured pauses, completion-based data volume, and cleanup.
 Its first failed cell stops the sequence; `--resume` provides recovery at the
 cell boundary.
@@ -666,7 +665,8 @@ invocations. `env_used.yaml` is the human/tool-readable configuration snapshot;
 `env_used.sh` is the sourceable snapshot used by `--resume`. The `executions/`
 directory is the execution ledger and may also contain exit codes, Slurm job IDs,
 exact-completion JSON, workload TSV records, core files, and treefile-cache usage
-records. Metadata sweeps write their own `env_used.yaml` snapshot. Separately,
+records. Metadata sweeps write `env_used.yaml` and a sourceable `env_used.sh`
+snapshot and use the same typed execution ledger. Separately,
 staged directory reads can persist their reusable treefile cache in the dataset,
 outside the result directory.
 

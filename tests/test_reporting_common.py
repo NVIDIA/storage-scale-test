@@ -52,10 +52,102 @@ def test_discover_result_pairs_returns_complete_pairs_and_warns(tmp_path):
     assert warnings == [f"Warning: Missing .out file for {tmp_path / 'result-2.csv'}"]
 
 
+def test_discover_result_pairs_never_joins_different_directories(tmp_path):
+    """Matching names in separate runs cannot make one result pair."""
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "result-1.csv").touch()
+    (second / "result-1.out").touch()
+    warnings = []
+
+    pairs = discover_result_pairs(
+        [str(first), str(second)],
+        re.compile(r"result-(\d+)\.(csv|out)"),
+        lambda match: int(match.group(1)),
+        extension_group=2,
+        warn=warnings.append,
+    )
+
+    assert pairs == {}
+    assert len(warnings) == 2
+    assert all("Missing" in warning for warning in warnings)
+
+
+def test_discover_result_pairs_rejects_duplicate_complete_keys(tmp_path):
+    """Two complete runs with the same key are ambiguous, even if ordered."""
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    for directory in (first, second):
+        (directory / "result-1.csv").touch()
+        (directory / "result-1.out").touch()
+    warnings = []
+
+    pairs = discover_result_pairs(
+        [str(first), str(second), str(first)],
+        re.compile(r"result-(\d+)\.(csv|out)"),
+        lambda match: int(match.group(1)),
+        extension_group=2,
+        warn=warnings.append,
+    )
+
+    assert pairs == {}
+    assert len(warnings) == 1
+    assert "Duplicate result pair" in warnings[0]
+
+
+def test_discover_result_pairs_rejects_normalized_name_aliases(tmp_path):
+    """Two CSV spellings for one numeric key cannot silently overwrite."""
+    for filename in ("result-1.csv", "result-01.csv", "result-1.out"):
+        (tmp_path / filename).touch()
+    warnings = []
+
+    pairs = discover_result_pairs(
+        [str(tmp_path)],
+        re.compile(r"result-(\d+)\.(csv|out)"),
+        lambda match: int(match.group(1)),
+        extension_group=2,
+        warn=warnings.append,
+    )
+
+    assert pairs == {}
+    assert len(warnings) == 1
+    assert "Duplicate .csv artifact" in warnings[0]
+
+
+def test_discover_result_pairs_keeps_distinct_keys_across_directories(tmp_path):
+    """Separate runs remain usable when their logical keys are distinct."""
+    expected = {}
+    for name, key in (("first", 1), ("second", 2)):
+        directory = tmp_path / name
+        directory.mkdir()
+        csv_path = directory / f"result-{key}.csv"
+        out_path = directory / f"result-{key}.out"
+        csv_path.touch()
+        out_path.touch()
+        expected[key] = (str(csv_path), str(out_path))
+    warnings = []
+
+    pairs = discover_result_pairs(
+        [str(tmp_path / "first"), str(tmp_path / "second")],
+        re.compile(r"result-(\d+)\.(csv|out)"),
+        lambda match: int(match.group(1)),
+        extension_group=2,
+        warn=warnings.append,
+    )
+
+    assert pairs == expected
+    assert warnings == []
+
+
 def test_report_parsers_and_formatters():
     """Shared parsers preserve the analyzer-facing formatting behavior."""
     warnings = []
     assert parse_integer_histogram("1: 2, bad, 3: 4") == {1: 2, 3: 4}
+    assert parse_integer_histogram("1: 2, 1: 3, 2: 4") == {1: 5, 2: 4}
     assert parse_int_values_with_ranges("1,3-5,bad", warnings.append) == {
         1,
         3,

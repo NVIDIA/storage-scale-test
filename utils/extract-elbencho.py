@@ -1193,7 +1193,7 @@ def _parse_op_hist_fragment(hist_str: str) -> Dict[float, int]:
             continue
         time_us, count = hist_item.split(": ", 1)
         time_sec = float(time_us) / 1_000_000
-        hist_data[time_sec] = int(count)
+        hist_data[time_sec] = hist_data.get(time_sec, 0) + int(count)
     return hist_data
 
 
@@ -2652,11 +2652,31 @@ def _elbencho_csv_parse_histogram_cell(row: Dict[str, Any]) -> None:
     """Replace JSON histogram string with a dict (or {})."""
     if "histogram" in row and row["histogram"]:
         try:
-            row["histogram"] = json.loads(row["histogram"])
+            row["histogram"] = json.loads(
+                row["histogram"], object_pairs_hook=_elbencho_histogram_pairs
+            )
         except json.JSONDecodeError:
             row["histogram"] = {}
     else:
         row["histogram"] = {}
+
+
+def _elbencho_histogram_pairs(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    """Reject JSON histogram keys that normalize to the same latency bucket."""
+    normalized_keys = set()
+    result = {}
+    for key, value in pairs:
+        try:
+            normalized = float(key)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Invalid histogram bucket: {key}") from error
+        if not math.isfinite(normalized):
+            raise ValueError(f"Invalid histogram bucket: {key}")
+        if normalized in normalized_keys:
+            raise ValueError(f"Duplicate histogram bucket: {key}")
+        normalized_keys.add(normalized)
+        result[key] = value
+    return result
 
 
 def _elbencho_csv_apply_backward_compat_defaults(row: Dict[str, Any]) -> None:
@@ -3836,7 +3856,9 @@ def _elbencho_apply_out_section_histogram_and_percentiles(
             count = count.strip()
             if count.isdigit():
                 bucket_sec = float(bucket) / 1_000_000
-                metric.histogram[bucket_sec] = int(count)
+                metric.histogram[bucket_sec] = metric.histogram.get(
+                    bucket_sec, 0
+                ) + int(count)
 
 
 def _elbencho_dedupe_latest_operation_metrics(

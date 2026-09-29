@@ -120,6 +120,7 @@ After setup succeeds, run the bounded filesystem regression cases with:
 integration-tests/bin/integration-test.py test
 integration-tests/bin/integration-test.py test --substrate ssh
 integration-tests/bin/integration-test.py test --scenario baseline
+integration-tests/bin/integration-test.py test --scenario mdtest-sweep
 integration-tests/bin/integration-test.py test --list-scenarios
 ```
 
@@ -132,7 +133,10 @@ from the packaged `env.sh.template`, and run `validate_env.sh` before a sweep.
 
 The real scenario catalog covers buffered and direct I/O, one- and two-node
 selection, failure and resume, retained write/read/delete data, extended live
-CSV capture, and result reporting on all applicable substrates. Focused cases
+CSV capture, and mdtest-Elbencho sweeps over one and two nodes and one and two
+tasks per node on SSH, Slurm, and Kubernetes. The MD scenario checks both raw
+result files, injects one failed cell, and resumes while checking that the
+earlier successful cell is preserved. Focused cases
 add a multidimensional Slurm sweep, Slurm include/exclude and exclusive-user
 allocation behavior, SSH weighted roots, generated and staged single-file
 work, and shared SSH homes. Workloads stay deliberately small; assertions
@@ -141,7 +145,7 @@ evidence, dataset totals, required native flags, relevant scheduling evidence,
 and semantic report rows and plot families without treating incidental output
 or performance values as contracts.
 
-The Kubernetes substrate runs the same filesystem sweep as one asynchronous
+The Kubernetes substrate runs each supported sweep as one asynchronous
 cluster Job. `submit` returns after staging the control bundle and creating
 the attempt; `status` reads its durable state, `collect` copies completed
 cell results into the local result directory, and `cancel` stops the exact
@@ -180,6 +184,9 @@ storage-tests/fs/nv-elbencho-sweep.sh --cancel "$RESULTS_DIR/elbencho-<run>"
 storage-tests/fs/nv-elbencho-sweep.sh --collect "$RESULTS_DIR/elbencho-<run>"
 storage-tests/fs/nv-elbencho-sweep.sh --resume "$RESULTS_DIR/elbencho-<run>"
 ```
+
+The MD sweep uses the same lifecycle options through
+`storage-tests/fs/nv-mdtest-elbencho.sh` and accepts `--nodes 1,2 --tasks 1,2`.
 
 Use `--cancel` instead of `--status` when stopping an active attempt. The
 submit command is intentionally asynchronous; `--collect` is the operation

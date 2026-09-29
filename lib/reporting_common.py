@@ -35,10 +35,11 @@ def discover_result_pairs(
     extension_group: int,
     warn: Callable[[str], Any],
 ) -> dict[_ResultKey, tuple[str, str]]:
-    """Find complete CSV/OUT result pairs matching a benchmark filename pattern."""
-    file_pairs: dict[_ResultKey, dict[str, str]] = {}
+    """Find pairs within each directory and reject ambiguous logical keys."""
+    file_pairs: dict[tuple[str, _ResultKey], dict[str, str]] = {}
+    duplicate_artifacts: set[tuple[str, _ResultKey]] = set()
 
-    for input_dir in input_dirs:
+    for input_dir in dict.fromkeys(os.path.realpath(path) for path in input_dirs):
         if not os.path.isdir(input_dir):
             warn(f"Warning: {input_dir} is not a directory, skipping")
             continue
@@ -48,18 +49,40 @@ def discover_result_pairs(
             if not match:
                 continue
             key = key_from_match(match)
-            file_pairs.setdefault(key, {})[match.group(extension_group)] = os.path.join(
-                input_dir, filename
-            )
+            source_key = (input_dir, key)
+            extension = match.group(extension_group)
+            paths = file_pairs.setdefault(source_key, {})
+            if extension in paths:
+                warn(
+                    f"Warning: Duplicate .{extension} artifact for {key!r} "
+                    f"in {input_dir}; skipping this pair"
+                )
+                duplicate_artifacts.add(source_key)
+            else:
+                paths[extension] = os.path.join(input_dir, filename)
 
     result: dict[_ResultKey, tuple[str, str]] = {}
-    for key, paths in file_pairs.items():
+    ambiguous: set[_ResultKey] = set()
+    for source_key, paths in file_pairs.items():
+        if source_key in duplicate_artifacts:
+            continue
+        _, key = source_key
         if "csv" in paths and "out" in paths:
-            result[key] = (paths["csv"], paths["out"])
+            if key in result:
+                warn(
+                    f"Warning: Duplicate result pair for {key!r} in "
+                    f"{os.path.dirname(result[key][0])} and "
+                    f"{os.path.dirname(paths['csv'])}; skipping both"
+                )
+                ambiguous.add(key)
+            else:
+                result[key] = (paths["csv"], paths["out"])
         elif "csv" in paths:
             warn(f"Warning: Missing .out file for {paths['csv']}")
         elif "out" in paths:
             warn(f"Warning: Missing .csv file for {paths['out']}")
+    for key in ambiguous:
+        del result[key]
     return result
 
 
@@ -71,9 +94,11 @@ def parse_integer_histogram(histogram_text: str) -> dict[int, int]:
         if len(parts) != 2:
             continue
         try:
-            histogram[int(parts[0].strip())] = int(parts[1].strip())
+            bucket = int(parts[0].strip())
+            count = int(parts[1].strip())
         except ValueError:
             continue
+        histogram[bucket] = histogram.get(bucket, 0) + count
     return histogram
 
 

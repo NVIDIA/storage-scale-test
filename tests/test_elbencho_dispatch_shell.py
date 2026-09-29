@@ -47,6 +47,34 @@ def _run_bash(script: str) -> subprocess.CompletedProcess:
 class TestElbenchoDispatchShell(unittest.TestCase):
     """Dispatch helpers preserve per-execution state across retries."""
 
+    def test_slurm_metadata_cell_installs_core_dump_context(self) -> None:
+        script = f"""
+        set -e
+        source "{_ENV_FUNCTIONS}"
+        source "{_ELBENCHO_FUNCTIONS}"
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        output_dir="$tmp/elbencho-20260929Z120000"
+        executions_dir="$output_dir/executions"
+        mkdir -p "$executions_dir"
+        cat > "$executions_dir/0001.sh" <<'EOF'
+        export ELBENCHO_EXECUTION_KIND=mdtest
+        export nodes=1 tasks_per_node=2
+        EOF
+        _compute_test_dirs_csv_for_execution() {{ printf '/tmp/mdtest-target'; }}
+        _elbencho_required_result_artifacts_for_execution() {{ :; }}
+        run_elbencho_metadata_benchmark() {{
+            [[ "$ELBENCHO_RUN_EXECUTION_ID" == 0001 ]]
+            [[ "$ELBENCHO_RUN_SCRATCH_OUTPUT_DIR" == "$output_dir" ]]
+        }}
+        SLURM_JOB_ID=12345
+        coordinator_run_one_execution "$executions_dir" 0001 host-a "$output_dir" \
+            > "$tmp/coordinator.log" 2>&1
+        [[ "$(cat "$executions_dir/0001.status")" == SUCCESS ]]
+        """
+        result = _run_bash(textwrap.dedent(script))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_slurm_dispatch_signals_cancel_once_and_preserve_exit_trap(self) -> None:
         """INT and TERM cancel once before the caller's EXIT cleanup runs."""
         for signal_name, expected_rc in (("INT", 130), ("TERM", 143)):
@@ -1133,6 +1161,34 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         self.assertEqual(lines["layout"], "shared-directory")
         self.assertEqual(lines["files"], "8")
         self.assertEqual(lines["size"], "64G")
+
+    def test_ssh_metadata_scriptlet_installs_core_dump_context(self) -> None:
+        script = f"""
+        set -e
+        source "{_ENV_FUNCTIONS}"
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        nnnn="$tmp/0007.sh"
+        cat > "$nnnn" <<'EOF'
+        export ELBENCHO_EXECUTION_KIND=mdtest
+        export nodes=2 tasks_per_node=3
+        EOF
+        cat > "$tmp/_elbencho_functions.sh" <<'EOS'
+        _elbencho_set_metadata_core_context() {{
+            export ELBENCHO_RUN_EXECUTION_ID="$1"
+            export ELBENCHO_RUN_SCRATCH_OUTPUT_DIR="$2"
+        }}
+        run_elbencho_metadata_benchmark() {{
+            [[ "$ELBENCHO_RUN_EXECUTION_ID" == 0007 ]]
+            [[ "$ELBENCHO_RUN_SCRATCH_OUTPUT_DIR" == "$PWD/remote-results" ]]
+        }}
+        EOS
+        scriptlet=$(_ssh_build_execution_scriptlet \
+            "$nnnn" "host-a,host-b" 2 "/data/a,/data/b" "remote-results" "0007")
+        (cd "$tmp" && bash -s <<< "$scriptlet")
+        """
+        result = _run_bash(textwrap.dedent(script))
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_read_from_passes_nonempty_treefile_to_elbencho(self) -> None:
         script = """
