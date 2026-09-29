@@ -212,8 +212,8 @@ Elbencho validation, worker, and coordinator Pods explicitly request an
 operations such as `io_getevents`. Namespace admission policy must allow that
 profile. The Pods still run as the configured non-root UID/GID, disable
 privilege escalation, drop all capabilities, and mount no API token.
-`validate_env.sh` creates a short-lived Job with that profile and verifies the
-running process reports unconfined seccomp mode before submission is allowed.
+Run `validate_env.sh` before a sweep; it creates a short-lived Job with that
+profile and verifies that the running process reports unconfined seccomp mode.
 
 `TEST_DIRS` remains a logical filesystem configuration in Kubernetes mode.
 The sweep prepends `/mnt/storage-scale-test/` when it constructs Pod-side

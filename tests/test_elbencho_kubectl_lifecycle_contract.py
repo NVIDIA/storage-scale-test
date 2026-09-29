@@ -67,7 +67,9 @@ def test_s04_local_lifecycle_lock_rejects_a_concurrent_mutator(
                 "pid=$!\n"
                 'for _ in {1..50}; do [[ -e "$ready" ]] && break; sleep .02; done\n'
                 '[[ -e "$ready" ]]\n'
-                '! kubectl_local_lock_acquire "$root" contender\n'
+                '! kubectl_local_lock_acquire "$root" contender 2>"$root/error"\n'
+                'grep -F "another Kubernetes lifecycle operation is active" "$root/error"\n'
+                'grep -F "Wait for that operation to finish" "$root/error"\n'
                 'wait "$pid"\n'
             ),
             str(tmp_path / "state"),

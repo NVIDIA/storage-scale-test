@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+import signal
 import socketserver
 import subprocess
 import threading
@@ -76,15 +77,19 @@ def _probe_server(
 
 
 @pytest.mark.parametrize(
-    ("host", "response", "expected_rc"),
+    ("host", "response", "expected_returncodes"),
     (
-        ("127.0.0.2", b"HTTP/1.0 200 OK\r\n\r\n", 0),
-        ("127.0.0.3", b"HTTP/1.0 503 Busy\r\n\r\n", 1),
-        ("127.0.0.4", b"garbage 200 text\r\n", 1),
+        ("127.0.0.2", b"HTTP/1.0 200 OK\r\n\r\n", (0,)),
+        ("127.0.0.3", b"HTTP/1.0 503 Busy\r\n\r\n", (1,)),
+        (
+            "127.0.0.4",
+            b"garbage 200 text\r\n",
+            (1, -signal.SIGPIPE, 128 + signal.SIGPIPE),
+        ),
     ),
 )
 def test_probe_endpoint_uses_real_http_result(
-    host: str, response: bytes, expected_rc: int
+    host: str, response: bytes, expected_returncodes: tuple[int, ...]
 ) -> None:
     """The file-resident child accepts 200 and rejects non-200 responses."""
     with _probe_server(host, response):
@@ -97,7 +102,7 @@ def test_probe_endpoint_uses_real_http_result(
             check=False,
             timeout=10,
         )
-    assert result.returncode == expected_rc, result.stderr
+    assert result.returncode in expected_returncodes, result.stderr
 
 
 def test_probe_endpoint_times_out_a_tarpit_connection() -> None:

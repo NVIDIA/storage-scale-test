@@ -292,6 +292,9 @@ kubectl_local_lock_acquire() {
     exec {acquired_fd}>"$kubernetes_dir/lifecycle.lock" || return 1
     if ! flock -n "$acquired_fd"; then
         eval "exec ${acquired_fd}>&-"
+        printf 'Error: another Kubernetes lifecycle operation is active for %s\n' \
+            "$kubernetes_dir" >&2
+        echo "Wait for that operation to finish, then retry this command." >&2
         return 1
     fi
     KUBECTL_LOCAL_LOCK_ROOTS["$acquired_fd"]="$kubernetes_dir"
@@ -1571,20 +1574,16 @@ kubectl_release_pvc_lease() {
         if [[ -e "$intent" || -L "$intent" ]]; then
             kubectl_attempt_load_identity "$kubernetes_dir/attempts/$attempt_id" || return 1
             kubectl_attempt_load_creation_intent "$intent" || return 1
-            local intent_observed="" intent_uid=""
-            kubectl_observe_pvc_lease intent_observed "$KUBECTL_INTENT_NAMESPACE" \
-                "$KUBECTL_INTENT_NAME" || return 1
-            if [[ -n "$intent_observed" ]]; then
-                if kubectl_pvc_lease_observation_matches "$intent_observed" \
-                        "$attempt_id" "$KUBECTL_INTENT_NONCE"; then
-                    IFS=$'\t' read -r intent_uid _ <<< "$intent_observed"
-                    kubectl_attempt_journal_resource "$kubernetes_dir" "$lock_fd" \
-                        "$attempt_id" pvc-lease Lease "$KUBECTL_INTENT_NAME" \
-                        "$KUBECTL_INTENT_NAMESPACE" "$intent_uid" \
-                        "$KUBECTL_INTENT_NONCE" || return 1
-                fi
-            fi
-            kubectl_attempt_clear_creation_intent "$kubernetes_dir" "$lock_fd" \
+            [[ "$KUBECTL_INTENT_KIND" == Lease \
+                && "$KUBECTL_INTENT_NAME" == "$KUBECTL_PVC_LEASE_NAME" \
+                && "$KUBECTL_INTENT_NAMESPACE" == "$KUBECTL_NAMESPACE" \
+                && "$KUBECTL_INTENT_NONCE" == "$KUBECTL_OWNERSHIP_NONCE" ]] \
+                || return 1
+            # Lease creation has the same ambiguous-success window as every
+            # other API object. Use the common bounded observation path so an
+            # accepted but initially invisible Lease is deleted by exact UID,
+            # or its possible late identity is retained for diagnosis.
+            kubectl_cleanup_creation_intent "$kubernetes_dir" "$lock_fd" \
                 "$attempt_id" pvc-lease || return 1
         fi
     elif [[ -e "$intent" || -L "$intent" ]]; then
@@ -1634,7 +1633,9 @@ kubectl_release_pvc_lease() {
                 -f - >/dev/null 2>&1 || true
     fi
     kubectl_observe_pvc_lease observed "$namespace" "$name" || return 1
-    [[ -z "$observed" ]] || return 1
+    # The deterministic name can be reacquired immediately after our
+    # UID-preconditioned delete. Only the exact old UID must be absent.
+    [[ -z "$observed" || "${observed%%$'\t'*}" != "$uid" ]] || return 1
     kubectl_attempt_journal_step "$kubernetes_dir" "$lock_fd" "$attempt_id" \
         release-pvc-lease
 }
@@ -1702,21 +1703,78 @@ kubectl_collection_cleanup_precedes_lease_release() {
 kubectl_reconcile_pvc_lease_release_after_collection_cleanup() {
     local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3"
     _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
-    kubectl_collection_cleanup_precedes_lease_release "$kubernetes_dir" \
-        "$attempt_id" || return 1
-    kubectl_attempt_load_identity "$kubernetes_dir/attempts/$attempt_id" || return 1
-    kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" pvc-lease \
-        || return 1
-    [[ "$KUBECTL_RESOURCE_KIND" == Lease \
-        && "$KUBECTL_RESOURCE_NAME" == "$KUBECTL_PVC_LEASE_NAME" \
-        && "$KUBECTL_RESOURCE_NAMESPACE" == "$KUBECTL_NAMESPACE" ]] || return 1
+    if ! kubectl_attempt_load_identity "$kubernetes_dir/attempts/$attempt_id"; then
+        KUBECTL_ATTEMPT_ID="$attempt_id" kubectl_report_lifecycle_error \
+            collect pvc-lease LEDGER_INCONSISTENT \
+            "inspect the missing or corrupt attempt identity; do not alter resources by name" \
+            unknown || true
+        return 1
+    fi
+    if ! kubectl_attempt_load_resource "$kubernetes_dir" "$attempt_id" pvc-lease; then
+        KUBECTL_ATTEMPT_ID="$attempt_id" kubectl_report_lifecycle_error \
+            collect pvc-lease LEDGER_INCONSISTENT \
+            "inspect the missing or corrupt Lease journal; do not alter resources by name" \
+            unknown Lease "$KUBECTL_PVC_LEASE_NAME" "$KUBECTL_NAMESPACE" \
+            "" "" "" || true
+        return 1
+    fi
+    if [[ "$KUBECTL_RESOURCE_KIND" != Lease \
+            || "$KUBECTL_RESOURCE_NAME" != "$KUBECTL_PVC_LEASE_NAME" \
+            || "$KUBECTL_RESOURCE_NAMESPACE" != "$KUBECTL_NAMESPACE" ]]; then
+        KUBECTL_ATTEMPT_ID="$attempt_id" kubectl_report_lifecycle_error \
+            collect pvc-lease LEDGER_INCONSISTENT \
+            "inspect the conflicting Lease journal; do not alter resources by name" \
+            unknown "$KUBECTL_RESOURCE_KIND" "$KUBECTL_RESOURCE_NAME" \
+            "$KUBECTL_RESOURCE_NAMESPACE" "$KUBECTL_RESOURCE_UID" "" "" || true
+        return 1
+    fi
     local observed=""
-    kubectl_observe_pvc_lease observed "$KUBECTL_RESOURCE_NAMESPACE" \
-        "$KUBECTL_RESOURCE_NAME" || return 1
-    # Only the exact delete-to-journal crash window is recoverable here. If
-    # the journaled UID is still live, normal collection must release it.
-    [[ -z "$observed" || "${observed%%$'\t'*}" != "$KUBECTL_RESOURCE_UID" ]] \
-        || return 1
+    if ! kubectl_observe_pvc_lease observed "$KUBECTL_RESOURCE_NAMESPACE" \
+            "$KUBECTL_RESOURCE_NAME"; then
+        KUBECTL_ATTEMPT_ID="$attempt_id" kubectl_report_lifecycle_error \
+            collect pvc-lease API_UNAVAILABLE \
+            "restore Kubernetes API access and retry --collect" unknown \
+            Lease "$KUBECTL_RESOURCE_NAME" "$KUBECTL_RESOURCE_NAMESPACE" \
+            "$KUBECTL_RESOURCE_UID" "" "" || true
+        return 1
+    fi
+    local observed_uid="${observed%%$'\t'*}"
+    if [[ -n "$observed" && "$observed_uid" == "$KUBECTL_RESOURCE_UID" ]]; then
+        if kubectl_attempt_step_done "$kubernetes_dir" "$attempt_id" \
+                release-pvc-lease; then
+            KUBECTL_ATTEMPT_ID="$attempt_id" kubectl_report_lifecycle_error \
+                collect pvc-lease LEDGER_INCONSISTENT \
+                "inspect the released Lease journal and live exact UID before retrying" \
+                unknown Lease "$KUBECTL_RESOURCE_NAME" \
+                "$KUBECTL_RESOURCE_NAMESPACE" "$KUBECTL_RESOURCE_UID" \
+                "$observed_uid" "" || true
+            return 1
+        fi
+        if kubectl_pvc_lease_observation_matches "$observed" "$attempt_id" \
+                "$KUBECTL_RESOURCE_NONCE" "$KUBECTL_RESOURCE_UID"; then
+            return 0
+        fi
+        KUBECTL_ATTEMPT_ID="$attempt_id" kubectl_report_lifecycle_error \
+            collect pvc-lease IDENTITY_MISMATCH \
+            "inspect the retained Lease and original attempt; do not delete it by name" \
+            unknown Lease "$KUBECTL_RESOURCE_NAME" \
+            "$KUBECTL_RESOURCE_NAMESPACE" "$KUBECTL_RESOURCE_UID" \
+            "$observed_uid" "" || true
+        return 1
+    fi
+    # An empty name or a replacement UID proves the exact journaled Lease is
+    # gone. Reconcile only after local publication and every preceding exact
+    # cleanup marker prove that releasing PVC ownership was the final action.
+    if ! kubectl_collection_cleanup_precedes_lease_release "$kubernetes_dir" \
+            "$attempt_id"; then
+        KUBECTL_ATTEMPT_ID="$attempt_id" kubectl_report_lifecycle_error \
+            collect pvc-lease LEDGER_INCONSISTENT \
+            "inspect incomplete cleanup evidence before retrying --collect" \
+            unknown Lease "$KUBECTL_RESOURCE_NAME" \
+            "$KUBECTL_RESOURCE_NAMESPACE" "$KUBECTL_RESOURCE_UID" \
+            "$observed_uid" "" || true
+        return 1
+    fi
     kubectl_attempt_journal_step "$kubernetes_dir" "$lock_fd" "$attempt_id" \
         release-pvc-lease
 }
@@ -2263,12 +2321,18 @@ kubectl_validate_cluster_identity() {
     }
     local verb allowed
     for verb in get create delete; do
-        allowed=$(kubectl_run_observational auth can-i "$verb" \
-            leases.coordination.k8s.io -n "$KUBECTL_NAMESPACE") || {
-                printf 'Error: could not verify Kubernetes Lease permission: %s leases.coordination.k8s.io in namespace %s\n' \
+        allowed=""
+        if ! allowed=$(kubectl_run_observational auth can-i "$verb" \
+                leases.coordination.k8s.io -n "$KUBECTL_NAMESPACE"); then
+            if [[ "$allowed" == no ]]; then
+                printf 'Error: Kubernetes filesystem sweeps require permission to %s leases.coordination.k8s.io in namespace %s\n' \
                     "$verb" "$KUBECTL_NAMESPACE" >&2
                 return 1
-            }
+            fi
+            printf 'Error: could not verify Kubernetes Lease permission: %s leases.coordination.k8s.io in namespace %s\n' \
+                "$verb" "$KUBECTL_NAMESPACE" >&2
+            return 1
+        fi
         if [[ "$allowed" != yes ]]; then
             printf 'Error: Kubernetes filesystem sweeps require permission to %s leases.coordination.k8s.io in namespace %s\n' \
                 "$verb" "$KUBECTL_NAMESPACE" >&2
@@ -4197,10 +4261,10 @@ kubectl_prepare_attempt_lifecycle() {
 }
 
 # Add the frozen sweep input to the small, immutable coordinator bundle made by
-# kubectl_prepare_control_bundle.  This happens before the Job exists: a Job
-# never observes a partly populated control tree.  The bundle's manifest is
-# deliberately regenerated from the exact uploaded files rather than trying to
-# reproduce the tar command's inclusion rules in a second implementation.
+# kubectl_prepare_control_bundle. This happens before the Job exists: a Job
+# never observes a partly populated control tree. The manifest writer applies
+# the bundle's supported top-level and execution-file inclusion rules once all
+# inputs are present.
 kubectl_populate_sweep_control_bundle() {
     local bundle="$1" results_dir="$2" endpoints="$3" selection_file="${4:-}"
     [[ -d "$bundle" && ! -L "$bundle" && -d "$results_dir" && ! -L "$results_dir" \
@@ -4711,17 +4775,16 @@ kubectl_lifecycle_operation() {
         "$kubernetes_dir" "$attempt_id" || rc=1
     if [[ "$rc" -eq 0 \
             && "$KUBECTL_LIFECYCLE_STATE" =~ ^(SUBMITTED|CANCEL_REQUESTED|TERMINAL|COLLECTION_IN_PROGRESS)$ ]]; then
-        if ! kubectl_verify_journaled_pvc_lease "$kubernetes_dir" "$attempt_id"; then
-            if [[ "$operation" == collect \
-                    && "$KUBECTL_LIFECYCLE_STATE" == COLLECTION_IN_PROGRESS ]]; then
-                # Result publication and every exact cleanup step precede
-                # Lease deletion. Recover only the final delete-to-journal
-                # interruption; active attempts still require the exact Lease.
-                kubectl_reconcile_pvc_lease_release_after_collection_cleanup \
-                    "$kubernetes_dir" "$lock_fd" "$attempt_id" || rc=1
-            else
-                rc=1
-            fi
+        if [[ "$operation" == collect \
+                && "$KUBECTL_LIFECYCLE_STATE" == COLLECTION_IN_PROGRESS ]]; then
+            # Observe without first emitting the ordinary mismatch diagnostic:
+            # a successor may legitimately own the deterministic Lease name
+            # after this attempt deleted its exact UID but missed journaling it.
+            kubectl_reconcile_pvc_lease_release_after_collection_cleanup \
+                "$kubernetes_dir" "$lock_fd" "$attempt_id" || rc=1
+        else
+            kubectl_verify_journaled_pvc_lease "$kubernetes_dir" "$attempt_id" \
+                || rc=1
         fi
     fi
     if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == PREPARED ]]; then
@@ -5220,6 +5283,8 @@ kubectl_collect_attempt() {
             "$kubernetes_dir" "$lock_fd" "$attempt_id" || recovery_rc=1
         [[ -z "${inspector:-}" ]] || _kubectl_remove_inspector "$kubernetes_dir" \
             "$lock_fd" "$inspector" "$inspector_uid" "$attempt_id" || recovery_rc=1
+        [[ "$recovery_rc" -ne 0 ]] || kubectl_release_pvc_lease \
+            "$kubernetes_dir" "$lock_fd" "$attempt_id" || recovery_rc=1
         [[ "$recovery_rc" -eq 0 ]] || return "$recovery_rc"
         kubectl_attempt_transition "$kubernetes_dir" "$lock_fd" "$attempt_id" \
             COLLECTED || return 1

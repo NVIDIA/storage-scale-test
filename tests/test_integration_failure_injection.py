@@ -162,20 +162,54 @@ def test_coordinator_forwards_signal_and_preserves_child_status(tmp_path):
         Path(plan.layout.delegate),
         "trap 'exit 42' TERM\nprintf '%s\\n' \"$BASHPID\"\nwhile true; do sleep 1; done",
     )
-    process = subprocess.Popen(
-        [str(plan.layout.wrapper), TARGET_ARGUMENT],
-        text=True,
-        stdout=subprocess.PIPE,
+    for _ in range(20):
+        process = subprocess.Popen(
+            [str(plan.layout.wrapper), TARGET_ARGUMENT],
+            text=True,
+            stdout=subprocess.PIPE,
+        )
+        assert process.stdout is not None
+        child_pid = int(process.stdout.readline().strip())
+
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=5)
+
+        assert process.returncode == 42
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    assert not Path(plan.layout.marker).exists()
+
+
+def test_coordinator_forwards_signal_before_child_pid_publication(tmp_path):
+    """A signal between fork and PID assignment is delivered after publication."""
+    plan, _ = _local_plan(tmp_path)
+    ready = tmp_path / "delegate-ready"
+    _write_delegate(
+        Path(plan.layout.delegate),
+        "trap 'exit 42' TERM\nprintf ready > \"$2\"\nwhile true; do sleep 1; done",
     )
-    assert process.stdout is not None
-    child_pid = int(process.stdout.readline().strip())
+    wrapper = Path(plan.layout.wrapper)
+    text = wrapper.read_text(encoding="utf-8")
+    fork_boundary = '"$delegate" "$@" &\nchild_pid=$!'
+    assert fork_boundary in text
+    text = text.replace(
+        fork_boundary,
+        '"$delegate" "$@" &\n'
+        'while [[ ! -e "$2" ]]; do sleep .01; done\n'
+        "kill -TERM $$\n"
+        "child_pid=$!",
+        1,
+    )
+    wrapper.write_text(text, encoding="utf-8")
 
-    process.send_signal(signal.SIGTERM)
-    process.wait(timeout=5)
+    result = subprocess.run(
+        [str(wrapper), TARGET_ARGUMENT, str(ready)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
-    assert process.returncode == 42
-    with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, 0)
+    assert result.returncode == 42, result.stderr
     assert not Path(plan.layout.marker).exists()
 
 

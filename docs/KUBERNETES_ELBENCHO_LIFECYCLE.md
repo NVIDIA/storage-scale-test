@@ -310,7 +310,7 @@ assertion at the appropriate layer; merely reaching the branch is not evidence.
 | S-04 | `test_s04_local_lifecycle_lock_rejects_a_concurrent_mutator` |
 | S-05 | `test_intended_reservation_does_not_touch_competing_pvc_owner`, `test_pvc_lease_is_create_only_and_has_no_time_expiry` |
 | S-06 | `test_interrupted_pvc_lease_creation_is_reconciled_by_exact_identity`, `test_pvc_lease_release_uses_uid_precondition_and_is_journaled`, `test_pvc_lease_release_clears_redundant_matching_creation_intent` |
-| S-07, S-08, S-09 | `test_creation_intent_cleans_object_left_before_resource_journal`, `test_creation_intent_rechecks_absence_after_create_deadline`, `test_creation_absence_retains_possible_late_object_identity`, `test_create_only_verifies_exact_identity_before_returning_uid` |
+| S-07, S-08, S-09 | `test_creation_intent_cleans_object_left_before_resource_journal`, `test_creation_intent_rechecks_absence_after_create_deadline`, `test_creation_absence_retains_possible_late_object_identity`, `test_create_only_verifies_exact_identity_before_returning_uid`, `test_delayed_pvc_lease_creation_uses_common_ambiguity_wait` |
 | S-10, T-01 | `test_observational_calls_retry_only_transient_api_failures` |
 | S-11, T-02 | `test_exhausted_observation_emits_actionable_diagnostic_envelope` |
 | S-12 | `test_worker_readiness_timeout_captures_daemonset_diagnostics` |

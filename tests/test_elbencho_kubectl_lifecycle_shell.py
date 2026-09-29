@@ -1353,6 +1353,31 @@ def test_cluster_storage_contract_reports_expected_and_observed_values() -> None
     assert "observed: volumeName=another-pv phase=Pending" in result.stderr
 
 
+def test_cluster_identity_reports_denied_lease_permission() -> None:
+    """[S-01] An authoritative RBAC denial names the missing permission."""
+    result = _bash(r"""
+        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NODE_SELECTOR=storage-test=true
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_IMAGE_PULL_POLICY=Never
+        export KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
+        kubectl() { :; }
+        kubectl_run_observational() {
+          case "$*" in
+            version) return 0 ;;
+            auth\ can-i\ get\ leases.coordination.k8s.io\ -n\ test-ns)
+              printf no
+              return 1 ;;
+            *) return 90 ;;
+          esac
+        }
+        ! kubectl_validate_cluster_identity
+    """)
+    assert result.returncode == 0, result.stderr
+    assert "require permission to get leases.coordination.k8s.io" in result.stderr
+    assert "could not verify Kubernetes Lease permission" not in result.stderr
+
+
 def test_prepare_failure_classification_preserves_local_capacity_and_path_causes() -> (
     None
 ):
@@ -1882,6 +1907,32 @@ def test_pvc_lease_release_uses_uid_precondition_and_is_journaled(
     assert result.returncode == 0, result.stderr
 
 
+def test_pvc_lease_release_accepts_successor_after_exact_uid_delete(
+    tmp_path: Path,
+) -> None:
+    """A successor may safely reacquire the deterministic name after deletion."""
+    result = _bash(_identity(tmp_path / "state") + """
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd pvc-lease \
+          Lease "$KUBECTL_PVC_LEASE_NAME" test-ns lease-uid \
+          0123456789abcdef0123456789abcdef
+        observations=0
+        kubectl_observe_pvc_lease() {
+          observations=$((observations + 1))
+          if [[ "$observations" -eq 1 ]]; then
+            printf -v "$1" '%s' $'lease-uid\t0123456789abcdef0123456789abcdef\t1234abcd\tnamespace-uid\tpv-uid\tpvc-uid\t1234abcd/0123456789abcdef0123456789abcdef'
+          else
+            printf -v "$1" '%s' $'successor-uid\tsuccessor-nonce\tsuccessor\tnamespace-uid\tpv-uid\tpvc-uid\tsuccessor/successor-nonce'
+          fi
+        }
+        kubectl_run_bounded() { cat >/dev/null; }
+        kubectl_release_pvc_lease "$root" "$fd" 1234abcd
+        kubectl_attempt_step_done "$root" 1234abcd release-pvc-lease
+        kubectl_local_lock_release "$fd"
+    """)
+    assert result.returncode == 0, result.stderr
+
+
 def test_interrupted_pvc_lease_creation_is_reconciled_by_exact_identity(
     tmp_path: Path,
 ) -> None:
@@ -1891,19 +1942,49 @@ def test_interrupted_pvc_lease_creation_is_reconciled_by_exact_identity(
         kubectl_attempt_write_creation_intent "$root" "$fd" 1234abcd pvc-lease \
           Lease "$KUBECTL_PVC_LEASE_NAME" test-ns \
           0123456789abcdef0123456789abcdef
-        observations=0
-        kubectl_observe_pvc_lease() {
-          observations=$((observations + 1))
-          if [[ "$observations" -le 2 ]]; then
-            printf -v "$1" '%s' $'lease-uid\t0123456789abcdef0123456789abcdef\t1234abcd\tnamespace-uid\tpv-uid\tpvc-uid\t1234abcd/0123456789abcdef0123456789abcdef'
+        kubectl_run_observational() {
+          if [[ "$*" == *'jsonpath={.metadata.uid}' ]]; then
+            printf lease-uid
           else
-            printf -v "$1" ''
+            printf '%s' $'Lease\t'$KUBECTL_PVC_LEASE_NAME$'\tlease-uid\t0123456789abcdef0123456789abcdef\t1234abcd'
           fi
         }
-        kubectl_run_bounded() { cat >/dev/null; }
+        kubectl_delete_owned_object() { :; }
         kubectl_release_pvc_lease "$root" "$fd" 1234abcd
         kubectl_attempt_step_done "$root" 1234abcd release-pvc-lease
         test ! -e "$root/attempts/1234abcd/creation-intents/pvc-lease.sh"
+        kubectl_local_lock_release "$fd"
+    """)
+    assert result.returncode == 0, result.stderr
+
+
+def test_delayed_pvc_lease_creation_uses_common_ambiguity_wait(
+    tmp_path: Path,
+) -> None:
+    """[S-07] [S-08] Rollback rechecks a temporarily invisible Lease."""
+    result = _bash(_identity(tmp_path / "state") + """
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_write_creation_intent "$root" "$fd" 1234abcd pvc-lease \
+          Lease "$KUBECTL_PVC_LEASE_NAME" test-ns \
+          0123456789abcdef0123456789abcdef
+        calls=$(mktemp)
+        kubectl_run_observational() {
+          printf x >> "$calls"
+          case $(wc -c < "$calls") in
+            1) return 0 ;;
+            2) printf lease-uid ;;
+            *) printf '%s' $'Lease\t'$KUBECTL_PVC_LEASE_NAME$'\tlease-uid\t0123456789abcdef0123456789abcdef\t1234abcd' ;;
+          esac
+        }
+        sleep() { :; }
+        stat() { printf '1\n'; }
+        date() { printf '1000\n'; }
+        kubectl_delete_owned_object() { printf deleted > "$root/deleted"; }
+        kubectl_release_pvc_lease "$root" "$fd" 1234abcd
+        [[ -f "$root/deleted" ]]
+        [[ $(wc -c < "$calls") -eq 3 ]]
+        [[ ! -e "$root/attempts/1234abcd/creation-intents/pvc-lease.sh" ]]
+        kubectl_attempt_step_done "$root" 1234abcd release-pvc-lease
         kubectl_local_lock_release "$fd"
     """)
     assert result.returncode == 0, result.stderr
@@ -1939,12 +2020,14 @@ def test_pvc_lease_release_clears_redundant_matching_creation_intent(
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize("successor_lease", (False, True))
 def test_collection_recovers_lease_delete_before_release_journal(
-    tmp_path: Path,
+    tmp_path: Path, successor_lease: bool
 ) -> None:
-    """Exact cleanup evidence closes the final Lease delete crash window."""
+    """Exact cleanup evidence closes deletion with no or a successor Lease."""
     results = tmp_path / "results"
     result = _bash(_identity(results / "kubernetes") + f"""
+        successor_lease={int(successor_lease)}
         kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
         kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
         kubectl_attempt_transition "$root" "$fd" 1234abcd TERMINAL
@@ -1970,7 +2053,13 @@ def test_collection_recovers_lease_delete_before_release_journal(
         kubectl_cleanup_ephemeral_helpers() {{ :; }}
         _kubectl_verify_saved_cluster_identity() {{ :; }}
         _kubectl_validate_collected_publication() {{ printf -v "$3" SUCCESS; }}
-        kubectl_observe_pvc_lease() {{ printf -v "$1" ''; }}
+        kubectl_observe_pvc_lease() {{
+          if (( successor_lease )); then
+            printf -v "$1" '%s' $'successor-uid\tsuccessor-nonce\tsuccessor\tnamespace-uid\tpv-uid\tpvc-uid\tsuccessor/successor-nonce'
+          else
+            printf -v "$1" ''
+          fi
+        }}
         _kubectl_create_inspector() {{
           echo 'unexpected inspector creation' >&2
           return 1
@@ -1982,6 +2071,7 @@ def test_collection_recovers_lease_delete_before_release_journal(
         kubectl_attempt_step_done "$root" 1234abcd release-pvc-lease
     """)
     assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=" not in result.stderr
 
 
 def test_collection_does_not_reconcile_lease_before_exact_cleanup(
@@ -2086,7 +2176,7 @@ def test_intended_reservation_does_not_touch_competing_pvc_owner(
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("failed_stage", ("release", "cleanup", "remove"))
+@pytest.mark.parametrize("failed_stage", ("release", "cleanup", "remove", "lease"))
 def test_collection_recovery_retries_every_cleanup_stage(
     tmp_path: Path, failed_stage: str
 ) -> None:
@@ -2124,14 +2214,17 @@ def test_collection_recovery_retries_every_cleanup_stage(
             printf remove- >> "$events"
             fail_once remove
         }}
-        kubectl_release_pvc_lease() {{ printf lease- >> "$events"; }}
+        kubectl_release_pvc_lease() {{
+            printf lease- >> "$events"
+            fail_once lease
+        }}
         kubectl_attempt_transition() {{ printf transition- >> "$events"; }}
         kubectl_emit_state() {{ printf '%s\\n' "$1"; }}
         ! kubectl_collect_attempt {str(results)!r} {str(results / 'kubernetes')!r} \
             9 1234abcd
         kubectl_collect_attempt {str(results)!r} {str(results / 'kubernetes')!r} \
             9 1234abcd
-        grep -F transition- "$events"
+        grep -F lease-transition- "$events"
         """)
     assert result.returncode == 0, result.stderr
 
@@ -2726,6 +2819,41 @@ def test_cancel_rejects_missing_exact_job_journal(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=LEDGER_INCONSISTENT" in result.stderr
     assert "do\\ not\\ cancel\\ by\\ label" in result.stderr
+
+
+def test_collection_reports_missing_pvc_lease_journal(tmp_path: Path) -> None:
+    """A corrupt recovery ledger fails closed with an actionable diagnostic."""
+    result = _bash(_identity(tmp_path / "state") + """
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd TERMINAL
+        kubectl_attempt_transition "$root" "$fd" 1234abcd COLLECTION_IN_PROGRESS
+        ! kubectl_reconcile_pvc_lease_release_after_collection_cleanup \
+            "$root" "$fd" 1234abcd
+        kubectl_local_lock_release "$fd"
+    """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=LEDGER_INCONSISTENT" in result.stderr
+    assert "missing\\ or\\ corrupt\\ Lease\\ journal" in result.stderr
+
+
+def test_collection_reports_conflicting_pvc_lease_journal(tmp_path: Path) -> None:
+    """A conflicting recovery journal fails closed with its exact reason."""
+    result = _bash(_identity(tmp_path / "state") + """
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd TERMINAL
+        kubectl_attempt_transition "$root" "$fd" 1234abcd COLLECTION_IN_PROGRESS
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd pvc-lease \
+          Job conflicting-name test-ns conflicting-uid \
+          0123456789abcdef0123456789abcdef
+        ! kubectl_reconcile_pvc_lease_release_after_collection_cleanup \
+            "$root" "$fd" 1234abcd
+        kubectl_local_lock_release "$fd"
+    """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=LEDGER_INCONSISTENT" in result.stderr
+    assert "conflicting\\ Lease\\ journal" in result.stderr
 
 
 def test_no_clobber_journals_remove_unpublished_temporary_files(
