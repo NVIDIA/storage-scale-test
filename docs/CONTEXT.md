@@ -98,9 +98,9 @@ Elbencho/runtime identity, and extracts isolated scenario workspaces. Real cases
 cover baseline and default I/O, failure/resume, retained data, live capture,
 Cartesian sweeps, single-file and weighted-root behavior, shared SSH homes, and
 Slurm scheduling. Fast tests cover parsing, precedence, path and workload safety,
-sizing, scheduler boundaries, failure contracts, and reporting. CI runs the full
-NFS-backed catalog concurrently on amd64 and arm64 with repeatable-teardown
-headroom; SBX is a supported local backend.
+sizing, scheduler boundaries, failure contracts, and reporting. On-demand CI
+runs the full NFS-backed catalog concurrently on amd64 and arm64 with
+repeatable-teardown headroom; SBX is a supported local backend.
 
 The kubectl filesystem sweep's implemented decisions and tradeoffs are retained
 in the historical

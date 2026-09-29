@@ -208,6 +208,37 @@ selection, nonempty benchmark output, environment snapshots, and cleanup of
 generated data directories. It runs `utils/extract-elbencho.sh` on host-side result
 copies and checks the semantic report content applicable to each scenario.
 
+## Bootstrapping prerequisites in a constrained sandbox
+
+An agent preparing a fresh, network-constrained sandbox for this suite
+(for example, a Docker SBX environment) should prefer these sources, which
+are reliably reachable even when arbitrary internet hosts are not:
+
+- Install `kind` (pin the version this repository tests, currently v0.30.0),
+  `file`, and `python3-venv` from the distribution's own `apt` repositories
+  instead of downloading GitHub release binaries.
+- Fetch `kubectl` from `dl.k8s.io` and Helm via its official
+  `get.helm.sh` install script; verify the published checksums. These
+  endpoints are commonly allowed even where generic GitHub release downloads
+  are not.
+- Run ShellCheck from the `shellcheck-py` PyPI package inside the repository's
+  `.venv-ci`, rather than fetching a standalone ShellCheck release archive.
+- Let the harness pull container images (including the pinned Elbencho image)
+  through the host Docker daemon and import them into kind, rather than
+  relying on kind's own node containers to reach registries directly — the
+  host daemon's registry path and proxy/CA configuration is usually the most
+  reliable one available. Images pulled this way stay cached in the sandbox
+  for subsequent runs.
+- Ensure the sandbox's Docker data root (commonly `/var/lib/docker`) has at
+  least the ~50 GiB this suite's images, kind nodes, and build artifacts need;
+  request a larger backing volume for it up front rather than after hitting
+  `no space left on device`.
+
+If a required tool is genuinely unavailable through these channels, install
+it into the repository's own state (a local venv, `tmp/`, or similar) rather
+than assuming it is preinstalled — see "Checks (run before committing)" in
+`AGENTS.md` for the equivalent guidance for CI tooling.
+
 ## On-demand CI
 
 The `Filesystem integration` GitHub Actions workflow runs independent amd64
@@ -215,19 +246,14 @@ and arm64 jobs concurrently. Each job runs setup twice, stops and restarts the
 fixture, proves that root lifecycle execution is rejected, runs `test` as the
 ordinary runner account, and tears down twice. A final status job requires both
 architectures to pass. The workflow is deliberately absent from ordinary
-pull-request and default-branch events.
+pull-request, push, and default-branch events.
 
-For a pull request, use the repository's existing PR authorization control—the
-same control used to start the regular PR checks. Authorization copies the
-reviewed PR commit to the trusted `pull-request/<PR-number>` branch. A push to
-that narrowly matched branch starts the integration workflow. Updating a PR
-requires authorizing its new head before a new integration run can start. An
-existing run can instead be repeated with **Re-run jobs** in GitHub Actions.
-
-Before this workflow file is present on the default branch, that authorized PR
-branch is the way to run it. After the workflow is merged, a maintainer can also
-open **Actions**, choose **Filesystem integration**, select **Run workflow**,
-and choose an authorized branch or the default branch.
+To run it, open **Actions**, choose **Filesystem integration**, and select
+**Run workflow**. Choose the workflow ref, then optionally enter a different
+source branch, tag, or commit SHA to check out and test. Leaving the source ref
+empty tests the selected workflow ref. This supports explicit runs against a
+pull-request branch, another development revision, or `main`; an existing run
+can instead be repeated with **Re-run jobs**.
 
 Delete the disposable kind cluster and, for the NFS backend when owned
 exclusively by the harness, stop NFS with:
