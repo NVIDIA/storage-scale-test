@@ -34,6 +34,16 @@ fi
 readonly SCRIPT_DIR
 readonly INVOKING_EXECUTION_SUBSTRATE="${EXECUTION_SUBSTRATE:-}"
 
+# Prepared batches are routed before env.sh can redefine a saved workload.
+if [[ -f "$SCRIPT_DIR/../../lib/_batch_functions.sh" ]]; then
+    # The independent batch library restores globals only in isolated contexts.
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/../../lib/_batch_functions.sh" || exit 1
+    batch_route_rc=0
+    elbencho_batch_cli_route io "$0" "$@" || batch_route_rc=$?
+    [[ "$batch_route_rc" == 2 ]] || exit "$batch_route_rc"
+fi
+
 print_usage() {
     cat << EOF
 Usage: $0 [FLAGS] --nodes <node_spec>
@@ -42,6 +52,15 @@ Usage: $0 [FLAGS] --nodes <node_spec>
    or: $0 --status <results_dir>
    or: $0 --cancel <results_dir>
    or: $0 --collect <results_dir>
+   or: $0 --batch [FLAGS] --nodes <node_spec>
+   or: $0 --append <batch_dir> [FLAGS] --nodes <node_spec>
+   or: $0 --start <batch_dir>
+
+Prepared batches: --batch saves the first group without dispatching;
+--append adds a group only before first start. Either filesystem launcher can
+--start or --resume the mixed batch. Start permanently freezes its execution
+set; saved group settings, not today's env.sh, control execution and retries.
+--status reports scoped execution progress, collection readiness, and next action.
 
 Runs elbencho on one or more nodes (sweep over node counts and IO sizes), or deletes
 a prior sweep subtree with --delete-only, or resumes an interrupted sweep with --resume.
@@ -669,8 +688,8 @@ fi
 # Using one datestamp for all the jobs will give output parsing script(s)
 # more options for how to group-by when given just a directory containing
 # these log files (easier to specify).
-DS=$(date -u +"%Y%m%dZ%H%M%S")
-OUTPUT_DIR="${RESULTS_DIR}/elbencho-${DS}"
+DS=${ELBENCHO_BATCH_DATESTAMP:-$(date -u +"%Y%m%dZ%H%M%S")}
+OUTPUT_DIR=${ELBENCHO_BATCH_PREPARE_DIR:-"${RESULTS_DIR}/elbencho-${DS}"}
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -700,7 +719,7 @@ if [[ -n "$sweep_read_from" ]]; then
     fi
 fi
 
-if [[ -n "$SLURM_ENABLED" ]]; then
+if [[ -n "$SLURM_ENABLED" && -z "${ELBENCHO_BATCH_PREPARE_DIR:-}" ]]; then
     print_slurm_node_warnings "$max_node_count"
 fi
 
@@ -714,6 +733,8 @@ if ! reify_all_elbencho_executions "$OUTPUT_DIR" "$nodes_spec" \
     echo "Error: failed to reify executions" >&2
     exit 1
 fi
+
+[[ -z "${ELBENCHO_BATCH_PREPARE_DIR:-}" ]] || exit 0
 
 if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
     _source_kubectl_lifecycle_helpers || exit 1

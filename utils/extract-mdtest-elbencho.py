@@ -46,6 +46,9 @@ if str(_REPO_ROOT) not in sys.path:
 from lib.env_used_yaml import (  # pylint: disable=wrong-import-position
     load_env_used_yaml,
 )
+from lib.filesystem_batch import (
+    route_batch_report,
+)  # pylint: disable=wrong-import-position
 from lib.join_datestamps import (  # pylint: disable=wrong-import-position
     join_datestamps as join_datestamps_lib,
     join_datestamps_for_filename,
@@ -2309,7 +2312,17 @@ def main() -> None:
         help="Test parsing a single CSV file (provide path without extension)",
     )
 
+    parser.add_argument(
+        "--groups", help="Select comma-separated prepared batch group IDs"
+    )
+    parser.add_argument(
+        "--output-dir", help="Write reports and plots to this directory"
+    )
     args = parser.parse_args()
+    try:
+        route_batch_report(args, "mdtest", sys.argv[1:])
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
 
     if args.normalize_to is not None and args.normalize_to <= 0:
         parser.error("--normalize-to must be a positive integer")
@@ -2405,9 +2418,13 @@ def main() -> None:
         output_dir = args.input_dirs[0]
     elif args.from_csv:
         output_dir = os.path.dirname(os.path.abspath(args.from_csv)) or "."
+    output_dir = args.output_dir or output_dir
+    os.makedirs(output_dir, exist_ok=True)
 
     if not test_configuration:
-        configuration_dirs = args.input_dirs or [output_dir]
+        configuration_dirs = args.input_dirs or [
+            os.path.dirname(os.path.abspath(args.from_csv)) or "."
+        ]
         test_configuration = load_mdtest_configuration(configuration_dirs)
 
     # Export to CSV if requested

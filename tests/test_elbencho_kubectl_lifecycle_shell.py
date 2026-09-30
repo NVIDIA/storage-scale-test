@@ -62,6 +62,145 @@ def _identity(root: Path) -> str:
     """
 
 
+def test_repeated_helper_loading_preserves_constants_and_active_locks(tmp_path):
+    """Preflight followed by dispatch must neither warn nor reset ownership."""
+    result = _bash(f"""
+        set -euo pipefail
+        root={str(tmp_path / 'kubernetes')!r}
+        kubectl_local_lock_acquire "$root" fd
+        saved_root=${{KUBECTL_LOCAL_LOCK_ROOTS[$fd]}}
+        KUBECTL_BATCH_VALIDATION_PATHS=(one two)
+        source {_FUNCTIONS!s}
+        [[ "$KUBECTL_SWEEP_MOUNT_ROOT" == /mnt/storage-scale-test ]]
+        [[ "${{KUBECTL_LOCAL_LOCK_ROOTS[$fd]}}" == "$saved_root" ]]
+        [[ "${{KUBECTL_BATCH_VALIDATION_PATHS[*]}}" == 'one two' ]]
+        kubectl_local_lock_release "$fd"
+        """)
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("remote_state", ["PREPARED", "RUNNING", "FAILED", "SUCCESS"])
+def test_remote_execution_progress_counts_only_current_attempt(tmp_path, remote_state):
+    """Read live cells, not uncollected local states or a predecessor's cells."""
+    run = tmp_path / "run"
+    definitions = run / "control/executions"
+    ledger = run / "state/executions"
+    definitions.mkdir(parents=True)
+    ledger.mkdir(parents=True)
+    for execution, status in zip(
+        ["0002", "0004", "0006", "0008"],
+        ["PENDING", "RUNNING", "SUCCESS", "FAILED"],
+    ):
+        (definitions / f"{execution}.sh").write_text("definition\n")
+        (ledger / f"{execution}.status").write_text(status + "\n")
+    (ledger / "0001.status").write_text("SUCCESS\n")
+    result = _bash(f"""
+        kubectl_attempt_remote_root() {{ printf '%s' {str(run)!r}; }}
+        kubectl_remote_tree_guard_script() {{ printf 'run=$1; attempt=$2; run_real=$1\n'; }}
+        kubectl_pvc_exec() {{ shift 2; "$@"; }}
+        kubectl_read_remote_execution_progress test-ns helper 1234abcd {remote_state}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "1 1 1 1\n"
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["startup", "missing", "invalid", "symlink-file", "symlink-directory", "no-cells"],
+)
+def test_remote_execution_progress_handles_startup_and_rejects_invalid_state(
+    tmp_path, fault
+):
+    """Only PREPARED can have an as-yet uninitialized execution ledger."""
+    run = tmp_path / "run"
+    definitions = run / "control/executions"
+    ledger = run / "state/executions"
+    definitions.mkdir(parents=True)
+    ledger.mkdir(parents=True)
+    (definitions / "0001.sh").write_text("definition\n")
+    status = ledger / "0001.status"
+    if fault == "invalid":
+        status.write_text("nonsense\n")
+    elif fault == "symlink-file":
+        target = tmp_path / "external.status"
+        target.write_text("SUCCESS\n")
+        status.symlink_to(target)
+    elif fault == "symlink-directory":
+        ledger.rmdir()
+        target = tmp_path / "external"
+        target.mkdir()
+        (target / "0001.status").write_text("SUCCESS\n")
+        ledger.symlink_to(target)
+    elif fault == "no-cells":
+        (definitions / "0001.sh").unlink()
+    elif fault == "startup":
+        ledger.rmdir()
+    remote_state = "PREPARED" if fault == "startup" else "RUNNING"
+    result = _bash(f"""
+        kubectl_attempt_remote_root() {{ printf '%s' {str(run)!r}; }}
+        kubectl_remote_tree_guard_script() {{ printf 'run=$1; attempt=$2; run_real=$1\n'; }}
+        kubectl_pvc_exec() {{ shift 2; "$@"; }}
+        kubectl_read_remote_execution_progress test-ns helper 1234abcd {remote_state}
+        """)
+    assert (result.returncode == 0) is (fault == "startup"), result.stderr
+    if fault == "startup":
+        assert result.stdout == "1 0 0 0\n"
+    else:
+        assert not result.stdout
+
+
+@pytest.mark.parametrize(
+    "missing_evidence", ["none", "lease", "remote", "resource", "intent", "predecessor"]
+)
+def test_failed_batch_submission_retry_requires_complete_rollback(
+    tmp_path: Path, missing_evidence: str
+) -> None:
+    """Only a clean initial failure may create a replacement batch attempt."""
+    root = tmp_path / "kubernetes"
+    setup = ""
+    if missing_evidence != "lease":
+        setup += (
+            'kubectl_attempt_journal_step "$root" "$fd" 1234abcd release-pvc-lease\n'
+        )
+    if missing_evidence == "remote":
+        setup += 'printf "reservation\\n" > "$root/attempts/1234abcd/remote-reservation.sh"\n'
+    if missing_evidence == "resource":
+        setup += (
+            'printf "resource\\n" > "$root/attempts/1234abcd/resources/workers.sh"\n'
+        )
+    if missing_evidence == "intent":
+        setup += 'printf "intent\\n" > "$root/attempts/1234abcd/creation-intents/worker.sh"\n'
+    if missing_evidence == "predecessor":
+        setup += (
+            'printf "aaaabbbb\\n" > "$root/attempts/1234abcd/predecessor-attempt"\n'
+        )
+    result = _bash(_identity(root) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd SUBMISSION_FAILED
+        mkdir -p "$root/attempts/1234abcd/resources" "$root/attempts/1234abcd/creation-intents"
+        {setup}
+        _kubectl_batch_failed_submission_retryable "$root" 1234abcd
+        """)
+    assert (result.returncode == 0) is (missing_evidence == "none"), result.stderr
+
+
+def test_runtime_validation_does_not_require_a_results_directory() -> None:
+    """Ordinary environment validation works before any sweep is prepared."""
+    result = _bash("""
+        set -u
+        unset results_dir
+        declare -gA TEST_DIRS=([benchmark]=1)
+        KUBECTL_NODE_SELECTOR=benchmark=true
+        kubectl_validate_cluster_identity() { return 0; }
+        kubectl_discover_candidate_nodes() { printf 'reached-discovery\\n'; return 1; }
+        if kubectl_validate_runtime_pod; then exit 1; fi
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "reached-discovery" in result.stdout
+    assert "unbound variable" not in result.stderr
+
+
 def test_ordinary_pvc_exec_does_not_attach_interactive_terminal(
     tmp_path: Path,
 ) -> None:
@@ -2065,7 +2204,7 @@ def test_collection_recovers_lease_delete_before_release_journal(
           return 1
         }}
         output=$(kubectl_lifecycle_operation collect {str(results)!r})
-        [[ "$output" == *STORAGE_SCALE_TEST_KUBECTL_STATE=SUCCESS* ]]
+        [[ "$output" == *STATE=SUCCESS* ]]
         kubectl_attempt_load_metadata "$root/attempts/1234abcd"
         [[ "$KUBECTL_LIFECYCLE_STATE" == COLLECTED ]]
         kubectl_attempt_step_done "$root" 1234abcd release-pvc-lease
@@ -2956,12 +3095,15 @@ def test_collected_terminal_status_is_a_successful_query(
         : > "$root/attempts/1234abcd/configuration.sh"
         kubectl_local_lock_release "$fd"
         kubectl_cleanup_ephemeral_helpers() {{ :; }}
-        _kubectl_validate_collected_publication() {{ printf -v "$3" {terminal}; }}
+        _kubectl_validate_collected_publication() {{
+            printf 'execution\t0001\tFAILED\n' > "$1/publication-manifest.tsv"
+            printf -v "$3" {terminal}
+        }}
         _kubectl_verify_saved_cluster_identity() {{ return 99; }}
         kubectl_lifecycle_operation status {str(results)!r}
         """)
     assert result.returncode == 0, result.stderr
-    assert f"STORAGE_SCALE_TEST_KUBECTL_STATE={terminal}" in result.stdout
+    assert f"STATE={terminal}" in result.stdout
 
 
 def test_repeated_collect_preserves_failed_benchmark_exit_semantics(
@@ -2981,11 +3123,14 @@ def test_repeated_collect_preserves_failed_benchmark_exit_semantics(
         : > "$root/attempts/1234abcd/configuration.sh"
         kubectl_local_lock_release "$fd"
         kubectl_cleanup_ephemeral_helpers() {{ :; }}
-        _kubectl_validate_collected_publication() {{ printf -v "$3" FAILED; }}
+        _kubectl_validate_collected_publication() {{
+            printf 'execution\t0001\tFAILED\n' > "$1/publication-manifest.tsv"
+            printf -v "$3" FAILED
+        }}
         ! kubectl_lifecycle_operation collect {str(results)!r}
         """)
     assert result.returncode == 0, result.stderr
-    assert "STORAGE_SCALE_TEST_KUBECTL_STATE=FAILED" in result.stdout
+    assert "STATE=FAILED" in result.stdout
 
 
 def test_status_projects_published_collection_after_remote_cleanup(
@@ -3005,16 +3150,17 @@ def test_status_projects_published_collection_after_remote_cleanup(
         : > "$root/attempts/1234abcd/configuration.sh"
         kubectl_local_lock_release "$fd"
         kubectl_cleanup_ephemeral_helpers() {{ :; }}
-        _kubectl_validate_collected_publication() {{ printf -v "$3" FAILED; }}
+        _kubectl_validate_collected_publication() {{
+            printf 'execution\t0001\tFAILED\n' > "$1/publication-manifest.tsv"
+            printf -v "$3" FAILED
+        }}
         _kubectl_verify_saved_cluster_identity() {{ return 99; }}
         kubectl_lifecycle_operation status {str(results)!r}
         """)
     assert result.returncode == 0, result.stderr
-    assert "STORAGE_SCALE_TEST_KUBECTL_STATE=FAILED" in result.stdout
-    assert (
-        "STORAGE_SCALE_TEST_KUBECTL_LOCAL_STATE=COLLECTION_IN_PROGRESS" in result.stdout
-    )
-    assert "STORAGE_SCALE_TEST_COLLECT_COMMAND=" in result.stdout
+    assert "STATE=FAILED" in result.stdout
+    assert "RESULT_COLLECTION=CLEANUP_PENDING" in result.stdout
+    assert "NEXT_ACTION=COLLECT" in result.stdout
 
 
 def test_collect_active_attempt_reports_terminal_gate_and_next_action(
@@ -3138,13 +3284,139 @@ EOF
         _kubectl_verify_saved_worker_endpoints() {{ :; }}
         kubectl_preserve_storage_failure_diagnostics() {{ printf diagnose- >> "$events"; }}
         kubectl_recover_lost_coordinator() {{ printf recover- >> "$events"; }}
+        kubectl_read_remote_execution_progress() {{
+            [[ "$4" == FAILED ]] || return 1
+            printf progress- >> "$events"
+            printf '1 0 0 0\n'
+        }}
         _kubectl_remove_inspector() {{ printf remove- >> "$events"; }}
         kubectl_emit_state() {{ printf 'STATE=%s\n' "$1"; }}
         kubectl_lifecycle_operation status {str(results)!r}
-        [[ $(cat "$events") == diagnose-recover-remove- ]]
+        [[ $(cat "$events") == diagnose-recover-progress-remove- ]]
     """)
     assert result.returncode == 0, result.stderr
     assert "STATE=FAILED" in result.stdout
+    assert "EXECUTIONS_PENDING=1" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "failure,reason",
+    [
+        (None, None),
+        ("return 1", "LEDGER_INCONSISTENT"),
+        ("echo Forbidden >&2; return 1", "AUTH"),
+        ("return 124", "TIMEOUT"),
+        (
+            "echo 'invalid Kubernetes execution status' >&2; return 1",
+            "LEDGER_INCONSISTENT",
+        ),
+    ],
+)
+@pytest.mark.parametrize("warning", [False, True])
+def test_public_status_reads_progress_before_removing_inspector(
+    tmp_path, failure, reason, warning
+):
+    """Live progress uses the existing helper and leaves client cells untouched."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    result = _bash(_identity(state) + f"""
+        set -e
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        printf 'export KUBECTL_NAMESPACE=test-ns\n' > "$root/attempts/1234abcd/configuration.sh"
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
+          Job sweep test-ns job-uid 0123456789abcdef0123456789abcdef
+        kubectl_local_lock_release "$fd"
+        mkdir -p {str(results / 'executions')!r}
+        printf PENDING > {str(results / 'executions/0001.status')!r}
+        events={str(tmp_path / 'events')!r}
+        kubectl_cleanup_ephemeral_helpers() {{ :; }}
+        _kubectl_verify_saved_cluster_identity() {{ :; }}
+        kubectl_verify_journaled_pvc_lease() {{ :; }}
+        _kubectl_create_inspector() {{ printf -v "$1" helper; printf -v "$2" uid; }}
+        kubectl_read_remote_status() {{ printf RUNNING; }}
+        kubectl_job_terminal_state() {{ return 2; }}
+        _kubectl_verify_saved_worker_endpoints() {{ :; }}
+        kubectl_read_remote_execution_progress() {{
+            [[ "$1:$2:$3:$4" == test-ns:helper:1234abcd:RUNNING ]] || return 2
+            printf progress- >> "$events"
+            {"echo 'Warning: version difference between client and server' >&2" if warning else ":"}
+            {failure or "printf '0 1 0 0\\n'"}
+        }}
+        _kubectl_remove_inspector() {{ printf remove- >> "$events"; }}
+        outcome=0
+        kubectl_lifecycle_operation status {str(results)!r} || outcome=$?
+        [[ "$outcome" == {1 if failure else 0} ]]
+        [[ $(cat "$events") == progress-remove- ]]
+        [[ $(cat {str(results / 'executions/0001.status')!r}) == PENDING ]]
+        """)
+    assert result.returncode == 0, result.stderr
+    if failure:
+        assert "STORAGE_SCALE_TEST_DIAGNOSTIC_PHASE=execution-progress" in result.stderr
+        assert f"STORAGE_SCALE_TEST_DIAGNOSTIC_REASON={reason}" in result.stderr
+        assert "EXECUTIONS_RUNNING=" not in result.stdout
+    else:
+        assert "STATE=RUNNING" in result.stdout
+        assert "EXECUTIONS_RUNNING=1" in result.stdout
+        assert "Warning:" not in result.stdout
+        if warning:
+            assert "Warning: version difference" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "outcome,counts,collection,expected,next_action",
+    [
+        ("PREPARED", "30 0 0 0", "PENDING", "PREPARING", "WAIT"),
+        ("RUNNING", "8 1 21 0", "PENDING", "RUNNING", "WAIT"),
+        ("RUNNING", "8 0 22 0", "PENDING", "BETWEEN_EXECUTIONS", "WAIT"),
+        ("RUNNING", "0 0 30 0", "PENDING", "AWAITING_COMPLETION", "WAIT"),
+        ("RUNNING", "29 0 0 1", "PENDING", "BETWEEN_EXECUTIONS", "WAIT"),
+        ("SUCCESS", "0 0 30 0", "PENDING", "SUCCESS", "COLLECT"),
+        ("FAILED", "1 0 1 1", "CLEANUP_PENDING", "FAILED", "COLLECT"),
+        ("FAILED", "1 0 1 1", "COMPLETE", "FAILED", "RESUME"),
+        ("CANCELLED", "0 0 2 0", "COMPLETE", "CANCELLED", "NONE"),
+        ("SUCCESS", "0 0 2 0", "COMPLETE", "SUCCESS", "NONE"),
+    ],
+)
+def test_status_view_separates_execution_progress_from_collection(
+    tmp_path, outcome, counts, collection, expected, next_action
+):
+    """One scoped progress view; zero running cells never proves collectibility."""
+    result = _bash(f"""
+        kubectl_emit_status_view {str(tmp_path)!r} 1234abcd {outcome} \
+            PVC {collection} '{counts}'
+        """)
+    assert result.returncode == 0, result.stderr
+    fields = dict(line.split("=", 1) for line in result.stdout.splitlines())
+    assert fields["STATE"] == expected
+    assert fields["NEXT_ACTION"] == next_action
+    assert fields["EXECUTION_SCOPE"] == "CURRENT_ATTEMPT"
+    assert fields["EXECUTIONS_TOTAL"] == str(sum(map(int, counts.split())))
+    assert fields["RESULT_COLLECTION"] == collection
+    assert not any(key.startswith("STORAGE_SCALE_TEST_") for key in fields)
+
+
+def test_status_refreshes_outcome_and_counts_after_completion(tmp_path):
+    """The final state read wins over the earlier RUNNING observation."""
+    events = tmp_path / "events"
+    result = _bash(f"""
+        events={str(events)!r}
+        kubectl_read_remote_execution_progress() {{
+            printf '%s\n' "$4" >> "$events"
+            [[ "$4" == RUNNING ]] && printf '0 1 29 0' || printf '0 0 30 0'
+        }}
+        kubectl_read_remote_status() {{ printf SUCCESS; }}
+        progress=$(kubectl_read_refreshed_execution_progress ns pod 1234abcd RUNNING)
+        [[ "$progress" == 'SUCCESS 0 0 30 0' ]]
+        kubectl_emit_status_view {str(tmp_path)!r} 1234abcd "${{progress%% *}}" \
+            PVC PENDING "${{progress#* }}"
+        """)
+    assert result.returncode == 0, result.stderr
+    assert events.read_text().splitlines() == ["RUNNING", "SUCCESS"]
+    assert "STATE=SUCCESS\n" in result.stdout
+    assert "EXECUTIONS_RUNNING=0\n" in result.stdout
+    assert "NEXT_ACTION=COLLECT\n" in result.stdout
 
 
 def test_status_reports_incomplete_cancellation_as_retryable_failure(
@@ -3170,7 +3442,7 @@ EOF
         ! kubectl_lifecycle_operation status {str(results)!r}
     """)
     assert result.returncode == 0, result.stderr
-    assert "STORAGE_SCALE_TEST_KUBECTL_STATE=CANCEL_REQUESTED" in result.stdout
+    assert "STATE=CANCEL_REQUESTED" in result.stdout
     assert (
         "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=CANCELLATION_INCOMPLETE" in result.stderr
     )
@@ -3204,8 +3476,10 @@ EOF
     assert "do\\ not\\ cancel\\ by\\ label" in result.stderr
 
 
+@pytest.mark.parametrize("terminal_on_refresh", [False, True])
 def test_completed_job_with_nonterminal_ledger_is_diagnosed(
     tmp_path: Path,
+    terminal_on_refresh: bool,
 ) -> None:
     """[T-05] Complete Job plus nonterminal PVC state is diagnosed."""
     results = tmp_path / "results"
@@ -3224,15 +3498,31 @@ EOF
         _kubectl_verify_saved_cluster_identity() {{ :; }}
         kubectl_verify_journaled_pvc_lease() {{ :; }}
         _kubectl_create_inspector() {{ printf -v "$1" helper; printf -v "$2" uid; }}
-        kubectl_read_remote_status() {{ printf RUNNING; }}
+        status_calls={str(tmp_path / 'calls')!r}
+        kubectl_read_remote_status() {{
+            printf x >> "$status_calls"
+            if [[ $(wc -c < "$status_calls") -gt 1 && {1 if terminal_on_refresh else 0} == 1 ]]; then
+                printf SUCCESS
+            else
+                printf RUNNING
+            fi
+        }}
         kubectl_job_terminal_state() {{ printf -v "$1" COMPLETE; }}
+        kubectl_read_remote_execution_progress() {{ printf '0 0 1 0\n'; }}
         _kubectl_verify_saved_worker_endpoints() {{ :; }}
         _kubectl_remove_inspector() {{ :; }}
-        ! kubectl_lifecycle_operation status {str(results)!r}
+        {"" if terminal_on_refresh else "! "}kubectl_lifecycle_operation status {str(results)!r}
     """)
     assert result.returncode == 0, result.stderr
-    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=LEDGER_INCONSISTENT" in result.stderr
-    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_EXPECTED_UID=job-uid" in result.stderr
+    if terminal_on_refresh:
+        assert "STATE=SUCCESS\n" in result.stdout
+        assert "NEXT_ACTION=COLLECT\n" in result.stdout
+        assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=" not in result.stderr
+    else:
+        assert (
+            "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=LEDGER_INCONSISTENT" in result.stderr
+        )
+        assert "STORAGE_SCALE_TEST_DIAGNOSTIC_EXPECTED_UID=job-uid" in result.stderr
 
 
 def test_missing_worker_daemonset_emits_identity_diagnostics(tmp_path: Path) -> None:

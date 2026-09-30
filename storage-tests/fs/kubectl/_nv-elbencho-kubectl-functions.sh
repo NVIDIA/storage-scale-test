@@ -15,9 +15,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Source-only foundations for the asynchronous Kubernetes sweep lifecycle.
-# Resource-specific templates and dispatch remain intentionally absent until
-# the complete state machine is available.
+# Source-only helpers for the asynchronous Kubernetes sweep lifecycle.
+# Preflight and dispatch may load these in the same shell. Preserve constants
+# and active ownership maps rather than reinitializing them on a second load.
+[[ "${_STORAGE_SCALE_TEST_KUBECTL_HELPERS_LOADED:-}" != 1 ]] || return 0
 
 if [[ "${STORAGE_SCALE_TEST_INTEGRATION:-}" == 1 \
         && -n "${KUBECTL_INTEGRATION_PVC_ROOT:-}" ]]; then
@@ -44,6 +45,7 @@ readonly KUBECTL_DIAGNOSTIC_MAX_BYTES=$((4 * 1024 * 1024))
 readonly KUBECTL_DIAGNOSTIC_MAX_PODS=4
 readonly KUBECTL_COLLECTION_ERROR_MAX_BYTES=$((128 * 1024))
 declare -gA KUBECTL_LOCAL_LOCK_ROOTS=()
+declare -ga KUBECTL_BATCH_VALIDATION_PATHS=()
 
 kubectl_normalize_logical_path() {
     local value="$1"
@@ -436,7 +438,7 @@ _kubectl_write_bundle_manifest() {
     local temporary="$manifest.tmp.${BASHPID:-$$}.$RANDOM"
     local path relative digest
     : > "$temporary" || return 1
-    for path in "$bundle"/* "$bundle"/executions/*; do
+    for path in "$bundle"/* "$bundle"/executions/* "$bundle"/groups/*/*/env_used.*; do
         [[ -f "$path" && ! -L "$path" && "$path" != "$manifest" \
             && "$path" != "$temporary" ]] || continue
         relative=${path#"$bundle/"}
@@ -680,7 +682,54 @@ kubectl_emit_state() {
     local state="$1"
     [[ "$state" =~ ^(PREPARED|SUBMITTED|RUNNING|SUCCESS|FAILED|CANCELLED|CANCEL_REQUESTED|SUBMISSION_FAILED|COLLECTED)$ ]] \
         || return 1
-    printf 'STORAGE_SCALE_TEST_KUBECTL_STATE=%s\n' "$state"
+    printf 'STATE=%s\n' "$state"
+}
+
+# Presentation only: durable lifecycle states and collection gates are unchanged.
+kubectl_emit_status_view() {
+    local results="$1" attempt="$2" outcome="$3" source="$4" collection="$5"
+    local progress="$6" pending running success failed extra display next total
+    read -r pending running success failed extra <<< "$progress"
+    [[ "$pending:$running:$success:$failed" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+$ \
+        && -z "$extra" && "$outcome" =~ ^(PREPARED|SUBMITTED|RUNNING|SUCCESS|FAILED|CANCELLED)$ \
+        && "$source" =~ ^(LOCAL|PVC)$ \
+        && "$collection" =~ ^(PENDING|CLEANUP_PENDING|COMPLETE)$ ]] || {
+        echo 'Error: invalid Kubernetes status view' >&2; return 1;
+    }
+    total=$((pending + running + success + failed))
+    (( total > 0 && total <= 9999 )) || return 1
+    display="$outcome" next=WAIT
+    case "$outcome" in
+        PREPARED|SUBMITTED) display=PREPARING ;;
+        RUNNING)
+            if (( running == 0 )); then
+                display=BETWEEN_EXECUTIONS
+                (( pending > 0 )) || display=AWAITING_COMPLETION
+            fi ;;
+        SUCCESS|FAILED|CANCELLED)
+            next=COLLECT
+            if [[ "$collection" == COMPLETE ]]; then
+                next=NONE
+                (( pending + running + failed == 0 )) || next=RESUME
+            fi ;;
+    esac
+    [[ ! -f "$results/batch-manifest.tsv" ]] || printf 'BATCH=SEALED\n'
+    printf 'ATTEMPT=%s\nSTATE=%s\n' "$attempt" "$display"
+    printf 'EXECUTION_SCOPE=CURRENT_ATTEMPT\nPROGRESS_SOURCE=%s\n' "$source"
+    printf 'EXECUTIONS_TOTAL=%s\nEXECUTIONS_PENDING=%s\nEXECUTIONS_RUNNING=%s\n' \
+        "$total" "$pending" "$running"
+    printf 'EXECUTIONS_SUCCEEDED=%s\nEXECUTIONS_FAILED=%s\n' "$success" "$failed"
+    printf 'RESULT_COLLECTION=%s\nNEXT_ACTION=%s\n' "$collection" "$next"
+}
+
+kubectl_read_collected_execution_progress() {
+    # The caller first verifies the complete local publication manifest.
+    local manifest="$1/publication-manifest.tsv"
+    awk -F '\t' '
+        $1=="execution" {counts[$3]++; total++}
+        END {if(!total) exit 1; printf "%d %d %d %d\n",
+            counts["PENDING"], counts["RUNNING"], counts["SUCCESS"], counts["FAILED"]}
+    ' "$manifest"
 }
 
 _kubectl_validate_placeholder() {
@@ -3359,6 +3408,73 @@ kubectl_read_remote_status() {
     printf '%s\n' "$status"
 }
 
+# Read the current attempt only: resumed attempts omit previously successful
+# cells. Each status is atomic, but these counts are a live, non-atomic snapshot.
+kubectl_read_remote_execution_progress() {
+    local namespace="$1" pod_name="$2" attempt_id="$3" remote_state="$4"
+    [[ "$attempt_id" =~ ^[0-9a-f]{8}$ \
+        && "$remote_state" =~ ^(PREPARED|RUNNING|SUCCESS|FAILED|CANCELLED)$ ]] || return 1
+    local remote_run guard_script
+    remote_run=$(kubectl_attempt_remote_root "$attempt_id") || return 1
+    guard_script=$(kubectl_remote_tree_guard_script) || return 1
+    local progress_script
+    # shellcheck disable=SC2016  # This script runs in the Linux helper Pod.
+    progress_script='
+remote_state=$3
+for directory in control control/executions state; do
+    [[ -d "$run/$directory" && ! -L "$run/$directory" \
+        && "$(realpath -e -- "$run/$directory")" == "$run_real/$directory" ]] || exit 1
+done
+ledger=$run/state/executions
+if [[ -e "$ledger" || -L "$ledger" ]]; then
+    [[ -d "$ledger" && ! -L "$ledger" \
+        && "$(realpath -e -- "$ledger")" == "$run_real/state/executions" ]] || exit 1
+else
+    [[ "$remote_state" == PREPARED ]] || exit 1
+fi
+shopt -s nullglob
+definitions=("$run"/control/executions/[0-9][0-9][0-9][0-9].sh)
+[[ ${#definitions[@]} -gt 0 && ${#definitions[@]} -le 9999 ]] || exit 1
+pending=0 running=0 success=0 failed=0
+for definition in "${definitions[@]}"; do
+    [[ -f "$definition" && ! -L "$definition" ]] || exit 1
+    id=${definition##*/}
+    status_file=$ledger/${id%.sh}.status
+    if [[ ! -e "$status_file" && ! -L "$status_file" && "$remote_state" == PREPARED ]]; then
+        value=PENDING
+    else
+        [[ -f "$status_file" && ! -L "$status_file" ]] || exit 1
+        value=$(< "$status_file") || exit 1
+    fi
+    case "$value" in
+        PENDING) pending=$((pending + 1)) ;;
+        RUNNING) running=$((running + 1)) ;;
+        SUCCESS) success=$((success + 1)) ;;
+        FAILED) failed=$((failed + 1)) ;;
+        *) echo "Error: invalid Kubernetes execution status: ${id%.sh}" >&2; exit 1 ;;
+    esac
+done
+printf "%s %s %s %s\n" "$pending" "$running" "$success" "$failed"
+'
+    kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu \
+        "$guard_script
+$progress_script" bash "$remote_run" "$attempt_id" "$remote_state"
+}
+
+kubectl_read_refreshed_execution_progress() {
+    local namespace="$1" inspector="$2" attempt="$3" state="$4" refreshed progress
+    progress=$(kubectl_read_remote_execution_progress "$namespace" "$inspector" \
+        "$attempt" "$state") || return $?
+    # Refresh after the ledger scan so an older RUNNING observation cannot
+    # conceal a terminal outcome committed during the intervening API calls.
+    refreshed=$(kubectl_read_remote_status "$namespace" "$inspector" "$attempt") || return $?
+    if [[ "$refreshed" != "$state" ]]; then
+        progress=$(kubectl_read_remote_execution_progress "$namespace" "$inspector" \
+            "$attempt" "$refreshed") || return $?
+    fi
+    printf '%s %s\n' "$refreshed" "$progress"
+}
+
 kubectl_stream_remote_attempt() {
     local namespace="$1" pod_name="$2" attempt_id="$3" archive_path="$4"
     local local_state_path="${5:-}" remote_state_path="${6:-}"
@@ -3777,7 +3893,7 @@ kubectl_prepare_control_bundle() {
     local output_basename="$5" coordinator_source="$6"
     [[ "$output_variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ \
         && "$attempt_id" =~ ^[0-9a-f]{8}$ \
-        && "$output_basename" =~ ^(elbencho|mdtest-elbencho)-[0-9]{8}Z[0-9]{6}$ \
+        && "$output_basename" =~ ^(elbencho|mdtest-elbencho|filesystem-batch)-[0-9]{8}Z[0-9]{6}$ \
         && -f "$coordinator_source" && ! -L "$coordinator_source" ]] || return 1
     _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
     kubectl_attempt_load_identity "$kubernetes_dir/attempts/$attempt_id" || return 1
@@ -4041,8 +4157,11 @@ kubectl_prepare_attempt_lifecycle() {
                 || primary_rc=1
             kubectl_attempt_load_metadata \
                 "$kubernetes_dir/attempts/$current_attempt" || primary_rc=1
-            [[ "$primary_rc" -ne 0 || "$KUBECTL_LIFECYCLE_STATE" == COLLECTED ]] \
-                || primary_rc=1
+            if [[ "$primary_rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" != COLLECTED ]]; then
+                [[ -f "$results_dir/batch-manifest.tsv" ]] \
+                    && _kubectl_batch_failed_submission_retryable "$kubernetes_dir" "$current_attempt" \
+                    || primary_rc=1
+            fi
         fi
     elif [[ -n "$expected_current" ]]; then
         kubectl_record_prepare_failure local-predecessor LEDGER_INCONSISTENT 1 \
@@ -4136,6 +4255,9 @@ kubectl_prepare_attempt_lifecycle() {
         local -n mapped_dirs_ref="$mapped_dirs_name"
         local -a pvc_paths=("${!mapped_dirs_ref[@]}")
         [[ -z "$mapped_read_from" ]] || pvc_paths+=("$mapped_read_from")
+        # Batch definitions can contain different roots and staged datasets.
+        # The submitter computed these paths in isolated saved cell contexts.
+        pvc_paths+=("${KUBECTL_BATCH_VALIDATION_PATHS[@]}")
         kubectl_run_prepare_phase pvc-paths kubectl_validate_pvc_paths \
             "$KUBECTL_NAMESPACE" "$helper_name" "${pvc_paths[@]}" || primary_rc=1
         [[ "$primary_rc" -ne 0 ]] || kubectl_run_prepare_phase test-dir-access \
@@ -4281,6 +4403,21 @@ kubectl_populate_sweep_control_bundle() {
         && cp -- "$source_dir/lib/_platform_functions.sh" "$bundle/_platform_functions.sh" \
         && cp -- "$source_dir/lib/_elbencho_functions.sh" "$bundle/_elbencho_functions.sh" \
         || return 1
+    if [[ -f "$results_dir/batch-manifest.tsv" ]]; then
+        elbencho_batch_verify_manifest "$results_dir" || return 1
+        cp -- "$results_dir/batch-manifest.tsv" "$bundle/batch-manifest.tsv" \
+            && cp -- "$results_dir/batch-sealed.sha256" "$bundle/batch-sealed.sha256" \
+            && cp -- "$source_dir/lib/_batch_functions.sh" "$bundle/_batch_functions.sh" \
+            || return 1
+        local group_relative
+        while IFS= read -r group_relative; do
+            _kubectl_safe_relative_file_path "$group_relative/env_used.sh" || return 1
+            mkdir -p "$bundle/$group_relative" || return 1
+            cp -- "$results_dir/$group_relative/env_used.sh" \
+                "$results_dir/$group_relative/env_used.yaml" "$bundle/$group_relative/" \
+                || return 1
+        done < <(awk -F '\t' '$1 == "group" {print $4}' "$results_dir/batch-manifest.tsv")
+    fi
     local overlay_source overlay_remote
     overlay_source=$(bash -c 'set -e; source "$1"; printf "%s" "${KUBECTL_INTEGRATION_FAILURE_OVERLAY:-}"' kubectl-env "$results_dir/env_used.sh") || return 1
     if [[ -n "$selection_file" ]]; then
@@ -4301,18 +4438,32 @@ kubectl_populate_sweep_control_bundle() {
     if [[ -n "$selection_file" ]]; then
         [[ -f "$selection_file" && ! -L "$selection_file" ]] || return 1
         local selected_id
+        local -A selected_ids=()
         while IFS= read -r selected_id; do
-            [[ "$selected_id" =~ ^[0-9]{4}$ ]] || return 1
+            [[ "$selected_id" =~ ^[0-9]{4}$ && ! -v selected_ids["$selected_id"] ]] || return 1
+            selected_ids["$selected_id"]=1
+            if [[ -f "$results_dir/batch-manifest.tsv" ]]; then
+                elbencho_batch_execution_output_dir "$results_dir" "$selected_id" >/dev/null || return 1
+                [[ "$(cat "$results_dir/executions/$selected_id.status")" =~ ^(PENDING|RUNNING|FAILED)$ ]] || return 1
+            fi
             definitions+=("$results_dir/executions/$selected_id.sh")
         done < "$selection_file"
     else
-        definitions=("$results_dir"/executions/[0-9][0-9][0-9][0-9].sh)
+        if [[ -f "$results_dir/batch-manifest.tsv" ]]; then
+            while IFS= read -r id; do
+                definitions+=("$results_dir/executions/$id.sh")
+            done < <(awk -F '\t' '$1 == "execution" {print $2}' "$results_dir/batch-manifest.tsv")
+        else
+            definitions=("$results_dir"/executions/[0-9][0-9][0-9][0-9].sh)
+        fi
     fi
     [[ ${#definitions[@]} -gt 0 ]] || return 1
     for definition in "${definitions[@]}"; do
         [[ -f "$definition" && ! -L "$definition" ]] || return 1
         cp -- "$definition" "$bundle/executions/$(basename "$definition")" || return 1
     done
+    [[ ! -f "$bundle/batch-manifest.tsv" ]] \
+        || elbencho_batch_verify_manifest "$bundle" subset || return 1
     : > "$bundle/worker-endpoints.tsv" || return 1
     while IFS=$'\t' read -r node node_uid pod pod_uid ip arch image extra; do
         [[ -z "${extra:-}" ]] && kubectl_validate_object_name "$node" \
@@ -4565,6 +4716,27 @@ kubectl_cleanup_ephemeral_helpers() {
     done
 }
 
+_kubectl_batch_workload_paths() (
+    local results_dir="$1" id
+    [[ -f "$results_dir/batch-manifest.tsv" ]] || return 0
+    elbencho_batch_verify_manifest "$results_dir" || return 1
+    while IFS= read -r id; do
+        (
+            # shellcheck disable=SC1090  # Verified, immutable local definition.
+            source "$results_dir/executions/$id.sh" || exit 1
+            local target
+            local -a targets=()
+            IFS=, read -ra targets <<< "$ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV"
+            [[ ${#targets[@]} -gt 0 ]] || exit 1
+            for target in "${targets[@]}"; do
+                kubectl_map_logical_path "$target" || exit 1
+            done
+            [[ -z "${ELBENCHO_SWEEP_READ_FROM:-}" ]] \
+                || kubectl_map_read_from_path "$ELBENCHO_SWEEP_READ_FROM" || exit 1
+        ) || return 1
+    done < <(awk -F '\t' '$1 == "execution" {print $2}' "$results_dir/batch-manifest.tsv")
+)
+
 kubectl_submit_sweep() {
     local results_dir="$1" required_nodes="$2" expected_current="${3:-}"
     [[ -d "$results_dir" && "$required_nodes" =~ ^[1-9][0-9]*$ ]] || return 1
@@ -4574,7 +4746,21 @@ kubectl_submit_sweep() {
     kubectl_map_test_dirs mapped_dirs || return 1
     local control_logical_root control_test_root
     kubectl_select_control_root control_logical_root control_test_root || return 1
+    if [[ -f "$results_dir/batch-manifest.tsv" && -n "${KUBECTL_CONTROL_LOGICAL_ROOT:-}" ]]; then
+        kubectl_validate_saved_control_layout || return 1
+        [[ "$control_logical_root" == "$KUBECTL_CONTROL_LOGICAL_ROOT" \
+            && "$control_test_root" == "$KUBECTL_CONTROL_TEST_ROOT" ]] || {
+            echo "Error: batch canonical control root differs from its saved union" >&2
+            return 1
+        }
+    fi
     kubectl_set_control_layout "$control_logical_root" "$control_test_root" || return 1
+    # Keep all group roots available for canonical layout and access checks,
+    # even when this attempt contains only unfinished execution definitions.
+    local batch_paths=""
+    batch_paths=$(_kubectl_batch_workload_paths "$results_dir") || return 1
+    local -a KUBECTL_BATCH_VALIDATION_PATHS=()
+    [[ -z "$batch_paths" ]] || mapfile -t KUBECTL_BATCH_VALIDATION_PATHS <<< "$batch_paths"
     local mapped_read_from=""
     [[ -z "${ELBENCHO_SWEEP_READ_FROM:-}" ]] \
         || mapped_read_from=$(kubectl_map_read_from_path "$ELBENCHO_SWEEP_READ_FROM") || return 1
@@ -4740,7 +4926,15 @@ kubectl_lifecycle_operation() {
             >/dev/null || rc=1
         kubectl_local_lock_release "$lock_fd" || rc=1
         [[ "$rc" -eq 0 ]] || return "$rc"
-        kubectl_emit_state "$collected_terminal"
+        if [[ "$operation" == status ]]; then
+            local collected_progress
+            collected_progress=$(kubectl_read_collected_execution_progress \
+                "$kubernetes_dir/attempts/$attempt_id/collected-state") || return 1
+            kubectl_emit_status_view "$results_dir" "$attempt_id" "$collected_terminal" \
+                LOCAL COMPLETE "$collected_progress" || return 1
+        else
+            kubectl_emit_state "$collected_terminal"
+        fi
         [[ "$operation" == status || "$collected_terminal" == SUCCESS ]]
         return
     fi
@@ -4759,9 +4953,11 @@ kubectl_lifecycle_operation() {
             >/dev/null || rc=1
         kubectl_local_lock_release "$lock_fd" || rc=1
         [[ "$rc" -eq 0 ]] || return "$rc"
-        kubectl_emit_state "$published_terminal"
-        printf 'STORAGE_SCALE_TEST_KUBECTL_LOCAL_STATE=COLLECTION_IN_PROGRESS\n'
-        kubectl_emit_lifecycle_commands "$results_dir"
+        local published_progress
+        published_progress=$(kubectl_read_collected_execution_progress \
+            "$kubernetes_dir/attempts/$attempt_id/collected-state") || return 1
+        kubectl_emit_status_view "$results_dir" "$attempt_id" "$published_terminal" \
+            LOCAL CLEANUP_PENDING "$published_progress" || return 1
         return 0
     fi
     if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED ]]; then
@@ -4858,6 +5054,13 @@ kubectl_lifecycle_operation() {
                 fi
             fi
         fi
+        # A terminal Job observation is newer than the initial PVC read.
+        # Refresh before diagnosing a completed Job with a nonterminal ledger.
+        if [[ "$rc" -eq 0 && "$job_rc" -eq 0 \
+                && "$KUBECTL_LIFECYCLE_STATE" == SUBMITTED ]]; then
+            remote_state=$(kubectl_read_remote_status "$KUBECTL_NAMESPACE" \
+                "$inspector" "$attempt_id") || rc=1
+        fi
         if [[ "$rc" -eq 0 && "$remote_state" =~ ^(PREPARED|RUNNING)$ \
                 && "$KUBECTL_LIFECYCLE_STATE" == SUBMITTED ]]; then
             # Endpoint identity is the more specific failure evidence.  Check
@@ -4909,9 +5112,44 @@ kubectl_lifecycle_operation() {
                     "$attempt_id" || rc=1
             fi
         fi
+        local progress="" progress_rc=0 progress_reason="" progress_action=""
+        if [[ "$rc" -eq 0 ]]; then
+            # Reuse the phase capture adapter to keep benign kubectl warnings
+            # on stderr, not inside the structured progress response. Its
+            # bounded failure evidence remains available for classification.
+            KUBECTL_PREPARE_FAILURE_OUTPUT=""
+            kubectl_run_prepare_phase_capture progress execution-progress \
+                kubectl_read_refreshed_execution_progress \
+                "$KUBECTL_NAMESPACE" "$inspector" "$attempt_id" "$remote_state" \
+                || progress_rc=$?
+            if [[ "$progress_rc" -ne 0 ]]; then
+                local progress_error="$KUBECTL_PREPARE_FAILURE_OUTPUT"
+                local progress_evidence
+                progress_evidence=$(printf '%s\n' "$progress_error" \
+                    | sed '/^Warning: version difference between client /d')
+                kubectl_classify_prepare_failure progress_reason remote-control \
+                    "$progress_rc" "$progress_error" || progress_reason=API_UNAVAILABLE
+                progress_action=$(_kubectl_observation_safe_action "$progress_reason")
+                if [[ "$progress_rc" -eq 1 && ( -z "$progress_evidence" \
+                        || "$progress_error" == *'invalid Kubernetes execution status'* ) ]]; then
+                    progress_reason=LEDGER_INCONSISTENT
+                    progress_action="inspect the current attempt execution ledger and retry --status"
+                fi
+                KUBECTL_ATTEMPT_ID="$attempt_id" \
+                    KUBECTL_REMOTE_STATE="$remote_state" \
+                    kubectl_report_lifecycle_error status execution-progress \
+                        "$progress_reason" "$progress_action" unknown || true
+                rc=1
+            fi
+        fi
         [[ -z "${inspector:-}" ]] || _kubectl_remove_inspector "$kubernetes_dir" \
             "$lock_fd" "$inspector" "$inspector_uid" "$attempt_id" || rc=1
-        [[ "$rc" -ne 0 ]] || kubectl_emit_state "$remote_state"
+        if [[ "$rc" -eq 0 ]]; then
+            remote_state=${progress%% *}
+            progress=${progress#* }
+            kubectl_emit_status_view "$results_dir" "$attempt_id" "$remote_state" \
+                PVC PENDING "$progress" || rc=1
+        fi
     elif [[ "$rc" -eq 0 && "$operation" == cancel ]]; then
         if [[ "$KUBECTL_LIFECYCLE_STATE" == COLLECTED ]]; then
             kubectl_emit_state COLLECTED
@@ -4942,6 +5180,11 @@ _kubectl_validate_collected_publication() {
     local -A seen_executions=() execution_states=() seen_sources=()
     local -A seen_destinations=() source_roles=() source_destinations=()
     local -A destination_roles=() destination_sources=()
+    local control_dir="${definitions_dir%/*}" batch=0
+    if [[ -f "$control_dir/batch-manifest.tsv" ]]; then
+        elbencho_batch_verify_manifest "$control_dir" subset || return 1
+        batch=1
+    fi
     while IFS= read -r line || [[ -n "$line" ]]; do
         IFS=$'\t' read -r kind first second third fourth fifth extra <<< "$line"
         case "$kind" in
@@ -4968,6 +5211,10 @@ _kubectl_validate_collected_publication() {
                     && "$second" =~ ^[A-Za-z0-9._/-]+$ \
                     && "$third" =~ ^[0-9]+$ && "$fourth" =~ ^[0-9a-f]{64}$ \
                     && -z "${fifth:-}" ]] || return 1
+                if [[ "$batch" -eq 1 && "$kind" == ledger ]]; then
+                    [[ "$first" == "$second" \
+                        && "$first" =~ ^(run\.status|run-summary\.tsv|startup-error\.txt|coordinator-loss\.tsv|executions/[0-9]{4}\.(status|exitcode|workers\.tsv))$ ]] || return 1
+                fi
                 _kubectl_safe_relative_file_path "$first" \
                     && _kubectl_safe_relative_file_path "$second" \
                     && [[ ! -v seen_sources["$first"] \
@@ -4992,11 +5239,19 @@ _kubectl_validate_collected_publication() {
     terminal_state=$(cat "$state_dir/run.status" 2>/dev/null || true)
     [[ "$terminal_state" =~ ^(SUCCESS|FAILED|CANCELLED)$ ]] || return 1
     local core
-    for core in run.status run-summary.tsv env_used.sh env_used.yaml; do
+    local -a core_paths=(run.status run-summary.tsv env_used.sh env_used.yaml)
+    if [[ "$batch" -eq 1 ]]; then
+        core_paths+=(batch-manifest.tsv batch-sealed.sha256)
+        while IFS= read -r core; do
+            core_paths+=("$core/env_used.sh" "$core/env_used.yaml")
+        done < <(awk -F '\t' '$1 == "group" {print $4}' "$control_dir/batch-manifest.tsv")
+    fi
+    for core in "${core_paths[@]}"; do
         [[ -v source_roles["$core"] \
             && "${source_destinations[$core]}" == "$core" ]] || return 1
-        if [[ "$core" == env_used.* ]]; then
+        if [[ "$core" == env_used.* || "$core" == batch-* || "$core" == groups/* ]]; then
             [[ "${source_roles[$core]}" == snapshot ]] || return 1
+            [[ "$batch" -eq 0 ]] || cmp -s -- "$state_dir/$core" "$control_dir/$core" || return 1
         else
             [[ "${source_roles[$core]}" == ledger ]] || return 1
         fi
@@ -5014,6 +5269,31 @@ _kubectl_validate_collected_publication() {
         && "${#seen_executions[@]}" -eq "$expected_count" ]] || return 1
     for id in "${!seen_executions[@]}"; do
         [[ -v expected_executions["$id"] ]] || return 1
+    done
+    if [[ "$batch" -eq 1 ]]; then
+        local ledger_source
+        for ledger_source in "${!source_roles[@]}"; do
+            [[ "${source_roles[$ledger_source]}" == ledger \
+                && "$ledger_source" =~ ^executions/([0-9]{4})\. ]] || continue
+            [[ -v expected_executions["${BASH_REMATCH[1]}"] ]] || return 1
+        done
+    fi
+    local row remote_result local_result relative_result result_id result_prefix
+    for row in "${result_rows[@]}"; do
+        IFS=$'\t' read -r remote_result local_result <<< "$row"
+        [[ "$remote_result" =~ ^results/([0-9]{4})/(.+)$ ]] || return 1
+        result_id="${BASH_REMATCH[1]}"
+        relative_result="${BASH_REMATCH[2]}"
+        [[ -v expected_executions["$result_id"] ]] || return 1
+        if [[ "$batch" -eq 1 && "$relative_result" =~ ^executions/([0-9]{4})\. ]]; then
+            [[ "${BASH_REMATCH[1]}" == "$result_id" ]] || return 1
+        fi
+        result_prefix=""
+        if [[ "$batch" -eq 1 ]]; then
+            result_prefix=$(elbencho_batch_execution_output_dir "$control_dir" "$result_id") || return 1
+            result_prefix="${result_prefix#"$control_dir"/}/"
+        fi
+        [[ "$local_result" == "$result_prefix$relative_result" ]] || return 1
     done
     for id in "${!expected_executions[@]}"; do
         [[ -v execution_states["$id"] ]] || return 1
@@ -5042,9 +5322,14 @@ _kubectl_validate_collected_publication() {
                     "$definitions_dir/$id.sh" || workload_rc=$?
                 case "$workload_rc" in
                     0)
-                        [[ "${destination_roles[executions/$id.workload.tsv]:-}" \
+                        result_prefix=""
+                        if [[ "$batch" -eq 1 ]]; then
+                            result_prefix=$(elbencho_batch_execution_output_dir "$control_dir" "$id") || return 1
+                            result_prefix="${result_prefix#"$control_dir"/}/"
+                        fi
+                        [[ "${destination_roles[${result_prefix}executions/$id.workload.tsv]:-}" \
                             == result \
-                            && "${destination_sources[executions/$id.workload.tsv]:-}" \
+                            && "${destination_sources[${result_prefix}executions/$id.workload.tsv]:-}" \
                                 == "results/$id/executions/$id.workload.tsv" ]] \
                             || return 1
                         ;;
@@ -5105,6 +5390,12 @@ _kubectl_merge_collected_results() {
     [[ "$reason_output" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
     printf -v "$reason_output" '%s' LEDGER_INCONSISTENT
     [[ "$attempt_id" =~ ^[0-9a-f]{8}$ ]] || return 1
+    if [[ -f "$results_dir/batch-manifest.tsv" ]]; then
+        elbencho_batch_verify_manifest "$results_dir" || return 1
+        cmp -s -- "$results_dir/batch-manifest.tsv" "$state_dir/batch-manifest.tsv" \
+            && cmp -s -- "$results_dir/batch-sealed.sha256" "$state_dir/batch-sealed.sha256" \
+            || return 1
+    fi
     local manifest="$state_dir/publication-manifest.tsv" kind remote local_path bytes digest extra
     _kubectl_remove_superseded_collection_paths "$state_dir" "$results_dir" \
         "$reason_output" \
@@ -5195,10 +5486,16 @@ _kubectl_remove_superseded_collection_paths() {
         || printf -v "$reason_output" '%s' LEDGER_INCONSISTENT
     local current_manifest="$state_dir/publication-manifest.tsv"
     local kind first second _rest prior_manifest remote local_path bytes digest extra
-    local -A resumed_ids=()
+    local -A resumed_ids=() current_digests=()
     while IFS=$'\t' read -r kind first second _rest; do
         [[ "$kind" == execution && "$first" =~ ^[0-9]{4}$ ]] || continue
         resumed_ids["$first"]=1
+    done < "$current_manifest"
+    while IFS=$'\t' read -r kind remote local_path bytes digest extra; do
+        [[ "$kind" == result || "$kind" == ledger ]] || continue
+        [[ -z "${extra:-}" && "$digest" =~ ^[0-9a-f]{64}$ ]] \
+            && _kubectl_safe_relative_file_path "$local_path" || return 1
+        current_digests["$local_path"]="$digest"
     done < "$current_manifest"
     local restore_nullglob=0
     shopt -q nullglob && restore_nullglob=1
@@ -5227,9 +5524,16 @@ _kubectl_remove_superseded_collection_paths() {
                 "$reason_output" \
                 || return 1
             [[ -e "$destination" ]] || continue
-            [[ -f "$destination" && ! -L "$destination" \
-                && "$(_kubectl_sha256_file "$destination")" == "$digest" ]] \
-                || return 1
+            [[ -f "$destination" && ! -L "$destination" ]] || return 1
+            local destination_digest
+            destination_digest=$(_kubectl_sha256_file "$destination") || return 1
+            if [[ "$destination_digest" != "$digest" ]]; then
+                # An interrupted import may already have replaced this prior
+                # artifact. Keep it only when the current verified publication
+                # proves its exact bytes; unknown content remains an error.
+                [[ "${current_digests[$local_path]:-}" == "$destination_digest" ]] || return 1
+                continue
+            fi
             if ! rm -f -- "$destination"; then
                 [[ -z "$reason_output" ]] \
                     || printf -v "$reason_output" '%s' LOCAL_IO
@@ -5517,6 +5821,31 @@ kubectl_collect_attempt() {
     return "$rc"
 }
 
+_kubectl_batch_failed_submission_retryable() {
+    local kubernetes_dir="$1" attempt_id="$2"
+    local metadata_dir="$kubernetes_dir/attempts/$attempt_id" path key
+    kubectl_attempt_load_metadata "$metadata_dir" || return 1
+    [[ "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED \
+        && ! -e "$metadata_dir/predecessor-attempt" \
+        && ! -L "$metadata_dir/predecessor-attempt" ]] || return 1
+    kubectl_attempt_step_done "$kubernetes_dir" "$attempt_id" release-pvc-lease || return 1
+    if [[ -e "$metadata_dir/remote-reservation.sh" || -L "$metadata_dir/remote-reservation.sh" ]]; then
+        [[ -f "$metadata_dir/remote-reservation.sh" && ! -L "$metadata_dir/remote-reservation.sh" ]] || return 1
+        kubectl_attempt_step_done "$kubernetes_dir" "$attempt_id" release-remote-run || return 1
+    fi
+    for path in "$metadata_dir/creation-intents"/*.sh; do
+        [[ ! -e "$path" && ! -L "$path" ]] || return 1
+    done
+    for path in "$metadata_dir/resources"/*.sh; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        [[ -f "$path" && ! -L "$path" ]] || return 1
+        key=$(basename "$path" .sh)
+        [[ "$key" == pvc-lease ]] && continue
+        kubectl_attempt_step_done "$kubernetes_dir" "$attempt_id" "delete-$key" || return 1
+    done
+    return 0
+}
+
 kubectl_resume_collected_sweep() {
     local results_dir="$1" attempt_id lock_fd state_dir coordinator_source
     local kubernetes_dir="$results_dir/kubernetes"
@@ -5528,7 +5857,17 @@ kubectl_resume_collected_sweep() {
         rc=1
     fi
     [[ "$rc" -ne 0 ]] || kubectl_attempt_load_metadata "$kubernetes_dir/attempts/$attempt_id" || rc=1
-    if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" != COLLECTED ]]; then
+    local retry_submission=0
+    if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED \
+        && -f "$results_dir/batch-manifest.tsv" ]]; then
+        if _kubectl_batch_failed_submission_retryable "$kubernetes_dir" "$attempt_id"; then
+            retry_submission=1
+        else
+            echo "Error: failed batch submission lacks complete rollback evidence" >&2
+            rc=1
+        fi
+    fi
+    if [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" != COLLECTED && "$retry_submission" -eq 0 ]]; then
         kubectl_emit_lifecycle_commands "$results_dir" || true
         KUBECTL_ATTEMPT_ID="$attempt_id" \
             KUBECTL_DIAGNOSTIC_LOCAL_STATE_PATH="$kubernetes_dir/attempts/$attempt_id/state.sh" \
@@ -5546,8 +5885,20 @@ kubectl_resume_collected_sweep() {
     # snapshot and can contain a bug fixed after collection.
     [[ "$rc" -ne 0 ]] || [[ -f "$coordinator_source" && ! -L "$coordinator_source" ]] \
         || rc=1
-    [[ "$rc" -ne 0 ]] || "$BASH" "$coordinator_source" \
-        --select-collected-resume "$state_dir" > "$results_dir/executions/.kubectl-resume.tsv" || rc=1
+    if [[ "$rc" -eq 0 ]]; then
+        if [[ "$retry_submission" -eq 1 ]]; then
+            local retry_id retry_status
+            : > "$results_dir/executions/.kubectl-resume.tsv" || rc=1
+            while IFS= read -r retry_id; do
+                retry_status=$(cat "$results_dir/executions/$retry_id.status") || { rc=1; break; }
+                [[ "$retry_status" == PENDING ]] || { rc=1; break; }
+                printf '%s\tRUN\n' "$retry_id" >> "$results_dir/executions/.kubectl-resume.tsv" || { rc=1; break; }
+            done < <(awk -F '\t' '$1 == "execution" {print $2}' "$results_dir/batch-manifest.tsv")
+        else
+            "$BASH" "$coordinator_source" --select-collected-resume "$state_dir" \
+                > "$results_dir/executions/.kubectl-resume.tsv" || rc=1
+        fi
+    fi
     local selection="$results_dir/executions/.kubectl-resume.tsv"
     local selection_ids="$results_dir/executions/.kubectl-resume-ids.tsv"
     local max_nodes=0 id action nodes
@@ -5580,3 +5931,5 @@ kubectl_resume_collected_sweep() {
     export KUBECTL_SUBMIT_EXECUTIONS_FILE="$selection_ids"
     kubectl_submit_sweep "$results_dir" "$max_nodes" "$attempt_id"
 }
+
+readonly _STORAGE_SCALE_TEST_KUBECTL_HELPERS_LOADED=1

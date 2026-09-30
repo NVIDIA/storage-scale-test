@@ -28,6 +28,13 @@ Both workloads use the same attempt and execution ledgers. Metadata cells
 publish their per-iteration `.out` and `.csv` files; filesystem IO cells retain
 their workload-specific completion artifacts.
 
+Prepared filesystem batches add a local assembly phase before attempt creation.
+`--batch` and `--append` publish only local immutable group snapshots, execution
+definitions, and the versioned batch manifest. They create no Kubernetes or PVC
+resources. Start validates the complete saved profile and discovers capacity,
+then permanently seals the manifest before entering the attempt lifecycle below.
+A sealed batch remains immutable after submission failure.
+
 ## Failure policy and boundary
 
 Failures have three support classes:
@@ -51,7 +58,7 @@ the last proven state, exits nonzero, and reports the uncertainty.
 
 ## State machines
 
-The lifecycle comprises three authoritative state machines. Kubernetes Job
+The attempt lifecycle comprises three authoritative state machines. Kubernetes Job
 state is corroborating evidence, not a fourth source of lifecycle truth.
 
 ### Local attempt lifecycle
@@ -84,6 +91,13 @@ remote outcome is durably terminal and measured I/O has ended. The exact Job
 must additionally be terminal or verified absent before collection may
 publish or remove remote state.
 
+For a sealed batch, an initial `SUBMISSION_FAILED` attempt can be replaced by
+`--resume` only when all execution cells remain `PENDING`, no predecessor or
+creation intent remains, and the existing exact-resource journal proves every
+resource deletion, PVC Lease release, and reserved run-tree release. An incomplete
+rollback retains the existing recovery gate. Ordinary completed attempts still
+require collection before resume.
+
 ### PVC run lifecycle
 
 The PVC is authoritative for benchmark progress until collection:
@@ -107,6 +121,8 @@ immutable attempt configuration. The hidden directory is created by the
 configured workload identity; the PVC mount root need not be writable. The
 PVC-wide Lease remains discoverable even when competing invocations configure
 different test roots.
+For batches, selection uses the union of all saved group roots; resume retains
+that same canonical root even when only a later group's cells remain.
 
 ### Per-cell lifecycle
 
@@ -121,6 +137,15 @@ A cell never returns to `PENDING` within an attempt. Coordinator loss while a
 cell is `RUNNING` turns it into a collectible failure; later cells remain
 `PENDING`. Resume creates another attempt containing the cells that did not
 succeed. Collected successful cells and their results remain immutable.
+
+A batch control bundle retains the complete sealed manifest and every group's
+immutable snapshots, with only the selected execution definitions on resume.
+The coordinator verifies each included definition's committed membership and
+group mapping and runs cells in isolated contexts. Publication keeps the global
+execution ledger at the batch root while mapping each result and completion
+artifact to its owning group directory. Collection verifies those exact mappings
+and snapshot contents before importing results; it cannot reassign an artifact
+to another group or rewrite a previously successful cell.
 
 ### Kubernetes Job evidence
 
@@ -140,9 +165,9 @@ collectible failure when the saved identity and durable control state agree.
 
 | Local state | Public status behavior |
 |---|---|
-| `PREPARED` | Report `PREPARED`, or reconcile a provably failed submission to `SUBMISSION_FAILED`. |
+| `PREPARED` | Report preparation, or reconcile a provably failed submission to `SUBMISSION_FAILED`. |
 | `SUBMISSION_FAILED` | Report `SUBMISSION_FAILED`. |
-| `SUBMITTED` | Report the validated PVC state: `PREPARED`, `RUNNING`, `SUCCESS`, `FAILED`, or `CANCELLED`. |
+| `SUBMITTED` | Project the validated PVC state and current-attempt progress as described below. |
 | `CANCEL_REQUESTED` | Report pending cancellation and direct the user to retry `--cancel`. |
 | `TERMINAL` | Report the validated terminal PVC outcome. |
 | `COLLECTION_IN_PROGRESS` | Report the terminal outcome and resumable collection context. |
@@ -150,6 +175,21 @@ collectible failure when the saved identity and durable control state agree.
 
 Identity, authentication, query, and consistency failures return nonzero
 instead of inventing another state value.
+
+Public output uses `STATE=<outcome>`. During preparation it reports `PREPARING`;
+a durable `RUNNING` attempt with no running cell reports `BETWEEN_EXECUTIONS`
+when cells remain pending, otherwise `AWAITING_COMPLETION`. These are display
+projections, not additional durable states or proof of the coordinator's phase.
+The outcome is refreshed after the execution scan; a transition refreshes counts
+once. Counts remain bounded observations, not an atomic sweep-wide transaction.
+
+`ATTEMPT` identifies the current attempt. `EXECUTION_SCOPE=CURRENT_ATTEMPT` and
+`EXECUTIONS_{TOTAL,PENDING,RUNNING,SUCCEEDED,FAILED}` exclude previously successful
+cells on resume. Only one progress view is emitted: `PROGRESS_SOURCE=PVC` before
+publication, or `LOCAL` for verified collected state. `RESULT_COLLECTION` is
+`PENDING`, `CLEANUP_PENDING`, or `COMPLETE`; `NEXT_ACTION` is `WAIT`, `COLLECT`,
+`RESUME`, or `NONE`. A terminal PVC outcome permits collect, which still enforces
+exact Job quiescence before import. Zero running cells alone never permits it.
 
 ## Invariants
 
@@ -210,7 +250,7 @@ instead of inventing another state value.
 | Collection publication begins | `TERMINAL -> COLLECTION_IN_PROGRESS` after bounded archive receipt and before extraction or result publication. The unpublished archive may exist while local state remains `TERMINAL`. |
 | Local import checkpoint | Verified state is atomically installed as `collected-state` after result merging. |
 | Collection completes | Remote and resource cleanup completes, then local state becomes `COLLECTED`. |
-| Resume succeeds | A new attempt becomes current under compare-and-swap against the collected predecessor. |
+| Resume succeeds | A new attempt becomes current under compare-and-swap against the collected predecessor, or a sealed batch's initial failed submission with complete rollback evidence. |
 
 ## Fault matrix
 

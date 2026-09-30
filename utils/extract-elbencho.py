@@ -67,6 +67,7 @@ if str(_REPO_ROOT) not in sys.path:
 # Local import after sys.path: repo root must be on path first.
 # pylint: disable=wrong-import-position
 from lib.env_used_yaml import apply_env_used_to_metrics, load_env_used_yaml
+from lib.filesystem_batch import route_batch_report
 from lib.elbencho_live_report import (
     DomainAnalysis,
     LiveAnalysis,
@@ -4558,7 +4559,17 @@ def main() -> None:
         help="Maximum clients displayed in each live underperformance heatmap",
     )
 
+    parser.add_argument(
+        "--groups", help="Select comma-separated prepared batch group IDs"
+    )
+    parser.add_argument(
+        "--output-dir", help="Write reports and plots to this directory"
+    )
     args = parser.parse_args()
+    try:
+        route_batch_report(args, "io", sys.argv[1:])
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     if args.from_csv and args.input_dirs:
         parser.error("--from-csv cannot be combined with input directories")
 
@@ -4721,7 +4732,8 @@ def main() -> None:
     # Write to CSV if requested
     if args.to_csv:
         # Use the first input directory or current directory if none provided
-        output_dir = args.input_dirs[0] if args.input_dirs else "."
+        output_dir = args.output_dir or (args.input_dirs[0] if args.input_dirs else ".")
+        os.makedirs(output_dir, exist_ok=True)
         csv_filename = "elbencho-metrics.csv"
         csv_path = os.path.join(output_dir, csv_filename)
         try:
@@ -4736,6 +4748,8 @@ def main() -> None:
         output_dir = args.input_dirs[0]
     elif args.from_csv:
         output_dir = os.path.dirname(os.path.abspath(args.from_csv))
+    output_dir = args.output_dir or output_dir
+    os.makedirs(output_dir, exist_ok=True)
 
     if metrics:
         if args.markdown:

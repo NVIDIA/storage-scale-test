@@ -3736,6 +3736,11 @@ reify_all_mdtest_executions() {
 # Usage: list_elbencho_execution_ids <executions_dir>
 list_elbencho_execution_ids() {
     local executions_dir="$1"
+    if [[ -f "${executions_dir%/*}/batch-manifest.tsv" ]]; then
+        awk -F '\t' '$1=="execution" {print $2}' \
+            "${executions_dir%/*}/batch-manifest.tsv"
+        return $?
+    fi
     local f
     if [[ ! -d "$executions_dir" ]]; then
         return 0

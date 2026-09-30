@@ -458,6 +458,61 @@ def _failure_resume() -> FilesystemScenarioSpec:
     )
 
 
+def _mixed_batch() -> FilesystemScenarioSpec:
+    """Prepare three groups with repeated IO coordinates and changed provenance."""
+    first = _step(
+        "prepare-first-io",
+        ("--batch", "--bio", "--nodes", "1"),
+        _SHARED_ENV,
+        _coordinates((1,), ("4K",), (1,), (1,)),
+        _NORMAL_PHASES,
+        timeout_seconds=600,
+        exports=("batch_results_dir",),
+    )
+    metadata = _step(
+        "append-metadata",
+        ("--append", "{batch_results_dir}", "--nodes", "2", "--tasks", "1"),
+        (
+            "unset TEST_DIRS",
+            'declare -A TEST_DIRS=(["{test_root_secondary}"]=1)',
+            "export MDTEST_BRANCH_FACTOR=1",
+            "export MDTEST_ITEMS_PER_DIR=2",
+            "export MDTEST_ITERATIONS=2",
+        ),
+        (
+            ExpectedExecution(
+                ExecutionCoordinate(2, workload_kind="mdtest", tasks_per_node=1),
+                ExecutionStatus.FAILED,
+            ),
+        ),
+        (WorkloadPhase.MDTEST_RESULTS,),
+        timeout_seconds=600,
+        requires=("batch_results_dir",),
+        failure_injection=FailureInjection.FAIL_AFTER_WRITE_ONCE,
+        workload_kind="mdtest",
+    )
+    repeated = _step(
+        "append-repeated-io",
+        ("--append", "{batch_results_dir}", "--bio", "--nodes", "1"),
+        _override_env(
+            _SHARED_ENV,
+            {
+                "ELBENCHO_FILE_SIZE": 'export ELBENCHO_FILE_SIZE="8M"',
+                "ELBENCHO_SCALE_READ_WRITE_DURATION": (
+                    "export ELBENCHO_SCALE_READ_WRITE_DURATION=2"
+                ),
+            },
+        ),
+        _coordinates((1,), ("4K",), (1,), (1,)),
+        _NORMAL_PHASES,
+        timeout_seconds=600,
+        requires=("batch_results_dir",),
+    )
+    return FilesystemScenarioSpec(
+        "mixed-batch", _BASELINE_SUBSTRATES, (first, metadata, repeated)
+    )
+
+
 def _retained_lifecycle() -> FilesystemScenarioSpec:
     coordinate = _coordinates((1,), ("4K",), (1,), (1,))
     write = _step(
@@ -831,6 +886,7 @@ SCENARIO_SPECS = (
     _mdtest_sweep(),
     _default_dio(),
     _failure_resume(),
+    _mixed_batch(),
     _retained_lifecycle(),
     _live_capture(),
     _kubectl_retained_read(),

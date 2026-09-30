@@ -107,6 +107,7 @@ These requirements are driven by the primary use cases of an **NVIDIA Storage Sc
 | UC-5.5 | The tool shall support a generated shared-directory many-file workload with a configurable file count per node and optional exact per-file size. | Yes |
 | UC-5.6 | The tool shall support generated and pre-existing single-shared-file workloads, including partitioned access and an option for every participating node to access the full file. | Yes |
 | UC-5.7 | The filesystem IO sweep shall support retaining generated datasets, repeatedly reading staged datasets, safely deleting retained datasets, and resuming incomplete sweep executions from persisted state. | Yes |
+| UC-5.8 | Either filesystem launcher shall prepare mixed IO/metadata batches, append only before first start, and start or resume the complete saved batch on all three substrates. First start shall permanently seal its ordered execution set. | Yes |
 
 ### UC-6: Multi-Node Filesystem Metadata
 
@@ -147,6 +148,7 @@ These requirements are driven by the primary use cases of an **NVIDIA Storage Sc
 | UC-8.8 | The tool shall support filtering reports by node count, thread count, IO size, IO depth, or object size. | Yes |
 | UC-8.9 | Reporting shall clearly separate and label write vs. read results, sequential vs. random IO, and direct IO vs. buffered IO in all tables and plots. | Yes |
 | UC-8.10 | Plot colors shall use colorblind-accessible palettes. | Yes |
+| UC-8.11 | A unified filesystem reporting entry point shall discover batch groups, report successful cells separately per group, and publish a state-counted index without combining groups or implicitly collecting Kubernetes results. | Yes |
 
 ### UC-9: Minimal Environment
 

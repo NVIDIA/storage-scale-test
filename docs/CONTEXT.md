@@ -396,7 +396,15 @@ workload kind, parameters, and distinct generated target paths. SSH and Slurm
 resume non-successful cells from `env_used.sh` while retaining successful
 results; Kubernetes uses the asynchronous status/cancel/collect lifecycle and
 requires collection before resume. The shared dispatch protocol accepts both
-workload kinds; adding cells to an existing run is not yet supported.
+workload kinds. Prepared batches save ordered groups locally, freeze common
+resources, and permanently seal their manifest before first external mutation.
+One global ledger owns statuses; group snapshots and artifacts remain isolated
+through dispatch, collection, resume, and unified filesystem reporting.
+Kubernetes helper loading is idempotent: repeated preflight/dispatch loads must
+preserve readonly constants and active ownership maps.
+Status emits one scoped progress view with collection state and next action.
+Kubernetes counts its current attempt from the PVC until local publication;
+zero running cells do not imply terminality or collection readiness.
 Because elbencho appends to existing result files, a metadata retry removes
 all per-iteration `.out`/`.csv` pairs before target preparation. Every
 substrate requires nonempty, nonsymlink result pairs and an atomic completion

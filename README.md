@@ -480,6 +480,58 @@ directory. Because elbencho assigns an integer count to each worker, the actual
 total is `nodes * tasks * round(target / (nodes * tasks))`; requested and
 actual counts are recorded.
 
+### Prepared filesystem batches
+
+Assemble IO and metadata sweeps before running them. Each invocation saves one
+**group**, including its workload settings and CLI flags:
+
+```bash
+./storage-tests/fs/nv-elbencho-sweep.sh --batch --nodes 1,2
+# Set BATCH to the printed STORAGE_SCALE_TEST_BATCH_RESULTS path.
+# Edit env.sh for the next group's workload, then append it.
+./storage-tests/fs/nv-mdtest-elbencho.sh --append "$BATCH" --nodes 2,4 --tasks 4,8
+./storage-tests/fs/nv-elbencho-sweep.sh --status "$BATCH"
+./storage-tests/fs/nv-mdtest-elbencho.sh --start "$BATCH"
+# Kubernetes: use the printed --status/--collect commands before resuming.
+./storage-tests/fs/nv-elbencho-sweep.sh --resume "$BATCH"
+./utils/extract-filesystem.sh "$BATCH"
+```
+
+Either launcher can start or resume the complete batch on SSH, Slurm, or
+Kubernetes. `--resume` also starts a draft batch. First start permanently seals
+the execution set: append is rejected thereafter, even if submission fails.
+Existing ordinary runs cannot be converted to batches. Execution stops at the
+first failure; resume skips successful cells and sizes resources for the
+remaining work.
+
+`--status` prints one `KEY=value` view: `BATCH=DRAFT|SEALED`, execution `STATE`,
+`EXECUTIONS_{TOTAL,PENDING,RUNNING,SUCCEEDED,FAILED}`, and `NEXT_ACTION`.
+`EXECUTION_SCOPE=BATCH` counts the full local SSH/Slurm or draft ledger;
+`CURRENT_ATTEMPT` counts only the current Kubernetes attempt, excluding cells
+completed before resume. `PROGRESS_SOURCE=LOCAL|PVC` identifies the ledger.
+`BETWEEN_EXECUTIONS` means the coordinator has pending work but no running cell;
+`AWAITING_COMPLETION` means no cells remain pending or running, but the attempt
+has not yet committed its terminal outcome.
+Neither permits collection: wait for `NEXT_ACTION=COLLECT`.
+`RESULT_COLLECTION=PENDING|CLEANUP_PENDING|COMPLETE` distinguishes remote results,
+published results needing cleanup, and completed collection. SSH/Slurm report
+`NOT_REQUIRED`. Unknown executor ownership reports `STATE=UNKNOWN`, not success.
+
+Groups may use different test roots, weights, IO modes, sizes, durations, and
+metadata layouts. The substrate, executable identity, architecture, ordering,
+host pool, and selected substrate's connection/allocation settings are frozen;
+append names mismatched fields. Start and resume use saved settings, not the
+current `env.sh`. Kubernetes credentials remain those of the current client.
+Its durable control directory is chosen from the union of all group test roots.
+
+Each group has separate artifacts and reports, so repeated coordinates never
+overwrite or average across groups. `reports/index.md` links the group reports
+and lists cell states. Report only selected groups with `--groups 0001,0003`,
+choose `--kind io|mdtest|all`, or redirect reports with `--output-dir PATH`.
+Reports include successful cells only; Kubernetes results must first be
+collected. Both existing specialized reporters accept batches and select their
+own workload kind.
+
 ### Filesystem reporting
 
 Both analysis wrappers accept one or more result directories, filters, CSV

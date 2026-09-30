@@ -19,6 +19,13 @@
 # shellcheck disable=SC1091  # Resolved beside this library in the repository
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_platform_functions.sh"
 
+if ! declare -F elbencho_batch_is_batch >/dev/null; then
+    # Batch cells restore globals in isolated contexts; this library is linted
+    # separately rather than treating its subshell snapshots as caller state.
+    # shellcheck source=/dev/null
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_batch_functions.sh"
+fi
+
 # Parse SSH host file into an array of hostnames/IPs
 # Usage:
 #   mapfile -t my_hosts < <(parse_ssh_host_file "/path/to/hostfile")
@@ -114,6 +121,14 @@ run_ssh_single() {
     # Build SSH command according to stdin_mode
     local ssh_cmd
     if [[ "$stdin_mode" == "bash_string" || "$stdin_mode" == "bash_file" ]]; then
+        # SSH joins command arguments before the remote login shell parses them.
+        # Quote each positional argument there as well as in the local array.
+        local remote_command='/bin/bash -s --'
+        local remote_argument
+        for remote_argument in "$@"; do
+            remote_argument=${remote_argument//\'/\'\\\'\'}
+            remote_command+=" '$remote_argument'"
+        done
         ssh_cmd=(
             ssh
             -T
@@ -123,7 +138,7 @@ run_ssh_single() {
             -o PreferredAuthentications=publickey
             -o LogLevel=ERROR
             "${ssh_target}"
-            "/bin/bash" "-s" "--" "${@}"
+            "$remote_command"
         )
     else
         ssh_cmd=(
@@ -1857,6 +1872,57 @@ _compute_test_dirs_csv_for_execution() {
     return 0
 }
 
+# Load trusted saved settings in the caller's isolated execution context.
+# Definitions belong to the authoritative root ledger, including for batches.
+_elbencho_load_execution_definition() {
+    local definition="$1"
+    local root
+    root=$(dirname "$(dirname "$definition")") || return 1
+    ELBENCHO_FILE_LAYOUT=worker-directories
+    ELBENCHO_FILES_PER_NODE=
+    ELBENCHO_FILE_SIZE=
+    unset ELBENCHO_EXECUTION_KIND
+    elbencho_batch_load_execution_context \
+        "$root" "$(basename "$definition" .sh)"
+}
+
+# Batch artifact consumers may pass either the ledger root or the owning group.
+# Reject another group's path even when repeated coordinates share filenames.
+_elbencho_execution_output_dir_for_definition() {
+    local requested="$1" definition="$2" root owning requested_canonical
+    root=$(dirname "$(dirname "$definition")") || return 1
+    if ! elbencho_batch_is_batch "$root"; then
+        printf '%s\n' "$requested"
+        return 0
+    fi
+    root=$(cd "$root" && pwd -P) || return 1
+    requested_canonical=$(cd "$requested" && pwd -P) || return 1
+    owning=$(elbencho_batch_execution_output_dir \
+        "$root" "$(basename "$definition" .sh)") || return 1
+    if [[ "$requested_canonical" != "$root" && "$requested_canonical" != "$owning" ]]; then
+        echo "Error: batch artifact destination does not belong to execution $definition: $requested" >&2
+        return 1
+    fi
+    printf '%s\n' "$owning"
+}
+
+# Both distributed IO and metadata cells use the Elbencho service protocol.
+# SUCCESS cells do not contribute to resume resource requirements.
+_elbencho_execution_needs_distributed_services() {
+    local root="$1"
+    local id
+    while IFS= read -r id; do
+        [[ "$(cat "$root/executions/$id.status" 2>/dev/null)" != SUCCESS ]] || continue
+        if (
+            _elbencho_load_execution_definition "$root/executions/$id.sh" || exit 1
+            [[ "${nodes:-0}" -gt 1 ]]
+        ); then
+            return 0
+        fi
+    done < <(list_elbencho_execution_ids "$root/executions")
+    return 1
+}
+
 # Print the result artifact paths for one reified execution, one per line.
 # Usage: _elbencho_result_artifacts_for_execution <output_dir> <nnnn.sh>
 _elbencho_result_artifacts_for_execution() {
@@ -1870,15 +1936,10 @@ _elbencho_result_artifacts_for_execution() {
 
     (
         local nodes io_size thread_count io_depth tasks_per_node
-        # shellcheck disable=SC1090
-        ELBENCHO_FILE_LAYOUT=worker-directories
-        ELBENCHO_FILES_PER_NODE=
-        ELBENCHO_FILE_SIZE=
-        unset ELBENCHO_EXECUTION_KIND
-        # shellcheck disable=SC1090
-        source "$nnnn_sh" || exit 1
+        _elbencho_load_execution_definition "$nnnn_sh" || exit 1
         local execution_id
         execution_id=$(basename "$nnnn_sh" .sh)
+        output_dir=$(_elbencho_execution_output_dir_for_definition "$output_dir" "$nnnn_sh") || exit 1
         if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == mdtest ]]; then
             local ds="${output_dir##*-}"
             local iter base
@@ -1917,12 +1978,8 @@ _elbencho_required_result_artifacts_for_execution() {
     local execution_id="$2"
     local nnnn_sh="$3"
     (
-        ELBENCHO_FILE_LAYOUT=worker-directories
-        ELBENCHO_FILES_PER_NODE=
-        ELBENCHO_FILE_SIZE=
-        unset ELBENCHO_EXECUTION_KIND
-        # shellcheck disable=SC1090
-        source "$nnnn_sh" || exit 1
+        _elbencho_load_execution_definition "$nnnn_sh" || exit 1
+        output_dir=$(_elbencho_execution_output_dir_for_definition "$output_dir" "$nnnn_sh") || exit 1
         local prefix="${output_dir}/executions/${execution_id}"
         if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == mdtest ]]; then
             _elbencho_result_artifacts_for_execution "$output_dir" "$nnnn_sh"
@@ -1990,12 +2047,8 @@ _elbencho_finalize_shared_failure_from_nnnn() {
     local output_dir="$3"
     # shellcheck disable=SC2030  # Defaults and run identity intentionally stay in this finalizer subshell.
     (
-        ELBENCHO_FILE_LAYOUT=worker-directories
-        ELBENCHO_FILES_PER_NODE=
-        ELBENCHO_FILE_SIZE=
-        unset ELBENCHO_EXECUTION_KIND
-        # shellcheck disable=SC1090
-        source "$nnnn_sh" || exit 1
+        _elbencho_load_execution_definition "$nnnn_sh" || exit 1
+        output_dir=$(_elbencho_execution_output_dir_for_definition "$output_dir" "$nnnn_sh") || exit 1
         export ELBENCHO_RUN_EXECUTION_ID="$execution_id"
         export ELBENCHO_RUN_SCRATCH_OUTPUT_DIR="$output_dir"
         _elbencho_finalize_generated_shared_failure
@@ -2056,6 +2109,8 @@ coordinator_run_one_execution() {
     # copy in the subshell below -- which static analysis flags as an unused
     # local because it can't see the cross-function consumer.
     local output_dir="$4"
+    local batch_root="$output_dir"
+    output_dir=$(elbencho_batch_execution_output_dir "$output_dir" "$id") || return 1
 
     local nnnn_sh="${executions_dir}/${id}.sh"
     local status_file="${executions_dir}/${id}.status"
@@ -2074,9 +2129,14 @@ coordinator_run_one_execution() {
     local tee_rc=0
     local -a execution_pipe_status=()
     (
-        # shellcheck disable=SC1090
-        unset ELBENCHO_EXECUTION_KIND
-        source "$nnnn_sh" || exit 1
+        _elbencho_load_execution_definition "$nnnn_sh" || exit 1
+        local -a allocation_hosts=()
+        IFS=, read -r -a allocation_hosts <<< "$alloc_hosts_csv"
+        if [[ ! "${nodes:-}" =~ ^[1-9][0-9]*$ \
+                || "${#allocation_hosts[@]}" -lt "$nodes" ]]; then
+            echo "Error: allocation lacks the requested ${nodes:-unknown} execution hosts" >&2
+            exit 1
+        fi
         local first_n_hosts_csv
         first_n_hosts_csv=$(printf '%s\n' "$alloc_hosts_csv" \
             | tr ',' '\n' | head -n "${nodes:?missing nodes in NNNN.sh}" \
@@ -2111,7 +2171,8 @@ coordinator_run_one_execution() {
             rc="$tee_rc"
         fi
     fi
-    if [[ -f "${executions_dir}/${id}.treefile-cache" ]]; then
+    if ! elbencho_batch_is_batch "$batch_root" \
+            && [[ -f "${output_dir}/executions/${id}.treefile-cache" ]]; then
         update_elbencho_env_used_treefile_cache_usage "$output_dir" || \
             echo "Warning: failed to update treefile-cache records in env_used snapshots" >&2
     fi
@@ -2260,7 +2321,7 @@ _elbencho_dispatch_lock_is_active() {
         return 2
     fi
     case "$mode" in
-        ssh|slurm-submit)
+        ssh|batch|slurm-submit)
             local_host=$(hostname) || return 2
             if [[ "$owner_host" != "$local_host" || ! "$owner_pid" =~ ^[0-9]+$ ]]; then
                 return 2
@@ -2268,7 +2329,7 @@ _elbencho_dispatch_lock_is_active() {
             if kill -0 "$owner_pid" 2>/dev/null; then
                 return 0
             fi
-            if [[ "$mode" == "ssh" ]]; then
+            if [[ "$mode" != "slurm-submit" ]]; then
                 return 1
             fi
             # The submitter may have died after sbatch accepted the job but
@@ -2319,10 +2380,10 @@ _elbencho_write_dispatch_lock_metadata() {
 }
 
 # Atomically acquire exclusive ownership of mutable execution state. A stale
-# owner is reclaimed only when its SSH process is dead or its Slurm job has a
+# owner is reclaimed only when its SSH/preparation process is dead or its Slurm job has a
 # terminal accounting record. A dead slurm-submit owner remains locked because
 # its accepted job may still be starting.
-# Usage: _elbencho_acquire_dispatch_lock <executions_dir> <ssh|slurm-submit> <token_var>
+# Usage: _elbencho_acquire_dispatch_lock <executions_dir> <ssh|batch|slurm-submit> <token_var>
 _elbencho_acquire_dispatch_lock() {
     local executions_dir="$1"
     local mode="$2"
@@ -2330,7 +2391,7 @@ _elbencho_acquire_dispatch_lock() {
     local lock_dir="${executions_dir}/.dispatch.lock"
     local local_host new_token existing_token active_rc attempt
 
-    if [[ "$mode" != "ssh" && "$mode" != "slurm-submit" ]]; then
+    if [[ "$mode" != "ssh" && "$mode" != "batch" && "$mode" != "slurm-submit" ]]; then
         echo "Error: invalid dispatch lock mode: $mode" >&2
         return 1
     fi
@@ -2549,12 +2610,15 @@ _dispatch_ssh_executions_owned() {
         return 1
     fi
 
-    if ! _ssh_start_services_on_all_hosts; then
-        echo "Error: failed to start elbencho services on any reachable SSH host" >&2
-        return 1
+    if ! elbencho_batch_is_batch "$output_dir" \
+            || _elbencho_execution_needs_distributed_services "$output_dir"; then
+        if ! _ssh_start_services_on_all_hosts; then
+            echo "Error: failed to start elbencho services on any reachable SSH host" >&2
+            return 1
+        fi
+        # shellcheck disable=SC2034  # Nameref assignment updates the caller's flag.
+        ssh_services_started_ref=1
     fi
-    # shellcheck disable=SC2034  # Nameref assignment updates the caller's flag.
-    ssh_services_started_ref=1
 
     local max_nodes
     if ! max_nodes=$(max_nodes_remaining_executions "$executions_dir"); then
@@ -2570,7 +2634,10 @@ _dispatch_ssh_executions_owned() {
     # during the long delay of executing. DS is in the basename suffix;
     # nodes_spec / dio_or_bio / etc. are in env (set by env.sh or
     # env_used.sh on resume).
-    if [[ "${output_dir##*/}" == mdtest-elbencho-* ]]; then
+    if elbencho_batch_is_batch "$output_dir"; then
+        printf 'Filesystem batch: %s remaining execution(s), maximum %s nodes\n' \
+            "$remaining" "$max_nodes"
+    elif [[ "${output_dir##*/}" == mdtest-elbencho-* ]]; then
         printf 'mdtest-elbencho-%s nodes_spec: %s tasks_spec: %s iterations: %s\n' \
             "${output_dir##*-}" "${nodes_spec:-?}" "${tasks_spec:-?}" \
             "${MDTEST_ITERATIONS:-?}"
@@ -2762,9 +2829,8 @@ _ssh_extract_nodes_from_nnnn() {
     local nnnn_sh="$1"
     local nodes_value
     nodes_value=$(
-        # shellcheck disable=SC1090
-        unset ELBENCHO_EXECUTION_KIND
-        source "$nnnn_sh" >/dev/null 2>&1 && printf '%s' "${nodes:-}"
+        _elbencho_load_execution_definition "$nnnn_sh" >/dev/null 2>&1 \
+            && printf '%s' "${nodes:-}"
     )
     if [[ -z "$nodes_value" ]] || [[ ! "$nodes_value" =~ ^[0-9]+$ ]] || [[ "$nodes_value" -lt 1 ]]; then
         return 1
@@ -2991,6 +3057,8 @@ _ssh_retrieve_remote_output() {
     local remote_basename="$3"
     local id="$4"
     local nnnn_sh="$5"
+    local batch_root="$output_dir"
+    output_dir=$(elbencho_batch_execution_output_dir "$output_dir" "$id") || return 1
 
     local artifact_output
     if ! artifact_output=$(
@@ -3013,7 +3081,7 @@ _ssh_retrieve_remote_output() {
     remote_paths+=("${remote_basename}/executions/${id}.treefile-cache")
 
     local parent
-    parent=$(dirname "$output_dir")
+    parent=$(dirname "$batch_root")
     local status_dir
     status_dir=$(mktemp -d) || return 1
     local tar_rc_file="${status_dir}/tar.rc"
@@ -3065,6 +3133,8 @@ _ssh_dispatch_one_execution() {
     local status_file="${executions_dir}/${id}.status"
     local log_file="${executions_dir}/${id}.log"
     local exitcode_file="${executions_dir}/${id}.exitcode"
+    local batch_root="$output_dir"
+    output_dir=$(elbencho_batch_execution_output_dir "$output_dir" "$id") || return 1
 
     local nodes_value
     if ! nodes_value=$(_ssh_extract_nodes_from_nnnn "$nnnn_sh"); then
@@ -3080,7 +3150,10 @@ _ssh_dispatch_one_execution() {
     fi
 
     local remote_basename
-    remote_basename=$(basename "$output_dir")
+    remote_basename=$(basename "$batch_root")
+    if elbencho_batch_is_batch "$batch_root"; then
+        remote_basename+="/${output_dir#"$batch_root/"}"
+    fi
     local head_host="${SSH_NODELIST%%,*}"
 
     _atomic_write_sentinel "$status_file" RUNNING || return 1
@@ -3091,9 +3164,7 @@ _ssh_dispatch_one_execution() {
     # their saved per-execution directory suffix / target-dir state.
     local test_dirs_csv
     test_dirs_csv=$(
-        # shellcheck disable=SC1090
-        unset ELBENCHO_EXECUTION_KIND
-        source "$nnnn_sh" || exit 1
+        _elbencho_load_execution_definition "$nnnn_sh" || exit 1
         _compute_test_dirs_csv_for_execution
     ) || {
         _ssh_finalize_remote_generated_shared_failure \
@@ -3159,7 +3230,7 @@ _ssh_dispatch_one_execution() {
     # Always retrieve remote outputs. Keep an earlier execution/logging rc;
     # only promote success to failure if retrieval itself fails.
     if ! _ssh_retrieve_remote_output \
-            "$head_host" "$output_dir" "$remote_basename" "$id" "$nnnn_sh"; then
+            "$head_host" "$batch_root" "$remote_basename" "$id" "$nnnn_sh"; then
         echo "Warning: tar retrieval failed for execution ${id}" >&2
         if [[ "$rc" -eq 0 ]]; then
             rc=1
@@ -3168,11 +3239,12 @@ _ssh_dispatch_one_execution() {
             # Cleanup changes workload metadata after the first retrieval
             # attempt, so make one best-effort evidence retrieval.
             _ssh_retrieve_remote_output \
-                "$head_host" "$output_dir" "$remote_basename" "$id" \
+                "$head_host" "$batch_root" "$remote_basename" "$id" \
                 "$nnnn_sh" || true
         fi
     fi
-    if [[ -f "${executions_dir}/${id}.treefile-cache" ]]; then
+    if ! elbencho_batch_is_batch "$batch_root" \
+            && [[ -f "${output_dir}/executions/${id}.treefile-cache" ]]; then
         update_elbencho_env_used_treefile_cache_usage "$output_dir" || \
             echo "Warning: failed to update treefile-cache records in env_used snapshots" >&2
     fi
@@ -3187,7 +3259,7 @@ _ssh_dispatch_one_execution() {
             _ssh_finalize_remote_generated_shared_failure \
                 "$head_host" "$remote_basename" "$id" "$nnnn_sh" || true
             _ssh_retrieve_remote_output \
-                "$head_host" "$output_dir" "$remote_basename" "$id" \
+                "$head_host" "$batch_root" "$remote_basename" "$id" \
                 "$nnnn_sh" || true
             _atomic_write_sentinel "$status_file" FAILED || \
                 echo "Error: unable to record FAILED for execution ${id}" >&2
@@ -4111,22 +4183,21 @@ build_sbatch_cmd() {
 #
 # Parses _SRUN_OPTIONS_BASE and appends SLURM_EXTRA_ARGS.
 build_srun_cmd() {
-    # shellcheck disable=SC2178  # nameref to caller array
-    local -n _result_array="$1"
+    local -n _srun_result_ref="$1"
 
     local _srun_path
     _srun_path=$(type -P srun) || {
         echo "Error: srun not found in PATH" >&2
         return 1
     }
-    _result_array=("$_srun_path")
+    _srun_result_ref=("$_srun_path")
 
     local -a _opts_array
     read -ra _opts_array <<< "$_SRUN_OPTIONS_BASE"
-    _result_array+=("${_opts_array[@]}")
+    _srun_result_ref+=("${_opts_array[@]}")
 
     if [[ ${#SLURM_EXTRA_ARGS[@]} -gt 0 ]]; then
-        _result_array+=("${SLURM_EXTRA_ARGS[@]}")
+        _srun_result_ref+=("${SLURM_EXTRA_ARGS[@]}")
     fi
 }
 
@@ -4140,25 +4211,24 @@ build_srun_cmd() {
 # Usage: declare -a srun_cmd; build_srun_validate_scale_cmd srun_cmd
 # shellcheck disable=SC2154  # account, partition, run_time, reservation from env.sh
 build_srun_validate_scale_cmd() {
-    # shellcheck disable=SC2178
-    local -n _result_array="$1"
+    local -n _srun_validate_result_ref="$1"
 
     local _srun_path
     _srun_path=$(type -P srun) || {
         echo "Error: srun not found in PATH" >&2
         return 1
     }
-    _result_array=("$_srun_path")
-    _result_array+=(-A "${account:?}" -p "${partition:?}" --time "${run_time:?}")
+    _srun_validate_result_ref=("$_srun_path")
+    _srun_validate_result_ref+=(-A "${account:?}" -p "${partition:?}" --time "${run_time:?}")
     if [[ -n "${reservation:-}" ]]; then
-        _result_array+=(--reservation "${reservation}")
+        _srun_validate_result_ref+=(--reservation "${reservation}")
     fi
     # shellcheck disable=SC2154  # SLURM_GPUS_PER_NODE_OPT set in env_base.sh
     if [[ -n "${SLURM_GPUS_PER_NODE_OPT:-}" ]]; then
-        _result_array+=("$SLURM_GPUS_PER_NODE_OPT")
+        _srun_validate_result_ref+=("$SLURM_GPUS_PER_NODE_OPT")
     fi
     if [[ ${#SLURM_EXTRA_ARGS[@]} -gt 0 ]]; then
-        _result_array+=("${SLURM_EXTRA_ARGS[@]}")
+        _srun_validate_result_ref+=("${SLURM_EXTRA_ARGS[@]}")
     fi
     return 0
 }

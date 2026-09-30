@@ -27,6 +27,32 @@ if [[ ! -d "${SCRIPT_DIR}" ]]; then
 fi
 readonly SCRIPT_DIR
 
+# Batch reporting uses saved group settings, even when current env.sh is invalid.
+for input_path in "$@"; do
+    [[ -d "$input_path" ]] || continue
+    input_root=$(cd "$input_path" && pwd -P) || exit 1
+    while [[ -n "$input_root" && "$input_root" != / ]]; do
+        batch_marker_found=0
+        for batch_marker in batch-manifest.tsv batch-profile.tsv \
+                batch-sealed.sha256 batch-sealed-environment.sha256; do
+            if [[ -e "$input_root/$batch_marker" || -L "$input_root/$batch_marker" ]]; then
+                batch_marker_found=1
+                break
+            fi
+        done
+        if [[ "$batch_marker_found" == 1 ]]; then
+            SCALE_TEST_BASE=$(cd "${SCRIPT_DIR}/.." && pwd)
+            export SCALE_TEST_BASE
+            # shellcheck source=lib/env_functions.sh
+            # shellcheck disable=SC1091
+            source "${SCALE_TEST_BASE}/lib/env_functions.sh"
+            python_path=$(setup_python_venv) || exit 1
+            exec "$python_path" "${SCRIPT_DIR}/extract-elbencho.py" "$@"
+        fi
+        input_root=${input_root%/*}
+    done
+done
+
 if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
         "${SCRIPT_DIR}/../env.sh" 2>&1); then
     printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"

@@ -126,6 +126,13 @@ SCENARIO_CATALOG = (
         ssh_home_mode=SshHomeMode.SEPARATE,
     ),
     Scenario(
+        "mixed-batch",
+        "Prepared mixed filesystem batch, failure, resume, and separate reports",
+        frozenset({Substrate.SSH, Substrate.SLURM, Substrate.KUBECTL}),
+        35,
+        ssh_home_mode=SshHomeMode.SEPARATE,
+    ),
+    Scenario(
         "retained-lifecycle",
         "Write-only, repeated read-from, and delete-only lifecycle",
         frozenset({Substrate.SSH, Substrate.SLURM}),

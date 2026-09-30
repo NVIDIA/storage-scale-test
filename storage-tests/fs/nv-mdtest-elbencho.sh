@@ -25,6 +25,15 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) || exit 1
 readonly SCRIPT_DIR
 readonly INVOKING_EXECUTION_SUBSTRATE="${EXECUTION_SUBSTRATE:-}"
 
+if [[ -f "$SCRIPT_DIR/../../lib/_batch_functions.sh" ]]; then
+    # The independent batch library restores globals only in isolated contexts.
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/../../lib/_batch_functions.sh" || exit 1
+    batch_route_rc=0
+    elbencho_batch_cli_route mdtest "$0" "$@" || batch_route_rc=$?
+    [[ "$batch_route_rc" == 2 ]] || exit "$batch_route_rc"
+fi
+
 usage() {
     cat <<USAGE
 Usage: $0 --nodes <node_spec> --tasks <task_spec> [--single-dir-file-target <count>]
@@ -32,6 +41,14 @@ Usage: $0 --nodes <node_spec> --tasks <task_spec> [--single-dir-file-target <cou
        $0 --status <results_dir>
        $0 --cancel <results_dir>
        $0 --collect <results_dir>
+       $0 --batch --nodes <node_spec> --tasks <task_spec>
+       $0 --append <batch_dir> --nodes <node_spec> --tasks <task_spec>
+       $0 --start <batch_dir>
+
+--batch prepares the first group without executing. --append adds a group only
+before first start. Either filesystem launcher can --start or --resume the
+mixed batch; starting permanently freezes its execution set and saved settings.
+--status reports scoped execution progress, collection readiness, and next action.
 
 Sweep node counts and tasks per node using Elbencho metadata create, stat,
 and delete phases. Specifications accept comma-separated counts, inclusive
@@ -61,10 +78,20 @@ while [[ $# -gt 0 ]]; do
                 echo "Error: $1 requires an argument" >&2; exit 1;
             }
             case "$1" in
-                --nodes) [[ -z "$nodes_spec" ]] || exit 1; nodes_spec="$2" ;;
-                --tasks) [[ -z "$tasks_spec" ]] || exit 1; tasks_spec="$2" ;;
+                --nodes)
+                    [[ -z "$nodes_spec" ]] || {
+                        echo "Error: --nodes may be specified only once" >&2; exit 1;
+                    }
+                    nodes_spec="$2" ;;
+                --tasks)
+                    [[ -z "$tasks_spec" ]] || {
+                        echo "Error: --tasks may be specified only once" >&2; exit 1;
+                    }
+                    tasks_spec="$2" ;;
                 --single-dir-file-target)
-                    [[ -z "$single_dir_target_files" ]] || exit 1
+                    [[ -z "$single_dir_target_files" ]] || {
+                        echo "Error: --single-dir-file-target may be specified only once" >&2; exit 1;
+                    }
                     single_dir_target_files="$2" ;;
                 *)
                     [[ "$operation" == submit ]] || {
@@ -217,8 +244,8 @@ if [[ -n "$single_dir_target_files" ]]; then
     single_dir_actual_files=$((node_counts[0] * task_counts[0] * single_dir_files_per_worker))
 fi
 
-DS=$(date -u +%Y%m%dZ%H%M%S)
-OUTPUT_DIR="$RESULTS_DIR/mdtest-elbencho-$DS"
+DS=${ELBENCHO_BATCH_DATESTAMP:-$(date -u +%Y%m%dZ%H%M%S)}
+OUTPUT_DIR=${ELBENCHO_BATCH_PREPARE_DIR:-"$RESULTS_DIR/mdtest-elbencho-$DS"}
 mkdir -p "$OUTPUT_DIR" || exit 1
 export DS OUTPUT_DIR
 write_mdtest_elbencho_env_used "$OUTPUT_DIR/env_used.yaml" \
@@ -235,6 +262,7 @@ if [[ -n "$single_dir_target_files" ]]; then
 fi
 reify_all_mdtest_executions "$OUTPUT_DIR" "$DS" node_counts task_counts \
     "$single_dir_target_files" "$single_dir_files_per_worker" || exit 1
+[[ -z "${ELBENCHO_BATCH_PREPARE_DIR:-}" ]] || exit 0
 cd "$SCALE_TEST_BASE/storage-tests/fs" || exit 1
 if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
     _source_kubectl_helpers || exit 1

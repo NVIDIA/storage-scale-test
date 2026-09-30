@@ -34,6 +34,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -108,7 +109,16 @@ KUBERNETES_UID = re.compile(
 )
 KUBECTL_TERMINAL_STATES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 KUBECTL_STATUS_STATES = KUBECTL_TERMINAL_STATES | frozenset(
-    {"PREPARED", "SUBMITTED", "RUNNING", "CANCEL_REQUESTED", "COLLECTED"}
+    {
+        "PREPARED",
+        "SUBMITTED",
+        "PREPARING",
+        "RUNNING",
+        "BETWEEN_EXECUTIONS",
+        "AWAITING_COMPLETION",
+        "CANCEL_REQUESTED",
+        "COLLECTED",
+    }
 )
 KUBECTL_SUPPORTED_SCENARIOS = frozenset(
     {
@@ -116,6 +126,7 @@ KUBECTL_SUPPORTED_SCENARIOS = frozenset(
         "mdtest-sweep",
         "default-dio",
         "failure-resume",
+        "mixed-batch",
         "live-capture",
         "kubectl-retained-read",
         "kubectl-cancel",
@@ -1730,6 +1741,7 @@ def _sync_step_runtime(
     if runtime.selector == "kubectl" and runtime.scenario.name in {
         "failure-resume",
         "mdtest-sweep",
+        "mixed-batch",
     }:
         # The product copies this integration-only executable into the control
         # bundle before creating the Job.  It fails exactly one reified cell;
@@ -1740,8 +1752,12 @@ def _sync_step_runtime(
             for execution_id, execution in enumerate(step.executions)
             if execution.status is ExecutionStatus.FAILED
         ]
-        if target_ids:
-            target_id = f"{target_ids[0] + 1:04d}"
+        if target_ids or runtime.scenario.name == "mixed-batch":
+            target_id = (
+                "0002"
+                if runtime.scenario.name == "mixed-batch"
+                else f"{target_ids[0] + 1:04d}"
+            )
             overlay = Path(runtime.workspace) / "kubectl-failure-overlay.sh"
             overlay.write_text(
                 "#!/usr/bin/env bash\n"
@@ -1921,7 +1937,7 @@ def _copy_scenario_result(
     """Copy one immutable result snapshot into the retained test-run log."""
     destination = runtime.artifact_root / "copied-results" / step.name
     destination.mkdir(parents=True, exist_ok=True)
-    if runtime.selector == "ssh":
+    if runtime.selector in {"ssh", "kubectl"}:
         target = destination / Path(remote_result).name
         if target.exists():
             shutil.rmtree(target)
@@ -2824,6 +2840,7 @@ def _run_kubectl_command(
     expected_failure: bool = False,
     accepted_states: frozenset[str] = frozenset(),
     kubeconfig: Path | None = None,
+    workload_kind: str | None = None,
 ) -> str:
     """Run one local kubectl-sweep command with the fixture kubeconfig."""
     command: list[str | Path] = [
@@ -2837,7 +2854,7 @@ def _run_kubectl_command(
         / "fs"
         / (
             "nv-mdtest-elbencho.sh"
-            if _runtime_workload_kind(runtime) == "mdtest"
+            if (workload_kind or _runtime_workload_kind(runtime)) == "mdtest"
             else "nv-elbencho-sweep.sh"
         ),
         *arguments,
@@ -2945,7 +2962,7 @@ def _kubectl_submission(output: str) -> tuple[Path, str]:
 
 def _kubectl_lifecycle_state(output: str) -> str:
     """Read and validate one stable lifecycle state from status output."""
-    state = _kubectl_output_value(output, "STORAGE_SCALE_TEST_KUBECTL_STATE")
+    state = _kubectl_output_value(output, "STATE")
     if state not in KUBECTL_STATUS_STATES:
         raise IntegrationTestError(f"invalid kubectl lifecycle state: {state!r}")
     return state
@@ -3625,8 +3642,28 @@ def _run_kubectl_failure_resume(
     )
 
 
-def _kubectl_delete_coordinator_pod(runner: Any, config: Any, attempt_id: str) -> None:
-    """Delete exactly the owned coordinator Pod for a submitted attempt."""
+def _kubectl_assert_coordinator_identity(
+    pod: dict[str, Any], identity: tuple[str, str, str]
+) -> None:
+    """Reject replacement Pods or ownership changes before any mutation."""
+    name, uid, attempt_id = identity
+    metadata = pod.get("metadata", {})
+    labels = metadata.get("labels", {})
+    if (
+        not name
+        or not uid
+        or metadata.get("name") != name
+        or metadata.get("uid") != uid
+        or labels.get("storage-scale-test.nvidia.com/run") != attempt_id
+        or labels.get("app.kubernetes.io/component") != "coordinator"
+    ):
+        raise IntegrationTestError("coordinator Pod ownership evidence is invalid")
+
+
+def _kubectl_coordinator_identity(
+    runner: Any, config: Any, attempt_id: str
+) -> tuple[str, str, str]:
+    """Resolve one exact owned coordinator Pod, including its immutable UID."""
     result = runner.run(
         _kubectl(
             config,
@@ -3647,15 +3684,215 @@ def _kubectl_delete_coordinator_pod(runner: Any, config: Any, attempt_id: str) -
         raise IntegrationTestError(
             f"expected exactly one coordinator Pod for {attempt_id}, found {len(pods)}"
         )
-    pod = pods[0]
-    name = str(pod.get("metadata", {}).get("name", ""))
-    observed = str(
-        pod.get("metadata", {})
-        .get("labels", {})
-        .get("storage-scale-test.nvidia.com/run", "")
+    metadata = pods[0].get("metadata", {})
+    identity = (
+        str(metadata.get("name", "")),
+        str(metadata.get("uid", "")),
+        attempt_id,
     )
-    if not name or observed != attempt_id:
-        raise IntegrationTestError("coordinator Pod ownership evidence is invalid")
+    _kubectl_assert_coordinator_identity(pods[0], identity)
+    return identity
+
+
+def _kubectl_coordinator_runtime_identity(
+    runner: Any, config: Any, identity: tuple[str, str, str]
+) -> tuple[str, str]:
+    """Resolve the container only inside an ownership-verified fixture node."""
+    result = runner.run(
+        _kubectl(
+            config, "-n", config.namespace, "get", "pod", identity[0], "-o", "json"
+        ),
+        timeout=20,
+    )
+    pod = json.loads(result.stdout)
+    _kubectl_assert_coordinator_identity(pod, identity)
+    node = pod.get("spec", {}).get("nodeName", "")
+    container_ids = [
+        container.get("containerID", "")
+        for container in pod.get("status", {}).get("containerStatuses", [])
+        if container.get("name") == "coordinator"
+    ]
+    if (
+        not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", node)
+        or len(container_ids) != 1
+        or not re.fullmatch(r"containerd://[0-9a-f]{64}", container_ids[0])
+    ):
+        raise IntegrationTestError("coordinator runtime identity is invalid")
+    labels = json.loads(
+        runner.run(
+            [
+                "docker",
+                "inspect",
+                "--type",
+                "container",
+                "--format",
+                "{{json .Config.Labels}}",
+                node,
+            ],
+            timeout=20,
+        ).stdout
+    )
+    if labels.get("io.x-k8s.kind.cluster") != config.cluster_name:
+        raise IntegrationTestError("coordinator node belongs to another kind fixture")
+    container_id = container_ids[0].removeprefix("containerd://")
+    container = json.loads(
+        runner.run(
+            [
+                "docker",
+                "exec",
+                node,
+                "ctr",
+                "-n",
+                "k8s.io",
+                "containers",
+                "info",
+                container_id,
+            ],
+            timeout=20,
+        ).stdout
+    )
+    _kubectl_assert_coordinator_container(container, config, identity, container_id)
+    return node, container_id
+
+
+def _kubectl_assert_coordinator_container(
+    container: dict[str, Any],
+    config: Any,
+    identity: tuple[str, str, str],
+    container_id: str,
+) -> None:
+    """Match runtime container metadata to the exact Kubernetes Pod identity."""
+    expected_labels = {
+        "io.kubernetes.pod.name": identity[0],
+        "io.kubernetes.pod.uid": identity[1],
+        "io.kubernetes.pod.namespace": config.namespace,
+        "io.kubernetes.container.name": "coordinator",
+    }
+    labels = container.get("Labels", {})
+    if container.get("ID") != container_id or any(
+        labels.get(key) != value for key, value in expected_labels.items()
+    ):
+        raise IntegrationTestError("coordinator runtime container ownership is invalid")
+
+
+def _kubectl_kill_coordinator_pid1(
+    runner: Any, config: Any, identity: tuple[str, str, str]
+) -> None:
+    """SIGKILL the verified container init, so no child can checkpoint TERM."""
+    name, uid, attempt_id = identity
+    node, container_id = _kubectl_coordinator_runtime_identity(runner, config, identity)
+    command = """
+[[ ${KUBECTL_COORDINATOR_POD_UID:-} == "$1" \
+    && ${KUBECTL_COORDINATOR_POD_NAME:-} == "$2" ]] || exit 64
+mapfile -d '' -t coordinator_argv < /proc/1/cmdline || exit 64
+[[ ${#coordinator_argv[@]} == 6 \
+    && ${coordinator_argv[1]} == */"$3"/control/coordinator.sh \
+    && ${coordinator_argv[2]} == "${coordinator_argv[1]%/coordinator.sh}" \
+    && ${coordinator_argv[3]} == "${coordinator_argv[2]%/control}/state" \
+    && ${coordinator_argv[5]} == "$3" ]] || exit 64
+""".strip()
+    result = runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "exec",
+            name,
+            "-c",
+            "coordinator",
+            "--",
+            "/bin/bash",
+            "-ceu",
+            command,
+            "coordinator-loss",
+            uid,
+            name,
+            attempt_id,
+        ),
+        check=False,
+        timeout=20,
+    )
+    if result.returncode:
+        raise IntegrationTestError("coordinator process ownership evidence is invalid")
+    # Linux namespace init ignores SIGKILL from its own PID namespace. The
+    # fixture node's runtime delivers it from an ancestor namespace instead.
+    runner.run(
+        [
+            "docker",
+            "exec",
+            node,
+            "ctr",
+            "-n",
+            "k8s.io",
+            "tasks",
+            "kill",
+            "--signal",
+            "SIGKILL",
+            container_id,
+        ],
+        check=False,
+        timeout=20,
+    )
+    # A runtime exec may disconnect during container death. Its result never
+    # proves the kill: require the same Pod UID's terminal exit below.
+
+
+def _kubectl_coordinator_has_sigkill_evidence(pod: dict[str, Any]) -> bool:
+    """Distinguish a verified abrupt exit from running or graceful termination."""
+    for container in pod.get("status", {}).get("containerStatuses", []):
+        if container.get("name") != "coordinator":
+            continue
+        terminated = container.get("state", {}).get("terminated")
+        if terminated is not None:
+            if terminated.get("exitCode") != 137:
+                raise IntegrationTestError(
+                    f"coordinator terminated without SIGKILL evidence: {terminated}"
+                )
+            return True
+    return False
+
+
+def _kubectl_wait_coordinator_sigkill(
+    runner: Any,
+    config: Any,
+    identity: tuple[str, str, str],
+    timeout: float = 30,
+) -> None:
+    """Require bounded, Kubernetes-observed exit 137 for the exact selected Pod."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = runner.run(
+            _kubectl(
+                config,
+                "-n",
+                config.namespace,
+                "get",
+                "pod",
+                identity[0],
+                "-o",
+                "json",
+            ),
+            check=False,
+            timeout=min(10, max(0.1, deadline - time.monotonic())),
+        )
+        if result.returncode:
+            raise IntegrationTestError(
+                "cannot prove coordinator SIGKILL termination: "
+                + (result.stderr or result.stdout).strip()
+            )
+        pod = json.loads(result.stdout)
+        _kubectl_assert_coordinator_identity(pod, identity)
+        if _kubectl_coordinator_has_sigkill_evidence(pod):
+            return
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    raise IntegrationTestError("coordinator SIGKILL termination evidence timed out")
+
+
+def _kubectl_delete_coordinator_pod(runner: Any, config: Any, attempt_id: str) -> None:
+    """Crash the exact owned coordinator, prove abrupt loss, then delete its Pod."""
+    identity = _kubectl_coordinator_identity(runner, config, attempt_id)
+    _kubectl_kill_coordinator_pid1(runner, config, identity)
+    _kubectl_wait_coordinator_sigkill(runner, config, identity)
     runner.run(
         _kubectl(
             config,
@@ -3663,7 +3900,7 @@ def _kubectl_delete_coordinator_pod(runner: Any, config: Any, attempt_id: str) -
             config.namespace,
             "delete",
             "pod",
-            name,
+            identity[0],
             "--wait=true",
             "--timeout=60s",
         ),
@@ -4028,7 +4265,7 @@ def _cleanup_kubectl_attempt(
         )
         if result.returncode:
             output = result.stdout + result.stderr
-            if "STORAGE_SCALE_TEST_KUBECTL_STATE=SUBMISSION_FAILED" in output:
+            if "STATE=SUBMISSION_FAILED" in output.splitlines():
                 # Submission rollback is terminal and leaves no benchmark
                 # results or remote resources to collect.
                 return
@@ -4067,7 +4304,8 @@ def _cleanup_ssh_remote_results(runner: Any, config: Any) -> None:
                 "--",
                 "bash",
                 "-c",
-                "rm -rf -- /home/tester/elbencho-[0-9]*",
+                "rm -rf -- /home/tester/elbencho-[0-9]* "
+                "/home/tester/filesystem-batch-[0-9]*",
             ],
             check=False,
             timeout=60,
@@ -4533,6 +4771,15 @@ def _remote_staging_operations(
     )
 
 
+def _failure_target_argument(runtime: ScenarioRuntime) -> str:
+    """Select the intended cell without changing the wrapper protocol."""
+    if runtime.scenario.name == "mixed-batch":
+        return "mdtest-elbencho-c_002-t_001"
+    if _runtime_workload_kind(runtime) == "mdtest":
+        return "mdtest-elbencho-c_001-t_002"
+    return "executions/0002.write.json"
+
+
 def _failure_plan(
     runner: Any,
     config: Any,
@@ -4559,11 +4806,7 @@ def _failure_plan(
         staging_root=SSH_FAILURE_STAGING_BASE,
         source_binary=source_binary,
         source_runtime=bundled_runtime,
-        target_argument=(
-            "mdtest-elbencho-c_001-t_002"
-            if _runtime_workload_kind(runtime) == "mdtest"
-            else "executions/0002.write.json"
-        ),
+        target_argument=_failure_target_argument(runtime),
         coordinator_endpoint="local",
         worker_endpoints=[item["metadata"]["name"] for item in pods],
     )
@@ -4593,11 +4836,7 @@ def _slurm_failure_plan(
         staging_root=f"{runtime.workspace}/.storage-scale-test-failure",
         source_binary=source_binary,
         source_runtime=bundled_runtime,
-        target_argument=(
-            "mdtest-elbencho-c_001-t_002"
-            if _runtime_workload_kind(runtime) == "mdtest"
-            else "executions/0002.write.json"
-        ),
+        target_argument=_failure_target_argument(runtime),
         shared_endpoint=fixture.login_pod,
     )
     operations = _remote_staging_operations(
@@ -4790,6 +5029,427 @@ def _run_failure_resume(
         )
 
 
+def _mixed_batch_command(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    step: ScenarioStep,
+    log_dir: Path,
+    *,
+    expected_failure: bool = False,
+) -> str:
+    """Use each group's launcher, including the opposite launcher at start."""
+    arguments = step.render_arguments(runtime.values)
+    if runtime.selector == "kubectl":
+        return _run_kubectl_command(
+            runner,
+            config,
+            runtime,
+            step.name,
+            arguments,
+            log_dir,
+            step.timeout_seconds,
+            expected_failure=expected_failure,
+            workload_kind=step.workload_kind,
+        )
+    script = (
+        "nv-mdtest-elbencho.sh"
+        if step.workload_kind == "mdtest"
+        else "nv-elbencho-sweep.sh"
+    )
+    return _run_step(
+        runner,
+        config,
+        fixture,
+        runtime.selector,
+        step.name,
+        f"cd -- {_shell(runtime.workspace)} && "
+        f"./storage-tests/fs/{script} {shlex.join(arguments)}",
+        log_dir,
+        step.timeout_seconds,
+        expected_failure=expected_failure,
+    )
+
+
+def _mixed_batch_membership(result: Path) -> tuple[list[list[str]], list[list[str]]]:
+    """Read committed membership, never orphaned definition files."""
+    rows = [
+        line.split("\t")
+        for line in (result / "batch-manifest.tsv")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    return (
+        [row for row in rows if row[0] == "group"],
+        [row for row in rows if row[0] == "execution"],
+    )
+
+
+def _assert_mixed_batch_cell(
+    result: Path,
+    group: list[str],
+    execution: list[str],
+    step: ScenarioStep,
+    status: ExecutionStatus,
+) -> None:
+    """Check provenance and result evidence for one owning group."""
+    identity = execution[1]
+    definition = result / "executions" / f"{identity}.sh"
+    assignments = _shell_assignments(definition)
+    kind = "mdtest" if step.workload_kind == "mdtest" else "io"
+    coordinate = step.executions[0].coordinate
+    if (
+        group[2] != kind
+        or assignments.get("ELBENCHO_EXECUTION_KIND") != kind
+        or assignments.get("ELBENCHO_BATCH_GROUP_ID") != group[1]
+        or execution[2] != group[1]
+        or assignments.get("ELBENCHO_BATCH_OUTPUT_RELATIVE") != group[3]
+        or int(assignments.get("nodes", "0")) != coordinate.nodes
+    ):
+        raise IntegrationTestError(
+            f"mixed batch cell {identity} has incorrect provenance"
+        )
+    output = result / group[3]
+    actual_status = (result / "executions" / f"{identity}.status").read_text().strip()
+    if actual_status != status.value:
+        raise IntegrationTestError(
+            f"mixed batch cell {identity}: expected {status.value}, got {actual_status}"
+        )
+    if status is not ExecutionStatus.SUCCESS:
+        return
+    if kind == "mdtest":
+        _assert_mdtest_result_artifacts(
+            output,
+            output / "executions",
+            identity,
+            coordinate.nodes,
+            coordinate.tasks_per_node,
+        )
+    else:
+        _assert_phase_artifacts(output / "executions", identity, step, status)
+    for suffix in ("csv", "out"):
+        if not any(path.stat().st_size for path in output.glob(f"*.{suffix}")):
+            raise IntegrationTestError(
+                f"mixed batch group {group[1]} lacks {suffix} evidence"
+            )
+
+
+def _assert_mixed_batch(
+    result: Path,
+    runtime: ScenarioRuntime,
+    statuses: tuple[ExecutionStatus, ...],
+) -> None:
+    """Require the ordered mixed ledger and different saved workload settings."""
+    groups, executions = _mixed_batch_membership(result)
+    if len(groups) != len(runtime.scenario.steps) or len(executions) != len(groups):
+        raise IntegrationTestError(
+            "mixed batch must commit exactly its three prepared groups"
+        )
+    if [row[1] for row in executions] != ["0001", "0002", "0003"]:
+        raise IntegrationTestError(
+            "mixed batch execution IDs are not global and sequential"
+        )
+    for group, execution, step, status in zip(
+        groups, executions, runtime.scenario.steps, statuses, strict=True
+    ):
+        _assert_mixed_batch_cell(result, group, execution, step, status)
+    settings = [
+        _shell_assignments(result / "executions" / f"{row[1]}.sh") for row in executions
+    ]
+    if (
+        settings[0].get("ELBENCHO_FILE_SIZE") != "16M"
+        or settings[2].get("ELBENCHO_FILE_SIZE") != "8M"
+        or settings[1].get("MDTEST_ITERATIONS") != "2"
+        or runtime.values["test_root_secondary"]
+        not in (result / "executions/0002.sh").read_text()
+    ):
+        raise IntegrationTestError(
+            "mixed batch did not preserve different group settings and roots"
+        )
+
+
+def _assert_mixed_batch_prepared(result: Path, runtime: ScenarioRuntime) -> None:
+    """Preparation must leave no dispatch or workload evidence."""
+    _assert_mixed_batch(result, runtime, (ExecutionStatus.PENDING,) * 3)
+    dispatched = [
+        path
+        for path in result.rglob("*")
+        if path.suffix
+        in {"log", ".log", ".jobid", ".exitcode", ".csv", ".out", ".json"}
+    ]
+    if (
+        dispatched
+        or (result / "batch-sealed.sha256").exists()
+        or (result / "kubernetes/current-attempt").exists()
+    ):
+        raise IntegrationTestError(
+            f"mixed batch preparation dispatched work: {dispatched}"
+        )
+
+
+def _hash_mixed_batch_success(result: Path) -> dict[str, str]:
+    """Include the first group's artifacts in successful-cell preservation."""
+    groups, _ = _mixed_batch_membership(result)
+    hashes = _hash_execution_contract(result, "0001")
+    for path in sorted((result / groups[0][3]).rglob("*")):
+        if path.is_file():
+            hashes[str(path.relative_to(result))] = _sha256(path)
+    return hashes
+
+
+def _mixed_batch_report(
+    runner: Any,
+    report_workspace: Path,
+    result: Path,
+    log_dir: Path,
+) -> None:
+    """Exercise the unified front door and keep repeated coordinates separate."""
+    reports = log_dir / "reports-mixed-batch"
+    completed = runner.run(
+        [
+            report_workspace / "utils/extract-filesystem.sh",
+            result,
+            "--output-dir",
+            reports,
+        ],
+        timeout=600,
+        check=False,
+    )
+    (log_dir / "extract-filesystem.log").write_text(
+        completed.stdout + completed.stderr, encoding="utf-8"
+    )
+    if completed.returncode or not (reports / "index.md").is_file():
+        raise IntegrationTestError(
+            "mixed batch reporting failed; see extract-filesystem.log"
+        )
+    index = (reports / "index.md").read_text(encoding="utf-8")
+    for identity in ("0001", "0002", "0003"):
+        report = reports / "groups" / identity / "report.txt"
+        if identity not in index or not report.is_file() or not report.stat().st_size:
+            raise IntegrationTestError(
+                f"mixed batch group {identity} lacks its separate report"
+            )
+
+
+def _assert_mixed_batch_kubectl_progress(
+    output: str, *, failed: bool, collected: bool = False
+) -> None:
+    """Current-attempt counts must reflect remote cells before collection."""
+    if (
+        _kubectl_output_value(output, "EXECUTION_SCOPE") != "CURRENT_ATTEMPT"
+        or _kubectl_output_value(output, "PROGRESS_SOURCE")
+        != ("LOCAL" if collected else "PVC")
+        or _kubectl_output_value(output, "RESULT_COLLECTION")
+        != ("COMPLETE" if collected else "PENDING")
+    ):
+        raise IntegrationTestError(
+            "mixed batch status did not distinguish ledger sources"
+        )
+    expected = (1, 0, 1, 1) if failed else (0, 0, 2, 0)
+    for state, count in zip(
+        ("PENDING", "RUNNING", "SUCCEEDED", "FAILED"), expected, strict=True
+    ):
+        observed = _kubectl_output_value(output, f"EXECUTIONS_{state}")
+        if observed != str(count):
+            raise IntegrationTestError(
+                f"mixed batch attempt {state}: expected {count}, got {observed}"
+            )
+
+
+def _mixed_batch_collect(
+    runner: Any,
+    config: Any,
+    runtime: ScenarioRuntime,
+    root: str,
+    step: ScenarioStep,
+    log_dir: Path,
+    *,
+    failed: bool,
+) -> None:
+    """Wait and collect before a Kubernetes batch can be resumed."""
+    terminal = _wait_for_kubectl_terminal_state(
+        runner, config, runtime, Path(root), log_dir, step.timeout_seconds
+    )
+    expected = "FAILED" if failed else "SUCCESS"
+    if terminal != expected:
+        raise IntegrationTestError(f"mixed batch expected {expected}, got {terminal}")
+    output = _run_kubectl_command(
+        runner,
+        config,
+        runtime,
+        "mixed-batch-progress",
+        ("--status", root),
+        log_dir,
+        step.timeout_seconds,
+        workload_kind=step.workload_kind,
+    )
+    _assert_mixed_batch_kubectl_progress(output, failed=failed)
+    _kubectl_collect_result(
+        runner,
+        config,
+        runtime,
+        Path(root),
+        log_dir,
+        terminal_states=frozenset({"FAILED"}) if failed else frozenset(),
+    )
+    runtime.values["kubectl_collected"] = "1"
+    output = _run_kubectl_command(
+        runner,
+        config,
+        runtime,
+        "mixed-batch-collected-progress",
+        ("--status", root),
+        log_dir,
+        step.timeout_seconds,
+        workload_kind=step.workload_kind,
+    )
+    _assert_mixed_batch_kubectl_progress(output, failed=failed, collected=True)
+
+
+def _run_mixed_batch(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    template: Path,
+    report_workspace: Path,
+    log_dir: Path,
+    binary_name: str,
+    source_binary: Path,
+    bundled_runtime: Path | None,
+) -> None:
+    """Prepare, fail a mixed batch's second cell, collect, and resume it."""
+    context = nullcontext()
+    if runtime.selector == "ssh":
+        plan, operations = _failure_plan(
+            runner,
+            config,
+            fixture,
+            runtime,
+            binary_name,
+            source_binary,
+            bundled_runtime,
+        )
+        context = staged_failure_injection(plan, operations)
+    elif runtime.selector == "slurm":
+        plan, operations = _slurm_failure_plan(
+            runner,
+            config,
+            fixture,
+            runtime,
+            source_binary,
+            binary_name,
+            bundled_runtime,
+        )
+        context = staged_failure_injection(plan, operations)
+    with context:
+        _execute_mixed_batch(
+            runner, config, fixture, runtime, template, report_workspace, log_dir
+        )
+
+
+def _execute_mixed_batch(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    template: Path,
+    report_workspace: Path,
+    log_dir: Path,
+) -> None:
+    """Run the finite scenario while its failure marker remains staged."""
+    result_base = f"{runtime.workspace}/results/mixed-batch"
+    _reset_result_base(runner, config, fixture, runtime, result_base)
+    for step in runtime.scenario.steps:
+        _sync_step_runtime(
+            runner, config, fixture, runtime, step, template, result_base
+        )
+        output = _mixed_batch_command(runner, config, fixture, runtime, step, log_dir)
+        root = _kubectl_output_value(output, "STORAGE_SCALE_TEST_BATCH_RESULTS")
+        if runtime.values.get("batch_results_dir", root) != root:
+            raise IntegrationTestError("mixed batch append changed the results root")
+        runtime.values["batch_results_dir"] = root
+    prepared = _copy_scenario_result(
+        runner,
+        config,
+        fixture,
+        runtime,
+        replace(runtime.scenario.steps[0], name="prepared-batch"),
+        root,
+    )
+    _assert_mixed_batch_prepared(prepared, runtime)
+    _finish_mixed_batch(
+        runner, config, fixture, runtime, root, report_workspace, log_dir
+    )
+
+
+def _finish_mixed_batch(
+    runner: Any,
+    config: Any,
+    fixture: Fixture,
+    runtime: ScenarioRuntime,
+    root: str,
+    report_workspace: Path,
+    log_dir: Path,
+) -> None:
+    """Start through metadata and resume through IO, preserving first success."""
+    start = replace(
+        runtime.scenario.steps[1], name="start-mixed-batch", arguments=("--start", root)
+    )
+    output = _mixed_batch_command(
+        runner,
+        config,
+        fixture,
+        runtime,
+        start,
+        log_dir,
+        expected_failure=runtime.selector != "kubectl",
+    )
+    if runtime.selector == "kubectl":
+        _, attempt = _kubectl_submission(output)
+        runtime.values["kubectl_result_root"] = root
+        _mixed_batch_collect(runner, config, runtime, root, start, log_dir, failed=True)
+        runtime.values["batch_first_attempt"] = attempt
+    failed = _copy_scenario_result(runner, config, fixture, runtime, start, root)
+    _assert_mixed_batch(
+        failed,
+        runtime,
+        (ExecutionStatus.SUCCESS, ExecutionStatus.FAILED, ExecutionStatus.PENDING),
+    )
+    preserved = _hash_mixed_batch_success(failed)
+    resume = replace(
+        runtime.scenario.steps[0],
+        name="resume-mixed-batch",
+        arguments=("--resume", root),
+    )
+    runtime.values["kubectl_collected"] = "0"
+    output = _mixed_batch_command(runner, config, fixture, runtime, resume, log_dir)
+    if runtime.selector == "kubectl":
+        _, attempt = _kubectl_submission(output)
+        if attempt == runtime.values["batch_first_attempt"]:
+            raise IntegrationTestError("mixed batch resume reused its failed attempt")
+        _mixed_batch_collect(
+            runner, config, runtime, root, resume, log_dir, failed=False
+        )
+    result = _copy_scenario_result(runner, config, fixture, runtime, resume, root)
+    _assert_mixed_batch(result, runtime, (ExecutionStatus.SUCCESS,) * 3)
+    if _hash_mixed_batch_success(result) != preserved:
+        raise IntegrationTestError(
+            "mixed batch resume replaced successful first-group evidence"
+        )
+    _assert_dataset_state(
+        runner,
+        config,
+        fixture,
+        resume,
+        result,
+        None,
+        KUBECTL_STORAGE_MOUNT if runtime.selector == "kubectl" else "",
+    )
+    _mixed_batch_report(runner, report_workspace, result, log_dir)
+
+
 def run_filesystem_tests(
     runner: Any,
     config: Any,
@@ -4891,7 +5551,20 @@ def run_filesystem_tests(
                         archive,
                         extracted,
                     )
-                    if step.substrate.value == "kubectl":
+                    if scenario == "mixed-batch":
+                        _run_mixed_batch(
+                            runner,
+                            config,
+                            fixture,
+                            runtime_state,
+                            extracted / "env.sh.template",
+                            report_workspace,
+                            scenario_logs,
+                            binary_name,
+                            binary,
+                            runtime,
+                        )
+                    elif step.substrate.value == "kubectl":
                         if scenario not in KUBECTL_SUPPORTED_SCENARIOS:
                             raise IntegrationTestError(
                                 f"Kubernetes scenario has no explicit adapter: {scenario}"

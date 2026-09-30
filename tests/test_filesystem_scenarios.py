@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.integration_scenario_test_helpers import EXPECTED_SCENARIO_NAMES
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _MODULE_PATH = _REPO_ROOT / "integration-tests" / "lib" / "scenario_planner.py"
 _SPEC = importlib.util.spec_from_file_location(
@@ -65,23 +67,7 @@ def test_catalog_exposes_stable_machine_metadata():
     """Listing metadata describes selection without freezing prose."""
     metadata = scenario_metadata(_SCENARIOS.SCENARIO_CATALOG)
 
-    assert [item["name"] for item in metadata] == [
-        "baseline",
-        "mdtest-sweep",
-        "default-dio",
-        "failure-resume",
-        "retained-lifecycle",
-        "live-capture",
-        "slurm-cartesian",
-        "ssh-single-big-file",
-        "ssh-weighted-roots",
-        "ssh-shared-home",
-        "kubectl-retained-read",
-        "kubectl-cancel",
-        "kubectl-coordinator-loss",
-        "kubectl-endpoint-drift",
-        "slurm-scheduling",
-    ]
+    assert [item["name"] for item in metadata] == list(EXPECTED_SCENARIO_NAMES)
     shared = next(item for item in metadata if item["name"] == "ssh-shared-home")
     assert shared["substrates"] == ["ssh"]
     assert shared["ssh_home_mode"] == "shared"
@@ -113,6 +99,7 @@ def test_default_plan_expands_substrates_and_batches_shared_home():
         ("work", "mdtest-sweep", "kubectl"),
         ("work", "default-dio", "kubectl"),
         ("work", "failure-resume", "kubectl"),
+        ("work", "mixed-batch", "kubectl"),
         ("work", "live-capture", "kubectl"),
         ("work", "kubectl-retained-read", "kubectl"),
         ("work", "kubectl-cancel", "kubectl"),
@@ -162,6 +149,7 @@ def test_kubectl_selection_has_no_ssh_transition():
         "mdtest-sweep",
         "default-dio",
         "failure-resume",
+        "mixed-batch",
         "live-capture",
         "kubectl-retained-read",
         "kubectl-cancel",

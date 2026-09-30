@@ -355,6 +355,37 @@ the same execution directory.
 makes the smallest resumable unit one parameter cell, while a single maximum-sized
 Slurm allocation avoids scheduler churn and repeated service startup.
 
+### Prepared filesystem batches
+
+Both filesystem launchers share local `--batch`, `--append`, and `--start`
+operations through `lib/_batch_functions.sh`. Preparation saves immutable IO or
+metadata groups without dispatching. `batch-manifest.tsv` commits their ordered
+membership, snapshot hashes, global execution IDs, and definition hashes by
+atomic rename. One root ledger owns cell states; group directories own snapshots,
+benchmark artifacts, completion evidence, and core dumps. Uncommitted staging
+is not executable. The existing dispatch-lock ownership checks protect append
+and seal operations.
+
+The common execution environment and host/scheduler-list contents are frozen at
+creation. Group workload settings may differ. Start performs non-mutating
+preflight, checks that the manifest revision is unchanged, and permanently seals
+it before external mutation. Submission failure never reopens preparation.
+Every cell restores its own saved configuration in an isolated context. Ordinary
+non-batch layouts and dispatch remain unchanged.
+
+SSH stays host-driven; Slurm acquires one maximum-sized allocation, and
+Kubernetes selects enough workers for all pending cells in one attempt.
+Kubernetes retains its existing attempt ownership, Lease, publication, and
+collection/resume gates; its canonical control root comes from the sealed union
+of test roots. Control bundles retain the full
+batch manifest and group provenance, including on partial resume.
+
+`utils/extract-filesystem.sh` delegates to the existing reporters independently
+per group. It snapshots only authoritative successful evidence into temporary
+inputs, writes disjoint group reports and an index, and never averages across
+group boundaries or contacts the cluster. The specialized reporter entry points
+share this batch routing while preserving legacy and cached-input behavior.
+
 ### 4.5 Remote Scriptlet and Result-Transfer Patterns
 
 SSH-mode nodes may not share the repository or output filesystem with the launch

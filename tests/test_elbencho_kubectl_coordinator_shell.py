@@ -64,6 +64,59 @@ def _refresh_bundle_manifest(control):
     (control / "bundle-manifest.tsv").write_text("".join(rows), encoding="utf-8")
 
 
+def _as_prepared_batch(control, kinds=("io", "io")):
+    """Freeze two independent group roots inside an existing fake bundle."""
+    shutil.copy2(_REPOSITORY_ROOT / "lib/_batch_functions.sh", control)
+    common = (control / "env_used.sh").read_text(encoding="utf-8")
+    rows = ["version\t1\nrevision\t2\ndatestamp\t20260923Z010203\n"]
+    outputs = []
+    for number, kind in enumerate(kinds, 1):
+        group_id = f"{number:04d}"
+        root = "z-io" if number == 1 else "a-metadata"
+        basename = "mdtest-elbencho" if kind == "mdtest" else "elbencho"
+        relative = f"groups/{group_id}/{basename}-20260923Z010203"
+        output = control / relative
+        output.mkdir(parents=True)
+        snapshot = common.replace("[benchmark]=1", f"[{root}]=1")
+        (output / "env_used.sh").write_text(snapshot, encoding="utf-8")
+        (output / "env_used.yaml").write_text(f"kind: {kind}\n", encoding="utf-8")
+        definition = control / "executions" / f"{group_id}.sh"
+        contents = definition.read_text(encoding="utf-8").replace("benchmark", root)
+        contents = (
+            snapshot
+            + contents
+            + (
+                f"\nexport ELBENCHO_EXECUTION_KIND={kind}\n"
+                f"export ELBENCHO_BATCH_GROUP_ID={group_id}\n"
+                f"export ELBENCHO_BATCH_OUTPUT_RELATIVE={relative}\n"
+            )
+        )
+        definition.write_text(contents, encoding="utf-8")
+        (control / "executions" / f"{group_id}.status").write_text(
+            "PENDING\n", encoding="utf-8"
+        )
+        rows.append(
+            f"group\t{group_id}\t{kind}\t{relative}\t"
+            f"{_sha256(output / 'env_used.sh')}\t{_sha256(output / 'env_used.yaml')}\n"
+        )
+        rows.append(f"execution\t{group_id}\t{group_id}\t{_sha256(definition)}\n")
+        outputs.append(relative)
+    (control / "env_used.sh").write_text(
+        common.replace("[benchmark]=1", "[z-io]=1 [a-metadata]=1"), encoding="utf-8"
+    )
+    (control / "run-metadata.tsv").write_text(
+        "attempt_id\t1234abcd\noutput_basename\tfilesystem-batch-20260923Z010203\n",
+        encoding="utf-8",
+    )
+    manifest = control / "batch-manifest.tsv"
+    manifest.write_text("".join(rows), encoding="utf-8")
+    (control / "batch-sealed.sha256").write_text(
+        _sha256(manifest) + "\n", encoding="utf-8"
+    )
+    _refresh_bundle_manifest(control)
+    return outputs
+
+
 def _write_bundle(tmp_path, execution_count=2):
     """Create one PVC control bundle and a fake, context-aware Elbencho."""
     run = tmp_path / "run"
@@ -214,7 +267,10 @@ def _run_recovery(control, state_dir, scratch):
 
 
 @pytest.mark.parametrize("produce_md_results", ["complete", "without-marker", "none"])
-def test_coordinator_dispatches_mixed_io_and_mdtest_cells(tmp_path, produce_md_results):
+@pytest.mark.parametrize("prepared_batch", [False, True])
+def test_coordinator_dispatches_mixed_io_and_mdtest_cells(
+    tmp_path, produce_md_results, prepared_batch
+):
     """A typed MD cell uses selected Pod hosts and publishes iteration outputs."""
     control, state_dir, scratch, fake = _write_bundle(tmp_path)
     (control / "executions" / "0002.sh").write_text(
@@ -260,6 +316,7 @@ def test_coordinator_dispatches_mixed_io_and_mdtest_cells(tmp_path, produce_md_r
         """,
     )
     _refresh_bundle_manifest(control)
+    outputs = _as_prepared_batch(control, ("io", "mdtest")) if prepared_batch else None
     result = _run_coordinator(
         control,
         state_dir,
@@ -276,8 +333,21 @@ def test_coordinator_dispatches_mixed_io_and_mdtest_cells(tmp_path, produce_md_r
     record = (control.parent / "fake-record").read_text(encoding="utf-8")
     assert "0001|io|" in record
     assert "0002|mdtest|10.10.0.1,10.10.0.2|" in record
-    assert f"|0002|{scratch / '0002' / 'elbencho-20260923Z010203'}" in record
-    assert "/benchmark/mdtest-elbencho-target-1-20260923Z010203-e0002" in record
+    basename = "mdtest-elbencho" if prepared_batch else "elbencho"
+    assert f"|0002|{scratch / '0002' / f'{basename}-20260923Z010203'}" in record
+    root = "a-metadata" if prepared_batch else "benchmark"
+    assert f"/{root}/mdtest-elbencho-target-1-20260923Z010203-e0002" in record
+    if prepared_batch:
+        publication = (state_dir / "publication-manifest.tsv").read_text(
+            encoding="utf-8"
+        )
+        assert f"\t{outputs[0]}/io.out\t" in publication
+        assert (
+            f"\t{outputs[1]}/executions/0002.mdtest.complete\t" in publication
+            or produce_md_results != "complete"
+        )
+        assert (state_dir / outputs[0] / "env_used.sh").is_file()
+        assert (state_dir / outputs[1] / "env_used.sh").is_file()
     if produce_md_results == "complete":
         assert (
             state_dir
@@ -798,6 +868,233 @@ def test_bundle_tampering_fails_before_state_or_lock_mutation(tmp_path):
     assert result.returncode != 0
     assert not state_dir.exists()
     assert "bundle digest mismatch" in result.stderr
+
+
+def test_batch_resume_bundle_runs_subset_and_retains_all_group_snapshots(tmp_path):
+    """A resumed attempt carries full provenance with only unfinished cells."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    outputs = _as_prepared_batch(control)
+    (control / "executions/0001.sh").unlink()
+    _refresh_bundle_manifest(control)
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode == 0, result.stderr
+    assert not (state_dir / "executions/0001.status").exists()
+    assert (state_dir / "executions/0002.status").read_text().strip() == "SUCCESS"
+    assert (state_dir / outputs[0] / "env_used.sh").exists()
+    assert (state_dir / outputs[1] / "env_used.sh").exists()
+    publication = (state_dir / "publication-manifest.tsv").read_text()
+    assert f"\t{outputs[1]}/result-0002.txt\t" in publication
+    assert "execution\t0001\t" not in publication
+
+
+def test_batch_snapshot_tampering_rejected_even_with_refreshed_bundle_digest(tmp_path):
+    """The sealed batch digest protects provenance independently of transfer."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    outputs = _as_prepared_batch(control)
+    (control / outputs[1] / "env_used.sh").write_text("TEST_DIRS=unsafe\n")
+    _refresh_bundle_manifest(control)
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode != 0
+    assert not state_dir.exists()
+    assert "snapshot digest mismatch" in result.stderr
+
+
+@pytest.mark.parametrize("mismatch", ["group", "output", "kind", "extra"])
+def test_batch_bundle_rejects_definition_membership_mismatch(tmp_path, mismatch):
+    """Verified digests do not authorize inconsistent execution ownership."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    outputs = _as_prepared_batch(control)
+    definition = control / "executions/0001.sh"
+    previous_digest = _sha256(definition)
+    if mismatch == "extra":
+        shutil.copy2(definition, control / "executions/0003.sh")
+    else:
+        replacements = {
+            "group": ("ELBENCHO_BATCH_GROUP_ID=0001", "ELBENCHO_BATCH_GROUP_ID=0002"),
+            "output": (outputs[0], outputs[1]),
+            "kind": ("ELBENCHO_EXECUTION_KIND=io", "ELBENCHO_EXECUTION_KIND=mdtest"),
+        }
+        original, replacement = replacements[mismatch]
+        definition.write_text(definition.read_text().replace(original, replacement))
+        manifest = control / "batch-manifest.tsv"
+        manifest.write_text(
+            manifest.read_text().replace(previous_digest, _sha256(definition))
+        )
+        (control / "batch-sealed.sha256").write_text(_sha256(manifest) + "\n")
+    _refresh_bundle_manifest(control)
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode != 0
+    assert not state_dir.exists()
+
+
+def test_batch_preflight_includes_every_generated_target_and_group_read_path(tmp_path):
+    """The PVC probe covers saved group paths beyond the common root profile."""
+    control, _, _, _ = _write_bundle(tmp_path)
+    _as_prepared_batch(control)
+    definition = control / "executions/0002.sh"
+    previous_digest = _sha256(definition)
+    definition.write_text(
+        definition.read_text()
+        + "\nexport ELBENCHO_SWEEP_READ_FROM=a-metadata/retained\n"
+    )
+    manifest = control / "batch-manifest.tsv"
+    manifest.write_text(
+        manifest.read_text().replace(previous_digest, _sha256(definition))
+    )
+    (control / "batch-sealed.sha256").write_text(_sha256(manifest) + "\n")
+    command = textwrap.dedent(f"""\
+        source '{_REPOSITORY_ROOT / 'lib/_batch_functions.sh'}'
+        source '{_KUBECTL_FUNCTIONS}'
+        _kubectl_batch_workload_paths '{control}'
+        """)
+    result = subprocess.run(
+        [_BASH, "-c", command], text=True, capture_output=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "/mnt/storage-scale-test/z-io/target-1",
+        "/mnt/storage-scale-test/a-metadata/target-2",
+        "/mnt/storage-scale-test/a-metadata/retained",
+    ]
+
+
+@pytest.mark.parametrize("sealed", [False, True])
+def test_batch_preflight_checks_canonical_control_layout_before_discovery(
+    tmp_path, sealed
+):
+    """Static path failures must be found before a draft is sealed or Pods created."""
+    control, _, _, _ = _write_bundle(tmp_path)
+    _as_prepared_batch(control)
+    if not sealed:
+        definition = control / "executions/0002.sh"
+        previous_digest = _sha256(definition)
+        definition.write_text(
+            definition.read_text() + "\nexport ELBENCHO_SWEEP_READ_FROM=a-metadata\n"
+        )
+        manifest = control / "batch-manifest.tsv"
+        manifest.write_text(
+            manifest.read_text().replace(previous_digest, _sha256(definition))
+        )
+        (control / "batch-sealed.sha256").unlink()
+    command = textwrap.dedent(f"""\
+        source '{_REPOSITORY_ROOT / 'lib/_batch_functions.sh'}'
+        source '{control / 'env_used.sh'}'
+        EXECUTION_SUBSTRATE=kubectl
+        SCALE_TEST_BASE='{_REPOSITORY_ROOT}'
+        max_nodes_remaining_executions() {{ printf '1\\n'; }}
+        _elbencho_batch_validate_cells() {{ return 0; }}
+        source() {{
+            builtin source "$@" || return
+            if [[ "$1" == '{_KUBECTL_FUNCTIONS}' ]]; then
+                kubectl_validate_runtime_configuration() {{ return 0; }}
+                kubectl_validate_cluster_identity() {{ return 0; }}
+                kubectl_discover_candidate_nodes() {{ echo discovery-was-reached >&2; return 1; }}
+            fi
+        }}
+        KUBECTL_CONTROL_LOGICAL_ROOT=z-io
+        KUBECTL_CONTROL_TEST_ROOT=/mnt/storage-scale-test/z-io
+        KUBECTL_CONTROL_ROOT=/mnt/storage-scale-test/z-io/.storage-scale-test
+        _elbencho_batch_preflight '{control}'
+        """)
+    result = subprocess.run(
+        [_BASH, "-c", command], text=True, capture_output=True, check=False
+    )
+    assert result.returncode != 0
+    expected = (
+        "canonical control root differs"
+        if sealed
+        else "may not scan the Kubernetes control-root"
+    )
+    assert expected in result.stderr
+    assert "discovery-was-reached" not in result.stderr
+    assert (control / "batch-sealed.sha256").exists() == sealed
+
+
+def test_coordinator_rejects_unlisted_execution_before_mutating_state(tmp_path):
+    """Directory contents cannot extend a verified control bundle."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    shutil.copy2(control / "executions/0001.sh", control / "executions/0003.sh")
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode != 0
+    assert not state_dir.exists()
+
+
+def test_batch_collection_imports_exact_group_paths_and_rejects_reassignment(tmp_path):
+    """Collection cannot publish one group's artifact into another group."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    outputs = _as_prepared_batch(control)
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode == 0, result.stderr
+    results = tmp_path / "local-results"
+    shutil.copytree(control, results)
+    prior_artifact = results / outputs[0] / "result-0001.txt"
+    prior_artifact.write_text("old-artifact\n")
+    prior_manifest = (
+        results
+        / "kubernetes/attempts/aaaabbbb/collected-state/publication-manifest.tsv"
+    )
+    prior_manifest.parent.mkdir(parents=True)
+    prior_manifest.write_text(
+        f"result\tresults/0001/result-0001.txt\t{outputs[0]}/result-0001.txt\t"
+        f"{prior_artifact.stat().st_size}\t{_sha256(prior_artifact)}\n"
+    )
+    command = textwrap.dedent(f"""\
+        source '{_REPOSITORY_ROOT / 'lib/_batch_functions.sh'}'
+        source '{_KUBECTL_FUNCTIONS}'
+        _kubectl_validate_collected_publication '{state_dir}' 1234abcd terminal \\
+            '{control / 'executions'}' >/dev/null || exit 1
+        _kubectl_merge_collected_results '{state_dir}' '{results}' 1234abcd reason
+        """)
+    imported = subprocess.run(
+        [_BASH, "-c", command], text=True, capture_output=True, check=False
+    )
+    assert imported.returncode == 0, imported.stderr
+    assert (results / outputs[0] / "result-0001.txt").read_text() == "artifact-0001\n"
+    assert (results / outputs[1] / "result-0002.txt").read_text() == "artifact-0002\n"
+    assert not (results / "result-0001.txt").exists()
+    # Repeat before the collected-state checkpoint: the destination now has
+    # the resumed attempt's digest, rather than its superseded predecessor's.
+    repeated = subprocess.run(
+        [_BASH, "-c", command], text=True, capture_output=True, check=False
+    )
+    assert repeated.returncode == 0, repeated.stderr
+    publication_path = state_dir / "publication-manifest.tsv"
+    publication = publication_path.read_text()
+    publication_path.write_text(
+        publication.replace(
+            f"\t{outputs[0]}/result-0001.txt\t", f"\t{outputs[1]}/result-0001.txt\t"
+        )
+    )
+    rejected = subprocess.run(
+        [_BASH, "-c", command], text=True, capture_output=True, check=False
+    )
+    assert rejected.returncode != 0
+    assert not (results / outputs[1] / "result-0001.txt").exists()
+
+
+def test_batch_publication_role_cannot_bypass_group_mapping(tmp_path):
+    """Calling an artifact a ledger does not authorize a cross-group copy."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    outputs = _as_prepared_batch(control)
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode == 0, result.stderr
+    manifest = state_dir / "publication-manifest.tsv"
+    manifest.write_text(
+        manifest.read_text().replace(
+            f"result\tresults/0001/result-0001.txt\t{outputs[0]}/result-0001.txt\t",
+            f"ledger\tresults/0001/result-0001.txt\t{outputs[1]}/result-0001.txt\t",
+        )
+    )
+    command = textwrap.dedent(f"""\
+        source '{_REPOSITORY_ROOT / 'lib/_batch_functions.sh'}'
+        source '{_KUBECTL_FUNCTIONS}'
+        _kubectl_validate_collected_publication '{state_dir}' 1234abcd terminal \\
+            '{control / 'executions'}' >/dev/null
+        """)
+    rejected = subprocess.run(
+        [_BASH, "-c", command], text=True, capture_output=True, check=False
+    )
+    assert rejected.returncode != 0
 
 
 def test_startup_endpoint_failure_publishes_a_collectible_terminal_ledger(tmp_path):
