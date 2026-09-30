@@ -160,6 +160,16 @@ class TestRunCiChecksShell(unittest.TestCase):
         for check in _LINT_CHECKS:
             self.assertIn(f"{check} diagnostic", result.stdout)
 
+    def test_all_reports_results_when_nested_lint_check_fails(self) -> None:
+        result, _ = self._run_checks(target="all", fail_check="shellcheck")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("No such file or directory", result.stderr)
+        self.assertIn("== shellcheck (failure,", result.stdout)
+        self.assertIn("== pytest (success,", result.stdout)
+        for check in _LINT_CHECKS:
+            self.assertIn(f"{check} diagnostic", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

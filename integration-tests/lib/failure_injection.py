@@ -180,9 +180,16 @@ if ! mkdir -- "$marker" 2>/dev/null; then
 fi
 
 child_pid=""
+pending_signal=""
+wait_interrupted=0
 forward_signal() {{
     local signal=$1
-    [[ -z "$child_pid" ]] || kill -s "$signal" "$child_pid" 2>/dev/null || true
+    wait_interrupted=1
+    if [[ -z "$child_pid" ]]; then
+        pending_signal=$signal
+    else
+        kill -s "$signal" "$child_pid" 2>/dev/null || true
+    fi
 }}
 trap 'forward_signal HUP' HUP
 trap 'forward_signal INT' INT
@@ -190,13 +197,19 @@ trap 'forward_signal TERM' TERM
 
 "$delegate" "$@" &
 child_pid=$!
+if [[ -n "$pending_signal" ]]; then
+    kill -s "$pending_signal" "$child_pid" 2>/dev/null || true
+fi
 set +e
 while true; do
+    wait_interrupted=0
     wait "$child_pid"
-    delegate_rc=$?
-    if ! kill -0 "$child_pid" 2>/dev/null; then
-        break
-    fi
+    wait_rc=$?
+    # A trapped signal interrupts wait before it reports the delegate's
+    # terminal status. Forward it, then reap again for the authoritative rc.
+    (( wait_interrupted )) && continue
+    delegate_rc=$wait_rc
+    break
 done
 set -e
 trap - HUP INT TERM

@@ -18,6 +18,7 @@
 """Fast decision-partition tests for the filesystem sweep contract."""
 
 import os
+import shlex
 import shutil
 import subprocess
 import textwrap
@@ -116,6 +117,7 @@ def test_env_precedence_selects_test_dirs_ssh_and_order_aliases(tmp_path):
         declare -A TEST_DIRS=(["{tmp_path}/preferred"]=2)
         OBJ_BUCKET=
         OBJ_AUTH_FILE="{tmp_path}/missing-auth"
+        EXECUTION_SUBSTRATE=ssh
         SSH_HOST_LIST="{hosts}"
         SSH_USER=tester
         ORDER_NODES=YeS
@@ -145,6 +147,7 @@ def test_env_fallbacks_apply_only_when_primary_values_are_empty(tmp_path):
         declare -A TEST_DIRS=()
         OBJ_BUCKET=
         OBJ_AUTH_FILE="{tmp_path}/missing-auth"
+        EXECUTION_SUBSTRATE=ssh
         SSH_HOST_LIST="{hosts}"
         ORDER_NODES=off
         client_type=cpu
@@ -347,15 +350,25 @@ def _make_sweep_fixture(tmp_path: Path) -> Path:
     script_dir.mkdir(parents=True)
     sweep = script_dir / _SWEEP.name
     shutil.copy2(_SWEEP, sweep)
+    kubectl_dir = script_dir / "kubectl"
+    kubectl_dir.mkdir()
+    shutil.copy2(
+        _REPO_ROOT / "storage-tests/fs/kubectl/_nv-elbencho-kubectl-functions.sh",
+        kubectl_dir / "_nv-elbencho-kubectl-functions.sh",
+    )
+    shutil.copy2(
+        _REPO_ROOT / "storage-tests/fs/kubectl/_nv-elbencho-kubectl-coordinator.sh",
+        kubectl_dir / "_nv-elbencho-kubectl-coordinator.sh",
+    )
     root = tmp_path / "data"
     root.mkdir()
     env = tmp_path / "env.sh"
     env.write_text(
         textwrap.dedent(f"""
-            export SCALE_TEST_BASE={_REPO_ROOT!s}
-            export RESULTS_DIR={tmp_path / 'results'!s}
-            export LOGS_DIR={tmp_path / 'logs'!s}
-            declare -A TEST_DIRS=([{root!s}]=1)
+            export SCALE_TEST_BASE={shlex.quote(str(_REPO_ROOT))}
+            export RESULTS_DIR={shlex.quote(str(tmp_path / 'results'))}
+            export LOGS_DIR={shlex.quote(str(tmp_path / 'logs'))}
+            declare -A TEST_DIRS=([{shlex.quote(str(root))}]=1)
             ELBENCHO_SCALE_THREAD_LIST=(1)
             ELBENCHO_SCALE_IO_SIZES=(4K)
             ELBENCHO_IODEPTH_LIST=(1)
@@ -370,6 +383,7 @@ def _make_sweep_fixture(tmp_path: Path) -> Path:
             export FS_MAX_AGG_THROUGHPUT=1
             export FS_MAX_NODE_THROUGHPUT_GBPS=1
             export FS_MAX_NODE_IOPS=1
+            export EXECUTION_SUBSTRATE=slurm
             export SSH_ENABLED=
             export SLURM_ENABLED=
             source "$SCALE_TEST_BASE/lib/env_functions.sh"
@@ -379,6 +393,25 @@ def _make_sweep_fixture(tmp_path: Path) -> Path:
     return sweep
 
 
+def test_sweep_sources_env_from_checkout_path_containing_apostrophe(tmp_path):
+    """The env syntax probe treats a valid checkout pathname as data."""
+    checkout = tmp_path / "storage-scale-test-a'b"
+    checkout.mkdir()
+    sweep = _make_sweep_fixture(checkout)
+    result = subprocess.run(
+        [str(sweep)],
+        check=False,
+        cwd=checkout,
+        env={**os.environ, "SHELL": _BASH},
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "--nodes is required" in result.stdout + result.stderr
+    assert "Failed to source env.sh" not in result.stdout + result.stderr
+    assert "unexpected EOF" not in result.stdout + result.stderr
+
+
 @pytest.mark.parametrize(
     "arguments, message",
     [
@@ -386,6 +419,9 @@ def _make_sweep_fixture(tmp_path: Path) -> Path:
         (("--read-from",), "requires a path argument"),
         (("--delete-only",), "requires a path argument"),
         (("--resume",), "requires a path argument"),
+        (("--status",), "requires a results directory"),
+        (("--cancel",), "requires a results directory"),
+        (("--collect",), "requires a results directory"),
         (("--unknown",), "Unknown option"),
         (("positional",), "Unexpected positional argument"),
         ((), "--nodes is required"),
@@ -396,6 +432,27 @@ def _make_sweep_fixture(tmp_path: Path) -> Path:
             "Use at most one",
         ),
         (("--resume", "/missing", "--bio"), "mutually exclusive"),
+        (("--status", "/missing", "--nodes", "1"), "mutually exclusive"),
+        (("--status", "/missing", "--cancel", "/missing"), "mutually exclusive"),
+        (("--resume", "/one", "--resume", "/two"), "only once"),
+        (("--status", "/one", "--status", "/two"), "only once"),
+        (("--cancel", "/one", "--cancel", "/two"), "only once"),
+        (("--collect", "/one", "--collect", "/two"), "only once"),
+        (("--nodes", ""), "requires an argument"),
+        (("--read-from", ""), "requires a path argument"),
+        (("--delete-only", ""), "requires a path argument"),
+        (("--resume", ""), "requires a path argument"),
+        (("--status", ""), "requires a results directory"),
+        (("--cancel", ""), "requires a results directory"),
+        (("--collect", ""), "requires a results directory"),
+        (("--bio", "--bio"), "only once"),
+        (("--rand", "--rand"), "only once"),
+        (("--single", "--single"), "only once"),
+        (("--write-only", "--write-only"), "only once"),
+        (("--write-no-read", "--write-no-read"), "only once"),
+        (("--nodes", "1", "--nodes", "2"), "only once"),
+        (("--read-from", "/a", "--read-from", "/b"), "only once"),
+        (("--delete-only", "/a", "--delete-only", "/b"), "only once"),
     ],
 )
 def test_sweep_cli_rejects_invalid_equivalence_classes(tmp_path, arguments, message):
@@ -429,3 +486,86 @@ def test_sweep_help_is_environment_independent(tmp_path, flag):
     assert result.returncode == 0, result.stderr
     assert "Usage:" in result.stdout
     assert "--resume" in result.stdout
+
+
+@pytest.mark.parametrize("operation", ("status", "cancel", "collect"))
+def test_kubectl_lifecycle_parses_without_current_environment(tmp_path, operation):
+    """Saved-attempt operations do not consult a changed or missing env.sh."""
+    sweep = _make_sweep_fixture(tmp_path)
+    (tmp_path / "env.sh").unlink()
+    result = subprocess.run(
+        [str(sweep), f"--{operation}", str(tmp_path / "prior-results")],
+        check=False,
+        cwd=tmp_path,
+        env={**os.environ, "SHELL": _BASH},
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "Failed to source env.sh" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("saved_line", "inherited", "message"),
+    (
+        ("", "", "legacy resume snapshots require inherited"),
+        (
+            "export EXECUTION_SUBSTRATE=ssh\n",
+            "slurm",
+            "does not match inherited",
+        ),
+        (
+            "export EXECUTION_SUBSTRATE=invalid\n",
+            "",
+            "saved EXECUTION_SUBSTRATE is unsupported",
+        ),
+    ),
+)
+def test_resume_rejects_saved_identity_before_sourcing_current_env(
+    tmp_path, saved_line, inherited, message
+):
+    """Current configuration cannot reinterpret an invalid saved attempt."""
+    sweep = _make_sweep_fixture(tmp_path)
+    marker = tmp_path / "env-sourced"
+    with (tmp_path / "env.sh").open("a", encoding="utf-8") as stream:
+        stream.write(f"printf sourced > {marker!s}\n")
+    result_dir = tmp_path / "results" / "elbencho-saved"
+    (result_dir / "executions").mkdir(parents=True)
+    (result_dir / "env_used.sh").write_text(saved_line, encoding="utf-8")
+    environment = {**os.environ, "SHELL": _BASH}
+    if inherited:
+        environment["EXECUTION_SUBSTRATE"] = inherited
+    else:
+        environment.pop("EXECUTION_SUBSTRATE", None)
+    result = subprocess.run(
+        [str(sweep), "--resume", str(result_dir)],
+        check=False,
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not marker.exists()
+
+
+def test_kubectl_resume_gates_from_saved_snapshot_without_current_env(tmp_path):
+    """The saved selector is authoritative before current configuration."""
+    sweep = _make_sweep_fixture(tmp_path)
+    (tmp_path / "env.sh").unlink()
+    result_dir = tmp_path / "results" / "elbencho-saved"
+    (result_dir / "executions").mkdir(parents=True)
+    (result_dir / "env_used.sh").write_text(
+        "export EXECUTION_SUBSTRATE=kubectl\n", encoding="utf-8"
+    )
+    result = subprocess.run(
+        [str(sweep), "--resume", str(result_dir)],
+        check=False,
+        cwd=tmp_path,
+        env={**os.environ, "SHELL": _BASH},
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "Failed to source env.sh" not in result.stdout + result.stderr

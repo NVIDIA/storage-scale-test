@@ -32,13 +32,19 @@ if [[ ! -d "${SCRIPT_DIR}" ]]; then
 fi
 readonly SCRIPT_DIR
 
-if ! source_output=$("$SHELL" -c ". '${SCRIPT_DIR}/../../env.sh'" 2>&1); then
+if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
+        "${SCRIPT_DIR}/../../env.sh" 2>&1); then
     printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
     exit 1
 fi
 
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../../env.sh"
+
+if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
+    echo "Error: kubectl execution is not supported by nv-mdtest-elbencho.sh" >&2
+    exit 1
+fi
 
 # Validate FS testing is enabled
 if [ -z "${FS_ENABLED:-}" ]; then

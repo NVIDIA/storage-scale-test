@@ -65,6 +65,10 @@ EXPECTED_NAMES = {
     "ssh-weighted-roots",
     "ssh-shared-home",
     "slurm-scheduling",
+    "kubectl-retained-read",
+    "kubectl-cancel",
+    "kubectl-coordinator-loss",
+    "kubectl-endpoint-drift",
 }
 
 

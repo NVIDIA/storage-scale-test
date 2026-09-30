@@ -284,10 +284,6 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
             mkdir -p "$root"
             output_dir="$tmp/out-DS"
             test_dirs_csv="$target"
-            ELBENCHO_RUN_NODE_COUNT=2
-            ELBENCHO_RUN_HOSTS_CSV=a,b
-            ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$output_dir"
-            ELBENCHO_RUN_EXECUTION_ID=0001
             ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV="$target"
             ELBENCHO_RUN_GENERATED_TEST_ROOT="$root"
             ELBENCHO_RUN_TEST_DIR_SUFFIX=-DS-e0001
@@ -326,6 +322,9 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
                         "$phase" >"$path"
                 fi
             }}
+            elbencho_set_cell_run_context 0001 2 a,b "$target" \
+                "$output_dir" "$output_dir" _elbencho_noop_cell_hook \
+                _elbencho_noop_cell_hook
             run_elbencho_io_sweep_iteration_shared_generated
             [[ ! -e "$target" ]]
             grep -q -- '--dirs=0 --files=2' "$tmp/calls"
@@ -356,10 +355,6 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
             mkdir -p "$root" "$tmp/out-DS/executions"
             output_dir="$tmp/out-DS"
             test_dirs_csv="$target"
-            ELBENCHO_RUN_NODE_COUNT=1
-            ELBENCHO_RUN_HOSTS_CSV=
-            ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$output_dir"
-            ELBENCHO_RUN_EXECUTION_ID=0002
             ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV="$target"
             ELBENCHO_RUN_GENERATED_TEST_ROOT="$root"
             ELBENCHO_RUN_TEST_DIR_SUFFIX=-DS-e0002
@@ -393,6 +388,9 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
                         >"$path"
                 fi
             }}
+            elbencho_set_cell_run_context 0002 1 a "$target" \
+                "$output_dir" "$output_dir" _elbencho_noop_cell_hook \
+                _elbencho_noop_cell_hook
             set +e
             run_elbencho_io_sweep_iteration
             rc=$?
@@ -424,10 +422,6 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
             output_dir="$tmp/out-DS"
             mkdir -p "$root"
             test_dirs_csv="$target"
-            ELBENCHO_RUN_NODE_COUNT=1
-            ELBENCHO_RUN_HOSTS_CSV=
-            ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$output_dir"
-            ELBENCHO_RUN_EXECUTION_ID=0007
             ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV="$target"
             ELBENCHO_RUN_GENERATED_TEST_ROOT="$root"
             ELBENCHO_RUN_TEST_DIR_SUFFIX=-DS-e0007
@@ -458,6 +452,9 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
                     return 23
                 fi
             }}
+            elbencho_set_cell_run_context 0007 1 a "$target" \
+                "$output_dir" "$output_dir" _elbencho_noop_cell_hook \
+                _elbencho_noop_cell_hook
             set +e
             run_elbencho_io_sweep_iteration_shared_generated
             rc=$?
@@ -530,7 +527,7 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
             mkdir -p "$target"
             touch "$target/r0-f0"
             ELBENCHO_RUN_EXECUTION_ID=0009
-            ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$tmp/out"
+            ELBENCHO_RUN_SCRATCH_OUTPUT_DIR="$tmp/out"
             ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV="$target"
             ELBENCHO_RUN_GENERATED_TEST_ROOT="$root"
             ELBENCHO_RUN_TEST_DIR_SUFFIX=-DS-e0009
@@ -568,15 +565,12 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
             mkdir -p "$tmp/data"
             output_dir="$tmp/out-DS"
             test_dirs_csv="$tmp/data"
-            ELBENCHO_RUN_NODE_COUNT=1
-            ELBENCHO_RUN_HOSTS_CSV=a
-            ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$output_dir"
-            ELBENCHO_RUN_EXECUTION_ID=0001
             ELBENCHO_SWEEP_READ_FROM="$tmp/data"
             ELBENCHO_SINGLE_BIG_FILE=0
             ELBENCHO_SCALE_READ_WRITE_DURATION=1
             ELBENCHO_LIVE_CSV_EXTENDED=0
             io_size=4K thread_count=1 io_depth=1 dio_or_bio=bio use_random=0
+            force_single=0
             run_an_elbencho() {{
                 local tree= arg
                 while [[ $# -gt 0 ]]; do
@@ -587,6 +581,9 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
                 printf 'f 999 competing\n' \
                     >"$tmp/data/.storage-scale-test-elbencho-treefile.txt"
             }}
+            elbencho_set_cell_run_context 0001 1 a "$tmp/data" \
+                "$output_dir" "$output_dir" _elbencho_noop_cell_hook \
+                _elbencho_noop_cell_hook
             run_elbencho_io_sweep_iteration_staged
             grep -q $'dataset_bytes_total\t5' \
                 "$output_dir/executions/0001.workload.tsv"
@@ -612,15 +609,12 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
             mkdir -p "$tmp/data"
             output_dir="$tmp/out-DS"
             test_dirs_csv="$tmp/data"
-            ELBENCHO_RUN_NODE_COUNT=1
-            ELBENCHO_RUN_HOSTS_CSV=a
-            ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$output_dir"
-            ELBENCHO_RUN_EXECUTION_ID=0001
             ELBENCHO_SWEEP_READ_FROM="$tmp/data"
             ELBENCHO_SINGLE_BIG_FILE=0
             ELBENCHO_SCALE_READ_WRITE_DURATION=1
             ELBENCHO_LIVE_CSV_EXTENDED=0
             io_size=4K thread_count=1 io_depth=1 dio_or_bio=bio use_random=0
+            force_single=0
             run_an_elbencho() {{
                 local tree= arg
                 while [[ $# -gt 0 ]]; do
@@ -637,6 +631,9 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
                 fi
                 command mv "$@"
             }}
+            elbencho_set_cell_run_context 0001 1 a "$tmp/data" \
+                "$output_dir" "$output_dir" _elbencho_noop_cell_hook \
+                _elbencho_noop_cell_hook
             run_elbencho_io_sweep_iteration_staged
             [[ ! -e "$tmp/data/.storage-scale-test-elbencho-treefile.txt" ]]
             grep -q $'dataset_files_total\t1' \

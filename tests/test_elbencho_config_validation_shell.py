@@ -47,6 +47,7 @@ class TestElbenchoConfigValidationShell(unittest.TestCase):
             RESULTS_DIR={str(Path(tmp) / "results")!r}
             LOGS_DIR={str(Path(tmp) / "logs")!r}
             OBJ_AUTH_FILE={str(Path(tmp) / "missing-auth")!r}
+            EXECUTION_SUBSTRATE=ssh
             SSH_HOST_LIST=/dev/null
             client_type=cpu
             client_arch=x86_64

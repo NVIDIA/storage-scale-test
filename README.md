@@ -30,17 +30,20 @@ recommended.
 
 ## Global Prerequisites
 
-* Linux on the orchestration host and on every client. Benchmark execution
-  relies on bash 4.3 or newer and a Linux userland. macOS can run static checks
-  and unit tests that do not require benchmark binaries, but it cannot run the
-  storage benchmarks. In particular, elbencho is not available for Apple
-  silicon; binary-dependent tests are skipped when it is unavailable. Running
-  the developer unit tests on macOS requires a newer Bash and GNU coreutils,
-  which can be installed with `brew install bash coreutils`.
+* Linux on every host where a benchmark process runs. Slurm orchestration also
+  requires a Linux host. macOS may initiate SSH and kubectl filesystem sweeps;
+  the benchmark still runs only on the remote Linux hosts or in Linux Pods.
+  macOS launchers require Bash 4.3 or newer plus GNU coreutils. Kubectl also
+  requires GNU tar and `flock` (`brew install bash coreutils gnu-tar flock`).
+  Put Homebrew's Bash first on `PATH`; `validate_env.sh` checks the prefixed
+  Homebrew tools. Apple-silicon macOS cannot run elbencho locally;
+  binary-dependent developer tests remain skipped there.
 * Python 3.12 or newer is required on the host that runs the analysis and
   reporting wrappers. The pinned current NumPy release establishes this minimum.
-* Clients must be available through Slurm or passwordless SSH. For Slurm,
-  gather the account, reservation, and partition required to submit jobs.
+* Filesystem clients must be available through exactly one configured
+  execution substrate: Slurm, passwordless SSH, or an authorized Kubernetes
+  cluster. Slurm users need the account, reservation, and partition required
+  to submit jobs.
 * Use tuned clients with enough aggregate network bandwidth to saturate the
   target. A starting count is
   `1.1 * target_Gbps / measured_per_client_Gbps`.
@@ -132,8 +135,11 @@ publish or distribute the resulting tarball or its binaries.
 
 ## Execution Modes
 
-Slurm is the default execution substrate. Setting `SSH_HOST_LIST` switches the
-tool to passwordless SSH mode; the two modes are mutually exclusive.
+Set exactly one `EXECUTION_SUBSTRATE` value in `env.sh`: `slurm`, `ssh`, or
+`kubectl`. There is intentionally no default, and `SSH_HOST_LIST` configures
+SSH mode but does not select it. The selected substrate applies to the
+filesystem sweep; its configuration must be complete before
+`validate_env.sh` is run.
 
 ### Passwordless SSH
 
@@ -154,7 +160,8 @@ export SSH_HOST_LIST=/absolute/path/to/host_list
 # export SSH_HOMEDIR_SHARED=1        # any non-empty value
 ```
 
-Setting `SSH_HOST_LIST` disables Slurm settings. Authentication must be
+`SSH_HOST_LIST` is used only when `EXECUTION_SUBSTRATE=ssh`; it does not select
+the substrate or disable Slurm configuration. Authentication must be
 non-interactive. Run `validate_env.sh` to verify connectivity.
 
 ### Slurm options
@@ -170,6 +177,87 @@ SLURM_EXTRA_ARGS=("--constraint=ib" "--comment=storage validation run")
 `SLURM_EXCLUSIVE_USER=1` uses `--exclusive=user` and derives
 `--cpus-per-task` when the target CPU count is available; the default uses
 `--exclusive`.
+
+### Kubernetes filesystem sweeps
+
+Kubernetes mode requires an already authorized `kubectl` context. The tool
+does not provision a cluster, namespace, PV, or PVC. Set all of the following
+in `env.sh`:
+
+```bash
+export EXECUTION_SUBSTRATE=kubectl
+export KUBECTL_NAMESPACE=storage-scale-test
+export KUBECTL_PV=storage-scale-test-pv
+export KUBECTL_PVC=storage-scale-test-pvc
+export KUBECTL_NODE_SELECTOR='storage-scale-test/worker=true'
+export KUBECTL_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.1-11
+export KUBECTL_IMAGE_PULL_POLICY=IfNotPresent
+export KUBECTL_RUN_AS_USER=2000
+export KUBECTL_RUN_AS_GROUP=2000
+```
+
+The namespace and the named PV/PVC must already exist and the PVC must be
+bound to that PV. The node selector must identify enough schedulable worker
+nodes for the requested sweep. The cluster CNI must provide direct Pod IPv4
+connectivity between the coordinator and worker Pods and enforce the
+attempt-scoped network policies; the selected nodes must be able to mount the
+PVC. The active identity also needs `get`, `create`, and `delete` permission
+for namespaced `leases.coordination.k8s.io`. The configured benchmark image
+must be usable under the configured pull policy, and any registry credentials
+required by the cluster are a user responsibility.
+`KUBECTL_IMAGE_PULL_POLICY=Always` requires a digest-qualified image reference
+so the coordinator cannot repull a different build from the worker Pods.
+Elbencho validation, worker, and coordinator Pods explicitly request an
+`Unconfined` seccomp profile because `RuntimeDefault` can reject Linux AIO
+operations such as `io_getevents`. Namespace admission policy must allow that
+profile. The Pods still run as the configured non-root UID/GID, disable
+privilege escalation, drop all capabilities, and mount no API token.
+Run `validate_env.sh` before a sweep; it creates a short-lived Job with that
+profile and verifies that the running process reports unconfined seccomp mode.
+
+`TEST_DIRS` remains a logical filesystem configuration in Kubernetes mode.
+The sweep prepends `/mnt/storage-scale-test/` when it constructs Pod-side
+paths, so users must not add that prefix themselves. The PVC is mounted at
+that path. Every configured root must already be a directory writable by
+`KUBECTL_RUN_AS_USER:KUBECTL_RUN_AS_GROUP`; the mount root itself need not be
+writable. The tool chooses the lexically first normalized `TEST_DIRS` root and
+creates `.storage-scale-test` beneath it for durable state and completed-cell
+data. Kubernetes path components accept letters, digits, `.`, `_`, and `-`;
+do not use `.storage-scale-test` as a component. A Kubernetes Lease
+keyed by the namespace, PV, and PVC UIDs prevents concurrent sweeps on the same
+claim even when they use different test roots.
+
+A Kubernetes invocation submits one asynchronous Job for the whole sweep.
+Submission stages the verified control bundle and execution definitions on
+the PVC, starts the Job, and prints commands for querying, cancelling, and
+collecting the attempt:
+
+```bash
+./storage-tests/fs/nv-elbencho-sweep.sh --nodes 1,2,4
+./storage-tests/fs/nv-elbencho-sweep.sh --status "$RESULTS_DIR"/elbencho-<datestamp>/
+./storage-tests/fs/nv-elbencho-sweep.sh --cancel "$RESULTS_DIR"/elbencho-<datestamp>/
+./storage-tests/fs/nv-elbencho-sweep.sh --collect "$RESULTS_DIR"/elbencho-<datestamp>/
+```
+
+The Job does not depend on the submitting process's later `kubectl`
+credentials, although lifecycle commands require current credentials until
+cleanup completes. `--status` inspects durable state and performs only bounded,
+exact-identity reconciliation. A successful status query exits zero regardless
+of the benchmark outcome. `--cancel` stops the exact saved attempt and preserves
+its durable state. `--collect` is required after a terminal attempt: it copies
+completed results, snapshots, and diagnostics into the local result directory
+and performs owned-resource cleanup. Collection of a failed or cancelled
+attempt returns nonzero after publishing the partial results, so callers must
+inspect the collected state before deciding whether to continue.
+
+Kubernetes `--resume` is collection-gated. After collecting a failed attempt,
+run `--resume <results-dir>` with the same Kubernetes configuration to submit
+only the uncompleted cells; successful cells and their results are retained.
+Concurrent mutating operations on one result directory and concurrent sweeps
+on one PVC are rejected. Active measured output is Pod-local scratch, while
+completed-cell publication and the control ledger are copied to the PVC
+between cells. A failure before publication can lose that cell's partial
+output, but cannot silently claim it succeeded.
 
 ## Heterogeneous Client Fleets
 

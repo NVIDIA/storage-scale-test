@@ -1,0 +1,145 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: @@RESOURCE_NAME@@
+  namespace: @@NAMESPACE@@
+  labels:
+    app.kubernetes.io/name: storage-scale-test
+    app.kubernetes.io/instance: sst-elb-@@ATTEMPT_ID@@
+    app.kubernetes.io/component: validation
+    app.kubernetes.io/managed-by: storage-scale-test
+    storage-scale-test.nvidia.com/benchmark: elbencho
+    storage-scale-test.nvidia.com/run: "@@ATTEMPT_ID@@"
+  annotations:
+    storage-scale-test.nvidia.com/ownership: "@@OWNERSHIP_NONCE@@"
+spec:
+  backoffLimit: 0
+  # The host stops waiting at 180 seconds and captures the still-live Pod.
+  # This later deadline bounds cleanup if the host disappears mid-validation.
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 60
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: storage-scale-test
+        app.kubernetes.io/instance: sst-elb-@@ATTEMPT_ID@@
+        app.kubernetes.io/component: validation
+        storage-scale-test.nvidia.com/run: "@@ATTEMPT_ID@@"
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 1
+      restartPolicy: Never
+      nodeName: @@NODE_NAME@@
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: @@RUN_AS_USER@@
+        runAsGroup: @@RUN_AS_GROUP@@
+        seccompProfile:
+          # Match the workload Pods so validation proves cluster admission.
+          type: Unconfined
+      containers:
+        - name: validation
+          image: @@IMAGE@@
+          imagePullPolicy: @@IMAGE_PULL_POLICY@@
+          command: ["/bin/bash", "-ceu", "--"]
+          args:
+            - |
+              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=identity\n'
+              test "$(id -u)" = "@@RUN_AS_USER@@" || {
+                  echo "Error: validation Pod UID does not match KUBECTL_RUN_AS_USER" >&2
+                  exit 1
+              }
+              test "$(id -g)" = "@@RUN_AS_GROUP@@" || {
+                  echo "Error: validation Pod GID does not match KUBECTL_RUN_AS_GROUP" >&2
+                  exit 1
+              }
+              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=seccomp\n'
+              seccomp_mode=
+              while read -r key value _; do
+                  if [[ "$key" == Seccomp: ]]; then
+                      seccomp_mode=$value
+                      break
+                  fi
+              done < /proc/self/status
+              test "$seccomp_mode" = 0 || {
+                  echo "Error: validation Pod is not running with the required Unconfined seccomp profile" >&2
+                  exit 1
+              }
+              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=required-tools\n'
+              for command in elbencho bash tar realpath timeout sha256sum awk find grep mkdir cp cmp date shuf mv wc cat sed rm sort basename dirname sleep mktemp tr xargs rmdir id cut od; do
+                  command -v "$command" >/dev/null || {
+                      echo "Error: benchmark image is missing required command: $command" >&2
+                      exit 1
+                  }
+              done
+              if ! type -P stat >/dev/null 2>&1 && ! type -P gstat >/dev/null 2>&1; then
+                  echo "Error: benchmark image must provide stat or gstat" >&2
+                  exit 1
+              fi
+              if ! type -P pkill >/dev/null 2>&1 && ! type -P killall >/dev/null 2>&1; then
+                  echo "Error: benchmark image must provide pkill or killall" >&2
+                  exit 1
+              fi
+              test -x /usr/bin/elbencho || {
+                  echo "Error: /usr/bin/elbencho is not executable in the benchmark image" >&2
+                  exit 1
+              }
+              test_roots=(
+@@TEST_ROOT_ARGUMENTS@@
+              )
+              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-permissions\n'
+              for test_root in "${test_roots[@]}"; do
+                  test -r "$test_root" || {
+                      echo "Error: configured UID/GID cannot read TEST_DIRS root $test_root" >&2
+                      exit 1
+                  }
+                  test -w "$test_root" || {
+                      echo "Error: configured UID/GID cannot write TEST_DIRS root $test_root" >&2
+                      exit 1
+                  }
+                  printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-create path=%s\n' "$test_root"
+                  probe=$(mktemp "$test_root/.sst-validation.XXXXXXXX") || {
+                      echo "Error: configured UID/GID cannot create a file in TEST_DIRS root $test_root" >&2
+                      exit 1
+                  }
+                  trap 'rm -f -- "$probe"' EXIT
+                  printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-write path=%s\n' "$test_root"
+                  printf 'storage-scale-test-validation\n' > "$probe" || {
+                      echo "Error: validation Pod could not write its PVC probe in $test_root" >&2
+                      exit 1
+                  }
+                  printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-read path=%s\n' "$test_root"
+                  test "$(cat "$probe")" = storage-scale-test-validation || {
+                      echo "Error: validation Pod could not read back its PVC probe in $test_root" >&2
+                      exit 1
+                  }
+                  rm -f -- "$probe"
+                  trap - EXIT
+              done
+              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=complete\n'
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: storage
+              mountPath: /mnt/storage-scale-test
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: @@PVC_NAME@@

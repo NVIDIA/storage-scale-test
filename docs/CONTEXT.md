@@ -54,11 +54,19 @@ only: NVIDIA and the project do not publish or deliver benchmark binaries or
 prepared deployment tarballs. Users may create a deployment tarball locally
 and are responsible for every binary they place in it.
 
-Slurm is the default execution substrate; `SSH_HOST_LIST` selects passwordless
-SSH. Kubernetes benchmark execution is not implemented. The `integration-tests/`
-fixture provisions three kind nodes, RWX storage, two SSH workers, and Slinky
-Slurm. Its `nfs` backend uses loop-backed NFSv4 and NFS CSI; `sbx-shared` uses
-static volumes over a repository-shared path. Both test the same storage contract.
+`EXECUTION_SUBSTRATE` explicitly selects Slurm, passwordless SSH, or kubectl;
+there is no default, and `SSH_HOST_LIST` no longer selects a mode. The
+benchmark processes require Linux; macOS with Homebrew Bash and coreutils may
+initiate SSH or kubectl sweeps. Kubectl also requires Homebrew GNU tar and
+`flock`; validation checks the prefixed commands before touching the cluster.
+The `integration-tests/` fixture provisions three kind nodes, RWX storage, two
+SSH workers, Slinky Slurm, and the Kubernetes sweep prerequisites. Its `nfs`
+backend uses loop-backed NFSv4 and NFS CSI; `sbx-shared` uses static volumes
+over a repository-shared path. NFS retains pinned Kindnet; Docker SBX uses
+pinned, preloaded Calico because its nested kernel cannot run Kindnet's
+nftables policy path. Setup proves non-root Elbencho Pod placement, direct
+Pod-IPv4 coordination, enforced NetworkPolicy, and PVC access before testing
+the SSH, Slurm, and kubectl substrates.
 
 One budget drives PVC capacity and the growable 4 GiB NFS image. Setup publishes
 image tags transactionally, grows retained filesystems, checks fixture and Docker
@@ -90,9 +98,28 @@ Elbencho/runtime identity, and extracts isolated scenario workspaces. Real cases
 cover baseline and default I/O, failure/resume, retained data, live capture,
 Cartesian sweeps, single-file and weighted-root behavior, shared SSH homes, and
 Slurm scheduling. Fast tests cover parsing, precedence, path and workload safety,
-sizing, scheduler boundaries, failure contracts, and reporting. CI runs the full
-NFS-backed catalog concurrently on amd64 and arm64 with repeatable-teardown
-headroom; SBX is a supported local backend.
+sizing, scheduler boundaries, failure contracts, and reporting. On-demand CI
+runs the full NFS-backed catalog concurrently on amd64 and arm64 with
+repeatable-teardown headroom; SBX is a supported local backend.
+
+The kubectl filesystem sweep's implemented decisions and tradeoffs are retained
+in the historical
+[design record](plans/kubernetes-elbencho-filesystem-sweep.md). Its normative
+state machines, invariants, fault matrix, and unsupported cases are frozen in
+[KUBERNETES_ELBENCHO_LIFECYCLE.md](KUBERNETES_ELBENCHO_LIFECYCLE.md).
+Attempts publish their local `PREPARED` pointer before external mutation so an
+interrupted setup remains recoverable; resume uses compare-and-swap against the
+collected predecessor. Collection waits for the exact journaled Job to
+become inactive, uses a transfer-sized deadline, and recovers coordinator loss
+from either PREPARED or RUNNING. Derived workload paths are resolved against
+live PVC symlinks, and endpoint checks freeze Node, Pod, address, architecture,
+and image identity. Ordinary PVC commands detach stdin; only finite bundle
+uploads use interactive `kubectl exec`. Successful status queries return zero
+regardless of the recorded benchmark outcome. Preparation distinguishes local,
+capacity, path, API, and PVC failures; bounded diagnostics retain Pod details,
+PVC ledger/publication evidence, and exact resource identities.
+Elbencho validation, worker, and coordinator Pods use `Unconfined` seccomp for
+Linux AIO; non-benchmark helpers retain `RuntimeDefault`.
 
 GitHub Actions runs concurrent compliance, ShellCheck, Black, and Pylint checks
 alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
@@ -102,7 +129,7 @@ alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 
 | Path | Responsibility |
 |---|---|
-| `storage-tests/fs/` | Filesystem IO and metadata entry points, Slurm jobs, and SSH scriptlets |
+| `storage-tests/fs/` | Filesystem IO and metadata entry points plus Slurm, SSH, and kubectl orchestration |
 | `storage-tests/object/` | Warp object-storage entry point and substrate-specific dispatchers |
 | `storage-tests/network/` | Elbencho netbench entry point and substrate-specific dispatchers |
 | `lib/env_base.sh` | Derived configuration, substrate selection, executable paths, and Slurm option construction |
@@ -137,9 +164,11 @@ work begins.
 
 Important configuration relationships:
 
-- A non-empty `SSH_HOST_LIST` enables SSH and disables Slurm. The referenced
-  file accepts comma- or whitespace-separated hosts and ignores comment lines.
-- Without `SSH_HOST_LIST`, `env_base.sh` enables Slurm. `SLURM_NODE_INCLUDES`
+- `EXECUTION_SUBSTRATE` is required and derives exactly one mode flag. `ssh`
+  also requires `SSH_HOST_LIST`; that file accepts comma- or whitespace-separated
+  hosts and ignores comment lines. Kubectl is supported by the filesystem
+  sweep; metadata, object, and network entry points remain SSH/Slurm-only.
+- In Slurm mode, `SLURM_NODE_INCLUDES`
   and `SLURM_NODE_IGNORES` point to optional files containing valid Slurm
   hostlists, including compressed forms.
 - `ORDER_NODES=1` makes SSH selection use the first requested hosts. With a
@@ -226,6 +255,26 @@ terminal state must be confirmed through Slurm accounting.
 human- and tool-readable run snapshot. Protect the result directory from
 untrusted modification because resume sources both `env_used.sh` and each
 `executions/NNNN.sh`.
+
+In kubectl mode, one submission represents the whole sweep. The launcher
+acquires a PVC-wide Kubernetes Lease, stages a verified control bundle below
+the lexically first normalized `TEST_DIRS` root, freezes worker Pod addresses,
+starts one Elbencho service Pod per worker, and creates one coordinator Job.
+The Job needs no API credentials after startup. `--status`, `--cancel`, and
+`--collect` operate on that attempt; collection releases the Lease last, and
+recovers its final delete-to-journal interruption only after proving publication
+and all preceding exact cleanup. `--resume` creates a new attempt after
+collection while preserving successful cells.
+
+Kubernetes uses ordinary Pod networking and attempt-scoped NetworkPolicy,
+not host networking, host ports, or Services. Worker endpoint identity is
+revalidated by status and collection; the API-independent coordinator probes
+frozen addresses before each cell. Drift or coordinator loss is recovered only
+with fresh identity evidence. Collection copies PVC results to the local result
+tree. A configured namespace, existing PV/PVC, node selector, authorized kubectl
+context, and compatible CNI are prerequisites.
+Docker SBX validates the supported kind profile; dual-architecture NFS CI and
+a separately authorized external-cluster run are release acceptance gates.
 
 ## Filesystem IO workload models
 

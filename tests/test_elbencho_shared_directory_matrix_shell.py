@@ -44,9 +44,6 @@ trap 'rm -rf "$tmp"' EXIT
 root="$tmp/data"
 output_dir="$tmp/elbencho-DS"
 mkdir -p "$root"
-ELBENCHO_RUN_NODE_COUNT=1
-ELBENCHO_RUN_HOSTS_CSV=
-ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$output_dir"
 ELBENCHO_RUN_GENERATED_TEST_ROOT="$root"
 ELBENCHO_FILE_LAYOUT=shared-directory
 ELBENCHO_FILE_SIZE=4K
@@ -81,6 +78,7 @@ run_case() {{
     ELBENCHO_RUN_TEST_DIR_SUFFIX="-DS-e${{id}}"
     ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV="$root/target-DS-e${{id}}"
     test_dirs_csv="$ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV"
+    ELBENCHO_RUN_TEST_DIRS_CSV="$test_dirs_csv"
     thread_count="$threads"
     ELBENCHO_FILES_PER_NODE="$files"
     EXPECTED_FILES="$files"
@@ -89,6 +87,9 @@ run_case() {{
     ELBENCHO_SWEEP_WRITE_NO_READ=0
     [[ "$mode" == write-only ]] && ELBENCHO_SWEEP_WRITE_ONLY=1
     [[ "$mode" == write-no-read ]] && ELBENCHO_SWEEP_WRITE_NO_READ=1
+    elbencho_set_cell_run_context "$id" 1 host-a "$test_dirs_csv" \
+        "$output_dir" "$output_dir" _elbencho_noop_cell_hook \
+        _elbencho_noop_cell_hook
     run_elbencho_io_sweep_iteration_shared_generated
 }}
 """

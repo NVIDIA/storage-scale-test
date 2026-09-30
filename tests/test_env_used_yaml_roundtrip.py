@@ -67,6 +67,7 @@ def _assert_yaml_nonempty_with_common_fs(
 ) -> None:
     testcase.assertIsInstance(loaded, dict)
     testcase.assertNotEqual(loaded, {})
+    testcase.assertEqual(loaded["EXECUTION_SUBSTRATE"], "slurm")
     td = loaded.get("TEST_DIRS")
     testcase.assertIsInstance(td, dict)
     testcase.assertEqual(td["/mnt/fs1"], 2)
@@ -79,7 +80,10 @@ def _assert_yaml_nonempty_with_common_fs(
 def _bash_write_env_used_yaml(out_dir: str) -> str:
     """Bash script body: IO sweep env + write_elbencho_env_used."""
     return _bash_script_with_repo(
-        """export ELBENCHO_SCALE_THREAD_LIST=("1" "2" "4" "8" "16")
+        """export EXECUTION_SUBSTRATE=slurm
+export ORDER_NODES=yes
+export ORDER_NODES_ENABLED=1
+export ELBENCHO_SCALE_THREAD_LIST=("1" "2" "4" "8" "16")
 export ELBENCHO_SCALE_IO_SIZES=("1M" "r4K" "4K,8K")
 export ELBENCHO_IODEPTH_LIST=("1" "4" "8")
 export ELBENCHO_FILE_SIZE_MULTIPLIER=16384
@@ -103,7 +107,8 @@ export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=1
 def _bash_write_env_used_yaml_write_no_read(out_dir: str) -> str:
     """Bash script body: IO sweep env + write_elbencho_env_used (--write-no-read)."""
     return _bash_script_with_repo(
-        """export ELBENCHO_SCALE_THREAD_LIST=("8")
+        """export EXECUTION_SUBSTRATE=slurm
+export ELBENCHO_SCALE_THREAD_LIST=("8")
 export ELBENCHO_SCALE_IO_SIZES=("1M")
 export ELBENCHO_IODEPTH_LIST=("1")
 export ELBENCHO_FILE_SIZE_MULTIPLIER=1024
@@ -122,7 +127,8 @@ export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=0
 def _bash_write_mdtest_env_used_yaml(out_dir: str, dense_args: str = "") -> str:
     """Bash script body: mdtest sweep env + write_mdtest_elbencho_env_used."""
     return _bash_script_with_repo(
-        """export MDTEST_BRANCH_FACTOR=7
+        """export EXECUTION_SUBSTRATE=slurm
+export MDTEST_BRANCH_FACTOR=7
 export MDTEST_ITEMS_PER_DIR=100
 export MDTEST_ITERATIONS=3
 export ELBENCHO_READ_AFTER_WRITE_PAUSE=5
@@ -155,6 +161,7 @@ class TestEnvUsedYamlRoundTrip(unittest.TestCase):
                 loaded["ELBENCHO_SCALE_THREAD_LIST"],
                 ["1", "2", "4", "8", "16"],
             )
+            self.assertEqual(loaded["ORDER_NODES"], "yes")
             self.assertEqual(
                 loaded["ELBENCHO_SCALE_IO_SIZES"],
                 ["1M", "r4K", "4K,8K"],
@@ -187,6 +194,9 @@ class TestEnvUsedYamlRoundTrip(unittest.TestCase):
             self.assertEqual(loaded["sweep_write_no_read"], 0)
             self.assertEqual(loaded["sweep_read_from"], "")
             self.assertEqual(loaded["nodes_spec"], "1-4")
+            shell_snapshot = (Path(tmp) / "env_used.sh").read_text(encoding="utf-8")
+            self.assertIn("export ORDER_NODES=yes\n", shell_snapshot)
+            self.assertIn("export ORDER_NODES_ENABLED=1\n", shell_snapshot)
 
     def test_write_no_read_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -247,6 +257,54 @@ class TestEnvUsedYamlRoundTrip(unittest.TestCase):
         self.assertEqual(metric.configured_file_layout, "shared-directory")
         self.assertEqual(metric.configured_files_per_node, "16")
         self.assertEqual(metric.configured_file_size, "128M")
+
+    def test_kubernetes_snapshot_preserves_runtime_identity_and_mapped_paths(self):
+        """Resume snapshots retain Kubernetes identity, not only env.sh defaults."""
+        with tempfile.TemporaryDirectory() as tmp:
+            script = _bash_script_with_repo("""export EXECUTION_SUBSTRATE=kubectl
+export KUBECTL_NAMESPACE=test-ns
+export KUBECTL_PV=test-pv
+export KUBECTL_PVC=test-pvc
+export KUBECTL_NODE_SELECTOR=storage-test=true
+export KUBECTL_ELBENCHO_IMAGE=example.invalid/elbencho@sha256:abc
+export KUBECTL_IMAGE_PULL_POLICY=Never
+export KUBECTL_RUN_AS_USER=2000
+export KUBECTL_RUN_AS_GROUP=2000
+export KUBECTL_MAPPED_READ_FROM=/mnt/storage-scale-test/bench/input
+declare -A KUBECTL_MAPPED_TEST_DIRS=(
+  [/mnt/storage-scale-test/bench/primary]=2
+  [/mnt/storage-scale-test/bench/secondary]=1
+)
+export ELBENCHO_SCALE_THREAD_LIST=("1")
+export ELBENCHO_SCALE_IO_SIZES=("4K")
+export ELBENCHO_IODEPTH_LIST=("1")
+export ELBENCHO_FILE_SIZE_MULTIPLIER=1024
+export ELBENCHO_FILE_LAYOUT=worker-directories
+export ELBENCHO_FILES_PER_NODE=
+export ELBENCHO_FILE_SIZE=
+export ELBENCHO_SCALE_READ_WRITE_DURATION=60
+export ELBENCHO_READ_AFTER_WRITE_PAUSE=0
+export ELBENCHO_LIVE_CSV_EXTENDED=0
+export ELBENCHO_LIVEINT=1000
+export ELBENCHO_SINGLE_BIG_FILE=0
+export ELBENCHO_SINGLE_BIG_FILE_BASENAME=elbencho-bigfile
+export ELBENCHO_SINGLE_BIG_FILE_SIZE=
+export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=0
+""" + f'write_elbencho_env_used "{tmp}/env_used.yaml" dio 0 0 0 0 "" 1\n')
+            _run_bash_write(tmp, script)
+            loaded = load_env_used_yaml(tmp)
+            self.assertEqual(loaded["KUBECTL_NAMESPACE"], "test-ns")
+            self.assertEqual(loaded["KUBECTL_PV"], "test-pv")
+            self.assertEqual(loaded["KUBECTL_PVC"], "test-pvc")
+            self.assertEqual(
+                loaded["KUBECTL_MAPPED_TEST_DIRS"][
+                    "/mnt/storage-scale-test/bench/primary"
+                ],
+                2,
+            )
+            shell_snapshot = (Path(tmp) / "env_used.sh").read_text(encoding="utf-8")
+            self.assertIn("export KUBECTL_NAMESPACE=test-ns", shell_snapshot)
+            self.assertIn("KUBECTL_MAPPED_TEST_DIRS", shell_snapshot)
 
     def test_mdtest_elbencho_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:

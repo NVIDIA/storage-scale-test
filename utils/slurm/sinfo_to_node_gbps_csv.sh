@@ -29,12 +29,13 @@ fi
 readonly SCRIPT_DIR
 
 # Silence stdout from env.sh (it may echo SLURM hints, CSV samples, etc.); keep stderr for errors.
-if ! source_output=$("$SHELL" -c ". '${SCRIPT_DIR}/../env.sh'" 2>&1 >/dev/null); then
+if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
+        "${SCRIPT_DIR}/../../env.sh" 2>&1 >/dev/null); then
     printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
     exit 1
 fi
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/../env.sh" >/dev/null
+source "${SCRIPT_DIR}/../../env.sh" >/dev/null
 
 export PARTITION="${partition:-}"
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -41,7 +42,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 INTEGRATION_LIB = Path(__file__).resolve().parents[1] / "lib"
 sys.path.insert(0, str(INTEGRATION_LIB))
@@ -56,6 +57,10 @@ from fixture_capacity import (  # pylint: disable=wrong-import-position
     NFS_IMAGE_BYTES,
     SSH_HOME_CAPACITY,
     STORAGE_TEST_CAPACITY,
+)
+from fixture_images import (  # pylint: disable=wrong-import-position
+    ELBENCHO_FIXTURE,
+    ELBENCHO_FIXTURE_IMAGE,
 )
 from scenario_planner import (  # pylint: disable=wrong-import-position
     SUBSTRATES,
@@ -85,6 +90,36 @@ SBX_KIND_NODE_IMAGE = (
     f"kindest/node:{SBX_KUBERNETES_VERSION}@"
     "sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8ec94d976dc5a"
 )
+CALICO_VERSION = "v3.32.2"
+CALICO_MANIFEST_SHA256 = (
+    "a8c828a06a87c629a282ebbc424895b77f3a030251993e41ea400a743675bb02"
+)
+CALICO_MANIFEST_URL = (
+    f"https://raw.githubusercontent.com/projectcalico/calico/{CALICO_VERSION}/"
+    "manifests/calico.yaml"
+)
+CALICO_POD_SUBNET = "192.168.0.0/16"
+CALICO_SBX_RECIPE = "iptables-without-securityfs-v2"
+CALICO_IMAGES = (
+    (
+        "cni",
+        "sha256:0ef740bc587f25565905adf1d1f61a7faff0d571c449c6bdd789feed743d3ef7",
+    ),
+    (
+        "kube-controllers",
+        "sha256:7870b67ebb13fabc3005252b44fe6e78b21635649bd3072b80afa1684b6565d0",
+    ),
+    (
+        "node",
+        "sha256:99b03fe91e8bfbcb153ae65ef4b701b24ce541ffdd74ff314eb041096008f7fd",
+    ),
+)
+KINDNET_IMAGE = "docker.io/kindest/kindnetd:v20260820-69b56db7"
+KUBECTL_PROBE_NAME = "storage-scale-kubectl-probe"
+KUBECTL_PROBE_WORKERS = f"{KUBECTL_PROBE_NAME}-workers"
+KUBECTL_PROBE_COORDINATOR = f"{KUBECTL_PROBE_NAME}-coordinator"
+KUBECTL_PROBE_DENIED = f"{KUBECTL_PROBE_NAME}-denied"
+KUBECTL_PROBE_STORAGE = "/mnt/storage-scale-test/.kubectl-prerequisite-probe"
 NFS_CSI_VERSION = "4.13.4"
 NFS_CSI_SOURCE_SHA256 = (
     "ded6ffba8b1600d4c723ce1ecb1fd91721ef48e732ce7ca30c0efeeecbb0b900"
@@ -121,6 +156,7 @@ SSH_BASE_IMAGE = (
     "sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3"
 )
 STATE_SCHEMA = 1
+SBX_SHARED_JOURNAL = "sbx-shared-owner.json"
 TARGET_LABEL = "storage-scale-test/target=true"
 LOGIN_LABEL = "storage-scale-test/login=true"
 WORKLOAD_USER = "tester"
@@ -303,6 +339,22 @@ def _repository_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _absolute_path_without_resolving(path: Path) -> Path:
+    """Normalize one path without erasing symlink components."""
+    return Path(os.path.abspath(path))
+
+
+def _path_contains_symlink(path: Path) -> bool:
+    """Return whether a path or any existing component is a symlink."""
+    current = _absolute_path_without_resolving(path)
+    while True:
+        if current.is_symlink():
+            return True
+        if current.parent == current:
+            return False
+        current = current.parent
+
+
 def _resource_path(name: str) -> Path:
     """Return a checked-in integration resource path."""
     return _repository_root() / "integration-tests" / name
@@ -315,9 +367,29 @@ def _sudo_prefix() -> list[str]:
 
 def _bootstrap_state_dir(config: Config) -> None:
     """Create user-owned state before file logging or privileged work."""
+    if _path_contains_symlink(config.state_dir):
+        raise ProvisionError(f"refusing symlinked state path: {config.state_dir}")
     create_marker = not config.state_dir.exists()
+    marker = config.state_dir / STATE_MARKER
+    if config.state_dir.exists():
+        if marker.is_symlink() or (marker.exists() and not marker.is_file()):
+            raise ProvisionError(f"refusing unsafe setup state marker: {marker}")
+        create_marker = not marker.exists()
+        if create_marker and any(config.state_dir.iterdir()):
+            raise ProvisionError(
+                f"refusing to adopt nonempty unmarked setup state: {config.state_dir}"
+            )
     config.state_dir.mkdir(mode=0o750, parents=True, exist_ok=True)
     config.state_dir.chmod(0o750)
+    if create_marker:
+        _write_text(
+            marker,
+            json.dumps(
+                {"schema": STATE_SCHEMA, "cluster_name": config.cluster_name},
+                sort_keys=True,
+            )
+            + "\n",
+        )
     for directory in (
         config.manifests_dir,
         config.keys_dir,
@@ -329,15 +401,6 @@ def _bootstrap_state_dir(config: Config) -> None:
     ):
         directory.mkdir(mode=0o750, parents=True, exist_ok=True)
         directory.chmod(0o750)
-    if create_marker:
-        _write_text(
-            config.state_dir / STATE_MARKER,
-            json.dumps(
-                {"schema": STATE_SCHEMA, "cluster_name": config.cluster_name},
-                sort_keys=True,
-            )
-            + "\n",
-        )
 
 
 def _configure_user_tool_path(config: Config) -> None:
@@ -380,23 +443,33 @@ def _configure_logging(config: Config, action: str) -> Path:
 def _write_text(path: Path, text: str, mode: int = 0o640) -> None:
     """Atomically write *text* with an explicit file mode."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=path.parent, delete=False
-    ) as handle:
-        handle.write(text)
-        temporary = Path(handle.name)
-    temporary.chmod(mode)
-    temporary.replace(path)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(text)
+        temporary.chmod(mode)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _write_bytes(path: Path, content: bytes, mode: int = 0o640) -> None:
     """Atomically write binary *content* with an explicit file mode."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
-        handle.write(content)
-        temporary = Path(handle.name)
-    temporary.chmod(mode)
-    temporary.replace(path)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+        temporary.chmod(mode)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _render_resource_text(name: str, replacements: dict[str, str]) -> str:
@@ -468,7 +541,9 @@ def _lifecycle_lock_path(config: Config) -> Path:
         or stat.S_IMODE(metadata.st_mode) != 0o700
     ):
         raise ProvisionError(f"refusing unsafe lifecycle lock root {lock_root}")
-    identity = hashlib.sha256(str(config.state_dir.resolve()).encode()).hexdigest()[:20]
+    identity = hashlib.sha256(
+        str(_absolute_path_without_resolving(config.state_dir)).encode()
+    ).hexdigest()[:20]
     return lock_root / f"{identity}.lock"
 
 
@@ -721,6 +796,8 @@ def _validate_nfs_host_owner(runner: Runner, config: Config) -> bool:
 def _validate_retained_state_summary(config: Config) -> None:
     """Reject immutable option changes after a setup has completed."""
     path = config.state_dir / "state.json"
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ProvisionError(f"refusing unsafe setup summary: {path}")
     if not path.exists():
         return
     state = json.loads(path.read_text(encoding="utf-8"))
@@ -748,6 +825,8 @@ def _select_storage_backend(config: Config) -> str:
     """Select once, persist, and validate the integration storage backend."""
     _validate_retained_state_summary(config)
     path = config.state_dir / "storage-backend.json"
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ProvisionError(f"refusing unsafe storage backend marker: {path}")
     if path.exists():
         document = json.loads(path.read_text(encoding="utf-8"))
         backend = str(document.get("backend", ""))
@@ -793,6 +872,14 @@ def _record_storage_backend_profile(config: Config, backend: str) -> None:
         config.state_dir / "storage-backend.json",
         json.dumps(_storage_backend_document(config, backend), sort_keys=True) + "\n",
     )
+
+
+def _invalidate_setup_summary(config: Config) -> None:
+    """Remove a prior success marker before a new setup can mutate resources."""
+    path = config.state_dir / "state.json"
+    if path.is_symlink():
+        raise ProvisionError(f"refusing symlinked setup summary: {path}")
+    path.unlink(missing_ok=True)
 
 
 def _meminfo() -> dict[str, int]:
@@ -1115,12 +1202,25 @@ def _fixture_profile(config: Config, backend: str) -> dict[str, str]:
     """Return the cluster inputs that require disposable-cluster replacement."""
     name, replacements = _kind_config_inputs(config, backend)
     rendered = _render_resource_text(name, replacements)
-    return {
+    profile = {
         "kind_version": SBX_KIND_VERSION if backend == "sbx-shared" else KIND_VERSION,
         "node_image": (
             SBX_KIND_NODE_IMAGE if backend == "sbx-shared" else KIND_NODE_IMAGE
         ),
         "kind_config_sha256": hashlib.sha256(rendered.encode()).hexdigest(),
+    }
+    if backend != "sbx-shared":
+        return {**profile, "cni": "kindnet", "cni_image": KINDNET_IMAGE}
+    return {
+        **profile,
+        "cni": "calico",
+        "cni_version": CALICO_VERSION,
+        "cni_manifest_sha256": CALICO_MANIFEST_SHA256,
+        "cni_recipe": CALICO_SBX_RECIPE,
+        "cni_pod_subnet": CALICO_POD_SUBNET,
+        "cni_images_sha256": hashlib.sha256(
+            json.dumps(CALICO_IMAGES, sort_keys=True).encode()
+        ).hexdigest(),
     }
 
 
@@ -1143,8 +1243,6 @@ def _create_cluster(runner: Runner, config: Config, backend: str) -> None:
             manifest,
             "--kubeconfig",
             config.kubeconfig,
-            "--wait",
-            "180s",
         ],
         timeout=600,
     )
@@ -1152,8 +1250,10 @@ def _create_cluster(runner: Runner, config: Config, backend: str) -> None:
 
 def _validate_sbx_shared_root(config: Config) -> None:
     """Require the Docker SBX root to be a narrow path inside repository tmp."""
-    allowed_parent = (_repository_root() / "tmp").resolve()
+    allowed_parent = _absolute_path_without_resolving(_repository_root() / "tmp")
     root = config.sbx_shared_root
+    if _path_contains_symlink(root) or (root.exists() and not root.is_dir()):
+        raise ProvisionError(f"refusing unsafe Docker SBX shared root: {root}")
     if root == allowed_parent or allowed_parent not in root.parents:
         raise ProvisionError(
             f"Docker SBX shared root must be below {allowed_parent}: {root}"
@@ -1165,7 +1265,9 @@ def _sbx_shared_marker(config: Config) -> dict[str, object]:
     return {
         **_owner_document(config),
         "backend": "sbx-shared",
+        "namespace": config.namespace,
         "shared_root": str(config.sbx_shared_root),
+        "state_dir": str(config.state_dir),
     }
 
 
@@ -1175,19 +1277,45 @@ def _prepare_sbx_shared(runner: Runner, config: Config) -> None:
     _ensure_pinned_image(runner, SBX_KIND_NODE_IMAGE)
     root = config.sbx_shared_root
     marker = root / EXPORT_MARKER
+    expected_marker = _sbx_shared_marker(config)
+    journal = config.state_dir / SBX_SHARED_JOURNAL
+    if journal.is_symlink() or (journal.exists() and not journal.is_file()):
+        raise ProvisionError(f"refusing unsafe SBX shared journal: {journal}")
     if root.exists() and not marker.exists() and any(root.iterdir()):
         raise ProvisionError(f"refusing nonempty unowned SBX shared root: {root}")
+    if marker.is_symlink() or (marker.exists() and not marker.is_file()):
+        raise ProvisionError(f"refusing unsafe SBX shared marker: {marker}")
+    if marker.exists():
+        document = json.loads(marker.read_text(encoding="utf-8"))
+        legacy_marker = {
+            **_owner_document(config),
+            "backend": "sbx-shared",
+            "shared_root": str(config.sbx_shared_root),
+        }
+        if document not in (expected_marker, legacy_marker):
+            raise ProvisionError(f"SBX shared marker does not match: {marker}")
+    if journal.exists():
+        if json.loads(journal.read_text(encoding="utf-8")) != expected_marker:
+            raise ProvisionError(f"SBX shared journal does not match: {journal}")
+    else:
+        # Journal ownership before creating the root, so an interrupted mkdir
+        # remains attributable and can be reclaimed only when still empty.
+        _write_text(journal, json.dumps(expected_marker, sort_keys=True) + "\n")
     root.mkdir(parents=True, exist_ok=True)
     if marker.exists():
         document = json.loads(marker.read_text(encoding="utf-8"))
-        if document != _sbx_shared_marker(config):
-            raise ProvisionError(f"SBX shared marker does not match: {marker}")
+        legacy_marker = {
+            **_owner_document(config),
+            "backend": "sbx-shared",
+            "shared_root": str(config.sbx_shared_root),
+        }
+        if marker.is_file() and document == legacy_marker:
+            _write_text(marker, json.dumps(expected_marker, sort_keys=True) + "\n")
     else:
-        _write_text(
-            marker,
-            json.dumps(_sbx_shared_marker(config), sort_keys=True) + "\n",
-        )
+        _write_text(marker, json.dumps(expected_marker, sort_keys=True) + "\n")
     for directory in (root / "storage-test", root / "ssh-home"):
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise ProvisionError(f"refusing unsafe SBX shared child path: {directory}")
         directory.mkdir(exist_ok=True)
         # Docker SBX can remap one pod's file owner when the same bind mount is
         # observed from a replacement pod. A sticky directory would then stop
@@ -1252,6 +1380,10 @@ def _ensure_cluster_ownership(config: Config, cluster_exists: bool) -> None:
     """Claim a new cluster name or validate its persistent ownership marker."""
     marker = config.state_dir / "cluster-owner.json"
     expected = {"schema": STATE_SCHEMA, "cluster_name": config.cluster_name}
+    if marker.is_symlink():
+        raise ProvisionError(f"refusing symlinked cluster ownership marker: {marker}")
+    if marker.exists() and not marker.is_file():
+        raise ProvisionError(f"refusing unsafe cluster ownership marker: {marker}")
     if marker.exists():
         if json.loads(marker.read_text(encoding="utf-8")) != expected:
             raise ProvisionError(f"cluster ownership marker does not match: {marker}")
@@ -1333,6 +1465,145 @@ def _expected_kubernetes_version(backend: str) -> str:
     return SBX_KUBERNETES_VERSION if backend == "sbx-shared" else KUBERNETES_VERSION
 
 
+def _validate_kindnet_profile(runner: Runner, config: Config) -> None:
+    """Require the exact healthy Kindnet bundled by the NFS node profile."""
+    document = json.loads(
+        runner.run(
+            _kubectl(
+                config,
+                "-n",
+                "kube-system",
+                "get",
+                "daemonset/kindnet",
+                "-o",
+                "json",
+            ),
+            timeout=30,
+        ).stdout
+    )
+    status = document.get("status", {})
+    containers = (
+        document.get("spec", {})
+        .get("template", {})
+        .get("spec", {})
+        .get("containers", [])
+    )
+    observed = containers[0].get("image") if len(containers) == 1 else None
+    if (
+        status.get("desiredNumberScheduled") != 3
+        or status.get("numberReady") != 3
+        or status.get("numberAvailable") != 3
+        or observed != KINDNET_IMAGE
+    ):
+        raise ProvisionError(
+            "Kindnet does not match the healthy NFS fixture profile: "
+            f"image={observed}, status={status}"
+        )
+
+
+def _calico_image(component: str) -> tuple[str, str]:
+    """Return the digest-qualified upstream image and fixture-private alias."""
+    digest = dict(CALICO_IMAGES)[component]
+    upstream = f"docker.io/calico/{component}:{CALICO_VERSION}@{digest}"
+    destination = (
+        "docker.io/storage-scale-test-integration/"
+        f"calico-{component}:{CALICO_VERSION}"
+    )
+    return upstream, destination
+
+
+def _observed_calico_images(runner: Runner, config: Config) -> dict[str, str]:
+    """Return images from the healthy Calico node and controller workloads."""
+    result = runner.run(
+        _kubectl(
+            config, "-n", "kube-system", "get", "daemonset/calico-node", "-o", "json"
+        ),
+        timeout=30,
+    )
+    document = json.loads(result.stdout)
+    status = document.get("status", {})
+    desired = status.get("desiredNumberScheduled")
+    ready = status.get("numberReady")
+    available = status.get("numberAvailable")
+    pod_spec = document.get("spec", {}).get("template", {}).get("spec", {})
+    containers = pod_spec.get("containers", [])
+    init_containers = pod_spec.get("initContainers", [])
+    if desired != 3 or ready != 3 or available != 3:
+        raise ProvisionError(
+            "Calico is not healthy on all fixture nodes: "
+            f"desired={desired}, ready={ready}, available={available}, "
+            f"containers={len(containers)}"
+        )
+    controller = json.loads(
+        runner.run(
+            _kubectl(
+                config,
+                "-n",
+                "kube-system",
+                "get",
+                "deployment/calico-kube-controllers",
+                "-o",
+                "json",
+            ),
+            timeout=30,
+        ).stdout
+    )
+    controller_status = controller.get("status", {})
+    if controller_status.get("availableReplicas") != 1:
+        raise ProvisionError("Calico kube-controllers is not available")
+    observed: dict[str, str] = {}
+    for container in [*containers, *init_containers]:
+        name = str(container.get("name", ""))
+        image = container.get("image")
+        if name in {
+            "calico-node",
+            "upgrade-ipam",
+            "install-cni",
+            "mount-bpffs",
+            "ebpf-bootstrap",
+        }:
+            if isinstance(image, str):
+                observed[name] = image
+    controller_containers = (
+        controller.get("spec", {})
+        .get("template", {})
+        .get("spec", {})
+        .get("containers", [])
+    )
+    if controller_containers:
+        observed["calico-kube-controllers"] = str(
+            controller_containers[0].get("image", "")
+        )
+    return observed
+
+
+def _validate_calico_profile(runner: Runner, config: Config) -> None:
+    """Require the exact preloaded Calico images selected by the fixture."""
+    observed = _observed_calico_images(runner, config)
+    expected = {
+        "calico-node": _calico_image("node")[1],
+        "ebpf-bootstrap": _calico_image("node")[1],
+        "upgrade-ipam": _calico_image("cni")[1],
+        "install-cni": _calico_image("cni")[1],
+        "calico-kube-controllers": _calico_image("kube-controllers")[1],
+    }
+    if observed != expected:
+        raise ProvisionError(
+            f"Calico images do not match the fixture profile: {observed} != {expected}"
+        )
+
+
+def _validate_network_policy_profile(
+    runner: Runner, config: Config, backend: str
+) -> str:
+    """Validate and name the backend-specific policy-capable CNI."""
+    if backend == "sbx-shared":
+        _validate_calico_profile(runner, config)
+        return f"Calico {CALICO_VERSION}"
+    _validate_kindnet_profile(runner, config)
+    return KINDNET_IMAGE
+
+
 def _observed_kubernetes_version(runner: Runner, config: Config) -> str:
     """Return the one kubelet version observed on every fixture node."""
     nodes = json.loads(
@@ -1366,14 +1637,23 @@ def _retained_cluster_matches_profile(
     _wait_for_kube_api(runner, config)
     observed = _observed_kubernetes_version(runner, config)
     expected = _expected_kubernetes_version(backend)
-    if observed == expected:
-        return True
-    LOG.warning(
-        "Replacing retained kind cluster with kubelet %s; profile requires %s",
-        observed,
-        expected,
-    )
-    return False
+    if observed != expected:
+        LOG.warning(
+            "Replacing retained kind cluster with kubelet %s; profile requires %s",
+            observed,
+            expected,
+        )
+        return False
+    try:
+        _validate_network_policy_profile(runner, config, backend)
+    except (
+        ProvisionError,
+        subprocess.CalledProcessError,
+        json.JSONDecodeError,
+    ) as error:
+        LOG.warning("Replacing retained kind cluster after CNI drift: %s", error)
+        return False
+    return True
 
 
 def _wait_for_kube_api(runner: Runner, config: Config) -> None:
@@ -1473,10 +1753,13 @@ def _ensure_export_marker(runner: Runner, config: Config) -> None:
         raise ProvisionError(
             f"refusing export with mismatched ownership marker: {marker_path}"
         )
+    marker_source = config.state_dir / "export-marker.json"
+    # Journal ownership in user state before creating or changing the
+    # privileged export directory. A crash after install/chown must remain
+    # attributable to this setup attempt.
+    _write_text(marker_source, expected + "\n")
     runner.run([*_sudo_prefix(), "install", "-d", "-m", "0770", config.export_dir])
     runner.run([*_sudo_prefix(), "chown", f"+{NFS_UID}:+{NFS_GID}", config.export_dir])
-    marker_source = config.state_dir / "export-marker.json"
-    _write_text(marker_source, expected + "\n")
     runner.run(
         [
             *_sudo_prefix(),
@@ -1709,9 +1992,42 @@ def _ensure_export_filesystem(runner: Runner, config: Config) -> None:
     _validate_nfs_filesystem_capacity(runner, config)
 
 
+def _assert_no_conflicting_nfs_v4_root(runner: Runner, export_dir: Path) -> None:
+    """Reject an active NFSv4 root that can redirect fixture clients."""
+    result = runner.run(
+        [*_sudo_prefix(), "exportfs", "-v"],
+        check=False,
+        timeout=30,
+    )
+    if result.returncode:
+        raise ProvisionError("cannot inspect active NFS exports before setup")
+    current_path = ""
+    roots = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        options = line.strip()
+        if not line[0].isspace():
+            fields = line.split(maxsplit=1)
+            current_path = fields[0]
+            options = fields[1] if len(fields) == 2 else ""
+        if current_path and re.search(
+            r"(?:^|[,(])\s*fsid=(?:0|root)(?=,|\)|\s*$)", options
+        ):
+            roots.append(current_path)
+    expected = os.path.normpath(str(export_dir))
+    conflicts = sorted({path for path in roots if os.path.normpath(path) != expected})
+    if conflicts:
+        raise ProvisionError(
+            "another active NFSv4 root export would redirect CSI mounts away "
+            f"from {export_dir}: {', '.join(conflicts)}"
+        )
+
+
 def _configure_nfs(runner: Runner, config: Config, subnet: str, gateway: str) -> None:
     """Reconcile the narrow NFSv4 export and firewall rule."""
     LOG.info("Configuring NFSv4 export for kind subnet %s", subnet)
+    _assert_no_conflicting_nfs_v4_root(runner, config.export_dir)
     _record_nfs_service_state(runner, config)
     _ensure_export_filesystem(runner, config)
     _ensure_export_marker(runner, config)
@@ -3213,6 +3529,712 @@ def _stage_pinned_fixture_image(
     _load_image_into_nodes(runner, image, nodes)
 
 
+def _stage_pinned_node_alias(
+    runner: Runner,
+    upstream: str,
+    destination: str,
+    nodes: list[str],
+    component: str,
+) -> None:
+    """Import one verified image under a node-local fixture alias."""
+    selected = _ensure_pinned_image(runner, upstream)
+    host_prefix = f"storage-scale-test-integration/{component}-import:"
+    node_prefix = f"docker.io/{host_prefix}"
+    _remove_stale_host_image_aliases(runner, host_prefix)
+    _remove_stale_node_image_aliases(runner, nodes, node_prefix)
+    temporary = f"{host_prefix}{secrets.token_hex(6)}"
+    runner.run(["docker", "image", "tag", selected, temporary])
+    try:
+        _load_image_into_nodes(
+            runner,
+            temporary,
+            nodes,
+            destination=destination,
+        )
+    finally:
+        runner.run(["docker", "image", "rm", temporary], check=False)
+
+
+def _prepare_fixture_node_image(
+    runner: Runner, config: Config, fixture_image: Any
+) -> None:
+    """Load one architecture-verified image under a fixture-private node alias."""
+    nodes = _kind_containers(runner, config, running_only=True)
+    if len(nodes) != 3:
+        raise ProvisionError(
+            f"expected three running kind nodes before image import; found {nodes}"
+        )
+    _stage_pinned_node_alias(
+        runner,
+        fixture_image.upstream,
+        fixture_image.fixture,
+        nodes,
+        fixture_image.component,
+    )
+
+
+def _prepare_kubectl_prerequisite_image(runner: Runner, config: Config) -> None:
+    """Load the verified Elbencho image under its fixture-private node alias."""
+    _prepare_fixture_node_image(runner, config, ELBENCHO_FIXTURE)
+
+
+def _ensure_calico_manifest(runner: Runner, config: Config) -> Path:
+    """Return the checksum-verified Calico manifest cached in fixture state."""
+    source = config.state_dir / "downloads" / f"calico-{CALICO_VERSION}.yaml"
+    if source.exists():
+        _verify_sha256(source, CALICO_MANIFEST_SHA256)
+        return source
+    source.parent.mkdir(parents=True, exist_ok=True)
+    temporary = source.with_suffix(".yaml.new")
+    temporary.unlink(missing_ok=True)
+    try:
+        _curl(runner, CALICO_MANIFEST_URL, temporary)
+        _verify_sha256(temporary, CALICO_MANIFEST_SHA256)
+        temporary.replace(source)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return source
+
+
+def _render_calico_manifest(runner: Runner, config: Config) -> Path:
+    """Render Calico with only preloaded fixture-private image aliases."""
+    source = _ensure_calico_manifest(runner, config)
+    text = source.read_text(encoding="utf-8")
+    for component in dict(CALICO_IMAGES):
+        upstream_tag = f"quay.io/calico/{component}:{CALICO_VERSION}"
+        destination = _calico_image(component)[1]
+        expected = 2 if component in {"cni", "node"} else 1
+        if text.count(upstream_tag) != expected:
+            raise ProvisionError(
+                f"Calico manifest image count changed for {upstream_tag}"
+            )
+        text = text.replace(upstream_tag, destination)
+    if "quay.io/calico/" in text:
+        raise ProvisionError("Calico manifest retains an unstaged workload image")
+    calico_node_env = """          env:
+            # Use Kubernetes API as the backing datastore.
+"""
+    explicit_iptables_env = """          env:
+            # Docker SBX cannot provide the kernel facilities for Calico eBPF mode.
+            - name: FELIX_BPFENABLED
+              value: "false"
+            # Use Kubernetes API as the backing datastore.
+"""
+    if text.count(calico_node_env) != 1:
+        raise ProvisionError("Calico manifest node environment changed")
+    text = text.replace(calico_node_env, explicit_iptables_env)
+    # Docker SBX exposes the kind node's sysfs read-only. The upstream mount is
+    # used only to let Felix distinguish a confidential kernel lockdown before
+    # selecting eBPF programs; in this iptables profile Felix documents a
+    # missing/unreadable lockdown file as not locked down. Removing only this
+    # optional mount avoids asking the nested runtime to create a read-only
+    # hostPath while retaining every networking and policy volume.
+    securityfs_mount = """            # Felix reads /sys/kernel/security/lockdown to detect kernel
+            # lockdown=confidentiality; under it, ftrace is disabled and Felix
+            # loads trace-printk-free BPF program variants. securityfs is a
+            # separate filesystem from /sys/fs, so it needs its own mount.
+            - name: sys-kernel-security
+              mountPath: /sys/kernel/security
+              readOnly: true
+"""
+    securityfs_volume = """        # securityfs, read by Felix to detect kernel lockdown=confidentiality.
+        # No type set (like nodeproc below) so nodes without securityfs still
+        # start; Felix treats an unreadable lockdown file as "not locked down".
+        - name: sys-kernel-security
+          hostPath:
+            path: /sys/kernel/security
+"""
+    for fragment in (securityfs_mount, securityfs_volume):
+        if text.count(fragment) != 1:
+            raise ProvisionError(
+                "Calico manifest securityfs compatibility fragment changed"
+            )
+        text = text.replace(fragment, "")
+    text = text.replace("imagePullPolicy: IfNotPresent", "imagePullPolicy: Never")
+    destination = config.manifests_dir / f"calico-{CALICO_VERSION}.yaml"
+    _write_text(destination, text)
+    return destination
+
+
+def _install_sbx_calico(runner: Runner, config: Config) -> None:
+    """Install the pinned iptables Calico profile required by Docker SBX."""
+    existing = runner.run(
+        _kubectl(
+            config,
+            "-n",
+            "kube-system",
+            "get",
+            "daemonset/calico-node",
+            "--ignore-not-found",
+            "-o",
+            "name",
+        ),
+        check=False,
+        timeout=30,
+    )
+    if existing.returncode == 0 and existing.stdout.strip():
+        _validate_calico_profile(runner, config)
+        return
+    nodes = _kind_containers(runner, config, running_only=True)
+    if len(nodes) != 3:
+        raise ProvisionError(
+            f"expected three running kind nodes before Calico import; found {nodes}"
+        )
+    for component in dict(CALICO_IMAGES):
+        upstream, destination = _calico_image(component)
+        _stage_pinned_node_alias(
+            runner, upstream, destination, nodes, f"calico-{component}"
+        )
+    manifest = _render_calico_manifest(runner, config)
+    runner.run(_kubectl(config, "apply", "-f", manifest), timeout=180)
+    runner.run(
+        _kubectl(
+            config,
+            "-n",
+            "kube-system",
+            "rollout",
+            "status",
+            "daemonset/calico-node",
+            "--timeout=300s",
+        ),
+        timeout=330,
+    )
+    runner.run(
+        _kubectl(
+            config,
+            "-n",
+            "kube-system",
+            "rollout",
+            "status",
+            "deployment/calico-kube-controllers",
+            "--timeout=300s",
+        ),
+        timeout=330,
+    )
+
+
+def _kubectl_probe_exec(
+    runner: Runner,
+    config: Config,
+    pod: str,
+    container: str,
+    arguments: Sequence[str],
+    *,
+    check: bool = True,
+    timeout: float = 30,
+) -> subprocess.CompletedProcess[str]:
+    """Execute one bounded prerequisite-probe command."""
+    return runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "exec",
+            pod,
+            "-c",
+            container,
+            "--",
+            *arguments,
+        ),
+        check=check,
+        timeout=timeout,
+    )
+
+
+def _kubectl_probe_status(
+    runner: Runner,
+    config: Config,
+    pod: str,
+    container: str,
+    address: str,
+    *,
+    check: bool = True,
+    deadline: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Query one Elbencho service directly by numeric Pod IPv4 address."""
+    ipaddress.IPv4Address(address)
+    operation_deadline = time.monotonic() + 10
+    if deadline is not None:
+        operation_deadline = min(operation_deadline, deadline)
+
+    def remaining_timeout(limit: float) -> float:
+        """Return a command timeout that stays inside this probe's budget."""
+        remaining = operation_deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProvisionError(
+                f"kubectl prerequisite probe did not finish for {address}"
+            )
+        return min(limit, remaining)
+
+    operation = secrets.token_hex(8)
+    remote_root = f"/tmp/{KUBECTL_PROBE_NAME}"
+    remote_dir = f"{remote_root}/{operation}"
+    trigger_script = (
+        'root="$1"; operation="$2"; address="$3"; '
+        '[[ "$operation" =~ ^[0-9a-f]{16}$ && -d "$root" '
+        '&& ! -e "$root/$operation" && ! -e "$root/$operation.request" ]]; '
+        'tmp="$root/$operation.request.tmp"; '
+        'printf "%s\\n" "$address" > "$tmp"; '
+        'mv -n -- "$tmp" "$root/$operation.request"'
+    )
+    result_code: int | None = None
+    stderr = ""
+    try:
+        _kubectl_probe_exec(
+            runner,
+            config,
+            pod,
+            container,
+            (
+                "bash",
+                "-ceu",
+                trigger_script,
+                "bash",
+                remote_root,
+                operation,
+                address,
+            ),
+            timeout=remaining_timeout(5),
+        )
+        while time.monotonic() < operation_deadline:
+            result = _kubectl_probe_exec(
+                runner,
+                config,
+                pod,
+                container,
+                (
+                    "bash",
+                    "-ceu",
+                    'test -f "$1/rc" && cat -- "$1/rc"',
+                    "bash",
+                    remote_dir,
+                ),
+                check=False,
+                timeout=remaining_timeout(2),
+            )
+            if result.returncode == 0:
+                value = result.stdout.strip()
+                if value.isdigit() and 0 <= int(value) <= 255:
+                    result_code = int(value)
+                    break
+                raise ProvisionError(
+                    f"invalid kubectl prerequisite probe result for {address}: {value!r}"
+                )
+            time.sleep(min(0.2, max(0, operation_deadline - time.monotonic())))
+        if result_code is None:
+            raise ProvisionError(
+                f"kubectl prerequisite probe did not finish for {address}"
+            )
+        if time.monotonic() < operation_deadline:
+            error_result = _kubectl_probe_exec(
+                runner,
+                config,
+                pod,
+                container,
+                ("cat", "--", f"{remote_dir}/stderr"),
+                check=False,
+                timeout=remaining_timeout(2),
+            )
+            stderr = error_result.stdout
+    finally:
+        remaining = operation_deadline - time.monotonic()
+        if remaining > 0:
+            try:
+                _kubectl_probe_exec(
+                    runner,
+                    config,
+                    pod,
+                    container,
+                    (
+                        "rm",
+                        "-rf",
+                        "--",
+                        remote_dir,
+                        f"{remote_root}/{operation}.request",
+                        f"{remote_root}/{operation}.request.tmp",
+                    ),
+                    check=False,
+                    timeout=min(2, remaining),
+                )
+            except subprocess.TimeoutExpired:
+                LOG.debug("Timed out cleaning prerequisite probe %s", operation)
+    completed = subprocess.CompletedProcess(
+        args=["kubectl-prerequisite-probe", address],
+        returncode=result_code,
+        stdout="",
+        stderr=stderr,
+    )
+    if check and completed.returncode:
+        detail = _failure_detail(completed.stdout, completed.stderr, False)
+        raise ProvisionError(
+            f"kubectl prerequisite probe failed ({completed.returncode}) for "
+            f"{address}{detail}"
+        )
+    return completed
+
+
+def _wait_for_kubectl_probe_denial(
+    runner: Runner,
+    config: Config,
+    coordinator: str,
+    denied: str,
+    address: str,
+) -> None:
+    """Wait for policy propagation while continuously proving the allowed path."""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        _kubectl_probe_status(
+            runner,
+            config,
+            coordinator,
+            "coordinator",
+            address,
+            deadline=deadline,
+        )
+        denied_result = _kubectl_probe_status(
+            runner,
+            config,
+            denied,
+            "denied",
+            address,
+            check=False,
+            deadline=deadline,
+        )
+        if denied_result.returncode:
+            _kubectl_probe_status(
+                runner,
+                config,
+                coordinator,
+                "coordinator",
+                address,
+                deadline=deadline,
+            )
+            return
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    raise ProvisionError(
+        "the policy CNI did not enforce worker ingress isolation from the unrelated "
+        f"probe Pod for {address}"
+    )
+
+
+def _wait_for_kubectl_probe_access(
+    runner: Runner,
+    config: Config,
+    pod: str,
+    container: str,
+    address: str,
+) -> None:
+    """Wait for one pre-policy cross-node path to become usable."""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        result = _kubectl_probe_status(
+            runner,
+            config,
+            pod,
+            container,
+            address,
+            check=False,
+            deadline=deadline,
+        )
+        if result.returncode == 0:
+            return
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    raise ProvisionError(
+        f"kubectl prerequisite Pod {pod} could not reach worker {address} "
+        "before NetworkPolicy creation"
+    )
+
+
+def _kubectl_probe_pods(runner: Runner, config: Config) -> list[dict[str, object]]:
+    """Return all nonterminating prerequisite-probe Pods."""
+    result = runner.run(
+        _kubectl(
+            config,
+            "-n",
+            config.namespace,
+            "get",
+            "pods",
+            "-l",
+            f"app.kubernetes.io/name={KUBECTL_PROBE_NAME}",
+            "-o",
+            "json",
+        ),
+        timeout=30,
+    )
+    return [
+        pod
+        for pod in json.loads(result.stdout).get("items", [])
+        if not pod.get("metadata", {}).get("deletionTimestamp")
+    ]
+
+
+def _validate_kubectl_probe_inventory(
+    runner: Runner, config: Config
+) -> tuple[list[dict[str, object]], dict[str, object], dict[str, object]]:
+    """Validate probe placement, readiness, identity, and Pod IPv4 addresses."""
+    pods = _kubectl_probe_pods(runner, config)
+    workers = [
+        pod
+        for pod in pods
+        if pod.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
+        == "worker"
+    ]
+    clients = {
+        str(
+            pod.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
+        ): pod
+        for pod in pods
+        if pod.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
+        in {"coordinator", "denied"}
+    }
+    target_output = runner.run(
+        _kubectl(
+            config,
+            "get",
+            "nodes",
+            "-l",
+            TARGET_LABEL,
+            "-o",
+            "jsonpath={.items[*].metadata.name}",
+        ),
+        timeout=30,
+    ).stdout
+    target_nodes = set(target_output.split())
+    worker_nodes = {str(pod.get("spec", {}).get("nodeName")) for pod in workers}
+    login_node = f"{config.cluster_name}-control-plane"
+    invalid = len(workers) != 2 or set(clients) != {"coordinator", "denied"}
+    invalid = invalid or target_nodes != worker_nodes or len(target_nodes) != 2
+    invalid = invalid or any(
+        pod.get("spec", {}).get("nodeName") != login_node for pod in clients.values()
+    )
+    invalid = invalid or any(not _pod_is_ready(pod) for pod in pods)
+    if invalid:
+        raise ProvisionError(
+            "kubectl prerequisite probe placement or readiness is invalid: "
+            f"pods={len(pods)}, workers={sorted(worker_nodes)}, "
+            f"targets={sorted(target_nodes)}, clients={sorted(clients)}"
+        )
+    addresses = [str(pod.get("status", {}).get("podIP", "")) for pod in workers]
+    try:
+        parsed_addresses = {ipaddress.IPv4Address(address) for address in addresses}
+    except ipaddress.AddressValueError as error:
+        raise ProvisionError(
+            f"kubectl prerequisite workers lack valid Pod IPv4 addresses: {addresses}"
+        ) from error
+    if len(parsed_addresses) != 2:
+        raise ProvisionError(
+            f"kubectl prerequisite workers lack distinct Pod IPv4 addresses: {addresses}"
+        )
+    image_ids = {
+        str(status.get("imageID"))
+        for pod in workers
+        for status in pod.get("status", {}).get("containerStatuses", [])
+    }
+    if len(image_ids) != 1 or image_ids == {"None"}:
+        raise ProvisionError(
+            f"kubectl prerequisite workers do not share one image ID: {image_ids}"
+        )
+    return workers, clients["coordinator"], clients["denied"]
+
+
+def _verify_kubectl_probe_storage(
+    runner: Runner,
+    config: Config,
+    workers: Sequence[dict[str, object]],
+    coordinator: dict[str, object],
+    token: str,
+) -> None:
+    """Prove bidirectional shared-PVC visibility under the workload identity."""
+    coordinator_name = str(coordinator["metadata"]["name"])  # type: ignore[index]
+    worker_nodes = sorted(str(pod["spec"]["nodeName"]) for pod in workers)  # type: ignore[index]
+    expected = " ".join(shlex.quote(node) for node in worker_nodes)
+    probe_path = f"{KUBECTL_PROBE_STORAGE}/{token}"
+    script = (
+        f"deadline=$((SECONDS + 30)); for node in {expected}; do "
+        f"expected={shlex.quote(token)}' '$node; "
+        f"while [[ $(cat {shlex.quote(probe_path)}/$node 2>/dev/null || true) "
+        '!= "$expected" ]]; do (( SECONDS < deadline )) || exit 1; '
+        "sleep 1; done; done; "
+        f"printf '%s\\n' {shlex.quote(token)} >"
+        f"{shlex.quote(probe_path)}/coordinator"
+    )
+    _kubectl_probe_exec(
+        runner,
+        config,
+        coordinator_name,
+        "coordinator",
+        ("bash", "-ceu", script),
+        timeout=45,
+    )
+    for worker in workers:
+        _kubectl_probe_exec(
+            runner,
+            config,
+            str(worker["metadata"]["name"]),  # type: ignore[index]
+            "elbencho",
+            (
+                "bash",
+                "-ceu",
+                f"[[ $(cat {shlex.quote(probe_path)}/coordinator) == "
+                f"{shlex.quote(token)} ]]",
+            ),
+        )
+
+
+def _cleanup_kubectl_prerequisite_probe(
+    runner: Runner, config: Config, manifests: Sequence[Path]
+) -> list[str]:
+    """Attempt all exact probe cleanup and return secondary diagnostics."""
+    failures: list[str] = []
+    try:
+        candidates = []
+        for item in _kubectl_probe_pods(runner, config):
+            component = (
+                item.get("metadata", {})
+                .get("labels", {})
+                .get("app.kubernetes.io/component")
+            )
+            if component == "coordinator":
+                candidates.append(
+                    (str(item.get("metadata", {}).get("name")), "coordinator")
+                )
+            elif component == "worker":
+                candidates.append(
+                    (str(item.get("metadata", {}).get("name")), "elbencho")
+                )
+    except (ProvisionError, subprocess.SubprocessError, OSError, json.JSONDecodeError):
+        candidates = []
+        failures.append("probe Pod discovery for storage cleanup failed")
+    for candidate, container in candidates:
+        try:
+            result = _kubectl_probe_exec(
+                runner,
+                config,
+                candidate,
+                container,
+                ("rm", "-rf", "--", KUBECTL_PROBE_STORAGE),
+                check=False,
+            )
+            if result.returncode:
+                failures.append(f"storage cleanup through {candidate} failed")
+        except (ProvisionError, subprocess.SubprocessError, OSError) as error:
+            failures.append(f"storage cleanup through {candidate} failed: {error}")
+    for manifest in manifests:
+        deletion = runner.run(
+            _kubectl(
+                config,
+                "delete",
+                "-f",
+                manifest,
+                "--ignore-not-found=true",
+                "--wait=true",
+                "--timeout=90s",
+            ),
+            check=False,
+            timeout=120,
+        )
+        if deletion.returncode:
+            failures.append(f"probe resource deletion failed for {manifest.name}")
+    return failures
+
+
+def _validate_kubectl_prerequisites(
+    runner: Runner, config: Config, backend: str
+) -> None:
+    """Prove the retained fixture can support the planned kubectl substrate."""
+    cni_profile = _validate_network_policy_profile(runner, config, backend)
+    _prepare_kubectl_prerequisite_image(runner, config)
+    token = secrets.token_hex(16)
+    workload_manifest = _render_resource(
+        config,
+        "manifests/kubectl-prerequisite-probe.yaml.tmpl",
+        {
+            "NAMESPACE": config.namespace,
+            "ELBENCHO_IMAGE": ELBENCHO_FIXTURE_IMAGE,
+            "PROBE_TOKEN": token,
+        },
+    )
+    policy_manifest = _render_resource(
+        config,
+        "manifests/kubectl-prerequisite-policy.yaml.tmpl",
+        {"NAMESPACE": config.namespace},
+    )
+    manifests = (policy_manifest, workload_manifest)
+    cleanup_failures = _cleanup_kubectl_prerequisite_probe(runner, config, manifests)
+    if cleanup_failures:
+        raise ProvisionError(
+            "stale kubectl prerequisite probe cleanup failed: "
+            + "; ".join(cleanup_failures)
+        )
+    primary_error: BaseException | None = None
+    try:
+        runner.run(_kubectl(config, "create", "-f", workload_manifest), timeout=60)
+        runner.run(
+            _kubectl(
+                config,
+                "-n",
+                config.namespace,
+                "rollout",
+                "status",
+                f"daemonset/{KUBECTL_PROBE_WORKERS}",
+                "--timeout=180s",
+            ),
+            timeout=210,
+        )
+        runner.run(
+            _kubectl(
+                config,
+                "-n",
+                config.namespace,
+                "wait",
+                "--for=condition=Ready",
+                f"pod/{KUBECTL_PROBE_COORDINATOR}",
+                f"pod/{KUBECTL_PROBE_DENIED}",
+                "--timeout=180s",
+            ),
+            timeout=210,
+        )
+        workers, coordinator, denied = _validate_kubectl_probe_inventory(runner, config)
+        coordinator_name = str(coordinator["metadata"]["name"])  # type: ignore[index]
+        denied_name = str(denied["metadata"]["name"])  # type: ignore[index]
+        # Establish the negative probe's working cross-node path before policy
+        # exists; otherwise an unrelated network failure could look like
+        # successful isolation.
+        for worker in workers:
+            address = str(worker["status"]["podIP"])  # type: ignore[index]
+            _wait_for_kubectl_probe_access(
+                runner, config, coordinator_name, "coordinator", address
+            )
+            _wait_for_kubectl_probe_access(
+                runner, config, denied_name, "denied", address
+            )
+        runner.run(_kubectl(config, "create", "-f", policy_manifest), timeout=60)
+        for worker in workers:
+            address = str(worker["status"]["podIP"])  # type: ignore[index]
+            _wait_for_kubectl_probe_denial(
+                runner, config, coordinator_name, denied_name, address
+            )
+        _verify_kubectl_probe_storage(runner, config, workers, coordinator, token)
+        LOG.info(
+            "Validated kubectl prerequisites with %s and direct Pod networking",
+            cni_profile,
+        )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        cleanup_failures = _cleanup_kubectl_prerequisite_probe(
+            runner, config, manifests
+        )
+        if cleanup_failures:
+            detail = "; ".join(cleanup_failures)
+            if primary_error is None:
+                raise ProvisionError(
+                    f"kubectl prerequisite probe cleanup failed: {detail}"
+                )
+            LOG.error("Secondary kubectl prerequisite cleanup failure: %s", detail)
+
+
 def _prepare_slurm_images(runner: Runner, config: Config) -> None:
     """Build or acquire every image that the Slurm fixture runs in kind."""
     control_plane = f"{config.cluster_name}-control-plane"
@@ -3739,6 +4761,10 @@ def _write_state_summary(
         "slinky_version": SLINKY_VERSION,
         "kind_subnet": subnet,
         "kind_gateway": gateway,
+        "cni": "calico" if backend == "sbx-shared" else "kindnet",
+        "cni_version": CALICO_VERSION if backend == "sbx-shared" else None,
+        "cni_image": None if backend == "sbx-shared" else KINDNET_IMAGE,
+        "kubectl_probe_image": ELBENCHO_FIXTURE_IMAGE,
     }
     _write_text(config.state_dir / "state.json", json.dumps(state, indent=2) + "\n")
 
@@ -3747,6 +4773,7 @@ def setup_environment(runner: Runner, config: Config) -> None:
     """Provision while serializing host-global NFS ownership."""
     architecture = _check_platform()
     backend = _select_storage_backend(config)
+    _invalidate_setup_summary(config)
     if backend == "nfs":
         with _nfs_host_lock(runner):
             _claim_nfs_host_owner(runner, config)
@@ -3762,6 +4789,8 @@ def _setup_environment_locked(
     capacity_path = (
         config.sbx_shared_root if backend == "sbx-shared" else config.state_dir
     )
+    if backend == "sbx-shared":
+        _validate_sbx_shared_root(config)
     _check_host_capacity(capacity_path)
     _prepare_host_dependencies(runner, config, backend)
     _ensure_docker(runner)
@@ -3798,6 +4827,7 @@ def _setup_environment_locked(
         _create_cluster(runner, config, backend)
     if backend == "sbx-shared":
         _configure_sbx_node_trust(runner, config)
+        _install_sbx_calico(runner, config)
     _wait_for_cluster(runner, config)
     kubernetes_version = _observed_kubernetes_version(runner, config)
     _record_storage_backend_profile(config, backend)
@@ -3810,6 +4840,7 @@ def _setup_environment_locked(
         _install_nfs_csi(runner, config, gateway)
     else:
         _install_sbx_shared_storage(runner, config)
+    _validate_kubectl_prerequisites(runner, config, backend)
     _install_ssh_workers(runner, config)
     _scale_ssh(runner, config, replicas=0)
     _install_slurm(runner, config)
@@ -3817,6 +4848,7 @@ def _setup_environment_locked(
     _wait_for_ssh(runner, config)
     private_key = config.keys_dir / "id_ed25519"
     _validate_ssh_workers(runner, config, private_key, "separate")
+    _verify_user_access(runner, config)
     _write_state_summary(config, backend, kubernetes_version, subnet, gateway)
     LOG.info("Integration environment is provisioned and running")
 
@@ -4001,6 +5033,14 @@ def _validate_sbx_teardown_ownership(
     _validate_sbx_shared_root(config)
     expected_owner = _owner_document(config)
     state_marker = config.state_dir / STATE_MARKER
+    if state_marker.is_symlink():
+        raise ProvisionError(
+            f"refusing teardown with symlinked ownership marker: {state_marker}"
+        )
+    if state_marker.exists() and not state_marker.is_file():
+        raise ProvisionError(
+            f"refusing teardown with unsafe ownership marker: {state_marker}"
+        )
     state_owned = state_marker.is_file()
     if (
         state_owned
@@ -4015,6 +5055,14 @@ def _validate_sbx_teardown_ownership(
         )
 
     cluster_marker = config.state_dir / "cluster-owner.json"
+    if cluster_marker.is_symlink():
+        raise ProvisionError(
+            f"refusing teardown with symlinked ownership marker: {cluster_marker}"
+        )
+    if cluster_marker.exists() and not cluster_marker.is_file():
+        raise ProvisionError(
+            f"refusing teardown with unsafe ownership marker: {cluster_marker}"
+        )
     setup_owned = cluster_marker.is_file()
     if (
         setup_owned
@@ -4028,12 +5076,51 @@ def _validate_sbx_teardown_ownership(
     shared_owned = root.exists()
     if shared_owned:
         marker = root / EXPORT_MARKER
-        if not marker.is_file() or json.loads(marker.read_text(encoding="utf-8")) != (
-            _sbx_shared_marker(config)
-        ):
+        expected_marker = _sbx_shared_marker(config)
+        journal = config.state_dir / SBX_SHARED_JOURNAL
+        if journal.is_symlink() or (journal.exists() and not journal.is_file()):
+            raise ProvisionError(
+                f"refusing teardown with unsafe SBX shared journal: {journal}"
+            )
+        journal_owned = False
+        if journal.is_file():
+            try:
+                journal_owned = (
+                    json.loads(journal.read_text(encoding="utf-8")) == expected_marker
+                )
+            except (OSError, json.JSONDecodeError) as error:
+                raise ProvisionError(
+                    f"refusing teardown with invalid SBX shared journal: {journal}"
+                ) from error
+            if not journal_owned:
+                raise ProvisionError(
+                    f"refusing teardown with mismatched SBX shared journal: {journal}"
+                )
+        if marker.is_symlink():
             raise ProvisionError(
                 f"refusing teardown of unowned SBX shared root: {root}"
             )
+        if marker.is_file():
+            document = json.loads(marker.read_text(encoding="utf-8"))
+            legacy_marker = {
+                **_owner_document(config),
+                "backend": "sbx-shared",
+                "shared_root": str(config.sbx_shared_root),
+            }
+            if document not in (expected_marker, legacy_marker):
+                raise ProvisionError(
+                    f"refusing teardown of unowned SBX shared root: {root}"
+                )
+        elif not journal_owned or any(root.iterdir()):
+            raise ProvisionError(
+                f"refusing teardown of unowned SBX shared root: {root}"
+            )
+        if not state_owned or not setup_owned:
+            raise ProvisionError(
+                "refusing destructive cleanup without matching state and cluster ownership"
+            )
+        if marker.is_file() and document == legacy_marker:
+            _write_text(marker, json.dumps(expected_marker, sort_keys=True) + "\n")
         allowed = {EXPORT_MARKER, "storage-test", "ssh-home"}
         unexpected = sorted(
             path.name for path in root.iterdir() if path.name not in allowed
@@ -4066,7 +5153,7 @@ def _remove_sbx_shared(runner: Runner, config: Config) -> None:
         ],
         timeout=120,
     )
-    (root / EXPORT_MARKER).unlink()
+    (root / EXPORT_MARKER).unlink(missing_ok=True)
     root.rmdir()
     if root.exists():
         raise ProvisionError(f"cleanup did not remove SBX shared root: {root}")
@@ -4079,6 +5166,11 @@ def _owner_document(config: Config) -> dict[str, object]:
 
 def _read_system_file(runner: Runner, path: Path) -> str | None:
     """Read a root-owned file, returning None when it is absent."""
+    symlink = runner.run([*_sudo_prefix(), "test", "-L", path], check=False, timeout=30)
+    if symlink.returncode == 0:
+        raise ProvisionError(f"refusing symlinked system path: {path}")
+    if symlink.returncode != 1:
+        raise ProvisionError(f"could not inspect system path: {path}")
     probe = runner.run([*_sudo_prefix(), "test", "-e", path], check=False, timeout=30)
     if probe.returncode == 1:
         return None
@@ -4095,6 +5187,14 @@ def _validate_teardown_ownership(
     expected_owner = _owner_document(config)
     state_marker = config.state_dir / STATE_MARKER
     state_owned = False
+    if state_marker.is_symlink():
+        raise ProvisionError(
+            f"refusing teardown with symlinked ownership marker: {state_marker}"
+        )
+    if state_marker.exists() and not state_marker.is_file():
+        raise ProvisionError(
+            f"refusing teardown with unsafe ownership marker: {state_marker}"
+        )
     if state_marker.exists():
         if json.loads(state_marker.read_text(encoding="utf-8")) != expected_owner:
             raise ProvisionError(
@@ -4103,6 +5203,14 @@ def _validate_teardown_ownership(
         state_owned = True
     cluster_marker = config.state_dir / "cluster-owner.json"
     cluster_owned = False
+    if cluster_marker.is_symlink():
+        raise ProvisionError(
+            f"refusing teardown with symlinked ownership marker: {cluster_marker}"
+        )
+    if cluster_marker.exists() and not cluster_marker.is_file():
+        raise ProvisionError(
+            f"refusing teardown with unsafe ownership marker: {cluster_marker}"
+        )
     if cluster_marker.exists():
         if json.loads(cluster_marker.read_text(encoding="utf-8")) != expected_owner:
             raise ProvisionError(
@@ -4119,6 +5227,29 @@ def _validate_teardown_ownership(
     marker_text = _read_system_file(runner, export_marker)
     export_owned = False
     export_directory: subprocess.CompletedProcess[str] | None = None
+    journal_path = config.state_dir / "export-marker.json"
+    journal_owned = False
+    if journal_path.is_symlink():
+        raise ProvisionError(
+            f"refusing teardown with symlinked export journal: {journal_path}"
+        )
+    if journal_path.exists() and not journal_path.is_file():
+        raise ProvisionError(
+            f"refusing teardown with unsafe export journal: {journal_path}"
+        )
+    if journal_path.is_file():
+        try:
+            journal_owned = (
+                json.loads(journal_path.read_text(encoding="utf-8")) == expected_owner
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            raise ProvisionError(
+                f"refusing teardown with invalid export journal: {journal_path}"
+            ) from error
+        if not journal_owned:
+            raise ProvisionError(
+                f"refusing teardown with mismatched export journal: {journal_path}"
+            )
     if marker_text is not None:
         try:
             marker = json.loads(marker_text)
@@ -4156,6 +5287,7 @@ def _validate_teardown_ownership(
             raise ProvisionError(
                 f"refusing to remove nonempty unowned export: {config.export_dir}"
             )
+        export_owned = journal_owned
 
     export_config = _read_system_file(runner, NFS_EXPORT_CONFIG)
     daemon_config = _read_system_file(runner, NFS_DAEMON_CONFIG)
@@ -4201,6 +5333,13 @@ def _validate_teardown_ownership(
 def _validate_cleanup_paths(config: Config) -> None:
     """Reject broad or overlapping lifecycle paths."""
     forbidden = {Path("/"), Path("/var"), Path("/srv"), Path("/etc")}
+    for path, label in (
+        (config.state_dir, "state"),
+        (config.export_dir, "export"),
+        (config.nfs_image, "NFS image"),
+    ):
+        if _path_contains_symlink(path):
+            raise ProvisionError(f"refusing symlinked {label} path: {path}")
     if config.state_dir in forbidden or config.export_dir in forbidden:
         raise ProvisionError(
             "refusing lifecycle action with a broad state or export path"
@@ -4230,7 +5369,9 @@ def _validate_lifecycle_paths(config: Config) -> None:
             f"setup state is not owned by the current user: {state_dir}"
         )
     marker = state_dir / STATE_MARKER
-    if not marker.is_file():
+    if marker.is_symlink() or not marker.is_file():
+        if not marker.exists() and not any(state_dir.iterdir()):
+            return
         raise ProvisionError(f"refusing to modify unowned setup state: {state_dir}")
     try:
         owner = json.loads(marker.read_text(encoding="utf-8"))
@@ -4660,10 +5801,10 @@ def _config(arguments: argparse.Namespace) -> Config:
     return Config(
         cluster_name=arguments.cluster_name,
         namespace=arguments.namespace,
-        state_dir=arguments.state_dir.resolve(),
-        export_dir=arguments.export_dir.resolve(),
+        state_dir=_absolute_path_without_resolving(arguments.state_dir),
+        export_dir=_absolute_path_without_resolving(arguments.export_dir),
         storage_backend=arguments.storage_backend,
-        sbx_shared_root=arguments.sbx_shared_root.resolve(),
+        sbx_shared_root=_absolute_path_without_resolving(arguments.sbx_shared_root),
         test_user=account.pw_name,
         test_uid=account.pw_uid,
         test_gid=account.pw_gid,
@@ -4750,7 +5891,6 @@ def main() -> int:
                 _run_filesystem_action(runner, config, arguments)
             else:
                 setup_environment(runner, config)
-                _verify_user_access(runner, config)
         return 0
     except (
         ProvisionError,

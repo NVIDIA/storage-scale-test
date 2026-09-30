@@ -1365,6 +1365,18 @@ _elbencho_env_used_emit_treefile_cache_sh() {
     return 0
 }
 
+yaml_double_quote() {
+    # Emit one YAML double-quoted scalar for generated immutable snapshots.
+    # The shell snapshot remains authoritative for arbitrary Bash values.
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '"%s"' "$value"
+}
+
 write_elbencho_env_used() {
     local out_file="$1"
     local dio_or_bio="$2"
@@ -1381,6 +1393,31 @@ write_elbencho_env_used() {
     {
         printf '# env_used.yaml - elbencho sweep configuration snapshot\n'
         printf '# Generated: %s\n\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+        printf 'EXECUTION_SUBSTRATE: "%s"\n' "${EXECUTION_SUBSTRATE:?}"
+        printf 'ORDER_NODES: %s\n\n' "$(yaml_double_quote "${ORDER_NODES:-0}")"
+
+        if [[ "${EXECUTION_SUBSTRATE:?}" == kubectl ]]; then
+            printf 'KUBECTL_NAMESPACE: %s\n' "$(yaml_double_quote "${KUBECTL_NAMESPACE:?}")"
+            printf 'KUBECTL_PV: %s\n' "$(yaml_double_quote "${KUBECTL_PV:?}")"
+            printf 'KUBECTL_PVC: %s\n' "$(yaml_double_quote "${KUBECTL_PVC:?}")"
+            printf 'KUBECTL_NODE_SELECTOR: %s\n' "$(yaml_double_quote "${KUBECTL_NODE_SELECTOR:?}")"
+            printf 'KUBECTL_ELBENCHO_IMAGE: %s\n' "$(yaml_double_quote "${KUBECTL_ELBENCHO_IMAGE:?}")"
+            printf 'KUBECTL_IMAGE_PULL_POLICY: %s\n' "$(yaml_double_quote "${KUBECTL_IMAGE_PULL_POLICY:?}")"
+            printf 'KUBECTL_RUN_AS_USER: %s\n' "${KUBECTL_RUN_AS_USER:?}"
+            printf 'KUBECTL_RUN_AS_GROUP: %s\n' "${KUBECTL_RUN_AS_GROUP:?}"
+            printf 'KUBECTL_MAPPED_READ_FROM: %s\n' \
+                "$(yaml_double_quote "${KUBECTL_MAPPED_READ_FROM:-}")"
+            printf 'KUBECTL_MAPPED_TEST_DIRS:\n'
+            local _mapped_path
+            if declare -p KUBECTL_MAPPED_TEST_DIRS &>/dev/null; then
+                for _mapped_path in "${!KUBECTL_MAPPED_TEST_DIRS[@]}"; do
+                    printf '  %s: %s\n' "$(yaml_double_quote "$_mapped_path")" \
+                        "${KUBECTL_MAPPED_TEST_DIRS[$_mapped_path]}"
+                done
+            fi
+            printf '\n'
+        fi
 
         printf 'TEST_DIRS:\n'
         local _path
@@ -1495,6 +1532,32 @@ _write_elbencho_env_used_sh() {
         printf '# Auto-generated. The companion env_used.yaml is the human/external-tool form.\n'
         printf '# This file is the canonical artifact for nv-elbencho-sweep.sh --resume.\n'
         printf '# Generated: %s\n\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+        printf 'export EXECUTION_SUBSTRATE=%q\n' "${EXECUTION_SUBSTRATE:?}"
+        printf 'export ORDER_NODES=%q\n' "${ORDER_NODES:-0}"
+        printf 'export ORDER_NODES_ENABLED=%q\n\n' "${ORDER_NODES_ENABLED:-}"
+
+        if [[ "${EXECUTION_SUBSTRATE:?}" == kubectl ]]; then
+            printf 'export KUBECTL_NAMESPACE=%q\n' "${KUBECTL_NAMESPACE:?}"
+            printf 'export KUBECTL_PV=%q\n' "${KUBECTL_PV:?}"
+            printf 'export KUBECTL_PVC=%q\n' "${KUBECTL_PVC:?}"
+            printf 'export KUBECTL_NODE_SELECTOR=%q\n' "${KUBECTL_NODE_SELECTOR:?}"
+            printf 'export KUBECTL_ELBENCHO_IMAGE=%q\n' "${KUBECTL_ELBENCHO_IMAGE:?}"
+            printf 'export KUBECTL_IMAGE_PULL_POLICY=%q\n' "${KUBECTL_IMAGE_PULL_POLICY:?}"
+            printf 'export KUBECTL_RUN_AS_USER=%q\n' "${KUBECTL_RUN_AS_USER:?}"
+            printf 'export KUBECTL_RUN_AS_GROUP=%q\n' "${KUBECTL_RUN_AS_GROUP:?}"
+            printf 'export KUBECTL_MAPPED_READ_FROM=%q\n' "${KUBECTL_MAPPED_READ_FROM:-}"
+            if declare -p KUBECTL_MAPPED_TEST_DIRS &>/dev/null; then
+                printf 'unset KUBECTL_MAPPED_TEST_DIRS\ndeclare -gA KUBECTL_MAPPED_TEST_DIRS=(\n'
+                local _mapped_path
+                for _mapped_path in "${!KUBECTL_MAPPED_TEST_DIRS[@]}"; do
+                    printf '    [%q]=%q\n' "$_mapped_path" \
+                        "${KUBECTL_MAPPED_TEST_DIRS[$_mapped_path]}"
+                done
+                printf ')\nexport KUBECTL_MAPPED_TEST_DIRS\n'
+            fi
+            printf '\n'
+        fi
 
         _emit_bash_test_dirs_decl
         printf '\n'
@@ -1655,6 +1718,8 @@ write_mdtest_elbencho_env_used() {
     {
         printf '# env_used.yaml - mdtest-elbencho configuration snapshot\n'
         printf '# Generated: %s\n\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+        printf 'EXECUTION_SUBSTRATE: "%s"\n\n' "${EXECUTION_SUBSTRATE:?}"
 
         printf 'TEST_DIRS:\n'
         local _path
@@ -1845,14 +1910,51 @@ _elbencho_finalize_shared_failure_from_nnnn() {
         # shellcheck disable=SC1090
         source "$nnnn_sh" || exit 1
         export ELBENCHO_RUN_EXECUTION_ID="$execution_id"
-        export ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$output_dir"
+        export ELBENCHO_RUN_SCRATCH_OUTPUT_DIR="$output_dir"
         _elbencho_finalize_generated_shared_failure
     )
 }
 
+# Slurm adapter for the common cell runner's phase-boundary health hook.
+# It owns the allocation-wide service process and may replace that process;
+# substrate-neutral workload code never inspects Slurm state directly.
+maybe_restart_elbencho_services_slurm() {
+    local phase_name="${1:-}"
+    local restarted_pid
+
+    if [[ -z "${SLURM_JOB_ID:-}" ]] \
+            || [[ "${SLURM_JOB_NUM_NODES:-1}" -le 1 ]] \
+            || [[ -z "${SRUN_ELBENCHO_PID:-}" ]]; then
+        return 0
+    fi
+    if check_elbencho_services_srun; then
+        return 0
+    fi
+    echo "Elbencho services unhealthy after ${phase_name} phase, restarting..."
+    stop_elbencho_services_srun "$SRUN_ELBENCHO_PID" || return 1
+    restarted_pid=$(start_elbencho_services_srun) || return 1
+    if [[ -n "${SRUN_ELBENCHO_PID_FILE:-}" ]] \
+            && ! _atomic_write_sentinel \
+                "$SRUN_ELBENCHO_PID_FILE" "$restarted_pid"; then
+        echo "Error: unable to record restarted elbencho service PID" >&2
+        stop_elbencho_services_srun "$restarted_pid" || true
+        return 1
+    fi
+    SRUN_ELBENCHO_PID="$restarted_pid"
+    if ! check_elbencho_services_srun; then
+        echo "Error: elbencho services still unhealthy after ${phase_name} restart" >&2
+        return 1
+    fi
+    return 0
+}
+
+_elbencho_slurm_service_health_hook() {
+    maybe_restart_elbencho_services_slurm "$1"
+}
+
 # Coordinator worker (SLURM): runs one execution within the sbatch allocation.
-# Sources NNNN.sh in a subshell, applies per-execution overrides, runs
-# run_elbencho_io_sweep_iteration with output redirected to NNNN.log,
+# Sources NNNN.sh in a subshell, installs its cell context, runs
+# run_elbencho_cell with output redirected to NNNN.log,
 # and atomically writes NNNN.status / NNNN.exitcode / NNNN.jobid.
 #
 # Usage: coordinator_run_one_execution <executions_dir> <id> <alloc_hosts_csv> <output_dir>
@@ -1861,7 +1963,7 @@ coordinator_run_one_execution() {
     local executions_dir="$1"
     local id="$2"
     local alloc_hosts_csv="$3"
-    # output_dir is named to match the variable that run_elbencho_io_sweep_iteration
+    # output_dir is named to match the variable that the common workload runner
     # reads (across files, in the calling shell scope). Keeping the parameter
     # name identical avoids a redundant `local output_dir="$sweep_output_dir"`
     # copy in the subshell below -- which static analysis flags as an unused
@@ -1891,25 +1993,17 @@ coordinator_run_one_execution() {
         first_n_hosts_csv=$(printf '%s\n' "$alloc_hosts_csv" \
             | tr ',' '\n' | head -n "${nodes:?missing nodes in NNNN.sh}" \
             | paste -sd, -)
-        export ELBENCHO_RUN_NODE_COUNT="$nodes"
-        export ELBENCHO_RUN_HOSTS_CSV="$first_n_hosts_csv"
-        # shellcheck disable=SC2031  # Per-execution values are freshly assigned in this subshell.
-        export ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$output_dir"
-        # shellcheck disable=SC2031  # Per-execution values are freshly assigned in this subshell.
-        export ELBENCHO_RUN_EXECUTION_ID="$id"
-        # test_dirs_csv is read as a plain shell variable by
-        # run_elbencho_io_sweep_iteration (a bash function in this same shell
-        # scope), so it doesn't need `export` -- and not exporting lets the
-        # existing lowercase name stay without tripping the "env vars must be
-        # ALL_CAPS" static-analysis rule. output_dir benefits from the same
-        # convention; the function's `local output_dir="$4"` (above) is its
-        # one and only declaration in this scope.
         local test_dirs_csv
         test_dirs_csv=$(_compute_test_dirs_csv_for_execution) || exit 1
+        elbencho_set_cell_run_context \
+            "$id" "$nodes" "$first_n_hosts_csv" "$test_dirs_csv" \
+            "$output_dir" "$output_dir" \
+            _elbencho_slurm_service_health_hook _elbencho_noop_cell_hook \
+            || exit 1
 
         # shellcheck disable=SC2154  # nodes, io_size, thread_count, io_depth come from sourcing NNNN.sh
         _echo_ts "[coordinator] starting execution ${id}: nodes=${nodes} hosts=${first_n_hosts_csv} io_size=${io_size} threads=${thread_count} iodepth=${io_depth}"
-        run_elbencho_io_sweep_iteration
+        run_elbencho_cell
     ) 2>&1 | tee "$log_file"
     execution_pipe_status=("${PIPESTATUS[@]}")
     rc="${execution_pipe_status[0]}"
@@ -2582,16 +2676,13 @@ _ssh_build_execution_scriptlet() {
     printf '    /*) __elbencho_remote_output_dir_abs="$__elbencho_remote_output_dir" ;;\n'
     printf '    *) __elbencho_remote_output_dir_abs="$(pwd)/$__elbencho_remote_output_dir" ;;\n'
     printf 'esac\n'
-    printf 'export ELBENCHO_RUN_NODE_COUNT=%s\n' "$nodes"
-    printf 'export ELBENCHO_RUN_HOSTS_CSV=%q\n' "$ssh_nodelist"
-    printf 'export ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$__elbencho_remote_output_dir_abs"\n'
-    printf 'export ELBENCHO_RUN_EXECUTION_ID=%q\n' "$execution_id"
-    printf 'export test_dirs_csv=%q\n' "$test_dirs_csv"
     printf 'export output_dir="$__elbencho_remote_output_dir_abs"\n'
     printf 'export ELBENCHO=./elbencho\n'
     printf 'source ./_elbencho_functions.sh || exit 1\n'
+    printf 'elbencho_set_cell_run_context %q %q %q %q "$__elbencho_remote_output_dir_abs" "$__elbencho_remote_output_dir_abs" _elbencho_noop_cell_hook _elbencho_noop_cell_hook || exit 1\n' \
+        "$execution_id" "$nodes" "$ssh_nodelist" "$test_dirs_csv"
     printf 'set +e\n'
-    printf 'run_elbencho_io_sweep_iteration\n'
+    printf 'run_elbencho_cell\n'
     printf '__rc=$?\n'
     # shellcheck disable=SC2016  # Intentional: literal $__rc in the generated remote scriptlet
     printf 'exit "$__rc"\n'
@@ -2613,7 +2704,7 @@ _ssh_finalize_remote_generated_shared_failure() {
         printf 'export ELBENCHO_FILE_SIZE=\n'
         cat "$nnnn_sh"
         printf 'export ELBENCHO_RUN_EXECUTION_ID=%q\n' "$execution_id"
-        printf 'export ELBENCHO_RUN_REMOTE_OUTPUT_DIR=%q\n' "$remote_basename"
+        printf 'export ELBENCHO_RUN_SCRATCH_OUTPUT_DIR=%q\n' "$remote_basename"
         printf 'export output_dir=%q\n' "$remote_basename"
         printf 'source ./_elbencho_functions.sh || exit 1\n'
         printf '_elbencho_finalize_generated_shared_failure\n'

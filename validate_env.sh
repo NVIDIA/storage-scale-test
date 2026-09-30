@@ -18,6 +18,12 @@
 # Exit on undefined variables
 set -u
 
+if (( BASH_VERSINFO[0] < 4 \
+        || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    printf 'Bash 4.3 or newer is required; on macOS run: brew install bash\n' >&2
+    exit 1
+fi
+
 # Initialize error tracking
 declare -a errors=()
 declare source_output=""
@@ -71,11 +77,11 @@ register_error() {
     if type -P flock >/dev/null 2>&1; then
         (
             flock -x 200
-            printf '%s\n' "$error_message" >> "$ERROR_FILE"
+            printf '%s\0' "$error_message" >> "$ERROR_FILE"
         ) 200>"$ERROR_FILE.lock"
     else
         # Fallback: direct write without locking (potential race condition)
-        printf '%s\n' "$error_message" >> "$ERROR_FILE"
+        printf '%s\0' "$error_message" >> "$ERROR_FILE"
     fi
 }
 
@@ -107,7 +113,7 @@ all_registered_errors() {
     fi
 
     # Read errors from file into array
-    while IFS= read -r line; do
+    while IFS= read -r -d '' line; do
         result_array+=("$line")
     done < "$ERROR_FILE"
 }
@@ -131,8 +137,9 @@ all_registered_warnings() {
 init_error_tracking
 
 # Source env.sh, capturing any output
-if ! source_output=$("$SHELL" -c ". ${SCALE_TEST_BASE}/env.sh" 2>&1); then
-    printf "%s\n\nFailed to soruce env.sh; fix ^^^^^^^^^^\n" "$source_output"
+if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
+        "${SCALE_TEST_BASE}/env.sh" 2>&1); then
+    printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
     exit 1
 fi
 
@@ -143,6 +150,101 @@ fi
 check_dirs() {
     [[ -d "${RESULTS_DIR}" ]] || register_error "Directory ${RESULTS_DIR} does not exist"
     [[ -d "${LOGS_DIR}" ]] || register_error "Directory ${LOGS_DIR} does not exist"
+}
+
+check_macos_launcher_prerequisites() {
+    [[ $(uname -s) == Darwin ]] || return 0
+
+    case "${EXECUTION_SUBSTRATE:-}" in
+        ssh|kubectl) ;;
+        *)
+            register_error "macOS may initiate only SSH or kubectl filesystem sweeps; EXECUTION_SUBSTRATE=${EXECUTION_SUBSTRATE:-unset} is unsupported"
+            return 1
+            ;;
+    esac
+
+    local -a missing=()
+    local command
+    for command in grealpath gstat; do
+        command -v "$command" >/dev/null 2>&1 || missing+=("$command")
+    done
+    if [[ "${EXECUTION_SUBSTRATE:-}" == kubectl ]]; then
+        for command in gtimeout gtar flock; do
+            command -v "$command" >/dev/null 2>&1 || missing+=("$command")
+        done
+    fi
+    if (( ${#missing[@]} > 0 )); then
+        local packages="bash coreutils"
+        [[ "${EXECUTION_SUBSTRATE:-}" == kubectl ]] \
+            && packages+=" gnu-tar flock"
+        register_error "macOS ${EXECUTION_SUBSTRATE} launcher prerequisites are missing: ${missing[*]}. Install them with: brew install $packages"
+        return 1
+    fi
+    printf '  macOS launcher prerequisites: passed for %s\n' "$EXECUTION_SUBSTRATE"
+}
+
+check_kubectl_filesystem_prerequisites() {
+    local kubectl_functions="${SCALE_TEST_BASE}/storage-tests/fs/kubectl/_nv-elbencho-kubectl-functions.sh"
+    if [[ ! -f "$kubectl_functions" ]]; then
+        register_error "Kubernetes filesystem support files are missing: $kubectl_functions"
+        return 1
+    fi
+    # shellcheck disable=SC1090  # Checked-in filesystem-sweep validation helpers.
+    source "$kubectl_functions"
+    local configuration_output
+    if ! configuration_output=$(kubectl_validate_runtime_configuration 2>&1); then
+        register_error "$configuration_output"
+        return 1
+    fi
+    if ! command -v kubectl >/dev/null 2>&1; then
+        register_error "kubectl is required for EXECUTION_SUBSTRATE=kubectl but is not on PATH"
+        return 1
+    fi
+    if ! command -v flock >/dev/null 2>&1; then
+        register_error "flock is required for kubectl lifecycle locking (on macOS: brew install flock)"
+        return 1
+    fi
+    local current_context
+    if ! current_context=$(kubectl config current-context 2>&1) \
+            || [[ -z "$current_context" ]]; then
+        register_error "Could not determine the active kubectl context: $current_context"
+        return 1
+    fi
+    printf '  Kubernetes context: %s\n' "$current_context"
+    local identity
+    if ! identity=$(kubectl_validate_cluster_identity 2>&1); then
+        register_error "Kubernetes API or storage validation failed: $identity"
+        return 1
+    fi
+    printf '  Kubernetes namespace/PV/PVC identity: %s\n' "$identity"
+    local nodes_dir nodes_path node_output node_count node_arch node_names
+    nodes_dir=$(mktemp -d "${TMPDIR:-/tmp}/storage-scale-test-validate-nodes.XXXXXX") || {
+        register_error "Could not create temporary storage for Kubernetes node validation"
+        return 1
+    }
+    nodes_path="$nodes_dir/nodes.tsv"
+    if ! node_output=$(kubectl_discover_candidate_nodes \
+            "$KUBECTL_NODE_SELECTOR" "$nodes_path" 2>&1); then
+        register_error "Kubernetes worker selector validation failed: $node_output"
+        rm -rf -- "$nodes_dir"
+        return 1
+    fi
+    node_count=$(wc -l < "$nodes_path")
+    node_arch=$(cut -f3 "$nodes_path" | sort -u | paste -sd, -)
+    node_names=$(cut -f1 "$nodes_path" | paste -sd, -)
+    printf '  Kubernetes worker selector: %s (%s Ready %s node(s): %s)\n' \
+        "$KUBECTL_NODE_SELECTOR" "$node_count" "$node_arch" "$node_names"
+    rm -rf -- "$nodes_dir"
+    local runtime_output
+    if ! runtime_output=$(kubectl_validate_runtime_pod 2>&1); then
+        if [[ -n "$runtime_output" ]]; then
+            register_error "Kubernetes workload image or PVC runtime validation failed: $runtime_output"
+        else
+            register_error "Kubernetes workload image or PVC runtime validation failed"
+        fi
+        return 1
+    fi
+    printf '  Kubernetes runtime: image, UID/GID, required tools, and PVC read/write passed\n'
 }
 
 # Determine architecture & check for binaries
@@ -774,22 +876,40 @@ EOF
 }
 
 check_dirs
+launcher_prerequisites_rc=0
+check_macos_launcher_prerequisites || launcher_prerequisites_rc=$?
 
-if [ -n "$SLURM_ENABLED" ]; then
-    check_slurm
-    slurm_rc=$?
+if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
+    if [[ "$launcher_prerequisites_rc" -eq 0 ]]; then
+        check_kubectl_filesystem_prerequisites
+    fi
+    slurm_rc=1
+    ssh_rc=1
+elif [ -n "$SLURM_ENABLED" ]; then
+    if [[ "$launcher_prerequisites_rc" -eq 0 ]]; then
+        check_slurm
+        slurm_rc=$?
+    else
+        slurm_rc=1
+    fi
 else
     slurm_rc=1  # not enabled, so we can't run slurm checks
 fi
 
 if [ -n "$SSH_ENABLED" ]; then
-    check_ssh
-    ssh_rc=$?
+    if [[ "$launcher_prerequisites_rc" -eq 0 ]]; then
+        check_ssh
+        ssh_rc=$?
+    else
+        ssh_rc=1
+    fi
 else
     ssh_rc=1  # not enabled, so we can't run ssh checks
 fi
 
-if [[ "$slurm_rc" -eq 0 || "$ssh_rc" -eq 0 ]]; then
+if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
+    : # The Kubernetes validation Job checks the image and target architecture.
+elif [[ "$slurm_rc" -eq 0 || "$ssh_rc" -eq 0 ]]; then
     check_arch_and_binaries
 else
     printf "  (NOTE: Could not check binary presence or architecture because neither Slurm nor SSH validation succeeded)\n\n"
@@ -845,20 +965,26 @@ if [ -n "$FS_ENABLED" ]; then
     }
     check_elbencho_config
 
-    # Loop over all filesystems in TEST_DIRS
-    for fs_path in "${!TEST_DIRS[@]}"; do
-        # Skip empty paths
-        if [ -n "$fs_path" ]; then
-            check_fs "$slurm_rc" "$fs_path"
-        fi
-    done
+    if [[ -z "${KUBECTL_ENABLED:-}" ]]; then
+        # Loop over all filesystems in TEST_DIRS
+        for fs_path in "${!TEST_DIRS[@]}"; do
+            # Skip empty paths
+            if [ -n "$fs_path" ]; then
+                check_fs "$slurm_rc" "$fs_path"
+            fi
+        done
+    fi
 else
-    printf "  (NOTE: FS not enabled; not checking filesystem testability)\n\n"
+    if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
+        register_error "Kubernetes filesystem testing requires at least one nonempty TEST_DIRS entry"
+    else
+        printf "  (NOTE: FS not enabled; not checking filesystem testability)\n\n"
+    fi
 fi
 
-if [ -n "$OBJ_ENABLED" ]; then
+if [[ -n "$OBJ_ENABLED" && -z "${KUBECTL_ENABLED:-}" ]]; then
     check_obj "$slurm_rc" "$ssh_rc"
-else
+elif [[ -z "${KUBECTL_ENABLED:-}" ]]; then
     printf "  (NOTE: OBJ not enabled; not checking object testability)\n\n"
 fi
 
