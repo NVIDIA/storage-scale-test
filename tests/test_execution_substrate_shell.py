@@ -117,7 +117,6 @@ def test_each_selection_derives_exactly_one_flag(tmp_path):
 @pytest.mark.parametrize(
     ("relative_script", "program"),
     (
-        ("storage-tests/fs/nv-mdtest-elbencho.sh", "nv-mdtest-elbencho.sh"),
         ("storage-tests/network/nv-netbench.sh", "nv-netbench.sh"),
         ("storage-tests/object/nv-warp-sweep.sh", "nv-warp-sweep.sh"),
     ),
@@ -125,7 +124,7 @@ def test_each_selection_derives_exactly_one_flag(tmp_path):
 def test_other_benchmarks_reject_kubectl_before_creating_results(
     tmp_path, relative_script, program
 ):
-    """Only the filesystem IO sweep may grow a kubectl implementation."""
+    """Object and network benchmarks still reject kubectl."""
     fake_root = tmp_path / "deployment"
     destination = fake_root / relative_script
     destination.parent.mkdir(parents=True)

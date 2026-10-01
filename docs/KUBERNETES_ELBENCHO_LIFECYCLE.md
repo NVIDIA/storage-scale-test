@@ -18,11 +18,15 @@ limitations under the License.
 # Kubernetes Elbencho Lifecycle and Fault Contract
 
 This document is the normative lifecycle and failure contract for the
-asynchronous kubectl substrate of the Elbencho filesystem sweep. It freezes
+asynchronous kubectl substrate of the Elbencho filesystem IO and metadata
+sweeps. It freezes
 the states, legal transitions, invariants, linearization points, supported
 fault boundaries, and explicit non-goals against which implementation and
 review are evaluated. The historical design record explains why the feature
 was built this way; this document defines the behavior that must remain true.
+Both workloads use the same attempt and execution ledgers. Metadata cells
+publish their per-iteration `.out` and `.csv` files; filesystem IO cells retain
+their workload-specific completion artifacts.
 
 ## Failure policy and boundary
 

@@ -889,14 +889,20 @@ def decode_histogram(encoded: str) -> Dict[int, int]:
     if not encoded:
         return {}
     hist = {}
+    seen = set()
     for pair in encoded.split(";"):
         if ":" not in pair:
             continue
         bucket_str, count_str = pair.split(":", 1)
         try:
-            hist[int(bucket_str)] = int(count_str)
+            bucket = int(bucket_str)
+            count = int(count_str)
         except ValueError:
             continue
+        if bucket in seen:
+            raise ValueError(f"Duplicate histogram bucket in CSV cache: {bucket}")
+        seen.add(bucket)
+        hist[bucket] = count
     return hist
 
 

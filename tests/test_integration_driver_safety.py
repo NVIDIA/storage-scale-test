@@ -121,6 +121,9 @@ _wait_for_no_ssh_pods = getattr(_DRIVER, "_wait_for_no_ssh_pods")
 _wait_for_slurm = getattr(_DRIVER, "_wait_for_slurm")
 _wait_for_ssh = getattr(_DRIVER, "_wait_for_ssh")
 _assert_execution_contract = getattr(_FILESYSTEM, "_assert_execution_contract")
+_assert_mdtest_result_artifacts = getattr(
+    _FILESYSTEM, "_assert_mdtest_result_artifacts"
+)
 _assert_ordered_workers = getattr(_FILESYSTEM, "_assert_ordered_workers")
 _ensure_elbencho = getattr(_FILESYSTEM, "_ensure_elbencho")
 _prepare_scenario_data = getattr(_FILESYSTEM, "_prepare_scenario_data")
@@ -2786,6 +2789,55 @@ def test_workload_totals_require_resume_metadata(tmp_path, monkeypatch):
         _FILESYSTEM.IntegrationTestError, match="missing required workload metadata"
     ):
         _assert_execution_contract(scenario, step, tmp_path / "result")
+
+
+def test_mdtest_execution_contract_requires_results_and_completion(tmp_path):
+    """The driver checks each successful MD cell's raw data and commit marker."""
+    specs = sys.modules["filesystem_scenario_specs"]
+    scenario = specs.SCENARIO_SPECS_BY_NAME["mdtest-sweep"]
+    step = scenario.steps[0]
+    result = tmp_path / "result"
+    execution_root = result / "executions"
+    execution_root.mkdir(parents=True)
+
+    for index, expected in enumerate(step.executions, start=1):
+        nodes = expected.coordinate.nodes
+        tasks = expected.coordinate.tasks_per_node
+        execution_id = f"{index:04d}"
+        (execution_root / f"{execution_id}.sh").write_text(
+            f"export ELBENCHO_EXECUTION_KIND=mdtest\nexport nodes={nodes}\n"
+            f"export tasks_per_node={tasks}\n",
+            encoding="utf-8",
+        )
+        (execution_root / f"{execution_id}.status").write_text(
+            f"{expected.status.value}\n", encoding="utf-8"
+        )
+        (execution_root / f"{execution_id}.exitcode").write_text(
+            "97\n" if expected.status is _FILESYSTEM.ExecutionStatus.FAILED else "0\n",
+            encoding="utf-8",
+        )
+        if expected.status is not _FILESYSTEM.ExecutionStatus.SUCCESS:
+            continue
+        for extension in ("csv", "out"):
+            (
+                result
+                / f"mdtest-elbencho-c_{nodes:03d}-t_{tasks:03d}_20260929Z000000_iter1.{extension}"
+            ).write_text("result\n", encoding="utf-8")
+        (execution_root / f"{execution_id}.mdtest.complete").write_text(
+            "COMPLETE\n", encoding="utf-8"
+        )
+
+    _assert_execution_contract(scenario, step, result)
+    marker = execution_root / "0001.mdtest.complete"
+    marker.unlink()
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="completion marker"):
+        _assert_execution_contract(scenario, step, result)
+    marker.write_text("COMPLETE\n", encoding="utf-8")
+    (result / "mdtest-elbencho-c_001-t_001_20260929Z000000_iter1.out").unlink()
+    with pytest.raises(
+        _FILESYSTEM.IntegrationTestError, match="missing unique nonempty MD out"
+    ):
+        _assert_execution_contract(scenario, step, result)
 
 
 def test_slurm_ordering_uses_copied_execution_logs(tmp_path):

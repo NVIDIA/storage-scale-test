@@ -148,7 +148,7 @@ _coordinator_load_run_metadata() {
         case "$key" in
             output_basename)
                 [[ -z "${COORDINATOR_OUTPUT_BASENAME:-}" \
-                    && "$value" =~ ^elbencho-[0-9]{8}Z[0-9]{6}$ ]] || return 1
+                    && "$value" =~ ^(elbencho|mdtest-elbencho)-[0-9]{8}Z[0-9]{6}$ ]] || return 1
                 COORDINATOR_OUTPUT_BASENAME="$value"
                 ;;
             attempt_id) [[ "$value" == "$ATTEMPT_ID" ]] || return 1 ;;
@@ -559,6 +559,27 @@ _coordinator_result_publication_hook() {
 
 _coordinator_require_success_artifacts() {
     local id="$1" scratch="$2"
+    if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == mdtest ]]; then
+        local iteration stem
+        for ((iteration = 1; iteration <= MDTEST_ITERATIONS; iteration++)); do
+            # shellcheck disable=SC2154  # Sourced from the verified MD execution definition.
+            stem=$(printf '%s/mdtest-elbencho-c_%03d-t_%03d_%s_iter%d' \
+                "$scratch" "$nodes" "$tasks_per_node" \
+                "${COORDINATOR_OUTPUT_BASENAME##*-}" "$iteration")
+            if [[ ! -s "$stem.out" || -L "$stem.out" \
+                    || ! -s "$stem.csv" || -L "$stem.csv" ]]; then
+                _coordinator_error "successful MD execution $id lacks iteration $iteration results"
+                return 1
+            fi
+        done
+        local completion_file
+        completion_file=$(_mdtest_completion_path "$scratch" "$id") || return 1
+        if ! _mdtest_completion_is_valid "$completion_file"; then
+            _coordinator_error "successful MD execution $id lacks completion evidence"
+            return 1
+        fi
+        return 0
+    fi
     # The pre-existing workload contract identifies completion files only for
     # shared-directory and staged-read modes. Legacy worker-directory output is
     # parsed from Elbencho's regular .out/.csv artifacts and has no synthetic
@@ -684,7 +705,54 @@ _coordinator_run_cell() {
         fi
         return "$publication_rc"
     fi
+    if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == mdtest ]]; then
+        local benchmark_rc=0 publication_rc=0
+        # shellcheck disable=SC2034  # Read through dynamic scope by the metadata runner.
+        local output_dir="$scratch"
+        run_elbencho_metadata_benchmark || benchmark_rc=$?
+        _coordinator_result_publication_hook "$benchmark_rc" "$scratch" "$durable" \
+            || publication_rc=$?
+        [[ "$benchmark_rc" -eq 0 ]] || return "$benchmark_rc"
+        return "$publication_rc"
+    fi
     run_elbencho_cell
+}
+
+_coordinator_validate_mdtest_definition() {
+    [[ "${tasks_per_node:-}" =~ ^[1-9][0-9]*$ \
+        && "${MDTEST_ITERATIONS:-}" =~ ^[1-9][0-9]*$ \
+        && "${MDTEST_BRANCH_FACTOR:-}" =~ ^[1-9][0-9]*$ \
+        && "${MDTEST_ITEMS_PER_DIR:-}" =~ ^[1-9][0-9]*$ ]] || return 1
+    case "${MDTEST_LAYOUT:-}" in
+        standard) return 0 ;;
+        single-dir)
+            [[ "${MDTEST_SINGLE_DIR_TARGET_FILES:-}" =~ ^[1-9][0-9]*$ \
+                && "${MDTEST_SINGLE_DIR_FILES_PER_WORKER:-}" =~ ^[1-9][0-9]*$ ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+_coordinator_validate_mdtest_targets() {
+    local id="$1" csv="$2" target root mapped_root basename index
+    local expected_suffix="${ELBENCHO_RUN_TEST_DIR_SUFFIX:-}"
+    [[ "$expected_suffix" =~ ^-[0-9]{8}Z[0-9]{6}-e${id}$ ]] || return 1
+    local -a targets=()
+    IFS=, read -ra targets <<< "$csv"
+    [[ ${#targets[@]} -gt 0 ]] || return 1
+    for target in "${targets[@]}"; do
+        basename="${target##*/}"
+        [[ "$basename" == mdtest-elbencho-target-*"$expected_suffix" ]] || return 1
+        index="${basename#mdtest-elbencho-target-}"
+        index="${index%"$expected_suffix"}"
+        [[ "$index" =~ ^[1-9][0-9]*$ ]] || return 1
+        local matches=0
+        for root in "${!TEST_DIRS[@]}"; do
+            mapped_root=$(kubectl_map_logical_path "$root") || return 1
+            [[ "${target%/*}" == "$mapped_root" ]] && matches=$((matches + 1))
+        done
+        [[ "$matches" -eq 1 ]] || return 1
+    done
 }
 
 _coordinator_run_one() {
@@ -698,6 +766,9 @@ _coordinator_run_one() {
     _coordinator_write_summary RUNNING || return 1
     rm -rf -- "${SCRATCH_DIR:?}/$id"
     mkdir -p "$scratch" "$durable" || return 1
+    unset ELBENCHO_EXECUTION_KIND tasks_per_node MDTEST_LAYOUT
+    unset MDTEST_SINGLE_DIR_TARGET_FILES MDTEST_SINGLE_DIR_FILES_PER_WORKER
+    unset MDTEST_BRANCH_FACTOR MDTEST_ITEMS_PER_DIR MDTEST_ITERATIONS
     # shellcheck disable=SC1090  # Digest-verified control bundle definition.
     source "$definition" || {
         _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
@@ -707,6 +778,19 @@ _coordinator_run_one() {
         _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
         return 1
     }
+    case "${ELBENCHO_EXECUTION_KIND:-io}" in
+        io) ;;
+        mdtest)
+            _coordinator_validate_mdtest_definition || {
+                _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
+                return 1
+            }
+            ;;
+        *)
+            _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
+            return 1
+            ;;
+    esac
     _coordinator_integration_crash_after after-running
     if [[ "$nodes" -eq 1 ]]; then
         COORDINATOR_SELECTED_ENDPOINTS=()
@@ -745,11 +829,16 @@ _coordinator_run_one() {
         _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
         return 1
     }
+    if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == mdtest ]] \
+            && ! _coordinator_validate_mdtest_targets "$id" "$test_dirs_csv"; then
+        _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
+        return 1
+    fi
     # Reified generated-target ownership is expressed in user-facing logical
     # paths. The shared workload's deletion safeguards consult these captured
     # values directly, so freeze their Kubernetes mappings before any phase.
     ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV="$test_dirs_csv"
-    if [[ -n "$ELBENCHO_RUN_GENERATED_TEST_ROOT" ]]; then
+    if [[ -n "${ELBENCHO_RUN_GENERATED_TEST_ROOT:-}" ]]; then
         ELBENCHO_RUN_GENERATED_TEST_ROOT=$(
             kubectl_map_logical_path "$ELBENCHO_RUN_GENERATED_TEST_ROOT"
         ) || {
@@ -762,7 +851,8 @@ _coordinator_run_one() {
         }
     fi
     export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV ELBENCHO_RUN_GENERATED_TEST_ROOT
-    if [[ -n "${ELBENCHO_SWEEP_READ_FROM:-}" ]]; then
+    if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == io \
+            && -n "${ELBENCHO_SWEEP_READ_FROM:-}" ]]; then
         mapped_read_from=$(kubectl_map_read_from_path "$ELBENCHO_SWEEP_READ_FROM") || {
             _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
             return 1
@@ -779,7 +869,25 @@ _coordinator_run_one() {
             return 1
         fi
     fi
-    if [[ "$nodes" -eq 1 ]]; then
+    if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == mdtest ]]; then
+        _elbencho_set_metadata_core_context "$id" "$scratch" || {
+            _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
+            return 1
+        }
+        ELBENCHO_RUN_NODE_COUNT="$nodes"
+        ELBENCHO_RUN_HOSTS_CSV=""
+        if [[ "$nodes" -gt 1 ]]; then
+            ELBENCHO_RUN_HOSTS_CSV=$(IFS=,; printf '%s' "${COORDINATOR_SELECTED_ENDPOINTS[*]}")
+        fi
+        ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$scratch"
+        ELBENCHO_RUN_TEST_DIRS_CSV="$test_dirs_csv"
+        ELBENCHO_RUN_COORDINATOR_LOCAL=0
+        [[ "$nodes" -ne 1 ]] || ELBENCHO_RUN_COORDINATOR_LOCAL=1
+        export ELBENCHO_RUN_NODE_COUNT \
+            ELBENCHO_RUN_HOSTS_CSV ELBENCHO_RUN_REMOTE_OUTPUT_DIR \
+            ELBENCHO_RUN_TEST_DIRS_CSV ELBENCHO_RUN_COORDINATOR_LOCAL
+        test_dirs_csv="$ELBENCHO_RUN_TEST_DIRS_CSV"
+    elif [[ "$nodes" -eq 1 ]]; then
         elbencho_set_cell_run_context "$id" "$nodes" '' "$test_dirs_csv" \
             "$scratch" "$durable" _coordinator_health_hook \
             _coordinator_result_publication_hook 1 || {

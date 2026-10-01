@@ -105,6 +105,13 @@ SCENARIO_CATALOG = (
         ssh_home_mode=SshHomeMode.SEPARATE,
     ),
     Scenario(
+        "mdtest-sweep",
+        "Bounded mdtest-Elbencho metadata sweep",
+        frozenset({Substrate.SSH, Substrate.SLURM, Substrate.KUBECTL}),
+        15,
+        ssh_home_mode=SshHomeMode.SEPARATE,
+    ),
+    Scenario(
         "default-dio",
         "Default worker-directory direct-I/O lifecycle",
         frozenset({Substrate.SSH, Substrate.SLURM, Substrate.KUBECTL}),

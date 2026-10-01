@@ -35,6 +35,7 @@ import types
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -293,6 +294,87 @@ class TestDenseResultsParse(unittest.TestCase):
         pairs = _EXTRACT_MOD.discover_files([str(self.results)])
         self.assertEqual(list(pairs), [(1, 8, _DATESTAMP, 1)])
 
+    def test_discovery_does_not_join_success_and_failed_runs(self) -> None:
+        """A successful CSV cannot authorize an OUT file from a failed run."""
+        success = self.results / "success"
+        failed = self.results / "failed"
+        for directory, status in ((success, "SUCCESS"), (failed, "FAILED")):
+            executions = directory / "executions"
+            executions.mkdir(parents=True)
+            (executions / "0001.sh").write_text(
+                "export ELBENCHO_EXECUTION_KIND=mdtest\n"
+                "export nodes=1\nexport tasks_per_node=8\n",
+                encoding="utf-8",
+            )
+            (executions / "0001.status").write_text(f"{status}\n", encoding="utf-8")
+        (self.results / f"{_STEM}.csv").rename(success / f"{_STEM}.csv")
+        (self.results / f"{_STEM}.out").rename(failed / f"{_STEM}.out")
+
+        pairs = _EXTRACT_MOD.discover_files([str(success), str(failed)])
+
+        self.assertEqual(pairs, {})
+
+    def test_reified_mdtest_ledger_filters_non_successful_coordinates(self) -> None:
+        executions = self.results / "executions"
+        executions.mkdir()
+        for execution_id, nodes, tasks, status in (
+            ("0001", 1, 8, "FAILED"),
+            ("0002", 2, 8, "SUCCESS"),
+            ("0003", 1, 16, "PENDING"),
+        ):
+            (executions / f"{execution_id}.sh").write_text(
+                "export ELBENCHO_EXECUTION_KIND=mdtest\n"
+                f"export nodes={nodes}\n"
+                f"export tasks_per_node={tasks}\n",
+                encoding="utf-8",
+            )
+            (executions / f"{execution_id}.status").write_text(
+                f"{status}\n", encoding="utf-8"
+            )
+        (executions / "0004.sh").write_text(
+            "export ELBENCHO_EXECUTION_KIND=io\nexport nodes=1\n",
+            encoding="utf-8",
+        )
+        (executions / "0004.status").write_text("SUCCESS\n", encoding="utf-8")
+        successful_stem = f"mdtest-elbencho-c_002-t_008_{_DATESTAMP}_iter1"
+        (self.results / f"{successful_stem}.csv").write_text(
+            _DENSE_CSV, encoding="utf-8"
+        )
+        (self.results / f"{successful_stem}.out").write_text(
+            _DENSE_OUT, encoding="utf-8"
+        )
+
+        with tempfile.TemporaryDirectory() as alias_directory:
+            aliases = Path(alias_directory)
+            direct_link = aliases / "results"
+            direct_link.symlink_to(self.results, target_is_directory=True)
+            parent_link = aliases / "parent"
+            parent_link.symlink_to(self.results.parent, target_is_directory=True)
+            inputs = (self.results, direct_link, parent_link / self.results.name)
+            for input_dir in inputs:
+                with self.subTest(input_dir=input_dir):
+                    pairs = _EXTRACT_MOD.discover_files([str(input_dir)])
+                    self.assertEqual(list(pairs), [(2, 8, _DATESTAMP, 1)])
+                    self.assertEqual(
+                        pairs[(2, 8, _DATESTAMP, 1)],
+                        (
+                            str(self.results.resolve() / f"{successful_stem}.csv"),
+                            str(self.results.resolve() / f"{successful_stem}.out"),
+                        ),
+                    )
+
+    def test_non_mdtest_ledger_excludes_unowned_metadata_results(self) -> None:
+        executions = self.results / "executions"
+        executions.mkdir()
+        (executions / "0001.sh").write_text(
+            "export ELBENCHO_EXECUTION_KIND=io\n", encoding="utf-8"
+        )
+        (executions / "0001.status").write_text("FAILED\n", encoding="utf-8")
+
+        pairs = _EXTRACT_MOD.discover_files([str(self.results)])
+
+        self.assertEqual(list(pairs), [])
+
     def test_mdtest_configuration_is_loaded_from_env_used_yaml(self) -> None:
         env_used = self.results / "env_used.yaml"
         env_used.write_text(
@@ -367,6 +449,28 @@ class TestDenseResultsParse(unittest.TestCase):
         self.assertEqual(sum(metrics.create_histogram.values()), 10000)
         self.assertEqual(sum(metrics.stat_histogram.values()), 10000)
         self.assertEqual(sum(metrics.delete_histogram.values()), 10000)
+
+    def test_decimal_latency_buckets_are_reported(self) -> None:
+        out_path = self.results / f"{_STEM}.out"
+        out_path.write_text(
+            _DENSE_OUT.replace(
+                "Files lat hist   : [ 5: 1000, 7: 8000, 11: 900, 362: 100 ]",
+                "Files lat hist   : [ 2.4: 5000, 4.8: 5000 ]",
+            ),
+            encoding="utf-8",
+        )
+
+        metrics = self._iteration_metrics()
+        aggregated = self._aggregated_metrics()
+
+        self.assertEqual(metrics.stat_histogram, {2.4: 5000, 4.8: 5000})
+        self.assertAlmostEqual(aggregated.stat_lat_p50, 0.0024)
+        self.assertAlmostEqual(aggregated.stat_lat_p100, 0.0048)
+
+    def test_repeated_source_buckets_preserve_all_counts(self) -> None:
+        histogram = _EXTRACT_MOD.parse_latency_histogram("2.4: 5, 2.40: 7, 3: 2")
+
+        self.assertEqual(histogram, {2.4: 12, 3.0: 2})
 
     def test_aggregation_produces_percentiles(self) -> None:
         result = self._aggregated_metrics()
@@ -464,6 +568,78 @@ class TestDenseResultsParse(unittest.TestCase):
         self.assertAlmostEqual(imported[0].stat_elapsed_avg_sec, 0.010)
         self.assertAlmostEqual(imported[0].delete_elapsed_avg_sec, 0.479)
         self.assertEqual(imported_configuration, combined_configuration)
+
+    def test_csv_histograms_round_trip_and_plot_with_numeric_buckets(self) -> None:
+        csv_path = self.results / "aggregated.csv"
+        output_dir = self.results / "plots"
+        metrics = replace(
+            self._aggregated_metrics(),
+            create_histogram={2.4: 5, 8.1: 3},
+            stat_histogram={1.2: 7},
+            delete_histogram={4.6: 2},
+        )
+        _EXTRACT_MOD.write_csv_export(csv_path, [metrics])
+
+        imported, _ = _EXTRACT_MOD.read_csv_import(str(csv_path))
+
+        self.assertEqual(imported[0].create_histogram, {2.4: 5, 8.1: 3})
+        self.assertTrue(
+            all(isinstance(bucket, float) for bucket in imported[0].create_histogram)
+        )
+        plotter = mock.MagicMock()
+        plotter.style.context.return_value = contextlib.nullcontext()
+        plotter.rcParams = {
+            "axes.prop_cycle": mock.Mock(
+                by_key=mock.Mock(return_value={"color": ["b"]})
+            )
+        }
+        axis = mock.MagicMock()
+        axis.plot.return_value = (object(),)
+        plotter.gca.return_value = axis
+        with mock.patch.object(_EXTRACT_MOD, "plt", plotter):
+            _EXTRACT_MOD.plot_latency_histograms(
+                imported,
+                str(output_dir),
+                imported[0].datestamps,
+                "round-trip",
+                False,
+            )
+
+        self.assertEqual(axis.plot.call_args_list[0].args[0], [0.0024, 0.0081])
+        self.assertEqual(plotter.savefig.call_count, 3)
+
+    def test_csv_histogram_import_rejects_invalid_values(self) -> None:
+        csv_path = self.results / "aggregated.csv"
+        _EXTRACT_MOD.write_csv_export(csv_path, [self._aggregated_metrics()])
+        with csv_path.open(newline="", encoding="utf-8") as stream:
+            reader = csv.DictReader(stream)
+            fieldnames = reader.fieldnames
+            rows = list(reader)
+        self.assertIsNotNone(fieldnames)
+        for payload in (
+            "[]",
+            '{"NaN": 1}',
+            '{"-1": 1}',
+            '{"2.4": -1}',
+            '{"2.4": true}',
+            '{"2.4": 5, "2.40": 7}',
+            '{"2.4": 5, "2.4": 7}',
+        ):
+            rows[0]["create_histogram"] = payload
+            with csv_path.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            with (
+                self.subTest(payload=payload),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["extract-mdtest-elbencho.py", "--from-csv", str(csv_path)],
+                ),
+                self.assertRaises(ValueError),
+            ):
+                _EXTRACT_MOD.main()
 
 
 if __name__ == "__main__":

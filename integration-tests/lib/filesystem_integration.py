@@ -108,11 +108,12 @@ KUBERNETES_UID = re.compile(
 )
 KUBECTL_TERMINAL_STATES = frozenset({"SUCCESS", "FAILED", "CANCELLED"})
 KUBECTL_STATUS_STATES = KUBECTL_TERMINAL_STATES | frozenset(
-    {"PREPARED", "SUBMITTED", "RUNNING", "CANCEL_REQUESTED"}
+    {"PREPARED", "SUBMITTED", "RUNNING", "CANCEL_REQUESTED", "COLLECTED"}
 )
 KUBECTL_SUPPORTED_SCENARIOS = frozenset(
     {
         "baseline",
+        "mdtest-sweep",
         "default-dio",
         "failure-resume",
         "live-capture",
@@ -130,6 +131,13 @@ WORKLOAD_GID = 2000
 
 class IntegrationTestError(RuntimeError):
     """An actionable filesystem integration test failure."""
+
+
+def _runtime_workload_kind(runtime: Any) -> str:
+    """Return a scenario's workload kind, defaulting legacy test doubles to FS."""
+    scenario = getattr(runtime, "scenario", None)
+    steps = getattr(scenario, "steps", ())
+    return getattr(steps[0], "workload_kind", "filesystem") if steps else "filesystem"
 
 
 @dataclass(frozen=True)
@@ -1181,6 +1189,7 @@ def _validate_deployment_archive(
         "storage-scale-test/validate_env.sh",
         "storage-scale-test/lib/env_base.sh",
         "storage-scale-test/storage-tests/fs/nv-elbencho-sweep.sh",
+        "storage-scale-test/storage-tests/fs/nv-mdtest-elbencho.sh",
         f"storage-scale-test/utils/{binary_name}",
     }
     if bundled_runtime:
@@ -1718,7 +1727,10 @@ def _sync_step_runtime(
     if runtime.selector == "kubectl":
         runtime.values["kubectl_result_base"] = result_base
     extra_env = step.render_env(runtime.values)
-    if runtime.selector == "kubectl" and runtime.scenario.name == "failure-resume":
+    if runtime.selector == "kubectl" and runtime.scenario.name in {
+        "failure-resume",
+        "mdtest-sweep",
+    }:
         # The product copies this integration-only executable into the control
         # bundle before creating the Job.  It fails exactly one reified cell;
         # the resume operation deliberately unsets the hook while selecting
@@ -1884,7 +1896,8 @@ def _discover_result(
         runtime.selector,
         f"{step.name}-discover",
         f"find {_shell(result_base)} -mindepth 1 -maxdepth 1 -type d "
-        "-name 'elbencho-*' -printf '%p\\n'",
+        f"-name '{'mdtest-elbencho' if step.workload_kind == 'mdtest' else 'elbencho'}-*' "
+        "-printf '%p\\n'",
         log_dir,
         30,
     )
@@ -1956,6 +1969,21 @@ def _coordinate_from_execution(path: Path) -> tuple[int, str, int, int]:
         raise IntegrationTestError(f"invalid execution metadata in {path}") from error
 
 
+def _mdtest_coordinate_from_execution(path: Path) -> tuple[str, int, int]:
+    """Return the explicit workload kind, node count, and task count."""
+    values = _shell_assignments(path)
+    try:
+        return (
+            values["ELBENCHO_EXECUTION_KIND"],
+            int(values["nodes"]),
+            int(values["tasks_per_node"]),
+        )
+    except (KeyError, ValueError) as error:
+        raise IntegrationTestError(
+            f"invalid MD execution metadata in {path}"
+        ) from error
+
+
 def _workload_values(path: Path) -> dict[str, str]:
     """Load a workload TSV while rejecting duplicate or malformed keys."""
     values: dict[str, str] = {}
@@ -1983,6 +2011,28 @@ def _expected_dataset_totals(
     ):
         return 1, 16 * 1024 * 1024
     return None
+
+
+def _assert_mdtest_result_artifacts(
+    result: Path, execution_root: Path, execution_id: str, nodes: int, tasks: int
+) -> None:
+    """Require a completed MD cell to publish raw data and its commit marker."""
+    for suffix in ("csv", "out"):
+        matches = sorted(
+            result.glob(f"mdtest-elbencho-c_{nodes:03d}-t_{tasks:03d}_*_iter1.{suffix}")
+        )
+        if (
+            len(matches) != 1
+            or not matches[0].is_file()
+            or not matches[0].stat().st_size
+        ):
+            raise IntegrationTestError(
+                f"missing unique nonempty MD {suffix} artifact for "
+                f"nodes={nodes}, tasks={tasks}: {matches} ({execution_root})"
+            )
+    marker = execution_root / f"{execution_id}.mdtest.complete"
+    if not marker.is_file() or marker.read_text(encoding="utf-8") != "COMPLETE\n":
+        raise IntegrationTestError(f"missing MD completion marker: {marker}")
 
 
 def _assert_phase_artifacts(
@@ -2020,16 +2070,25 @@ def _assert_execution_contract(
             f"{scenario.name}/{step.name}: expected {len(step.executions)} "
             f"executions, found {len(scripts)}"
         )
-    actual_coordinates = [_coordinate_from_execution(path) for path in scripts]
-    expected_coordinates = [
-        (
-            item.coordinate.nodes,
-            item.coordinate.io_size,
-            item.coordinate.threads,
-            item.coordinate.io_depth,
-        )
-        for item in step.executions
-    ]
+    if getattr(step, "workload_kind", "filesystem") == "mdtest":
+        actual_coordinates = [
+            _mdtest_coordinate_from_execution(path) for path in scripts
+        ]
+        expected_coordinates = [
+            ("mdtest", item.coordinate.nodes, item.coordinate.tasks_per_node)
+            for item in step.executions
+        ]
+    else:
+        actual_coordinates = [_coordinate_from_execution(path) for path in scripts]
+        expected_coordinates = [
+            (
+                item.coordinate.nodes,
+                item.coordinate.io_size,
+                item.coordinate.threads,
+                item.coordinate.io_depth,
+            )
+            for item in step.executions
+        ]
     if actual_coordinates != expected_coordinates:
         raise IntegrationTestError(
             f"{scenario.name}/{step.name}: coordinates {actual_coordinates!r} "
@@ -2057,6 +2116,16 @@ def _assert_execution_contract(
                 f"{scenario.name}/{step.name}/{execution_id}: expected exit "
                 f"{expected_exit}, found {exitcode}"
             )
+        if getattr(step, "workload_kind", "filesystem") == "mdtest":
+            if expected.status is ExecutionStatus.SUCCESS:
+                _assert_mdtest_result_artifacts(
+                    result,
+                    execution_root,
+                    execution_id,
+                    expected.coordinate.nodes,
+                    expected.coordinate.tasks_per_node,
+                )
+            continue
         if scenario.name not in {
             "default-dio",
             "ssh-single-big-file",
@@ -2226,8 +2295,13 @@ def _assert_scenario_report(
     """Exercise reporting and require semantic rows and plot families."""
     report_dir = log_dir / f"report-{step.name}"
     report_dir.mkdir()
+    extractor = (
+        "extract-mdtest-elbencho.sh"
+        if step.workload_kind == "mdtest"
+        else "extract-elbencho.sh"
+    )
     command: list[str | Path] = [
-        report_workspace / "utils" / "extract-elbencho.sh",
+        report_workspace / "utils" / extractor,
         "--markdown",
     ]
     if runtime.scenario.name == "live-capture":
@@ -2254,18 +2328,42 @@ def _assert_scenario_report(
             f"{runtime.scenario.name}/{runtime.selector}/{step.name}: reporting "
             f"failed; full output: {log_path}\n{output[-8000:]}"
         )
-    node_counts = sorted({item.coordinate.nodes for item in step.executions})
-    missing_rows = [
-        nodes
-        for nodes in node_counts
-        if not re.search(rf"^\|\s*{nodes}\s*\|", output, re.MULTILINE)
-    ]
-    required_operations = []
-    if WorkloadPhase.WRITE in step.required_phases:
-        required_operations.append("WRITE Operation")
-    if WorkloadPhase.READ in step.required_phases:
-        required_operations.append("READ Operation")
-    missing_operations = [item for item in required_operations if item not in output]
+    if step.workload_kind == "mdtest":
+        missing_rows = [
+            (item.coordinate.nodes, item.coordinate.tasks_per_node)
+            for item in step.executions
+            if not re.search(
+                rf"^\|\s*{item.coordinate.nodes}\s*\|\s*"
+                rf"{item.coordinate.tasks_per_node}\s*\|",
+                output,
+                re.MULTILINE,
+            )
+        ]
+        missing_operations = [
+            heading
+            for heading in (
+                "| Nodes | Threads | Iters | Create/s | Stat/s | Delete/s |",
+                "Create Latency Histogram",
+                "Stat Latency Histogram",
+                "Delete Latency Histogram",
+            )
+            if heading not in output
+        ]
+    else:
+        node_counts = sorted({item.coordinate.nodes for item in step.executions})
+        missing_rows = [
+            nodes
+            for nodes in node_counts
+            if not re.search(rf"^\|\s*{nodes}\s*\|", output, re.MULTILINE)
+        ]
+        required_operations = []
+        if WorkloadPhase.WRITE in step.required_phases:
+            required_operations.append("WRITE Operation")
+        if WorkloadPhase.READ in step.required_phases:
+            required_operations.append("READ Operation")
+        missing_operations = [
+            item for item in required_operations if item not in output
+        ]
     if missing_rows or missing_operations:
         raise IntegrationTestError(
             f"{runtime.scenario.name}/{runtime.selector}/{step.name}: report "
@@ -2515,25 +2613,38 @@ def _run_regular_step(
     log_dir: Path,
 ) -> StepOutcome:
     """Render, execute, collect, and validate one ordinary scenario step."""
-    if step.kind is CommandKind.RESUME:
-        raise IntegrationTestError("resume steps require the failure scenario runner")
-    result_base = f"{runtime.workspace}/results/{step.name}"
-    _reset_result_base(runner, config, fixture, runtime, result_base)
-    _sync_step_runtime(
-        runner,
-        config,
-        fixture,
-        runtime,
-        step,
-        template,
-        result_base,
+    is_mdtest_resume = (
+        step.workload_kind == "mdtest" and step.kind is CommandKind.RESUME
     )
-    _create_generated_inputs(runner, config, fixture, runtime, step)
-    _validate_step_environment(runner, config, fixture, runtime, step, log_dir)
+    if is_mdtest_resume:
+        result_base = runtime.values["mdtest_results_dir"]
+    else:
+        if step.kind is CommandKind.RESUME:
+            raise IntegrationTestError(
+                "filesystem resume steps require the failure scenario runner"
+            )
+        result_base = f"{runtime.workspace}/results/{step.name}"
+        _reset_result_base(runner, config, fixture, runtime, result_base)
+        _sync_step_runtime(
+            runner,
+            config,
+            fixture,
+            runtime,
+            step,
+            template,
+            result_base,
+        )
+        _create_generated_inputs(runner, config, fixture, runtime, step)
+        _validate_step_environment(runner, config, fixture, runtime, step, log_dir)
     arguments = shlex.join(step.render_arguments(runtime.values))
+    sweep_script = (
+        "nv-mdtest-elbencho.sh"
+        if step.workload_kind == "mdtest"
+        else "nv-elbencho-sweep.sh"
+    )
     command = (
         f"cd -- {_shell(runtime.workspace)} && "
-        f"./storage-tests/fs/nv-elbencho-sweep.sh {arguments}"
+        f"./storage-tests/fs/{sweep_script} {arguments}"
     )
     output = _run_step(
         runner,
@@ -2556,20 +2667,27 @@ def _run_regular_step(
             or f"{runtime.values['test_root']}/staged-input",
         )
         return StepOutcome(output, None, None)
-    remote_result = _discover_result(
-        runner,
-        config,
-        fixture,
-        runtime,
-        step,
-        result_base,
-        log_dir,
+    remote_result = (
+        result_base
+        if is_mdtest_resume
+        else _discover_result(
+            runner,
+            config,
+            fixture,
+            runtime,
+            step,
+            result_base,
+            log_dir,
+        )
     )
+    if step.workload_kind == "mdtest" and step.kind is CommandKind.SWEEP:
+        runtime.values["mdtest_results_dir"] = remote_result
     local_result = _copy_scenario_result(
         runner, config, fixture, runtime, step, remote_result
     )
     _assert_execution_contract(runtime.scenario, step, local_result)
-    _assert_semantic_flags(runtime.scenario.name, step, local_result)
+    if step.workload_kind != "mdtest":
+        _assert_semantic_flags(runtime.scenario.name, step, local_result)
     if "retained_data_dir" in step.exports:
         runtime.values["retained_data_dir"] = _retained_path(local_result)
     _assert_dataset_state(
@@ -2714,7 +2832,14 @@ def _run_kubectl_command(
         "timeout",
         "--kill-after=15s",
         f"{timeout}s",
-        Path(runtime.workspace) / "storage-tests" / "fs" / "nv-elbencho-sweep.sh",
+        Path(runtime.workspace)
+        / "storage-tests"
+        / "fs"
+        / (
+            "nv-mdtest-elbencho.sh"
+            if _runtime_workload_kind(runtime) == "mdtest"
+            else "nv-elbencho-sweep.sh"
+        ),
         *arguments,
     ]
     LOG.info("Running kubectl filesystem step: %s", name)
@@ -2777,9 +2902,14 @@ def _arm_incomplete_kubectl_submit_cleanup(runtime: ScenarioRuntime) -> None:
     if not result_base:
         return
     base = Path(result_base)
+    result_prefix = (
+        "mdtest-elbencho-*"
+        if _runtime_workload_kind(runtime) == "mdtest"
+        else "elbencho-*"
+    )
     candidates = [
         path
-        for path in base.glob("elbencho-*")
+        for path in base.glob(result_prefix)
         if path.is_dir()
         and not path.is_symlink()
         and (path / "kubernetes" / "current-attempt").is_file()
@@ -3217,7 +3347,8 @@ def _run_kubectl_baseline(
         )
     result = _collected_result_root(result_root)
     _assert_execution_contract(runtime.scenario, step, result)
-    _assert_semantic_flags(runtime.scenario.name, step, result)
+    if step.workload_kind != "mdtest":
+        _assert_semantic_flags(runtime.scenario.name, step, result)
     _assert_kubectl_ordered_workers(fixture, result)
     _assert_dataset_state(
         runner, config, fixture, step, result, None, KUBECTL_STORAGE_MOUNT
@@ -3263,11 +3394,21 @@ def _kubectl_run_step(
         raise IntegrationTestError(
             f"Kubernetes adapter does not execute delete-only step {step.name}"
         )
-    result_base = str(Path(runtime.workspace) / "results" / step.name)
-    _reset_result_base(runner, config, fixture, runtime, result_base)
-    _sync_step_runtime(runner, config, fixture, runtime, step, template, result_base)
-    _create_generated_inputs(runner, config, fixture, runtime, step)
-    _validate_step_environment(runner, config, fixture, runtime, step, log_dir)
+    is_mdtest_resume = (
+        step.workload_kind == "mdtest" and step.kind is CommandKind.RESUME
+    )
+    if is_mdtest_resume:
+        result_base = runtime.values["mdtest_results_dir"]
+    else:
+        if step.kind is CommandKind.RESUME:
+            raise IntegrationTestError("Kubernetes only supports MD resume here")
+        result_base = str(Path(runtime.workspace) / "results" / step.name)
+        _reset_result_base(runner, config, fixture, runtime, result_base)
+        _sync_step_runtime(
+            runner, config, fixture, runtime, step, template, result_base
+        )
+        _create_generated_inputs(runner, config, fixture, runtime, step)
+        _validate_step_environment(runner, config, fixture, runtime, step, log_dir)
     output = _run_kubectl_command(
         runner,
         config,
@@ -3277,8 +3418,23 @@ def _kubectl_run_step(
         log_dir,
         step.timeout_seconds,
     )
+    if is_mdtest_resume and _kubectl_lifecycle_state(output) == "COLLECTED":
+        result_root = Path(result_base)
+        result = _collected_result_root(result_root)
+        runtime.values["kubectl_result_root"] = str(result_root)
+        runtime.values["kubectl_collected"] = "1"
+        _assert_execution_contract(runtime.scenario, step, result)
+        _assert_dataset_state(
+            runner, config, fixture, step, result, None, KUBECTL_STORAGE_MOUNT
+        )
+        _assert_scenario_report(
+            runner, report_workspace, result, runtime, step, log_dir
+        )
+        return result
     result_root, attempt_id = _kubectl_submission(output)
     runtime.values["kubectl_result_root"] = str(result_root)
+    if step.workload_kind == "mdtest" and step.kind is CommandKind.SWEEP:
+        runtime.values["mdtest_results_dir"] = str(result_root)
     LOG.info("Submitted Kubernetes %s attempt %s", step.name, attempt_id)
     terminal = _wait_for_kubectl_terminal_state(
         runner, config, runtime, result_root, log_dir, step.timeout_seconds
@@ -3288,7 +3444,8 @@ def _kubectl_run_step(
     result = _kubectl_collect_result(runner, config, runtime, result_root, log_dir)
     runtime.values["kubectl_collected"] = "1"
     _assert_execution_contract(runtime.scenario, step, result)
-    _assert_semantic_flags(runtime.scenario.name, step, result)
+    if step.workload_kind != "mdtest":
+        _assert_semantic_flags(runtime.scenario.name, step, result)
     _assert_dataset_state(
         runner, config, fixture, step, result, None, KUBECTL_STORAGE_MOUNT
     )
@@ -3419,6 +3576,7 @@ def _run_kubectl_failure_resume(
         ),
     )
     runtime.values["failed_results_dir"] = str(result_root)
+    runtime.values["mdtest_results_dir"] = str(result_root)
     runtime.values["kubectl_collected"] = "1"
     if terminal not in {"FAILED", "CANCELLED"}:
         raise IntegrationTestError(
@@ -3426,9 +3584,10 @@ def _run_kubectl_failure_resume(
         )
     _assert_execution_contract(runtime.scenario, first, failed_result)
     preserved = _hash_execution_contract(failed_result, "0001")
-    _assert_dataset_state(
-        runner, config, fixture, first, failed_result, None, KUBECTL_STORAGE_MOUNT
-    )
+    if first.workload_kind != "mdtest":
+        _assert_dataset_state(
+            runner, config, fixture, first, failed_result, None, KUBECTL_STORAGE_MOUNT
+        )
 
     # The first attempt is collected, but the resumed attempt is active again;
     # scenario cleanup must therefore remain armed for the new attempt.
@@ -3854,7 +4013,12 @@ def _cleanup_kubectl_attempt(
                 "timeout",
                 "--kill-after=15s",
                 "90s",
-                command_root / "nv-elbencho-sweep.sh",
+                command_root
+                / (
+                    "nv-mdtest-elbencho.sh"
+                    if _runtime_workload_kind(runtime) == "mdtest"
+                    else "nv-elbencho-sweep.sh"
+                ),
                 operation,
                 result_root,
             ],
@@ -4395,7 +4559,11 @@ def _failure_plan(
         staging_root=SSH_FAILURE_STAGING_BASE,
         source_binary=source_binary,
         source_runtime=bundled_runtime,
-        target_argument="executions/0002.write.json",
+        target_argument=(
+            "mdtest-elbencho-c_001-t_002"
+            if _runtime_workload_kind(runtime) == "mdtest"
+            else "executions/0002.write.json"
+        ),
         coordinator_endpoint="local",
         worker_endpoints=[item["metadata"]["name"] for item in pods],
     )
@@ -4425,7 +4593,11 @@ def _slurm_failure_plan(
         staging_root=f"{runtime.workspace}/.storage-scale-test-failure",
         source_binary=source_binary,
         source_runtime=bundled_runtime,
-        target_argument="executions/0002.write.json",
+        target_argument=(
+            "mdtest-elbencho-c_001-t_002"
+            if _runtime_workload_kind(runtime) == "mdtest"
+            else "executions/0002.write.json"
+        ),
         shared_endpoint=fixture.login_pod,
     )
     operations = _remote_staging_operations(
@@ -4543,11 +4715,16 @@ def _run_failure_resume(
     _validate_step_environment(
         runner, config, fixture, runtime, injected_first, log_dir
     )
+    script_name = (
+        "nv-mdtest-elbencho.sh"
+        if _runtime_workload_kind(runtime) == "mdtest"
+        else "nv-elbencho-sweep.sh"
+    )
     with staged_failure_injection(plan, operations):
         arguments = shlex.join(first.render_arguments(runtime.values))
         command = (
             f"cd -- {_shell(runtime.workspace)} && "
-            f"./storage-tests/fs/nv-elbencho-sweep.sh {arguments}"
+            f"./storage-tests/fs/{script_name} {arguments}"
         )
         _run_step(
             runner,
@@ -4577,11 +4754,13 @@ def _run_failure_resume(
         )
         _assert_execution_contract(runtime.scenario, first, failed_result)
         runtime.values["failed_results_dir"] = remote_result
-        _assert_dataset_state(runner, config, fixture, first, failed_result, None)
+        runtime.values["mdtest_results_dir"] = remote_result
+        if first.workload_kind != "mdtest":
+            _assert_dataset_state(runner, config, fixture, first, failed_result, None)
         preserved = _hash_execution_contract(failed_result, "0001")
         resume_command = (
             f"cd -- {_shell(runtime.workspace)} && "
-            "./storage-tests/fs/nv-elbencho-sweep.sh "
+            f"./storage-tests/fs/{script_name} "
             f"{shlex.join(resume.render_arguments(runtime.values))}"
         )
         _run_step(
@@ -4726,7 +4905,7 @@ def run_filesystem_tests(
                             report_workspace,
                             scenario_logs,
                         )
-                        if scenario == "failure-resume":
+                        if scenario in {"failure-resume", "mdtest-sweep"}:
                             _run_kubectl_failure_resume(*kubectl_args)
                         elif scenario in {
                             "kubectl-cancel",
@@ -4745,7 +4924,7 @@ def run_filesystem_tests(
                             _run_kubectl_endpoint_drift(*kubectl_args)
                         else:
                             _run_kubectl_success_scenario(*kubectl_args)
-                    elif scenario == "failure-resume":
+                    elif scenario in {"failure-resume", "mdtest-sweep"}:
                         _run_failure_resume(
                             runner,
                             config,

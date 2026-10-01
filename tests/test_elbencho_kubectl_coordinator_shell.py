@@ -213,6 +213,80 @@ def _run_recovery(control, state_dir, scratch):
     )
 
 
+@pytest.mark.parametrize("produce_md_results", ["complete", "without-marker", "none"])
+def test_coordinator_dispatches_mixed_io_and_mdtest_cells(tmp_path, produce_md_results):
+    """A typed MD cell uses selected Pod hosts and publishes iteration outputs."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    (control / "executions" / "0002.sh").write_text(
+        textwrap.dedent("""\
+            export ELBENCHO_EXECUTION_KIND=mdtest
+            export nodes=2
+            export tasks_per_node=3
+            export MDTEST_LAYOUT=standard
+            export MDTEST_BRANCH_FACTOR=1
+            export MDTEST_ITEMS_PER_DIR=1
+            export MDTEST_ITERATIONS=1
+            export MDTEST_SINGLE_DIR_TARGET_FILES=''
+            export MDTEST_SINGLE_DIR_FILES_PER_WORKER=''
+            export ELBENCHO_RUN_TEST_DIR_SUFFIX=-20260923Z010203-e0002
+            export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=benchmark/mdtest-elbencho-target-1-20260923Z010203-e0002
+            export ELBENCHO_RUN_GENERATED_TEST_ROOT=''
+            """),
+        encoding="utf-8",
+    )
+    _make_executable(
+        fake,
+        """\
+        #!/usr/bin/env bash
+        set -eu
+        id=$1 scratch=$2
+        printf '%s|%s|%s|%s|%s|%s\\n' "$id" "${ELBENCHO_EXECUTION_KIND:-io}" \\
+            "$ELBENCHO_RUN_HOSTS_CSV" "$ELBENCHO_RUN_TEST_DIRS_CSV" \\
+            "$ELBENCHO_RUN_EXECUTION_ID" "$ELBENCHO_RUN_SCRATCH_OUTPUT_DIR" \\
+            >> "$FAKE_ELBENCHO_RECORD"
+        if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == mdtest ]]; then
+            if [[ "${FAKE_MD_RESULTS:-none}" != none ]]; then
+                stem="$scratch/mdtest-elbencho-c_002-t_003_20260923Z010203_iter1"
+                printf 'result\\n' > "$stem.out"
+                printf 'csv\\n' > "$stem.csv"
+            fi
+            if [[ "${FAKE_MD_RESULTS:-none}" == complete ]]; then
+                mkdir -p "$scratch/executions"
+                printf 'COMPLETE\\n' > "$scratch/executions/0002.mdtest.complete"
+            fi
+        else
+            printf 'io\\n' > "$scratch/io.out"
+        fi
+        """,
+    )
+    _refresh_bundle_manifest(control)
+    result = _run_coordinator(
+        control,
+        state_dir,
+        scratch,
+        fake,
+        FAKE_MD_RESULTS=produce_md_results,
+    )
+    assert (state_dir / "executions" / "0001.status").read_text().strip() == "SUCCESS"
+    expected_md_status = "SUCCESS" if produce_md_results == "complete" else "FAILED"
+    assert (
+        state_dir / "executions" / "0002.status"
+    ).read_text().strip() == expected_md_status
+    assert (result.returncode == 0) is (produce_md_results == "complete")
+    record = (control.parent / "fake-record").read_text(encoding="utf-8")
+    assert "0001|io|" in record
+    assert "0002|mdtest|10.10.0.1,10.10.0.2|" in record
+    assert f"|0002|{scratch / '0002' / 'elbencho-20260923Z010203'}" in record
+    assert "/benchmark/mdtest-elbencho-target-1-20260923Z010203-e0002" in record
+    if produce_md_results == "complete":
+        assert (
+            state_dir
+            / "results"
+            / "0002"
+            / "mdtest-elbencho-c_002-t_003_20260923Z010203_iter1.csv"
+        ).read_text() == "csv\n"
+
+
 def test_endpoint_probe_runs_socket_code_from_the_coordinator_file():
     """The bounded child does not carry socket code as inline shell text."""
     source = _COORDINATOR.read_text(encoding="utf-8")

@@ -66,6 +66,52 @@ _ZST_INSTALL_HINT = (
     "Install with: pip install -r requirements.txt "
     "(or run via ./utils/extract-warp.sh)"
 )
+
+
+def _json_object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict:
+    """Build a JSON object while rejecting repeated literal keys."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
+def _decode_cached_histogram(histogram_data: dict[str, Any]) -> dict[float, int]:
+    """Decode a cached histogram without collapsing equivalent float keys."""
+    histogram = {}
+    for bucket, count in histogram_data.items():
+        try:
+            numeric_bucket = float(bucket)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Invalid histogram bucket: {bucket}") from error
+        if not math.isfinite(numeric_bucket) or numeric_bucket < 0:
+            raise ValueError(f"Invalid histogram bucket: {bucket}")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"Invalid histogram count for bucket {bucket}")
+        if numeric_bucket in histogram:
+            raise ValueError(
+                f"Duplicate histogram bucket after normalization: {bucket}"
+            )
+        histogram[numeric_bucket] = int(count)
+    return histogram
+
+
+def _decode_warp_histogram_buckets(buckets: list[dict[str, Any]]) -> dict[float, int]:
+    """Decode Warp histogram arrays, accumulating equivalent bucket values."""
+    histogram = defaultdict(int)
+    for bucket in buckets:
+        numeric_bucket = float(bucket["millis"])
+        count = bucket["n"]
+        if not math.isfinite(numeric_bucket) or numeric_bucket < 0:
+            raise ValueError(f"Invalid histogram bucket: {bucket['millis']}")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"Invalid histogram count for bucket {bucket['millis']}")
+        histogram[numeric_bucket] += count
+    return dict(histogram)
+
+
 # Matplotlib legend locations
 _LEGEND_LOC_CENTER_LEFT = "center left"
 _LEGEND_LOC_UPPER_RIGHT = "upper right"
@@ -874,11 +920,7 @@ def parse_warp_json(filepath: str) -> Optional[WarpMetrics]:
         max_lat_ms = round(first_byte.get("slowest_millis", 0))
 
         # Parse overall TTFB histogram if available
-        ttfb_histogram = {}
-        if "ttfb_hist" in first_byte:
-            for bucket in first_byte["ttfb_hist"]:
-                # bucket["millis"] is the upper edge, bucket["n"] is the count
-                ttfb_histogram[float(bucket["millis"])] = int(bucket["n"])
+        ttfb_histogram = _decode_warp_histogram_buckets(first_byte.get("ttfb_hist", []))
 
         # Extract overall average throughput
         throughput = data["total"]["throughput"]
@@ -1031,10 +1073,9 @@ def parse_warp_json(filepath: str) -> Optional[WarpMetrics]:
             if client_fb is None:
                 continue
 
-            client_histogram = {}
-            if "ttfb_hist" in client_fb:
-                for bucket in client_fb["ttfb_hist"]:
-                    client_histogram[float(bucket["millis"])] = int(bucket["n"])
+            client_histogram = _decode_warp_histogram_buckets(
+                client_fb.get("ttfb_hist", [])
+            )
 
             if client_histogram:
                 ttfb_histograms_by_client[client_name] = client_histogram
@@ -3320,7 +3361,7 @@ def read_json(filepath: str) -> tuple[List[WarpMetrics], str]:
         json_str = decompressed_data.decode("utf-8")
 
     # Parse JSON
-    data = json.loads(json_str)
+    data = json.loads(json_str, object_pairs_hook=_json_object_without_duplicate_keys)
 
     # Check format - should be object with metadata
     if not isinstance(data, dict) or "metrics" not in data:
@@ -3348,13 +3389,11 @@ def read_json(filepath: str) -> tuple[List[WarpMetrics], str]:
         }
 
         # Reconstruct TTFB histogram (convert string keys back to floats)
-        ttfb_histogram = {
-            float(k): int(v) for k, v in metric_dict.get("ttfb_histogram", {}).items()
-        }
+        ttfb_histogram = _decode_cached_histogram(metric_dict.get("ttfb_histogram", {}))
 
         # Reconstruct per-client TTFB histograms
         ttfb_histograms_by_client = {
-            client: {float(k): int(v) for k, v in hist.items()}
+            client: _decode_cached_histogram(hist)
             for client, hist in metric_dict.get("ttfb_histograms_by_client", {}).items()
         }
 

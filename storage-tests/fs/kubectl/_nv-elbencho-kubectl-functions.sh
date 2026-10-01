@@ -3777,7 +3777,7 @@ kubectl_prepare_control_bundle() {
     local output_basename="$5" coordinator_source="$6"
     [[ "$output_variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ \
         && "$attempt_id" =~ ^[0-9a-f]{8}$ \
-        && "$output_basename" =~ ^elbencho-[0-9]{8}Z[0-9]{6}$ \
+        && "$output_basename" =~ ^(elbencho|mdtest-elbencho)-[0-9]{8}Z[0-9]{6}$ \
         && -f "$coordinator_source" && ! -L "$coordinator_source" ]] || return 1
     _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
     kubectl_attempt_load_identity "$kubernetes_dir/attempts/$attempt_id" || return 1
@@ -5087,9 +5087,11 @@ _kubectl_execution_requires_workload_metadata() (
     [[ -f "$definition" && ! -L "$definition" ]] || return 2
     unset ELBENCHO_SWEEP_READ_FROM ELBENCHO_SINGLE_BIG_FILE
     unset ELBENCHO_FILE_LAYOUT ELBENCHO_FILES_PER_NODE
+    unset ELBENCHO_EXECUTION_KIND
     ELBENCHO_FILE_LAYOUT=worker-directories
     # shellcheck disable=SC1090
     source "$definition" || return 2
+    [[ "${ELBENCHO_EXECUTION_KIND:-io}" != mdtest ]] || return 1
     if [[ -n "${ELBENCHO_SWEEP_READ_FROM:-}" \
             && "${ELBENCHO_SINGLE_BIG_FILE:-0}" != 1 ]]; then
         return 0

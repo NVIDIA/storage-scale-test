@@ -34,6 +34,8 @@ parse_elbencho_csv_file = _EXTRACT_MOD.parse_elbencho_csv_file
 print_workload_metadata_for_metrics = _EXTRACT_MOD.print_workload_metadata_for_metrics
 read_csv = _EXTRACT_MOD.read_csv
 write_csv = _EXTRACT_MOD.write_csv
+parse_io_histogram = getattr(_EXTRACT_MOD, "_parse_op_hist_fragment")
+parse_csv_histogram = getattr(_EXTRACT_MOD, "_elbencho_csv_parse_histogram_cell")
 
 _DS = "20260722Z030114"
 _BASE = f"elbencho-r64K-c_600-s_004-d_001_{_DS}"
@@ -520,6 +522,19 @@ class TestResumeOutLastSection(unittest.TestCase):
             add_elbencho_out_file_metrics(str(out_path), metrics)
             self.assertAlmostEqual(metrics[0].lat_pct_50, 0.001024)
             self.assertEqual(metrics[0].histogram.get(0.000512), 500)
+
+
+class TestHistogramBucketCollisions(unittest.TestCase):
+    """Duplicate raw buckets combine; malformed cache collisions fail."""
+
+    def test_raw_histogram_sums_equivalent_time_buckets(self) -> None:
+        histogram = parse_io_histogram("2400: 5, 2400.0: 7")
+        self.assertEqual(histogram, {0.0024: 12})
+
+    def test_cached_histogram_rejects_normalized_key_collision(self) -> None:
+        row = {"histogram": '{"2.4": 5, "2.40": 7}'}
+        with self.assertRaisesRegex(ValueError, "Duplicate histogram bucket"):
+            parse_csv_histogram(row)
 
 
 if __name__ == "__main__":

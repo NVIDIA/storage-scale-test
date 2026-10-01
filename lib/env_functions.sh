@@ -1746,7 +1746,61 @@ write_mdtest_elbencho_env_used() {
         printf '\nnodes_spec: "%s"\n' "$nodes_spec"
         printf 'tasks_spec: "%s"\n' "$tasks_spec"
     } > "$out_file"
+    _write_mdtest_elbencho_env_used_sh "${out_file%.yaml}.sh" \
+        "$nodes_spec" "$tasks_spec" "$single_dir_target_files" \
+        "$single_dir_files_per_worker" || return 1
     return 0
+}
+
+# Sourceable snapshot used by mdtest sweep resume and Slurm coordinators.
+_write_mdtest_elbencho_env_used_sh() {
+    local sh_path="$1"
+    local nodes_spec="$2"
+    local tasks_spec="$3"
+    local target_files="$4"
+    local files_per_worker="$5"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf '# Auto-generated mdtest-elbencho execution settings.\n'
+        printf 'export EXECUTION_SUBSTRATE=%q\n' "${EXECUTION_SUBSTRATE:?}"
+        printf 'export ORDER_NODES=%q\n' "${ORDER_NODES:-0}"
+        printf 'export ORDER_NODES_ENABLED=%q\n' "${ORDER_NODES_ENABLED:-}"
+        if [[ "${EXECUTION_SUBSTRATE:?}" == kubectl ]]; then
+            printf 'export KUBECTL_NAMESPACE=%q\n' "${KUBECTL_NAMESPACE:?}"
+            printf 'export KUBECTL_PV=%q\n' "${KUBECTL_PV:?}"
+            printf 'export KUBECTL_PVC=%q\n' "${KUBECTL_PVC:?}"
+            printf 'export KUBECTL_NODE_SELECTOR=%q\n' "${KUBECTL_NODE_SELECTOR:?}"
+            printf 'export KUBECTL_ELBENCHO_IMAGE=%q\n' "${KUBECTL_ELBENCHO_IMAGE:?}"
+            printf 'export KUBECTL_IMAGE_PULL_POLICY=%q\n' "${KUBECTL_IMAGE_PULL_POLICY:?}"
+            printf 'export KUBECTL_RUN_AS_USER=%q\n' "${KUBECTL_RUN_AS_USER:?}"
+            printf 'export KUBECTL_RUN_AS_GROUP=%q\n' "${KUBECTL_RUN_AS_GROUP:?}"
+            printf 'export KUBECTL_MAPPED_READ_FROM=%q\n' "${KUBECTL_MAPPED_READ_FROM:-}"
+            if declare -p KUBECTL_MAPPED_TEST_DIRS &>/dev/null; then
+                printf 'unset KUBECTL_MAPPED_TEST_DIRS\ndeclare -gA KUBECTL_MAPPED_TEST_DIRS=(\n'
+                local mapped_path
+                for mapped_path in "${!KUBECTL_MAPPED_TEST_DIRS[@]}"; do
+                    printf '    [%q]=%q\n' "$mapped_path" \
+                        "${KUBECTL_MAPPED_TEST_DIRS[$mapped_path]}"
+                done
+                printf ')\nexport KUBECTL_MAPPED_TEST_DIRS\n'
+            fi
+        fi
+        _emit_bash_test_dirs_decl
+        printf 'export FS_MAX_AGG_THROUGHPUT=%q\n' "$FS_MAX_AGG_THROUGHPUT"
+        printf 'export FS_MAX_NODE_THROUGHPUT_GBPS=%q\n' "$FS_MAX_NODE_THROUGHPUT_GBPS"
+        printf 'export FS_MAX_NODE_IOPS=%q\n' "$FS_MAX_NODE_IOPS"
+        printf 'export MDTEST_BRANCH_FACTOR=%q\n' "$MDTEST_BRANCH_FACTOR"
+        printf 'export MDTEST_ITEMS_PER_DIR=%q\n' "$MDTEST_ITEMS_PER_DIR"
+        printf 'export MDTEST_ITERATIONS=%q\n' "$MDTEST_ITERATIONS"
+        printf 'export ELBENCHO_READ_AFTER_WRITE_PAUSE=%q\n' "$ELBENCHO_READ_AFTER_WRITE_PAUSE"
+        local layout=standard
+        [[ -z "$target_files" ]] || layout=single-dir
+        printf 'export MDTEST_LAYOUT=%q\n' "$layout"
+        printf 'export MDTEST_SINGLE_DIR_TARGET_FILES=%q\n' "$target_files"
+        printf 'export MDTEST_SINGLE_DIR_FILES_PER_WORKER=%q\n' "$files_per_worker"
+        printf 'export nodes_spec=%q\n' "$nodes_spec"
+        printf 'export tasks_spec=%q\n' "$tasks_spec"
+    } > "$sh_path" || return 1
 }
 
 # =============================================================================
@@ -1769,6 +1823,11 @@ write_mdtest_elbencho_env_used() {
 # Compute the TSV-equivalent CSV of generated test dirs for a single execution.
 # Honors ELBENCHO_SWEEP_READ_FROM override. Prints the CSV to stdout.
 _compute_test_dirs_csv_for_execution() {
+    if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == mdtest ]]; then
+        [[ -n "${ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV:-}" ]] || return 1
+        printf '%s' "$ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV"
+        return 0
+    fi
     if [[ -n "${ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV:-}" ]]; then
         if [[ -n "${ELBENCHO_SWEEP_READ_FROM:-}" ]]; then
             printf '%s' "$ELBENCHO_SWEEP_READ_FROM"
@@ -1810,13 +1869,28 @@ _elbencho_result_artifacts_for_execution() {
     fi
 
     (
-        local nodes io_size thread_count io_depth
+        local nodes io_size thread_count io_depth tasks_per_node
         # shellcheck disable=SC1090
         ELBENCHO_FILE_LAYOUT=worker-directories
         ELBENCHO_FILES_PER_NODE=
         ELBENCHO_FILE_SIZE=
+        unset ELBENCHO_EXECUTION_KIND
         # shellcheck disable=SC1090
         source "$nnnn_sh" || exit 1
+        local execution_id
+        execution_id=$(basename "$nnnn_sh" .sh)
+        if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == mdtest ]]; then
+            local ds="${output_dir##*-}"
+            local iter base
+            base=$(printf '%s/mdtest-elbencho-c_%03d-t_%03d_%s' \
+                "$output_dir" "$nodes" "$tasks_per_node" "$ds")
+            for ((iter = 1; iter <= MDTEST_ITERATIONS; iter++)); do
+                printf '%s_iter%d.out\n%s_iter%d.csv\n' \
+                    "$base" "$iter" "$base" "$iter"
+            done
+            _mdtest_completion_path "$output_dir" "$execution_id"
+            exit 0
+        fi
         local ds="${output_dir##*-}"
         local resfile
         local csvfile
@@ -1828,8 +1902,6 @@ _elbencho_result_artifacts_for_execution() {
             "$thread_count" "$io_depth" "$ds"
         _elbencho_io_set_treefile "$output_dir" "$io_size" "$nodes" \
             "$thread_count" "$io_depth" "$ds"
-        local execution_id
-        execution_id=$(basename "$nnnn_sh" .sh)
         printf '%s\n' "$resfile" "$csvfile" "$livecsvfile" "$treefile" \
             "${output_dir}/executions/${execution_id}.write.json" \
             "${output_dir}/executions/${execution_id}.read.json" \
@@ -1848,9 +1920,14 @@ _elbencho_required_result_artifacts_for_execution() {
         ELBENCHO_FILE_LAYOUT=worker-directories
         ELBENCHO_FILES_PER_NODE=
         ELBENCHO_FILE_SIZE=
+        unset ELBENCHO_EXECUTION_KIND
         # shellcheck disable=SC1090
         source "$nnnn_sh" || exit 1
         local prefix="${output_dir}/executions/${execution_id}"
+        if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == mdtest ]]; then
+            _elbencho_result_artifacts_for_execution "$output_dir" "$nnnn_sh"
+            exit $?
+        fi
         if [[ -n "${ELBENCHO_SWEEP_READ_FROM:-}" \
                 && "${ELBENCHO_SINGLE_BIG_FILE:-0}" != 1 ]]; then
             printf '%s.workload.tsv\n' "$prefix"
@@ -1869,6 +1946,15 @@ _elbencho_required_result_artifacts_for_execution() {
             printf '%s.delete.json\n' "$prefix"
         fi
     )
+}
+
+# A success artifact must be a nonempty regular file, not a symlink.
+_elbencho_required_artifact_is_valid() {
+    if [[ "$1" == *.mdtest.complete ]]; then
+        _mdtest_completion_is_valid "$1"
+        return $?
+    fi
+    [[ -f "$1" && -s "$1" && ! -L "$1" ]]
 }
 
 # Remove local result artifacts for one reified execution. This is primarily
@@ -1907,6 +1993,7 @@ _elbencho_finalize_shared_failure_from_nnnn() {
         ELBENCHO_FILE_LAYOUT=worker-directories
         ELBENCHO_FILES_PER_NODE=
         ELBENCHO_FILE_SIZE=
+        unset ELBENCHO_EXECUTION_KIND
         # shellcheck disable=SC1090
         source "$nnnn_sh" || exit 1
         export ELBENCHO_RUN_EXECUTION_ID="$execution_id"
@@ -1988,6 +2075,7 @@ coordinator_run_one_execution() {
     local -a execution_pipe_status=()
     (
         # shellcheck disable=SC1090
+        unset ELBENCHO_EXECUTION_KIND
         source "$nnnn_sh" || exit 1
         local first_n_hosts_csv
         first_n_hosts_csv=$(printf '%s\n' "$alloc_hosts_csv" \
@@ -1995,15 +2083,24 @@ coordinator_run_one_execution() {
             | paste -sd, -)
         local test_dirs_csv
         test_dirs_csv=$(_compute_test_dirs_csv_for_execution) || exit 1
-        elbencho_set_cell_run_context \
-            "$id" "$nodes" "$first_n_hosts_csv" "$test_dirs_csv" \
-            "$output_dir" "$output_dir" \
-            _elbencho_slurm_service_health_hook _elbencho_noop_cell_hook \
-            || exit 1
-
-        # shellcheck disable=SC2154  # nodes, io_size, thread_count, io_depth come from sourcing NNNN.sh
-        _echo_ts "[coordinator] starting execution ${id}: nodes=${nodes} hosts=${first_n_hosts_csv} io_size=${io_size} threads=${thread_count} iodepth=${io_depth}"
-        run_elbencho_cell
+        if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == mdtest ]]; then
+            export output_dir test_dirs_csv
+            _elbencho_set_metadata_core_context "$id" "$output_dir" || exit 1
+            export ELBENCHO_RUN_NODE_COUNT="$nodes"
+            export ELBENCHO_RUN_HOSTS_CSV="$first_n_hosts_csv"
+            export ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$output_dir"
+            _echo_ts "[coordinator] starting mdtest execution ${id}: nodes=${nodes} hosts=${first_n_hosts_csv} tasks=${tasks_per_node}"
+            run_elbencho_metadata_benchmark
+        else
+            elbencho_set_cell_run_context \
+                "$id" "$nodes" "$first_n_hosts_csv" "$test_dirs_csv" \
+                "$output_dir" "$output_dir" \
+                _elbencho_slurm_service_health_hook _elbencho_noop_cell_hook \
+                || exit 1
+            # shellcheck disable=SC2154  # coordinates are sourced from NNNN.sh
+            _echo_ts "[coordinator] starting execution ${id}: nodes=${nodes} hosts=${first_n_hosts_csv} io_size=${io_size} threads=${thread_count} iodepth=${io_depth}"
+            run_elbencho_cell
+        fi
     ) 2>&1 | tee "$log_file"
     execution_pipe_status=("${PIPESTATUS[@]}")
     rc="${execution_pipe_status[0]}"
@@ -2020,20 +2117,37 @@ coordinator_run_one_execution() {
     fi
     printf '%s\n' "${SLURM_JOB_ID:-}" > "$jobid_file"
     if [[ "$rc" -eq 0 ]]; then
+        local required_artifacts required_artifact
+        required_artifacts=$(_elbencho_required_result_artifacts_for_execution \
+            "$output_dir" "$id" "$nnnn_sh") || rc=1
+        while IFS= read -r required_artifact; do
+            [[ -n "$required_artifact" ]] || continue
+            if ! _elbencho_required_artifact_is_valid "$required_artifact"; then
+                echo "Error: required execution artifact is missing, empty, or linked: $required_artifact" >&2
+                rc=1
+                break
+            fi
+        done <<< "$required_artifacts"
+    fi
+    if [[ "$rc" -eq 0 ]]; then
         if _atomic_write_sentinel "$status_file" SUCCESS; then
             _echo_ts "[coordinator] execution ${id} SUCCESS"
         else
             rc=1
             echo "Error: unable to record SUCCESS for execution ${id}" >&2
-            _elbencho_finalize_shared_failure_from_nnnn \
-                "$nnnn_sh" "$id" "$output_dir" || true
+            if [[ "$(unset ELBENCHO_EXECUTION_KIND; source "$nnnn_sh"; printf '%s' "${ELBENCHO_EXECUTION_KIND:-io}")" != mdtest ]]; then
+                _elbencho_finalize_shared_failure_from_nnnn \
+                    "$nnnn_sh" "$id" "$output_dir" || true
+            fi
             _atomic_write_sentinel "$status_file" FAILED || \
                 echo "Error: unable to record FAILED for execution ${id}" >&2
         fi
     else
-        if ! _elbencho_finalize_shared_failure_from_nnnn \
-                "$nnnn_sh" "$id" "$output_dir"; then
-            echo "Error: final generated-target cleanup failed for execution ${id}" >&2
+        if [[ "$(unset ELBENCHO_EXECUTION_KIND; source "$nnnn_sh"; printf '%s' "${ELBENCHO_EXECUTION_KIND:-io}")" != mdtest ]]; then
+            if ! _elbencho_finalize_shared_failure_from_nnnn \
+                    "$nnnn_sh" "$id" "$output_dir"; then
+                echo "Error: final generated-target cleanup failed for execution ${id}" >&2
+            fi
         fi
         _atomic_write_sentinel "$status_file" FAILED || \
             echo "Error: unable to record FAILED for execution ${id}" >&2
@@ -2332,8 +2446,10 @@ _dispatch_slurm_executions_owned() {
     fi
 
     local ds="${output_dir##*-}"
+    local job_prefix=elbencho
+    [[ "${output_dir##*/}" != mdtest-elbencho-* ]] || job_prefix=mdtest-elbencho
     local job_name
-    job_name=$(make_sbatch_job_name "elbencho" "$ds" "coordinator")
+    job_name=$(make_sbatch_job_name "$job_prefix" "$ds" "coordinator")
     local output_fmt="${output_dir}/coordinator-%j.log"
 
     # build_sbatch_cmd uses $sbatch_cmd in caller scope (existing convention);
@@ -2454,8 +2570,14 @@ _dispatch_ssh_executions_owned() {
     # during the long delay of executing. DS is in the basename suffix;
     # nodes_spec / dio_or_bio / etc. are in env (set by env.sh or
     # env_used.sh on resume).
-    print_elbencho_sweep_compact_summary \
-        "${output_dir##*-}" "${nodes_spec:-?}"
+    if [[ "${output_dir##*/}" == mdtest-elbencho-* ]]; then
+        printf 'mdtest-elbencho-%s nodes_spec: %s tasks_spec: %s iterations: %s\n' \
+            "${output_dir##*-}" "${nodes_spec:-?}" "${tasks_spec:-?}" \
+            "${MDTEST_ITERATIONS:-?}"
+    else
+        print_elbencho_sweep_compact_summary \
+            "${output_dir##*-}" "${nodes_spec:-?}"
+    fi
 
     local id
     local rc=0
@@ -2641,6 +2763,7 @@ _ssh_extract_nodes_from_nnnn() {
     local nodes_value
     nodes_value=$(
         # shellcheck disable=SC1090
+        unset ELBENCHO_EXECUTION_KIND
         source "$nnnn_sh" >/dev/null 2>&1 && printf '%s' "${nodes:-}"
     )
     if [[ -z "$nodes_value" ]] || [[ ! "$nodes_value" =~ ^[0-9]+$ ]] || [[ "$nodes_value" -lt 1 ]]; then
@@ -2679,10 +2802,21 @@ _ssh_build_execution_scriptlet() {
     printf 'export output_dir="$__elbencho_remote_output_dir_abs"\n'
     printf 'export ELBENCHO=./elbencho\n'
     printf 'source ./_elbencho_functions.sh || exit 1\n'
-    printf 'elbencho_set_cell_run_context %q %q %q %q "$__elbencho_remote_output_dir_abs" "$__elbencho_remote_output_dir_abs" _elbencho_noop_cell_hook _elbencho_noop_cell_hook || exit 1\n' \
-        "$execution_id" "$nodes" "$ssh_nodelist" "$test_dirs_csv"
     printf 'set +e\n'
-    printf 'run_elbencho_cell\n'
+    if [[ "$(unset ELBENCHO_EXECUTION_KIND; source "$nnnn_sh"; printf '%s' "${ELBENCHO_EXECUTION_KIND:-io}")" == mdtest ]]; then
+        printf 'export output_dir="$__elbencho_remote_output_dir_abs"\n'
+        printf 'export tasks_per_node=%q test_dirs_csv=%q\n' \
+            "$(unset ELBENCHO_EXECUTION_KIND; source "$nnnn_sh"; printf '%s' "$tasks_per_node")" "$test_dirs_csv"
+        printf '_elbencho_set_metadata_core_context %q "$__elbencho_remote_output_dir_abs" || exit 1\n' \
+            "$execution_id"
+        printf 'export ELBENCHO_RUN_NODE_COUNT=%q ELBENCHO_RUN_HOSTS_CSV=%q ELBENCHO_RUN_REMOTE_OUTPUT_DIR="$__elbencho_remote_output_dir_abs"\n' \
+            "$nodes" "$ssh_nodelist"
+        printf 'run_elbencho_metadata_benchmark\n'
+    else
+        printf 'elbencho_set_cell_run_context %q %q %q %q "$__elbencho_remote_output_dir_abs" "$__elbencho_remote_output_dir_abs" _elbencho_noop_cell_hook _elbencho_noop_cell_hook || exit 1\n' \
+            "$execution_id" "$nodes" "$ssh_nodelist" "$test_dirs_csv"
+        printf 'run_elbencho_cell\n'
+    fi
     printf '__rc=$?\n'
     # shellcheck disable=SC2016  # Intentional: literal $__rc in the generated remote scriptlet
     printf 'exit "$__rc"\n'
@@ -2696,6 +2830,9 @@ _ssh_finalize_remote_generated_shared_failure() {
     local remote_basename="$2"
     local execution_id="$3"
     local nnnn_sh="$4"
+    if [[ "$(unset ELBENCHO_EXECUTION_KIND; source "$nnnn_sh"; printf '%s' "${ELBENCHO_EXECUTION_KIND:-io}")" == mdtest ]]; then
+        return 0
+    fi
     local scriptlet
     scriptlet=$(
         printf '#!/usr/bin/env bash\n'
@@ -2735,6 +2872,7 @@ _ssh_nnnn_is_generated_shared() {
         ELBENCHO_FILE_LAYOUT=worker-directories
         ELBENCHO_FILES_PER_NODE=
         ELBENCHO_FILE_SIZE=
+        unset ELBENCHO_EXECUTION_KIND
         # shellcheck disable=SC1090
         source "$nnnn_sh" || exit 1
         [[ "${ELBENCHO_FILE_LAYOUT:-worker-directories}" == shared-directory \
@@ -2908,8 +3046,8 @@ tar -czf - -- "${existing[@]}"
     local required
     while IFS= read -r required; do
         [[ -n "$required" ]] || continue
-        if [[ ! -f "$required" ]]; then
-            echo "Error: required execution artifact was not retrieved: $required" >&2
+        if ! _elbencho_required_artifact_is_valid "$required"; then
+            echo "Error: required execution artifact was not retrieved or is empty or linked: $required" >&2
             return 1
         fi
     done <<<"$required_output"
@@ -2954,6 +3092,7 @@ _ssh_dispatch_one_execution() {
     local test_dirs_csv
     test_dirs_csv=$(
         # shellcheck disable=SC1090
+        unset ELBENCHO_EXECUTION_KIND
         source "$nnnn_sh" || exit 1
         _compute_test_dirs_csv_for_execution
     ) || {

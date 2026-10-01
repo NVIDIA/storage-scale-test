@@ -25,6 +25,7 @@ iterations, and generates performance reports and visualizations.
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import sys
@@ -57,7 +58,6 @@ from lib.reporting_common import (  # pylint: disable=wrong-import-position
     format_latency_ms,
     latency_column_widths,
     parse_int_values_with_ranges as parse_int_ranges,
-    parse_integer_histogram,
     strip_command_options,
 )
 from lib.stdout_report_file import (  # pylint: disable=wrong-import-position
@@ -108,9 +108,9 @@ class IterationMetrics:
     delete_lat_max: float
 
     # Histograms (bucket_us -> count) - from OUT file
-    create_histogram: Dict[int, int] = field(default_factory=dict)
-    stat_histogram: Dict[int, int] = field(default_factory=dict)
-    delete_histogram: Dict[int, int] = field(default_factory=dict)
+    create_histogram: Dict[float, int] = field(default_factory=dict)
+    stat_histogram: Dict[float, int] = field(default_factory=dict)
+    delete_histogram: Dict[float, int] = field(default_factory=dict)
 
     # Commands per operation type
     create_command: str = ""
@@ -150,9 +150,9 @@ class AggregatedMetrics:
     delete_elapsed_avg_sec: float = 0.0
 
     # Combined histograms (sum of all iteration histograms)
-    create_histogram: Dict[int, int] = field(default_factory=dict)
-    stat_histogram: Dict[int, int] = field(default_factory=dict)
-    delete_histogram: Dict[int, int] = field(default_factory=dict)
+    create_histogram: Dict[float, int] = field(default_factory=dict)
+    stat_histogram: Dict[float, int] = field(default_factory=dict)
+    delete_histogram: Dict[float, int] = field(default_factory=dict)
 
     # Computed percentiles from combined histogram (in milliseconds)
     create_lat_p0: float = 0.0  # min
@@ -217,9 +217,77 @@ def discover_files(
             int(match.group(4)),
         )
 
-    return discover_result_pairs(
+    file_pairs = discover_result_pairs(
         input_dirs, FILENAME_PATTERN, key_from_match, extension_group=5, warn=eprint
     )
+    successful_coordinates: Dict[str, Optional[set[Tuple[int, int]]]] = {
+        os.path.realpath(directory): _successful_mdtest_coordinates(directory)
+        for directory in dict.fromkeys(input_dirs)
+    }
+    filtered_pairs = {}
+    for key, paths in file_pairs.items():
+        result_dir = os.path.realpath(os.path.dirname(paths[0]))
+        coordinates = successful_coordinates.get(result_dir)
+        # None means this is a legacy result directory without a ledger.
+        if coordinates is None or (key[0], key[1]) in coordinates:
+            filtered_pairs[key] = paths
+        else:
+            eprint(
+                "Skipping metadata result without a SUCCESS execution ledger "
+                f"entry: {os.path.basename(paths[0])}"
+            )
+    return filtered_pairs
+
+
+def _successful_mdtest_coordinates(
+    input_dir: str,
+) -> Optional[set[Tuple[int, int]]]:
+    """Return successful reified MD coordinates, or None without a ledger."""
+    executions_dir = os.path.join(input_dir, "executions")
+    if not os.path.isdir(executions_dir):
+        return None
+
+    md_definitions = []
+    for filename in os.listdir(executions_dir):
+        if not re.fullmatch(r"[0-9]+\.sh", filename):
+            continue
+        execution_id = filename[:-3]
+        definition_path = os.path.join(executions_dir, filename)
+        try:
+            with open(definition_path, "r", encoding="utf-8") as definition:
+                content = definition.read()
+        except OSError as error:
+            eprint(
+                f"Warning: Cannot read execution definition {definition_path}: {error}"
+            )
+            continue
+        if not re.search(
+            r"^export ELBENCHO_EXECUTION_KIND=mdtest$", content, re.MULTILINE
+        ):
+            continue
+        nodes_match = re.search(r"^export nodes=([0-9]+)$", content, re.MULTILINE)
+        tasks_match = re.search(
+            r"^export tasks_per_node=([0-9]+)$", content, re.MULTILINE
+        )
+        md_definitions.append((execution_id, nodes_match, tasks_match))
+
+    successful = set()
+    for execution_id, nodes_match, tasks_match in md_definitions:
+        status_path = os.path.join(executions_dir, f"{execution_id}.status")
+        try:
+            with open(status_path, "r", encoding="utf-8") as status_file:
+                status = status_file.read().strip()
+        except OSError:
+            status = ""
+        if status != "SUCCESS":
+            continue
+        if nodes_match and tasks_match:
+            successful.add((int(nodes_match.group(1)), int(tasks_match.group(1))))
+        else:
+            eprint(
+                f"Warning: Invalid metadata execution coordinates in {execution_id}.sh"
+            )
+    return successful
 
 
 def _collect_configuration_values(
@@ -340,7 +408,7 @@ def parse_csv_file(csv_path: str) -> Dict[str, Dict[str, Any]]:
 
 def incomplete_result_reason(
     csv_data: Dict[str, Dict[str, Any]],
-    out_data: Dict[str, Dict[int, int]],
+    out_data: Dict[str, Dict[float, int]],
 ) -> str:
     """Explain why a result pair is not yet safe to aggregate."""
     missing_csv = [op for op in REQUIRED_OPERATIONS if op not in csv_data]
@@ -361,7 +429,26 @@ def incomplete_result_reason(
     return "; ".join(reasons)
 
 
-def parse_out_file(out_path: str) -> Dict[str, Dict[int, int]]:
+def parse_latency_histogram(histogram_text: str) -> Dict[float, int]:
+    """Parse elbencho latency buckets, including sub-microsecond decimals."""
+    histogram = {}
+    for item in histogram_text.split(","):
+        bucket_text, separator, count_text = item.partition(":")
+        if not separator:
+            continue
+        try:
+            bucket = float(bucket_text.strip())
+            count = int(count_text.strip())
+        except ValueError:
+            continue
+        if math.isfinite(bucket) and bucket >= 0 and count >= 0:
+            # Repeated spellings of the same bucket represent additional
+            # observations; preserve all counts after float normalization.
+            histogram[bucket] = histogram.get(bucket, 0) + count
+    return histogram
+
+
+def parse_out_file(out_path: str) -> Dict[str, Dict[float, int]]:
     """
     Parse OUT file for histograms.
 
@@ -396,7 +483,7 @@ def parse_out_file(out_path: str) -> Dict[str, Dict[int, int]]:
         if not hist_match:
             continue
 
-        result[op] = parse_integer_histogram(hist_match.group(1))
+        result[op] = parse_latency_histogram(hist_match.group(1))
 
     return result
 
@@ -482,7 +569,7 @@ def parse_file_pair(
 # =============================================================================
 
 
-def percentile_from_histogram(histogram: Dict[int, int], percentile: float) -> float:
+def percentile_from_histogram(histogram: Dict[float, int], percentile: float) -> float:
     """
     Calculate percentile from histogram.
 
@@ -516,7 +603,7 @@ def percentile_from_histogram(histogram: Dict[int, int], percentile: float) -> f
     return sorted_buckets[-1] / 1000.0 if sorted_buckets else 0.0
 
 
-def combine_histograms(histograms: List[Dict[int, int]]) -> Dict[int, int]:
+def combine_histograms(histograms: List[Dict[float, int]]) -> Dict[float, int]:
     """
     Combine multiple histograms by summing counts.
 
@@ -526,7 +613,7 @@ def combine_histograms(histograms: List[Dict[int, int]]) -> Dict[int, int]:
     Returns:
         Combined histogram
     """
-    result: Dict[int, int] = {}
+    result: Dict[float, int] = {}
     for hist in histograms:
         for bucket, count in hist.items():
             result[bucket] = result.get(bucket, 0) + count
@@ -1513,9 +1600,9 @@ def read_csv_import(
                 delete_lat_p90=float(row["delete_lat_p90"]),
                 delete_lat_p99=float(row["delete_lat_p99"]),
                 delete_lat_p100=float(row["delete_lat_p100"]),
-                create_histogram=json.loads(row["create_histogram"]),
-                stat_histogram=json.loads(row["stat_histogram"]),
-                delete_histogram=json.loads(row["delete_histogram"]),
+                create_histogram=_read_histogram_json(row["create_histogram"]),
+                stat_histogram=_read_histogram_json(row["stat_histogram"]),
+                delete_histogram=_read_histogram_json(row["delete_histogram"]),
                 create_command=row.get("create_command", row.get("command", "")),
                 stat_command=row.get("stat_command", ""),
                 delete_command=row.get("delete_command", ""),
@@ -1526,6 +1613,38 @@ def read_csv_import(
         configuration_values, "cached metric rows"
     )
     return metrics, configuration
+
+
+def _read_histogram_json(value: str) -> Dict[float, int]:
+    """Decode a JSON histogram, restoring and validating its numeric types."""
+
+    def reject_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        """Reject duplicate literal keys before JSON can discard their values."""
+        result: Dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate histogram JSON key: {key!r}")
+            result[key] = item
+        return result
+
+    decoded = json.loads(value, object_pairs_hook=reject_duplicate_keys)
+    if not isinstance(decoded, dict):
+        raise ValueError("Histogram JSON must be an object")
+
+    histogram: Dict[float, int] = {}
+    for raw_bucket, count in decoded.items():
+        try:
+            bucket = float(raw_bucket)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid histogram bucket: {raw_bucket!r}") from exc
+        if not math.isfinite(bucket) or bucket < 0:
+            raise ValueError(f"Invalid histogram bucket: {raw_bucket!r}")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"Invalid histogram count for bucket {raw_bucket!r}")
+        if bucket in histogram:
+            raise ValueError(f"Duplicate normalized histogram bucket: {raw_bucket!r}")
+        histogram[bucket] = count
+    return histogram
 
 
 # =============================================================================
