@@ -43,6 +43,7 @@ BATCH_MARKERS = (
 ENV_SHELL = "env_used.sh"
 ENV_YAML = "env_used.yaml"
 SUCCESS = "SUCCESS"
+REPORT_IDENTITY_FILENAME = ".report-identity"
 KINDS = ("all", "io", "mdtest")
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
@@ -463,11 +464,45 @@ def _generate_group_report(
     report_dir = output / "groups" / group.group_id
     try:
         report_dir.mkdir(parents=True, exist_ok=True)
+        # Invalidate prior evidence before an engine can partially overwrite it.
+        (report_dir / REPORT_IDENTITY_FILENAME).unlink(missing_ok=True)
+        report = report_dir / "report.txt"
+        report.unlink(missing_ok=True)
         _report_group(manifest, group, successful, report_dir, options)
+        _publish_report_text(
+            report_dir / REPORT_IDENTITY_FILENAME,
+            _report_identity(manifest, group, report),
+        )
         return _markdown_link("report", report_dir / "report.txt", output), True, False
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"Group {group.group_id}: {error}", file=sys.stderr)
         return "Reporting failed", False, True
+
+
+def _report_identity(manifest: BatchManifest, group: BatchGroup, report: Path) -> str:
+    """Bind a report to its canonical batch, immutable group, and exact content."""
+    fields = [
+        str(manifest.root),
+        group.group_id,
+        group.kind,
+        group.output_relative,
+        group.shell_digest,
+        group.yaml_digest,
+    ]
+    for execution in manifest.group_executions(group.group_id):
+        fields.extend((execution.execution_id, execution.definition_digest))
+    owner = hashlib.sha256("\0".join(fields).encode("utf-8")).hexdigest()
+    content = hashlib.sha256(_read_regular(report)).hexdigest()
+    return f"{owner}\n{content}\n"
+
+
+def _has_owned_report(manifest: BatchManifest, group: BatchGroup, report: Path) -> bool:
+    """Missing, foreign, corrupt, or partially overwritten evidence is not retained."""
+    try:
+        saved = _read_regular(report.parent / REPORT_IDENTITY_FILENAME)
+        return saved.decode("ascii") == _report_identity(manifest, group, report)
+    except (OSError, ValueError):
+        return False
 
 
 def _write_report_index(
@@ -492,7 +527,7 @@ def _write_report_index(
         if result is None:
             result = (
                 _markdown_link("report", report, output)
-                if report.is_file()
+                if _has_owned_report(manifest, group, report)
                 else "Not generated" if counts[SUCCESS] else "No successful results"
             )
         source = manifest.group_path(group)
@@ -506,12 +541,16 @@ def _write_report_index(
         lines.append(
             f"| {group.group_id} | {group.kind} | {settings} | {states} | {result} |"
         )
-    # Publish the index atomically so interruption cannot leave a truncated index.
-    descriptor, temporary = tempfile.mkstemp(prefix=".index-", dir=output)
+    _publish_report_text(output / "index.md", "\n".join(lines) + "\n")
+
+
+def _publish_report_text(destination: Path, content: str) -> None:
+    """Publish complete report evidence without leaving partial files on interruption."""
+    descriptor, temporary = tempfile.mkstemp(prefix=".index-", dir=destination.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write("\n".join(lines) + "\n")
-        os.replace(temporary, output / "index.md")
+            stream.write(content)
+        os.replace(temporary, destination)
     finally:
         Path(temporary).unlink(missing_ok=True)
 

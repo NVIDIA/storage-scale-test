@@ -237,6 +237,33 @@ def _run_coordinator(control, state_dir, scratch, fake, **extra_env):
     )
 
 
+def _assert_collectable_failure(control, state_dir):
+    """Use the production collection gate, not just the coordinator's manifest."""
+    result = subprocess.run(
+        [
+            _BASH,
+            "-c",
+            """
+        source "$1"
+        if [[ -f "$2/_batch_functions.sh" ]]; then
+            source "$2/_batch_functions.sh"
+        fi
+        _kubectl_validate_collected_publication "$3" 1234abcd test_terminal "$2/executions" >/dev/null || exit
+        [[ "$test_terminal" == FAILED ]]
+        """,
+            "collection-check",
+            str(_KUBECTL_FUNCTIONS),
+            str(control),
+            str(state_dir),
+        ],
+        cwd=_REPOSITORY_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def _run_recovery(control, state_dir, scratch):
     environment = os.environ.copy()
     pvc_root = control.parent.parent / "pvc"
@@ -1272,14 +1299,21 @@ def test_coordinator_local_context_allows_only_the_one_node_hostless_case(tmp_pa
     assert result.returncode == 0, result.stderr
 
 
-def test_signal_publishes_terminal_failure_without_erasing_scratch_evidence(tmp_path):
+@pytest.mark.parametrize("prepared_batch", [False, True])
+def test_signal_publishes_terminal_failure_without_erasing_scratch_evidence(
+    tmp_path, prepared_batch
+):
     """[C-05] TERM leaves collector-visible failed cell and run evidence."""
-    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=2)
+    outputs = _as_prepared_batch(control) if prepared_batch else None
     _make_executable(
         fake,
         """\
         #!/usr/bin/env bash
         set -eu
+        # Kill the execution shell before its own TERM handler can publish.
+        # The parent must preserve scratch evidence independently of the child.
+        trap 'kill -KILL "$PPID"; exit 143' TERM
         mkdir -p "$2/executions"
         printf 'partial\n' > "$2/partial.txt"
         printf 'started\n' > "$2/started"
@@ -1336,3 +1370,142 @@ def test_signal_publishes_terminal_failure_without_erasing_scratch_evidence(tmp_
     assert (state_dir / "results" / "0001" / "partial.txt").read_text(
         encoding="utf-8"
     ) == "partial\n"
+    assert (state_dir / "executions/0002.status").read_text().strip() == "PENDING"
+    assert "running\t0" in (state_dir / "run-summary.tsv").read_text()
+    if prepared_batch:
+        assert (
+            f"\t{outputs[0]}/partial.txt\t"
+            in (state_dir / "publication-manifest.tsv").read_text()
+        )
+    _assert_collectable_failure(control, state_dir)
+    recovered = _run_recovery(control, state_dir, scratch)
+    assert recovered.returncode == 0, recovered.stderr
+
+
+@pytest.mark.parametrize("prepared_batch", [False, True])
+@pytest.mark.parametrize(
+    "failure", ["kill", "kill-after-exitcode", "unpublished-success", "mkdir"]
+)
+def test_parent_finalizes_interrupted_cell_before_attempt_failure(
+    tmp_path, prepared_batch, failure
+):
+    """[C-05] A dead/early-returning child never strands a terminal RUNNING cell."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    if failure == "unpublished-success":
+        definition = control / "executions/0001.sh"
+        definition.write_text(definition.read_text() + "\nexit 0\n", encoding="utf-8")
+    _refresh_bundle_manifest(control)
+    outputs = _as_prepared_batch(control) if prepared_batch else None
+    _make_executable(
+        fake,
+        """\
+        #!/usr/bin/env bash
+        set -eu
+        printf 'partial\n' > "$2/partial.out"
+        if [[ "$FAILURE" == kill-after-exitcode ]]; then
+            printf '17\n' > "${3%/results/*}/executions/$1.exitcode"
+        fi
+        kill -KILL "$PPID"
+        """,
+    )
+    if failure == "mkdir":
+        _make_executable(
+            control.parent / "fake-bin/mkdir",
+            f"""\
+            #!/usr/bin/env bash
+            for argument in "$@"; do
+                [[ "$argument" != "$FAIL_SCRATCH"/* ]] || exit 38
+            done
+            exec {shutil.which('mkdir')} "$@"
+            """,
+        )
+    result = _run_coordinator(
+        control, state_dir, scratch, fake, FAILURE=failure, FAIL_SCRATCH=str(scratch)
+    )
+    expected_rc = 137 if failure.startswith("kill") else 1
+    assert result.returncode == expected_rc, result.stderr
+    assert (state_dir / "run.status").read_text().strip() == "FAILED"
+    assert (state_dir / "executions/0001.status").read_text().strip() == "FAILED"
+    assert (state_dir / "executions/0001.exitcode").read_text().strip() == str(
+        expected_rc
+    )
+    assert (state_dir / "executions/0002.status").read_text().strip() == "PENDING"
+    assert "running\t0" in (state_dir / "run-summary.tsv").read_text()
+    publication = (state_dir / "publication-manifest.tsv").read_text()
+    assert "execution\t0001\tFAILED" in publication
+    assert "execution\t0002\tPENDING" in publication
+    if failure.startswith("kill"):
+        assert (state_dir / "results/0001/partial.out").read_text() == "partial\n"
+        if prepared_batch:
+            assert f"\t{outputs[0]}/partial.out\t" in publication
+    if failure == "mkdir":
+        (control.parent / "fake-bin/mkdir").unlink()
+    _assert_collectable_failure(control, state_dir)
+    recovered = _run_recovery(control, state_dir, scratch)
+    assert recovered.returncode == 0, recovered.stderr
+
+
+def test_failed_cell_checkpoint_prevents_terminal_attempt_publication(tmp_path):
+    """[C-07] A failed durable write retains RUNNING for exact Job-loss recovery."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    _make_executable(
+        fake,
+        '#!/usr/bin/env bash\nprintf partial > "$2/partial.out"\nkill -KILL "$PPID"\n',
+    )
+    broken_mv = control.parent / "fake-bin/mv"
+    _make_executable(
+        broken_mv,
+        f"""\
+        #!/usr/bin/env bash
+        if [[ "${{@: -1}}" == */0001.status && "$(cat "${{@: -2:1}}")" == FAILED ]]; then
+            exit 77
+        fi
+        exec {shutil.which('mv')} "$@"
+        """,
+    )
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode != 0
+    assert (
+        "refusing terminal attempt publication with RUNNING executions" in result.stderr
+    )
+    assert (state_dir / "run.status").read_text().strip() == "RUNNING"
+    assert (state_dir / "executions/0001.status").read_text().strip() == "RUNNING"
+    assert not (state_dir / "publication-manifest.tsv").exists()
+    broken_mv.unlink()
+    recovered = _run_recovery(control, state_dir, scratch)
+    assert recovered.returncode == 0, recovered.stderr
+    assert (state_dir / "run.status").read_text().strip() == "FAILED"
+    assert (state_dir / "executions/0001.status").read_text().strip() == "FAILED"
+
+
+def test_child_loss_after_success_preserves_checkpoint_and_collectable_attempt(
+    tmp_path,
+):
+    """A process failure after publication must not downgrade a successful cell."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    definition = control / "executions/0001.sh"
+    definition.write_text(
+        definition.read_text() + textwrap.dedent("""\
+            eval "$(declare -f _coordinator_run_cell | sed '1s/_coordinator_run_cell/_test_run_cell/')"
+            _coordinator_run_cell() {
+                _test_run_cell "$@" || return
+                kill -KILL "$BASHPID"
+            }
+            """),
+        encoding="utf-8",
+    )
+    _refresh_bundle_manifest(control)
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode == 137, result.stderr
+    assert (state_dir / "run.status").read_text().strip() == "FAILED"
+    assert (state_dir / "executions/0001.status").read_text().strip() == "SUCCESS"
+    assert (state_dir / "executions/0001.exitcode").read_text().strip() == "0"
+    assert (state_dir / "executions/0002.status").read_text().strip() == "PENDING"
+    assert "rc=137" in (state_dir / "startup-error.txt").read_text()
+    assert (
+        "execution\t0001\tSUCCESS"
+        in (state_dir / "publication-manifest.tsv").read_text()
+    )
+    _assert_collectable_failure(control, state_dir)
+    recovered = _run_recovery(control, state_dir, scratch)
+    assert recovered.returncode == 0, recovered.stderr

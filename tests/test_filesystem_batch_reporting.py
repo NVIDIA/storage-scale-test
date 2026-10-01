@@ -34,6 +34,7 @@ from lib.filesystem_batch import (
     ENV_SHELL,
     ENV_YAML,
     MANIFEST_FILENAME,
+    REPORT_IDENTITY_FILENAME,
     SEAL_FILENAME,
     SUCCESS,
     is_batch_directory,
@@ -513,6 +514,100 @@ def test_failed_filtered_report_retains_other_report_links(tmp_path):
     assert "Reporting failed" in index
     assert "groups/0001/report.txt" in index
     assert "groups/0003/report.txt" in index
+
+
+def test_shared_report_destination_does_not_retain_another_batch(tmp_path):
+    """Identical group IDs and settings do not establish ownership across batches."""
+    first = _create_batch(tmp_path / "first")
+    second = _create_batch(tmp_path / "second")
+    output = tmp_path / "shared reports"
+    for manifest in (first, second):
+        for group in manifest.groups:
+            _publish_result(manifest, group)
+
+    def report(manifest, _group, _successful, destination, _options):
+        (destination / "report.txt").write_text(str(manifest.root), encoding="utf-8")
+
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert report_batch(first.root, output_dir=output) == 0
+        assert report_batch(second.root, groups="0001", output_dir=output) == 0
+        index = (output / "index.md").read_text(encoding="utf-8")
+        assert "groups/0001/report.txt" in index
+        assert "groups/0002/report.txt" not in index
+        assert "groups/0003/report.txt" not in index
+        assert report_batch(second.root, groups="0002", output_dir=output) == 0
+    index = (output / "index.md").read_text(encoding="utf-8")
+    assert "groups/0001/report.txt" in index
+    assert "groups/0002/report.txt" in index
+    assert "groups/0003/report.txt" not in index
+
+
+@pytest.mark.parametrize("fault", ["missing", "corrupt", "overwritten", "failed"])
+def test_filtered_report_rejects_unproven_retained_content(tmp_path, fault):
+    """Unrelated files and partial engine output cannot reuse stale provenance."""
+    manifest = _create_batch(tmp_path / "batch")
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+
+    def report(_manifest, group, _successful, output, _options):
+        (output / "report.txt").write_text(group.kind, encoding="utf-8")
+
+    output = manifest.root / "reports"
+    marker = output / "groups/0002" / REPORT_IDENTITY_FILENAME
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert report_batch(manifest.root) == 0
+        if fault == "missing":
+            marker.unlink()
+        elif fault == "corrupt":
+            marker.write_bytes(b"\xff")
+        elif fault == "overwritten":
+            (marker.parent / "report.txt").write_text("foreign", encoding="utf-8")
+        else:
+            with mock.patch(
+                "lib.filesystem_batch._report_group", side_effect=ValueError("partial")
+            ):
+                assert report_batch(manifest.root, groups="0002") == 1
+            assert not marker.exists()
+        assert report_batch(manifest.root, groups="0001") == 0
+    index = (output / "index.md").read_text(encoding="utf-8")
+    assert "groups/0001/report.txt" in index
+    assert "groups/0002/report.txt" not in index
+    assert "groups/0003/report.txt" in index
+
+
+def test_retained_report_accepts_canonical_batch_alias(tmp_path):
+    """A symlinked input resolving to the same batch retains valid provenance."""
+    manifest = _create_batch(tmp_path / "batch")
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+    alias = tmp_path / "alias"
+    alias.symlink_to(manifest.root, target_is_directory=True)
+
+    def report(_manifest, group, _successful, output, _options):
+        (output / "report.txt").write_text(group.kind, encoding="utf-8")
+
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert report_batch(manifest.root) == 0
+        assert report_batch(alias, groups="0001") == 0
+    index = (manifest.root / "reports/index.md").read_text(encoding="utf-8")
+    assert "groups/0002/report.txt" in index
+
+
+def test_successful_engine_without_report_cannot_certify_prior_content(tmp_path):
+    """An engine's zero exit alone does not prove it replaced the previous report."""
+    manifest = _create_batch(tmp_path / "batch", kinds=("io",))
+    _publish_result(manifest, manifest.groups[0])
+
+    def report(_manifest, _group, _successful, output, _options):
+        (output / "report.txt").write_text("original", encoding="utf-8")
+
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert report_batch(manifest.root) == 0
+    with mock.patch("lib.filesystem_batch._report_group"):
+        assert report_batch(manifest.root) == 1
+    output = manifest.root / "reports"
+    assert "Reporting failed" in (output / "index.md").read_text(encoding="utf-8")
+    assert not (output / "groups/0001" / REPORT_IDENTITY_FILENAME).exists()
 
 
 def test_interrupted_index_publication_preserves_previous_index(tmp_path):

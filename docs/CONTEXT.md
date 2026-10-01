@@ -91,6 +91,8 @@ The test CLI selects substrates and scenarios independently. Its planner batches
 shared-home SSH cases behind a crash-recoverable transition; separate homes are
 canonical. Pod work uses `tester` UID/GID 2000, matching the all-squashed NFS
 export and Slurm account.
+Restart the Slinky login Pod, not its operator-managed Deployment template;
+the operator can revert rollout annotations and kill an in-flight probe.
 
 The harness builds the ordinary deployment archive from an immutable tracked
 snapshot, caches it by snapshot, architecture, fixed recipe, and seeded
@@ -400,8 +402,11 @@ workload kinds. Prepared batches save ordered groups locally, freeze common
 resources, and permanently seal their manifest before first external mutation.
 One global ledger owns statuses; group snapshots and artifacts remain isolated
 through dispatch, collection, resume, and unified filesystem reporting.
+The Kubernetes parent owns each active cell's group-specific scratch path and
+finalizes abnormal child exits before publishing a terminal attempt.
 Reporters share option definitions; the unified entry point routes by workload
-kind and retains other groups' index links across filtered runs.
+kind and retains other groups' index links across filtered runs only when
+their canonical batch, immutable group, and report-content identity match.
 Kubernetes helper loading is idempotent: repeated preflight/dispatch loads must
 preserve readonly constants and active ownership maps.
 Status emits one scoped progress view with collection state and next action.

@@ -4138,6 +4138,43 @@ def test_fixture_build_does_not_force_registry_refresh(tmp_path, monkeypatch):
     assert "--pull" not in build
 
 
+def test_slurm_login_restart_preserves_operator_managed_template(tmp_path, monkeypatch):
+    """Replace the login Pod, then wait for its ready successor without a rollout."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    calls = []
+    names = iter(("login-original", "login-successor"))
+
+    def login(*_args):
+        name = next(names)
+        calls.append(("ready", name))
+        return name
+
+    class _LoginRunner:
+        def run(self, arguments, **kwargs):
+            calls.append(("delete", [str(item) for item in arguments], kwargs))
+
+    monkeypatch.setattr(_DRIVER, "_login_pod", login)
+    _DRIVER._restart_slinky_login(_LoginRunner(), config)
+    assert calls[0] == ("ready", "login-original")
+    assert calls[1] == (
+        "delete",
+        [
+            "kubectl",
+            "--kubeconfig",
+            str(config.kubeconfig),
+            "-n",
+            config.namespace,
+            "delete",
+            "pod",
+            "login-original",
+            "--wait=true",
+            "--timeout=180s",
+        ],
+        {"timeout": 210},
+    )
+    assert calls[2] == ("ready", "login-successor")
+
+
 def test_slurm_install_preloads_verified_mariadb_and_helper_images(
     tmp_path, monkeypatch
 ):

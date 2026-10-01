@@ -579,6 +579,10 @@ _coordinator_write_summary() {
             *) _coordinator_error "invalid execution state for summary: $id"; return 1 ;;
         esac
     done < <(_coordinator_execution_ids "$CONTROL_DIR/executions" .sh)
+    if [[ "$terminal" =~ ^(SUCCESS|FAILED|CANCELLED)$ && "$running" -ne 0 ]]; then
+        _coordinator_error "refusing terminal attempt publication with RUNNING executions"
+        return 1
+    fi
     {
         printf 'schema\t%s\n' "$KUBECTL_COORDINATOR_SCHEMA"
         printf 'attempt_id\t%s\n' "$ATTEMPT_ID"
@@ -674,8 +678,10 @@ _coordinator_require_success_artifacts() {
 _coordinator_finish_prebenchmark_failure() {
     local id="$1" scratch="$2" rc="${3:-1}"
     [[ "$rc" -ne 0 ]] || rc=1
-    [[ -d "$scratch" && ! -L "$scratch" ]] \
-        && _coordinator_copy_scratch_results "$id" "$scratch" || true
+    if [[ -d "$scratch" && ! -L "$scratch" ]] \
+            && ! _coordinator_copy_scratch_results "$id" "$scratch"; then
+        _coordinator_error "could not preserve partial scratch results for execution $id"
+    fi
     _coordinator_atomic_write "$STATE_DIR/executions/$id.exitcode" "$rc" || return 1
     _coordinator_atomic_write "$STATE_DIR/executions/$id.status" FAILED || return 1
     _coordinator_write_summary FAILED "$id" "$rc" || return 1
@@ -705,11 +711,13 @@ _coordinator_signal_handler() {
     if [[ -n "${COORDINATOR_ACTIVE_ID:-}" \
             && "$(cat "$STATE_DIR/executions/$COORDINATOR_ACTIVE_ID.status" 2>/dev/null || true)" == RUNNING ]]; then
         _coordinator_finish_prebenchmark_failure "$COORDINATOR_ACTIVE_ID" \
-            "${COORDINATOR_ACTIVE_SCRATCH:-$SCRATCH_DIR}" "$rc" || true
+            "$COORDINATOR_ACTIVE_SCRATCH" "$rc" || {
+                _coordinator_error "cannot finalize interrupted execution $COORDINATOR_ACTIVE_ID"
+                exit "$rc"
+            }
     fi
-    _coordinator_write_summary FAILED "${COORDINATOR_ACTIVE_ID:-}" "$rc" || true
-    _coordinator_atomic_write "$STATE_DIR/run.status" FAILED || true
-    _coordinator_publish_manifest || true
+    _coordinator_finalize_run "$rc" "${COORDINATOR_ACTIVE_ID:-}" || \
+        _coordinator_error "cannot finalize signalled attempt; durable state retained for recovery"
     exit "$rc"
 }
 
@@ -823,11 +831,48 @@ _coordinator_validate_mdtest_targets() {
     done
 }
 
+_coordinator_prepare_active_execution() {
+    local id="$1" output_basename="$COORDINATOR_OUTPUT_BASENAME" group_output
+    if [[ -f "$CONTROL_DIR/batch-manifest.tsv" ]]; then
+        group_output=$(elbencho_batch_execution_output_dir "$CONTROL_DIR" "$id") || return 1
+        output_basename="${group_output##*/}"
+    fi
+    COORDINATOR_ACTIVE_ID="$id"
+    COORDINATOR_ACTIVE_SCRATCH="$SCRATCH_DIR/$id/$output_basename"
+    # The parent must own both the path and RUNNING checkpoint before dispatch.
+    # Child-local assignments cannot inform signal or abnormal-exit recovery.
+    _coordinator_atomic_write "$STATE_DIR/executions/$id.status" RUNNING || return 1
+    _coordinator_write_summary RUNNING
+}
+
+_coordinator_complete_active_execution() {
+    local rc="$1" id="$COORDINATOR_ACTIVE_ID" status
+    status=$(cat "$STATE_DIR/executions/$id.status") || return 1
+    case "$status" in
+        RUNNING)
+            [[ "$rc" -ne 0 ]] || rc=1
+            _coordinator_error "execution $id exited before terminal cell publication (rc=$rc)"
+            _coordinator_finish_prebenchmark_failure "$id" "$COORDINATOR_ACTIVE_SCRATCH" "$rc" \
+                || return 1
+            ;;
+        SUCCESS) ;;
+        FAILED)
+            if [[ "$rc" -eq 0 ]]; then
+                rc=$(cat "$STATE_DIR/executions/$id.exitcode") || return 1
+                [[ "$rc" =~ ^[1-9][0-9]*$ ]] || return 1
+            fi
+            ;;
+        *) _coordinator_error "invalid execution state after child exit: $id=$status"; return 1 ;;
+    esac
+    return "$rc"
+}
+
 _coordinator_run_one() (
     local id="$1"
     local definition="$CONTROL_DIR/executions/$id.sh"
     local workers="$STATE_DIR/executions/$id.workers.tsv"
-    local scratch="$SCRATCH_DIR/$id/$COORDINATOR_OUTPUT_BASENAME"
+    local scratch="$COORDINATOR_ACTIVE_SCRATCH"
+    COORDINATOR_OUTPUT_BASENAME="${scratch##*/}"
     local durable="$STATE_DIR/results/$id"
     local rc=0
     local runtime_overlay="${KUBECTL_INTEGRATION_FAILURE_OVERLAY:-}"
@@ -835,8 +880,6 @@ _coordinator_run_one() (
     COORDINATOR_ACTIVE_PID=""
     trap '_coordinator_signal_handler INT' INT
     trap '_coordinator_signal_handler TERM' TERM
-    _coordinator_atomic_write "$STATE_DIR/executions/$id.status" RUNNING || return 1
-    _coordinator_write_summary RUNNING || return 1
     unset ELBENCHO_EXECUTION_KIND tasks_per_node MDTEST_LAYOUT
     unset MDTEST_SINGLE_DIR_TARGET_FILES MDTEST_SINGLE_DIR_FILES_PER_WORKER
     unset MDTEST_BRANCH_FACTOR MDTEST_ITEMS_PER_DIR MDTEST_ITERATIONS
@@ -845,12 +888,6 @@ _coordinator_run_one() (
         _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
         return 1
     }
-    if [[ -f "$CONTROL_DIR/batch-manifest.tsv" ]]; then
-        local group_output
-        group_output=$(elbencho_batch_execution_output_dir "$CONTROL_DIR" "$id") || return 1
-        COORDINATOR_OUTPUT_BASENAME="${group_output##*/}"
-        scratch="$SCRATCH_DIR/$id/$COORDINATOR_OUTPUT_BASENAME"
-    fi
     # Group snapshots carry the submitting host's executable path. Workloads
     # always execute the binary provided by the pinned coordinator image.
     export ELBENCHO=/usr/bin/elbencho
@@ -1037,6 +1074,15 @@ _coordinator_finalize_run() {
     local rc="$1" failed_id="${2:-}"
     local final=SUCCESS
     [[ "$rc" -eq 0 ]] || final=FAILED
+    if [[ "$final" == FAILED && ( -z "$failed_id" \
+            || "$(cat "$STATE_DIR/executions/$failed_id.status" 2>/dev/null)" != FAILED ) ]]; then
+        # Infrastructure failure after a successful checkpoint must preserve
+        # that cell, but still supply attempt-level failure evidence to collect.
+        _coordinator_atomic_write "$STATE_DIR/startup-error.txt" \
+            "coordinator interrupted outside a failed cell (execution=${failed_id:-none}, rc=$rc)" \
+            || return 1
+        failed_id=""
+    fi
     _coordinator_write_summary "$final" "$failed_id" "$rc" || return 1
     _coordinator_atomic_write "$STATE_DIR/run.status" "$final" || return 1
     _coordinator_publish_manifest
@@ -1334,12 +1380,15 @@ _coordinator_main() {
                 break
                 ;;
         esac
-        COORDINATOR_ACTIVE_ID="$id"
-        COORDINATOR_ACTIVE_SCRATCH="$SCRATCH_DIR/$id/$COORDINATOR_OUTPUT_BASENAME"
+        _coordinator_prepare_active_execution "$id" || {
+            _coordinator_error "cannot prepare execution $id; durable state retained for recovery"
+            return 1
+        }
         _coordinator_run_one "$id" &
         COORDINATOR_ACTIVE_PID=$!
         wait "$COORDINATOR_ACTIVE_PID" || rc=$?
         COORDINATOR_ACTIVE_PID=""
+        _coordinator_complete_active_execution "$rc" || rc=$?
         if [[ "$rc" -ne 0 ]]; then
             failed_id="$id"
             break
