@@ -432,8 +432,8 @@ The default layout pre-creates a wide branched tree and gives each thread
 uses elbencho `-n 0`, placing uniquely named worker files directly in one flat
 directory. Dense mode requires one node count, one task count, and one generated
 target. Elbencho assigns a uniform integer file count to every worker, so the
-actual total is the closest achievable whole-worker total; both requested and
-actual values are recorded.
+actual total is the closest whole-worker multiple with at least one file per
+worker. Both requested and actual values are recorded.
 
 The analyzer aggregates a result pair only when its CSV contains complete
 `WRITE`, `STAT`, and `RMFILES` records and its `.out` file contains all three

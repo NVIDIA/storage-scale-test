@@ -66,8 +66,11 @@ counts, and performs final DELETE cleanup. Each node count is a separate Slurm
 job or SSH invocation.
 
 Optional modes are `--multipart`, `--ranged`, and `--s3-express`. Ranged reads
-PUT one `WARP_RANGE_OBJ_SIZE` object per node and use `WARP_OBJ_SIZES` as range
-sizes.
+run 30-second PUT stages until at least `nodes` objects exist in total, using
+`WARP_RANGE_OBJ_SIZE` for object size and `WARP_OBJ_SIZES` for read range sizes.
+This is a minimum, not an exact count; stages can create substantially more
+objects, so budget storage accordingly.
+
 Aggregate PUT and GET request-rate budgets are available through
 `WARP_RPS_BUDGET_PUT` and `WARP_RPS_BUDGET_GET`. `WARP_PREFIXES` selects static
 prefixes and requires [NVIDIA/warp-minio](https://github.com/NVIDIA/warp-minio).

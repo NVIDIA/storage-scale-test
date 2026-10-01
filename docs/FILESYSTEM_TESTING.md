@@ -75,6 +75,16 @@ depth values for the scale sweep:
 ./storage-tests/fs/nv-elbencho-sweep.sh --nodes 1,2,4,8
 ```
 
+Ordinary sweeps default to direct IO; `-b/--bio` selects buffered IO.
+`-r/--rand` makes write and read access random; `r`-prefixed IO-size entries
+can instead select random access per phase. Random IO is incompatible with
+single-shared-file mode. `-s/--single` uses computed file counts for generated
+worker-directory writes on one test root; reads remain time-bounded. It does
+not mean one file and has no effect on shared-directory, `--read-from`, or
+single-shared-file workloads; multiple roots already use computed counts.
+`ELBENCHO_FILE_SIZE` fixes each generated file's size in ordinary sweeps too;
+otherwise, size is the write block size times `ELBENCHO_FILE_SIZE_MULTIPLIER`.
+
 All sweep scripts accept comma-separated positive integers and ascending
 inclusive ranges: `X`, `X-Y`, or `X-Y+Z`. The endpoint is included even when
 the step does not land on it; for example, `3-10+2` expands to
@@ -281,7 +291,10 @@ directory, pass `--single-dir-file-target <count>`:
 Dense mode requires one node count, one task count, and one generated target.
 Every worker creates, stats, and deletes uniquely named zero-byte files in that
 directory. Because elbencho assigns an integer count to each worker, the actual
-total is `nodes * tasks * round(target / (nodes * tasks))`; requested and
+total is `workers * max(1, round(target / workers))`, where
+`workers = nodes * tasks` and rounding is to the nearest integer, ties up.
+This rounds the target to a whole-worker multiple with at least one file per
+worker: target 1 with two nodes and 64 tasks creates 128 files. Requested and
 actual counts are recorded.
 
 ## Prepared filesystem batches
