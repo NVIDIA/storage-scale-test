@@ -433,6 +433,7 @@ $TAR_CMD czf "$OUTPUT_TARBALL" \
     --exclude=.ci-cache \
     --exclude=plans \
     --exclude=.venv-ci \
+    --exclude=requirements-ci.txt \
     --exclude=.security-triage.yaml \
     --exclude=.agents \
     --exclude=integration-tests \

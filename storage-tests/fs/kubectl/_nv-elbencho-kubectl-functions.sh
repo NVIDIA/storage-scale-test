@@ -44,6 +44,7 @@ readonly KUBECTL_DIAGNOSTIC_MAX_BUNDLES=8
 readonly KUBECTL_DIAGNOSTIC_MAX_BYTES=$((4 * 1024 * 1024))
 readonly KUBECTL_DIAGNOSTIC_MAX_PODS=4
 readonly KUBECTL_COLLECTION_ERROR_MAX_BYTES=$((128 * 1024))
+readonly KUBECTL_COLLECTION_STREAM_ATTEMPTS=3
 declare -gA KUBECTL_LOCAL_LOCK_ROOTS=()
 declare -ga KUBECTL_BATCH_VALIDATION_PATHS=()
 
@@ -836,7 +837,7 @@ kubectl_report_lifecycle_error() {
     local diagnostic_path="${11:-}" job_evidence="${12:-}"
     [[ "$operation" =~ ^[a-z][a-z0-9-]*$ \
         && "$phase" =~ ^[a-z][a-z0-9-]*$ \
-        && "$reason" =~ ^(AUTH|TIMEOUT|API_THROTTLED|API_UNAVAILABLE|IDENTITY_MISMATCH|POD_UNSCHEDULABLE|IMAGE_PULL|PVC_MOUNT|PVC_IO|ENOSPC|LOCAL_IO|PATH_REJECTED|INSUFFICIENT_CAPACITY|ARCHIVE_INVALID|LEDGER_INCONSISTENT|OWNERSHIP_AMBIGUOUS|CANCELLATION_INCOMPLETE|INVALID_LIFECYCLE_OPERATION)$ \
+        && "$reason" =~ ^(AUTH|TIMEOUT|API_THROTTLED|API_UNAVAILABLE|TRANSFER_FAILED|IDENTITY_MISMATCH|POD_UNSCHEDULABLE|IMAGE_PULL|PVC_MOUNT|PVC_IO|ENOSPC|LOCAL_IO|PATH_REJECTED|INSUFFICIENT_CAPACITY|ARCHIVE_INVALID|LEDGER_INCONSISTENT|OWNERSHIP_AMBIGUOUS|CANCELLATION_INCOMPLETE|INVALID_LIFECYCLE_OPERATION)$ \
         && "$may_still_be_running" =~ ^(yes|no|unknown)$ ]] || return 1
     {
         printf 'STORAGE_SCALE_TEST_DIAGNOSTIC_OPERATION=%q\n' "$operation"
@@ -1226,24 +1227,30 @@ kubectl_capture_resource_diagnostics() {
         rm -rf -- "$temporary"
         return 1
     }
+    _kubectl_prune_diagnostic_bundles "$root" "$destination" || return 1
+    printf '%s\n' "$destination"
+}
+
+_kubectl_prune_diagnostic_bundles() {
+    local root="$1" retained="${2:-}" candidate candidate_mtime index
     local -a bundles=()
-    local candidate_mtime
+    [[ -z "$retained" ]] || bundles+=("$retained")
     while IFS=$'\t' read -r candidate_mtime candidate; do
         bundles+=("$candidate")
     done < <(
         for candidate in "$root"/*; do
+            [[ "$candidate" != "$retained" ]] || continue
             [[ -d "$candidate" && ! -L "$candidate" ]] || continue
             candidate_mtime=$(_kubectl_local_path_mtime "$candidate") || exit 1
             printf '%s\t%s\n' "$candidate_mtime" "$candidate"
         done | LC_ALL=C sort -rn
     )
-    for ((pod_count = KUBECTL_DIAGNOSTIC_MAX_BUNDLES; \
-            pod_count < ${#bundles[@]}; pod_count++)); do
-        candidate="${bundles[$pod_count]}"
+    for ((index = KUBECTL_DIAGNOSTIC_MAX_BUNDLES; \
+            index < ${#bundles[@]}; index++)); do
+        candidate="${bundles[$index]}"
         [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
         rm -rf -- "$candidate" || return 1
     done
-    printf '%s\n' "$destination"
 }
 
 kubectl_capture_pvc_diagnostics() {
@@ -3480,9 +3487,11 @@ kubectl_stream_remote_attempt() {
     local local_state_path="${5:-}" remote_state_path="${6:-}"
     local job_kind="${7:-}" job_name="${8:-}" job_namespace="${9:-}"
     local job_uid="${10:-}" job_evidence="${11:-}"
-    [[ "$attempt_id" =~ ^[0-9a-f]{8}$ && -n "$archive_path" && ! -e "$archive_path" ]] || return 1
+    [[ "$attempt_id" =~ ^[0-9a-f]{8}$ && -n "$archive_path" \
+        && ! -e "$archive_path" && ! -L "$archive_path" ]] || return 1
     local collection_timeout="${KUBECTL_COLLECTION_TIMEOUT_SECONDS:-$KUBECTL_COLLECTION_TIMEOUT_SECONDS_DEFAULT}"
-    [[ "$collection_timeout" =~ ^[1-9][0-9]*$ ]] || return 1
+    local backoff="${KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS:-2}"
+    [[ "$collection_timeout" =~ ^[1-9][0-9]*$ && "$backoff" =~ ^[0-9]+$ ]] || return 1
     local remote_run error_path
     remote_run=$(kubectl_attempt_remote_root "$attempt_id") || return 1
     local guard_script
@@ -3507,9 +3516,163 @@ kubectl_stream_remote_attempt() {
         done
         [[ ! -e "$hold_file" && ! -L "$hold_file" ]] || return 1
     fi
+    local deadline=$((SECONDS + collection_timeout)) remaining attempt delay
+    local reason=TRANSFER_FAILED action diagnostic_path="" producer_output
+    local -a stream_status=()
+    for ((attempt = 1; attempt <= KUBECTL_COLLECTION_STREAM_ATTEMPTS; attempt++)); do
+        remaining=$((deadline - SECONDS))
+        if ((remaining <= 0)); then
+            reason=TIMEOUT
+            break
+        fi
+        _kubectl_stream_attempt_once "$namespace" "$pod_name" "$attempt_id" \
+            "$archive_path" "$error_path" "$guard_script" "$remote_run" \
+            "$remaining" stream_status || stream_status=(1 74)
+        if [[ "${stream_status[0]}" -eq 0 && "${stream_status[1]}" -eq 0 ]]; then
+            if [[ -n "$diagnostic_path" ]]; then
+                _kubectl_preserve_stream_error "$local_state_path" "$attempt_id" \
+                    "$namespace" "$pod_name" "$attempt" "$error_path" 0 0 \
+                    SUCCESS diagnostic_path || echo 'Warning: successful collection retry could not be journaled' >&2
+            fi
+            rm -f -- "$error_path" || return 1
+            return 0
+        fi
+        producer_output=$(cat -- "$error_path") || producer_output=""
+        reason=TRANSFER_FAILED
+        if [[ "${stream_status[1]}" -eq 65 ]]; then
+            reason=ARCHIVE_INVALID
+        elif [[ "${stream_status[1]}" -ne 0 ]]; then
+            reason=LOCAL_IO
+        else
+            _kubectl_classify_observation_failure reason "${stream_status[0]}" \
+                "$producer_output" || reason=TRANSFER_FAILED
+            [[ "$reason" != API_UNAVAILABLE ]] || reason=TRANSFER_FAILED
+            if [[ "$reason" != AUTH ]] \
+                    && grep -Eqi 'command terminated|tar:' <<< "$producer_output"; then
+                reason=TRANSFER_FAILED
+            elif grep -Eqi 'path.*(escapes|unsafe)|symlink|symbolic link' <<< "$producer_output"; then
+                reason=PATH_REJECTED
+            elif [[ -z "$producer_output" && "${stream_status[0]}" -ne 124 ]]; then
+                reason=TRANSFER_FAILED
+            elif [[ "$reason" == TIMEOUT && "${stream_status[0]}" -ne 124 ]] \
+                    && ! _kubectl_collection_failure_is_transient "$producer_output"; then
+                reason=TRANSFER_FAILED
+            fi
+        fi
+        # Print evidence before best-effort persistence; capture failure must
+        # never replace the transfer error or prevent safe partial cleanup.
+        printf 'Kubernetes collection transfer %d/%d: attempt=%s producer_rc=%s consumer_rc=%s reason=%s\n' \
+            "$attempt" "$KUBECTL_COLLECTION_STREAM_ATTEMPTS" "$attempt_id" \
+            "${stream_status[0]}" "${stream_status[1]}" "$reason" >&2
+        cat -- "$error_path" >&2 || true
+        _kubectl_preserve_stream_error "$local_state_path" "$attempt_id" \
+            "$namespace" "$pod_name" "$attempt" "$error_path" \
+            "${stream_status[0]}" "${stream_status[1]}" "$reason" \
+            diagnostic_path || echo 'Warning: collection transfer diagnostics could not be saved' >&2
+        rm -f -- "$archive_path" || { reason=LOCAL_IO; break; }
+        if ((attempt >= KUBECTL_COLLECTION_STREAM_ATTEMPTS)) \
+                || [[ "${stream_status[1]}" -ne 0 ]] \
+                || ! _kubectl_collection_transfer_is_retryable \
+                    "$attempt_id" "${stream_status[0]}" "$producer_output"; then
+            break
+        fi
+        delay=$((backoff * (1 << (attempt - 1))))
+        ((backoff == 0)) || delay=$((delay + RANDOM % (backoff + 1)))
+        remaining=$((deadline - SECONDS))
+        if ((remaining <= delay)); then
+            reason=TIMEOUT
+            break
+        fi
+        printf 'Warning: retryable collection transfer failed; retrying in %s seconds (remote results retained)\n' \
+            "$delay" >&2
+        sleep "$delay" || break
+    done
+    case "$reason" in
+        ARCHIVE_INVALID) action="inspect the remote attempt size before retrying --collect" ;;
+        LOCAL_IO) action="repair local result storage and retry --collect" ;;
+        TRANSFER_FAILED) action="inspect the captured transfer error before retrying --collect" ;;
+        *) action=$(_kubectl_observation_safe_action "$reason") ;;
+    esac
+    kubectl_report_collection_failure "$attempt_id" archive-stream "$reason" \
+        "$action; remote results were retained" "$local_state_path" \
+        "${remote_state_path:-$remote_run/state/run.status}" "$diagnostic_path" \
+        "$job_kind" "$job_name" "$job_namespace" "$job_uid" "" "$job_evidence"
+    rm -f -- "$error_path"
+    return 1
+}
+
+# A changed-source archive is never imported. Retry only tar's specific
+# changed-file warning, not missing files, read errors, or mixed diagnostics.
+# NFS attribute revalidation can trigger this even for quiescent files. A
+# fresh transfer must still pass all publication hashes before any cleanup.
+_kubectl_collection_transfer_is_retryable() {
+    local attempt_id="$1" producer_rc="$2" output="$3" line changed_path warnings=0
+    if _kubectl_collection_failure_is_transient "$output"; then
+        return 0
+    fi
+    [[ "$producer_rc" -eq 1 && "$attempt_id" =~ ^[0-9a-f]{8}$ ]] || return 1
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        if [[ "$line" == "command terminated with exit code 1" ]]; then
+            continue
+        fi
+        [[ "$line" == "tar: "*": file changed as we read it" ]] || return 1
+        changed_path="${line#tar: }"
+        changed_path="${changed_path%: file changed as we read it}"
+        [[ "$changed_path" == "$attempt_id/state" \
+            || "$changed_path" == "$attempt_id/state/"* ]] \
+            && _kubectl_safe_archive_member "$changed_path" || return 1
+        warnings=$((warnings + 1))
+    done <<< "$output"
+    ((warnings > 0))
+}
+
+# Do not mistake remote tar errors, auth denial, or an arbitrary killed
+# process for a transient transport fault, even if they mention a timeout.
+_kubectl_collection_failure_is_transient() {
+    local output="$1"
+    if grep -Eqi 'unauthorized|forbidden|authentication|credentials|not found|notfound|identity|unsafe|escapes|symlink|symbolic link|permission denied|command terminated|tar:|no such file|corrupt|checksum' <<< "$output"; then
+        return 1
+    fi
+    grep -Eqi 'connection (refused|reset|closed)|i/o timeout|TLS handshake timeout|net/http:.*timeout|error:.*(unexpected EOF|context deadline exceeded)|error: EOF|too many requests|(^|[^0-9])429([^0-9]|$)|service unavailable|internal server error|bad gateway|gateway timeout|(^|[^0-9])50[0234]([^0-9]|$)|http2.*(client connection lost|stream closed)|stream error.*(INTERNAL_ERROR|REFUSED_STREAM)' <<< "$output"
+}
+
+_kubectl_preserve_stream_error() {
+    local state_path="$1" attempt_id="$2" namespace="$3" pod="$4" ordinal="$5"
+    local source="$6" producer="$7" consumer="$8" reason="$9" output_name="${10}"
+    local metadata_dir="${state_path%/*}" root destination
+    [[ -n "$state_path" && -d "$metadata_dir" && ! -L "$metadata_dir" ]] || return 1
+    _kubectl_validate_local_directory_path "$metadata_dir" || return 1
+    root="$metadata_dir/diagnostics"
+    [[ ! -L "$root" ]] && mkdir -p -- "$root" || return 1
+    local -n saved_path="$output_name"
+    destination="$saved_path"
+    if [[ -z "$destination" ]]; then
+        destination=$(mktemp -d "$root/collection-stream.XXXXXXXX") || return 1
+        printf 'schema\t%s\nattempt_id\t%s\nnamespace\t%s\npod\t%s\n' \
+            "$KUBECTL_DIAGNOSTIC_SCHEMA_VERSION" "$attempt_id" "$namespace" "$pod" \
+            > "$destination/bundle.tsv" || return 1
+        saved_path="$destination"
+        kubectl_capture_retained_resource_identities "$metadata_dir" "$attempt_id" \
+            "$destination/retained-resource-identities.tsv" || true
+    fi
+    cp -- "$source" "$destination/transfer-$ordinal.stderr" || return 1
+    printf '%s\t%s\t%s\t%s\t%s\n' "$ordinal" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        "$producer" "$consumer" "$reason" >> "$destination/transfers.tsv" || return 1
+    _kubectl_prune_diagnostic_bundles "$root" "$destination" || return 1
+    printf 'Kubernetes collection transfer diagnostics: %s\n' "$destination" >&2
+}
+
+_kubectl_stream_attempt_once() {
+    local namespace="$1" pod_name="$2" attempt_id="$3" archive_path="$4"
+    local error_path="$5" guard_script="$6" remote_run="$7" remaining="$8"
+    local -n transfer_status="$9"
+    local umask_previous
+    umask_previous=$(umask)
     umask 077
     local error_fifo="$error_path.fifo" error_reader_pid
     mkfifo -m 600 -- "$error_fifo" || {
+        umask "$umask_previous"
         rm -f -- "$error_path"
         return 1
     }
@@ -3522,47 +3685,28 @@ kubectl_stream_remote_attempt() {
     # API-probe deadline used for status and object inspection. Keep at most
     # one byte beyond the limit so an oversized or unbounded producer is
     # stopped without first filling the local filesystem.
-    KUBECTL_REQUEST_TIMEOUT_SECONDS="$collection_timeout" \
-        KUBECTL_PROCESS_TIMEOUT_SECONDS=$((collection_timeout + 60)) \
+    KUBECTL_REQUEST_TIMEOUT_SECONDS="$remaining" \
+        KUBECTL_PROCESS_TIMEOUT_SECONDS="$remaining" \
         kubectl_pvc_exec "$namespace" "$pod_name" /bin/bash -ceu "$guard_script
-            exec tar -C \"\${run%/*}\" -cf - \"\${run##*/}\"" \
+            # Only the manifest-published state is collected. Control files
+            # are already retained locally and checked against that copy.
+            # Avoid rereading unused control files and mutable lock metadata.
+            export LC_ALL=C
+            exec tar -C \"\${run%/*}\" -cf - \"\${run##*/}/state\"" \
             bash "$remote_run" "$attempt_id" 2> "$error_fifo" \
         | _kubectl_write_bounded_collection_stream "$archive_path" \
             "$KUBECTL_COLLECTION_MAX_BYTES"
-    local -a stream_status=("${PIPESTATUS[@]}")
+    # shellcheck disable=SC2034  # Returned through the caller's array nameref.
+    transfer_status=("${PIPESTATUS[@]}")
+    umask "$umask_previous"
     wait "$error_reader_pid" || true
     rm -f -- "$error_fifo" || return 1
-    if [[ "${stream_status[0]:-1}" -ne 0 || "${stream_status[1]:-1}" -ne 0 ]]; then
-        local reason=API_UNAVAILABLE action="retry --collect; remote results were retained"
-        if [[ "${stream_status[1]:-1}" -eq 65 ]]; then
-            reason=ARCHIVE_INVALID
-            action="inspect the remote attempt size before retrying --collect"
-        elif [[ "${stream_status[1]:-1}" -eq 74 ]]; then
-            reason=LOCAL_IO
-            action="repair local result storage and retry --collect"
-        else
-            local producer_output=""
-            producer_output=$(cat -- "$error_path") || producer_output=""
-            _kubectl_classify_observation_failure reason \
-                "${stream_status[0]:-1}" "$producer_output" || reason=API_UNAVAILABLE
-            action=$(_kubectl_observation_safe_action "$reason")
-            action="$action; remote results were retained"
-        fi
-        rm -f -- "$archive_path"
-        kubectl_report_collection_failure "$attempt_id" archive-stream "$reason" \
-            "$action" "$local_state_path" \
-            "${remote_state_path:-$remote_run/state/run.status}" "" \
-            "$job_kind" "$job_name" "$job_namespace" "$job_uid" "" \
-            "$job_evidence"
-        rm -f -- "$error_path"
-        return 1
-    fi
-    rm -f -- "$error_path" || return 1
+    return 0
 }
 
 _kubectl_write_bounded_collection_stream() {
     local archive_path="$1" max_bytes="$2"
-    [[ -n "$archive_path" && ! -e "$archive_path" \
+    [[ -n "$archive_path" && ! -e "$archive_path" && ! -L "$archive_path" \
         && "$max_bytes" =~ ^[1-9][0-9]*$ ]] || return 1
     if ! head -c "$((max_bytes + 1))" > "$archive_path"; then
         rm -f -- "$archive_path"

@@ -382,8 +382,8 @@ assertion at the appropriate layer; merely reaching the branch is not evidence.
 | T-08 | `test_cancel_retries_after_job_delete_was_already_journaled` |
 | T-09 | `test_status_reports_incomplete_cancellation_as_retryable_failure` |
 | R-02 | `test_helper_template_is_rendered_and_removed_when_readiness_fails` |
-| R-03, R-04, R-05 | `test_collection_stream_uses_its_operation_sized_deadline`, `test_collection_stream_failure_removes_partial_and_reports_auth`, `test_collection_byte_limit_is_enforced_while_streaming` |
-| R-06, R-07, R-08 | `test_collection_archive_metadata_is_streamed_and_member_bounded`, `test_hostile_collection_archives_never_extract`, `test_collected_manifest_rejects_duplicate_semantic_rows`, `test_collected_manifest_requires_complete_terminal_evidence`, `test_collected_manifest_rejects_cross_execution_workload_substitution` |
+| R-03, R-04, R-05 | `test_collection_stream_uses_its_operation_sized_deadline`, `test_collection_stream_failure_removes_partial_and_reports_auth`, `test_collection_retries_transient_transfer_and_publishes_complete_results`, `test_collection_never_retries_permanent_or_unknown_remote_errors`, `test_collection_retry_limit_keeps_bounded_error_history`, `test_collection_retries_share_one_deadline`, `test_collection_byte_limit_is_enforced_while_streaming`, `test_collection_changed_source_exhaustion_preserves_remote_data` |
+| R-06, R-07, R-08 | `test_collection_archive_metadata_is_streamed_and_member_bounded`, `test_hostile_collection_archives_never_extract`, `test_collected_manifest_rejects_duplicate_semantic_rows`, `test_collected_manifest_requires_complete_terminal_evidence`, `test_collected_manifest_rejects_cross_execution_workload_substitution`, `test_changed_source_retry_still_rejects_content_corruption` |
 | R-09, R-10, R-11 | `test_collection_capacity_checks_the_results_filesystem`, `test_collection_scavenges_only_owned_staging_paths`, `test_collection_merges_manifest_declared_execution_ledgers`, `test_collection_classifies_parent_creation_failure_as_local_io` |
 | R-01 | `test_collect_active_attempt_reports_terminal_gate_and_next_action` |
 | R-12, R-13 | `test_collection_recovery_retries_every_cleanup_stage` |
@@ -413,13 +413,26 @@ and the next safe action
 ```
 
 Normalized reasons are `AUTH`, `TIMEOUT`, `API_THROTTLED`,
-`API_UNAVAILABLE`, `IDENTITY_MISMATCH`, `POD_UNSCHEDULABLE`, `IMAGE_PULL`,
+`API_UNAVAILABLE`, `TRANSFER_FAILED`, `IDENTITY_MISMATCH`, `POD_UNSCHEDULABLE`, `IMAGE_PULL`,
 `PVC_MOUNT`, `PVC_IO`, `ENOSPC`, `LOCAL_IO`, `PATH_REJECTED`,
 `INSUFFICIENT_CAPACITY`, `ARCHIVE_INVALID`,
 `LEDGER_INCONSISTENT`, `OWNERSHIP_AMBIGUOUS`, and
 `CANCELLATION_INCOMPLETE`. `INVALID_LIFECYCLE_OPERATION` identifies a valid
 request made from a state in which that operation is not legal; its diagnostic
 must print the exact prerequisite command or next lifecycle action.
+`TRANSFER_FAILED` identifies an unrecognized or remote-command transfer
+failure; it does not claim an API outage. Collection retries positively
+identified transient transport failures or tar's isolated changed-source
+warning up to three times with backoff,
+within one transfer deadline (plus the timeout tool's five-second kill
+grace). Authentication, identity, path, local-storage, archive-integrity,
+and unknown failures remain fatal. Each failed transfer preserves bounded
+stderr and producer/consumer status in local attempt diagnostics, including
+when a later transfer succeeds; partial archives are discarded between tries.
+Only the published `state/` subtree is transferred; uploaded control files
+remain available locally. Changed-source warnings are never ignored: a retry
+must finish cleanly and pass the same manifest hashes before publication.
+Persistent changes and other tar errors remain fatal with remote data retained.
 
 For required-recovery faults, capture bounded Job, Pod, and DaemonSet
 descriptions; relevant container logs and namespace events; durable PVC state;

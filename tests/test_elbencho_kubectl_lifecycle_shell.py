@@ -591,8 +591,8 @@ def test_resume_interprets_collected_state_with_current_coordinator() -> None:
     assert "control-bundle/coordinator.sh" not in body
 
 
-def test_collected_manifest_accepts_complete_success_evidence(tmp_path: Path) -> None:
-    """A complete cell ledger and required workload output are collectible."""
+def _complete_publication_fixture(tmp_path: Path):
+    """Build complete cell and manifest evidence for collection tests."""
     state = tmp_path / "state"
     executions = state / "executions"
     result_dir = state / "results/0001/executions"
@@ -643,6 +643,12 @@ def test_collected_manifest_accepts_complete_success_evidence(tmp_path: Path) ->
     (state / "publication-manifest.tsv").write_text(
         "\n".join(rows) + "\n", encoding="utf-8"
     )
+    return state, definitions
+
+
+def test_collected_manifest_accepts_complete_success_evidence(tmp_path: Path) -> None:
+    """A complete cell ledger and required workload output are collectible."""
+    state, definitions = _complete_publication_fixture(tmp_path)
     result = _bash(
         f"_kubectl_validate_collected_publication {str(state)!r} "
         f"1234abcd terminal {str(definitions)!r} >/dev/null; [[ $terminal == SUCCESS ]]"
@@ -959,9 +965,364 @@ def test_collection_stream_uses_its_operation_sized_deadline(tmp_path: Path) -> 
             "$KUBECTL_PROCESS_TIMEOUT_SECONDS"
         }}
         kubectl_stream_remote_attempt test-ns collector 1234abcd {str(archive)!r}
-        test "$(cat {str(archive)!r})" = $'123\t183'
+        read -r request process < {str(archive)!r}
+        [[ "$request" -gt 0 && "$request" -le 123 && "$process" == "$request" ]]
         """)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "error: unexpected EOF",
+        "read tcp: connection reset by peer",
+        "error: HTTP 429 Too Many Requests",
+        "error: HTTP 503 Service Unavailable",
+        "error: stream error: INTERNAL_ERROR",
+        "tar: 1234abcd/state/results/0001/report.out: file changed as we read it\n"
+        "command terminated with exit code 1",
+        "tar: 1234abcd/state: file changed as we read it",
+    ],
+)
+def test_collection_retries_transient_transfer_and_publishes_complete_results(
+    tmp_path: Path, error: str
+) -> None:
+    """[R-03] A retry restarts receipt and still verifies the full publication."""
+    state, definitions = _complete_publication_fixture(tmp_path)
+    payload = tmp_path / "remote.tar"
+    with tarfile.open(payload, "w") as archive:
+        archive.add(state, arcname="1234abcd/state")
+    received = tmp_path / "received.tar"
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    (tmp_path / "published").mkdir()
+    calls = tmp_path / "calls"
+    staging = tmp_path / ".kubernetes-collect-1234abcd.A1"
+    result = _bash(f"""
+        set -euo pipefail
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        kubectl_pvc_exec() {{
+            printf 'call\\n' >> {str(calls)!r}
+            if [[ $(wc -l < {str(calls)!r}) -eq 1 ]]; then
+                printf partial
+                printf '%s\\n' "$injected_error" >&2
+                return 1
+            fi
+            test ! -e {str(received)!r} || [[ ! -s {str(received)!r} ]]
+            cat {str(payload)!r}
+        }}
+        injected_error=$(printf '%b' {error!r})
+        kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(received)!r} {str(metadata / 'state.sh')!r}
+        kubectl_extract_attempt_archive {str(received)!r} 1234abcd \
+            {str(tmp_path)!r} {str(staging)!r}
+        _kubectl_validate_collected_publication {str(staging / '1234abcd/state')!r} \
+            1234abcd terminal {str(definitions)!r} >/dev/null
+        [[ "$terminal" == SUCCESS ]]
+        _kubectl_merge_collected_results {str(staging / '1234abcd/state')!r} \
+            {str(tmp_path / 'published')!r} 1234abcd reason
+        """)
+    assert result.returncode == 0, result.stderr
+    assert len(calls.read_text().splitlines()) == 2
+    assert received.read_bytes() == payload.read_bytes()
+    assert (tmp_path / "published/executions/0001.status").read_text() == "SUCCESS\n"
+    bundles = list((metadata / "diagnostics").glob("collection-stream.*"))
+    assert len(bundles) == 1
+    assert (bundles[0] / "transfer-1.stderr").read_text().strip() == error
+    assert "attempt_id\t1234abcd" in (bundles[0] / "bundle.tsv").read_text()
+    assert "\t1\t0\t" in (bundles[0] / "transfers.tsv").read_text()
+    assert "\t0\t0\tSUCCESS" in (bundles[0] / "transfers.tsv").read_text()
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "error,rc,reason",
+    [
+        ("Unauthorized: token expired; timeout", 1, "AUTH"),
+        ("Error: collector not found", 1, "IDENTITY_MISMATCH"),
+        ("Error: path escapes PVC mount", 1, "PATH_REJECTED"),
+        ("tar: unexpected EOF in archive", 1, "TRANSFER_FAILED"),
+        (
+            "tar: 1234abcd/state/run.status: file changed as we read it\n"
+            "tar: read error: Permission denied",
+            1,
+            "TRANSFER_FAILED",
+        ),
+        (
+            "tar: other/state/run.status: file changed as we read it",
+            1,
+            "TRANSFER_FAILED",
+        ),
+        (
+            "tar: 1234abcd/control/executions/0002.sh: file changed as we read it",
+            1,
+            "TRANSFER_FAILED",
+        ),
+        (
+            "tar: 1234abcd/state/../control: file changed as we read it",
+            1,
+            "TRANSFER_FAILED",
+        ),
+        (
+            "tar: 1234abcd/state/run.status: file changed as we read it",
+            2,
+            "TRANSFER_FAILED",
+        ),
+        ("command terminated with exit code 2: timeout", 1, "TRANSFER_FAILED"),
+        ("unknown remote failure", 1, "TRANSFER_FAILED"),
+        ("unknown remote timeout", 1, "TRANSFER_FAILED"),
+        ("", 137, "TRANSFER_FAILED"),
+    ],
+)
+def test_collection_never_retries_permanent_or_unknown_remote_errors(
+    tmp_path: Path, error: str, rc: int, reason: str
+) -> None:
+    """[R-03] Transport retries never hide auth, safety, or remote failures."""
+    archive = tmp_path / "attempt.tar"
+    calls = tmp_path / "calls"
+    result = _bash(f"""
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        kubectl_pvc_exec() {{
+            printf 'call\\n' >> {str(calls)!r}
+            printf partial
+            printf '%b\\n' {error!r} >&2
+            return {rc}
+        }}
+        ! kubectl_stream_remote_attempt test-ns collector 1234abcd {str(archive)!r}
+        test ! -e {str(archive)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert len(calls.read_text().splitlines()) == 1
+    assert f"STORAGE_SCALE_TEST_DIAGNOSTIC_REASON={reason}" in result.stderr
+    assert f"producer_rc={rc} consumer_rc=0" in result.stderr
+
+
+def test_collection_stream_reads_only_published_state(tmp_path: Path) -> None:
+    """Unused control files and locks cannot make terminal receipt fail."""
+    attempt = tmp_path / "1234abcd"
+    state = attempt / "state"
+    state.mkdir(parents=True)
+    (state / "run.status").write_text("SUCCESS\n")
+    control = attempt / "control/executions"
+    control.mkdir(parents=True)
+    (control / "0002.sh").write_text("immutable definition\n")
+    (attempt / "coordinator.lock").write_text("lock\n")
+    archive = tmp_path / "received.tar"
+    result = _bash(f"""
+        kubectl_attempt_remote_root() {{ printf '%s\\n' {str(attempt)!r}; }}
+        kubectl_remote_tree_guard_script() {{ printf 'run="$1"\\n'; }}
+        kubectl_pvc_exec() {{ shift 2; "$@"; }}
+        kubectl_stream_remote_attempt test-ns collector 1234abcd {str(archive)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    with tarfile.open(archive) as received:
+        assert set(received.getnames()) == {
+            "1234abcd/state",
+            "1234abcd/state/run.status",
+        }
+
+
+def test_changed_source_retry_still_rejects_content_corruption(tmp_path: Path) -> None:
+    """[R-07] Clean tar completion cannot override publication digests."""
+    state, definitions = _complete_publication_fixture(tmp_path)
+    (state / "results/0001/executions/0001.workload.tsv").write_text("changed\n")
+    payload = tmp_path / "corrupt.tar"
+    with tarfile.open(payload, "w") as archive:
+        archive.add(state, arcname="1234abcd/state")
+    received = tmp_path / "received.tar"
+    calls = tmp_path / "calls"
+    staging = tmp_path / ".kubernetes-collect-1234abcd.A1"
+    result = _bash(f"""
+        set -euo pipefail
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        kubectl_pvc_exec() {{
+            printf 'call\\n' >> {str(calls)!r}
+            if [[ $(wc -l < {str(calls)!r}) -eq 1 ]]; then
+                printf partial
+                echo 'tar: 1234abcd/state/run.status: file changed as we read it' >&2
+                return 1
+            fi
+            cat {str(payload)!r}
+        }}
+        kubectl_stream_remote_attempt test-ns collector 1234abcd {str(received)!r}
+        kubectl_extract_attempt_archive {str(received)!r} 1234abcd \
+            {str(tmp_path)!r} {str(staging)!r}
+        ! _kubectl_validate_collected_publication {str(staging / '1234abcd/state')!r} \
+            1234abcd terminal {str(definitions)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert len(calls.read_text().splitlines()) == 2
+
+
+def test_tar_changed_file_warning_can_be_metadata_only(tmp_path: Path) -> None:
+    """A real tar warning does not prove that benchmark bytes were modified."""
+    source = tmp_path / "report.out"
+    source.write_bytes(b"unchanged content\n" * 65536)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    archive = tmp_path / "metadata-change.tar"
+    result = _bash(f"""
+        export TAR_SOURCE={str(source)!r}
+        LC_ALL=C _kubectl_local_tar --checkpoint=1 \
+            --checkpoint-action='exec=touch -m -t 200001010000 "$TAR_SOURCE"' \
+            -cf {str(archive)!r} -C {str(tmp_path)!r} report.out
+        """)
+    assert result.returncode == 1, result.stderr
+    assert "file changed as we read it" in result.stderr
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == digest
+    with tarfile.open(archive) as received:
+        assert (
+            hashlib.sha256(received.extractfile("report.out").read()).hexdigest()
+            == digest
+        )
+
+
+def test_collection_changed_source_exhaustion_preserves_remote_data(
+    tmp_path: Path,
+) -> None:
+    """[R-03] Persistently changing source never becomes a valid receipt."""
+    archive = tmp_path / "attempt.tar"
+    calls = tmp_path / "calls"
+    result = _bash(f"""
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        kubectl_pvc_exec() {{
+            printf 'call\\n' >> {str(calls)!r}
+            printf partial
+            echo 'tar: 1234abcd/state/run.status: file changed as we read it' >&2
+            return 1
+        }}
+        ! kubectl_stream_remote_attempt test-ns collector 1234abcd {str(archive)!r}
+        test ! -e {str(archive)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert calls.read_text().count("call") == 3
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=TRANSFER_FAILED" in result.stderr
+    assert r"remote\ results\ were\ retained" in result.stderr
+
+
+def test_collection_retry_limit_keeps_bounded_error_history(tmp_path: Path) -> None:
+    """[R-03] Exhaustion preserves each failed transfer without partial data."""
+    archive = tmp_path / "attempt.tar"
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    result = _bash(f"""
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        kubectl_pvc_exec() {{
+            printf partial
+            printf 'error: unexpected EOF\\n' >&2
+            head -c 2097152 /dev/zero | tr '\\0' E >&2
+            return 1
+        }}
+        ! kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(archive)!r} {str(metadata / 'state.sh')!r}
+        test ! -e {str(archive)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    bundle = next((metadata / "diagnostics").glob("collection-stream.*"))
+    errors = list(bundle.glob("transfer-*.stderr"))
+    assert len(errors) == 3
+    assert all(path.stat().st_size <= 131072 for path in errors)
+    assert len((bundle / "transfers.tsv").read_text().splitlines()) == 3
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_PATH=" in result.stderr
+
+
+def test_collection_retries_share_one_deadline(tmp_path: Path) -> None:
+    """[R-04] Backoff cannot extend the collection operation's deadline."""
+    calls = tmp_path / "calls"
+    result = _bash(f"""
+        KUBECTL_COLLECTION_TIMEOUT_SECONDS=30
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=60
+        kubectl_pvc_exec() {{
+            printf 'call\\n' >> {str(calls)!r}
+            printf 'error: unexpected EOF\\n' >&2
+            return 1
+        }}
+        sleep() {{ echo 'unexpected sleep' >&2; return 99; }}
+        ! kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(tmp_path / 'attempt.tar')!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert len(calls.read_text().splitlines()) == 1
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=TIMEOUT" in result.stderr
+    assert "unexpected sleep" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "consumer_rc,reason", [(65, "ARCHIVE_INVALID"), (74, "LOCAL_IO")]
+)
+def test_collection_does_not_retry_consumer_failures(
+    tmp_path: Path, consumer_rc: int, reason: str
+) -> None:
+    """A transient-looking producer error cannot override local receive failure."""
+    calls = tmp_path / "calls"
+    result = _bash(f"""
+        kubectl_pvc_exec() {{
+            printf 'call\\n' >> {str(calls)!r}
+            printf 'error: HTTP 503 Service Unavailable\\n' >&2
+            return 1
+        }}
+        _kubectl_write_bounded_collection_stream() {{ return {consumer_rc}; }}
+        ! kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(tmp_path / 'attempt.tar')!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert len(calls.read_text().splitlines()) == 1
+    assert f"STORAGE_SCALE_TEST_DIAGNOSTIC_REASON={reason}" in result.stderr
+    assert f"consumer_rc={consumer_rc}" in result.stderr
+
+
+def test_collection_retry_diagnostics_are_bounded_and_keep_current_bundle(
+    tmp_path: Path,
+) -> None:
+    """Equal timestamps cannot prune the error currently being captured."""
+    metadata = tmp_path / "metadata"
+    root = metadata / "diagnostics"
+    root.mkdir(parents=True)
+    for number in range(10):
+        (root / f"z-old-{number}").mkdir()
+    result = _bash(f"""
+        kubectl_pvc_exec() {{ printf 'Forbidden\\n' >&2; return 1; }}
+        _kubectl_local_path_mtime() {{ printf '0\\n'; }}
+        ! kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(tmp_path / 'attempt.tar')!r} {str(metadata / 'state.sh')!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert len(list(root.iterdir())) == 8
+    bundle = next(root.glob("collection-stream.*"))
+    assert (bundle / "transfer-1.stderr").read_text() == "Forbidden\n"
+
+
+def test_collection_retry_uses_remaining_deadline_and_tolerates_diagnostic_failure(
+    tmp_path: Path,
+) -> None:
+    """Retries do not restart the clock or depend on a writable diagnostic path."""
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    (metadata / "diagnostics").write_text("not a directory")
+    calls = tmp_path / "calls"
+    archive = tmp_path / "attempt.tar"
+    result = _bash(f"""
+        KUBECTL_COLLECTION_TIMEOUT_SECONDS=30
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        sleep() {{ SECONDS=$((SECONDS + 5)); }}
+        kubectl_pvc_exec() {{
+            printf '%s\\n' "$KUBECTL_PROCESS_TIMEOUT_SECONDS" >> {str(calls)!r}
+            if [[ $(wc -l < {str(calls)!r}) == 1 ]]; then
+                printf partial
+                printf 'error: unexpected EOF\\n' >&2
+                return 1
+            fi
+            printf complete
+        }}
+        kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(archive)!r} {str(metadata / 'state.sh')!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    deadlines = [int(value) for value in calls.read_text().splitlines()]
+    assert len(deadlines) == 2
+    assert 0 < deadlines[1] <= deadlines[0] - 5
+    assert archive.read_text() == "complete"
+    assert "diagnostics could not be saved" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=" not in result.stderr
 
 
 def test_collection_stream_failure_removes_partial_and_reports_auth(

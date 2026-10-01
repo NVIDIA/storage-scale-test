@@ -114,7 +114,11 @@ state machines, invariants, fault matrix, and unsupported cases are frozen in
 Attempts publish their local `PREPARED` pointer before external mutation so an
 interrupted setup remains recoverable; resume uses compare-and-swap against the
 collected predecessor. Collection waits for the exact journaled Job to
-become inactive, uses a transfer-sized deadline, and recovers coordinator loss
+become inactive, uses one transfer deadline with bounded transient-only retries,
+and retains bounded transfer stderr and exit history even after recovery.
+Only published state is transferred, not uploaded control files. An isolated tar
+changed-source warning retries from scratch; manifest hashes still gate import.
+Unknown remote errors are not diagnosed as API outages. It recovers coordinator loss
 from either PREPARED or RUNNING. Derived workload paths are resolved against
 live PVC symlinks, and endpoint checks freeze Node, Pod, address, architecture,
 and image identity. Ordinary PVC commands detach stdin; only finite bundle
