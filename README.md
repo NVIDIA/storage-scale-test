@@ -532,6 +532,20 @@ Reports include successful cells only; Kubernetes results must first be
 collected. Both existing specialized reporters accept batches and select their
 own workload kind.
 
+The unified reporter also accepts the established analysis options. Common
+options such as `--only-nodes` and `--markdown` apply to both kinds;
+`--normalize-to` applies only to metadata and `--per-client-plots` only to IO.
+An option with no matching selected group is an error. Filtered runs update
+selected reports without dropping other groups from the index:
+
+```bash
+./utils/extract-filesystem.sh --normalize-to 1 --only-nodes 2,4 "$BATCH"
+./utils/extract-filesystem.sh --kind io --per-client-plots "$BATCH"
+```
+
+Use `--help` for all options. Cached CSV input and single-file parsing require
+`--kind io|mdtest` and are not batch-reporting modes.
+
 ### Filesystem reporting
 
 Both analysis wrappers accept one or more result directories, filters, CSV

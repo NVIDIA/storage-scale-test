@@ -30,6 +30,8 @@ import sys
 import tempfile
 from urllib.parse import quote
 
+from lib.filesystem_report_options import options_by_kind
+
 MANIFEST_FILENAME = "batch-manifest.tsv"
 SEAL_FILENAME = "batch-sealed.sha256"
 BATCH_MARKERS = (
@@ -414,12 +416,64 @@ def report_batch(
     groups: str | None = None,
     output_dir: str | Path | None = None,
     engine_options: list[str] | None = None,
+    *,
+    analysis_args: argparse.Namespace | None = None,
 ) -> int:
     """Generate independent group reports and an index; retain partial successes."""
     manifest = read_batch_manifest(path)
     selected = _selected_groups(manifest, kind, groups)
+    if not selected:
+        raise ValueError("No batch groups match --kind and --groups")
+    if analysis_args is not None and (
+        hasattr(analysis_args, "from_csv") or hasattr(analysis_args, "test_parse")
+    ):
+        raise ValueError("--from-csv and --test-parse cannot report a prepared batch")
+    routed = (
+        options_by_kind(analysis_args, {group.kind for group in selected})
+        if analysis_args is not None
+        else {}
+    )
     output = Path(output_dir).resolve() if output_dir else manifest.root / "reports"
     output.mkdir(parents=True, exist_ok=True)
+    outcomes = {}
+    generated = 0
+    failed = False
+    for group in selected:
+        result, group_generated, group_failed = _generate_group_report(
+            manifest, group, output, routed.get(group.kind, engine_options or [])
+        )
+        generated += group_generated
+        failed = failed or group_failed
+        outcomes[group.group_id] = result
+    _write_report_index(manifest, output, outcomes)
+    return int(failed or not generated)
+
+
+def _generate_group_report(
+    manifest: BatchManifest, group: BatchGroup, output: Path, options: list[str]
+) -> tuple[str, bool, bool]:
+    """Report one successful subset without abandoning other selected groups."""
+    successful = tuple(
+        execution
+        for execution in manifest.group_executions(group.group_id)
+        if _execution_status(manifest, execution) == SUCCESS
+    )
+    if not successful:
+        return "No successful results", False, False
+    report_dir = output / "groups" / group.group_id
+    try:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        _report_group(manifest, group, successful, report_dir, options)
+        return _markdown_link("report", report_dir / "report.txt", output), True, False
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"Group {group.group_id}: {error}", file=sys.stderr)
+        return "Reporting failed", False, True
+
+
+def _write_report_index(
+    manifest: BatchManifest, output: Path, outcomes: dict[str, str]
+) -> None:
+    """Rebuild all committed rows, retaining reports untouched by filtered runs."""
     lines = [
         "# Filesystem batch reports",
         "",
@@ -428,34 +482,19 @@ def report_batch(
         "| Group | Kind | Saved settings | Cell states | Reports |",
         "| --- | --- | --- | --- | --- |",
     ]
-    generated = 0
-    failed = False
-    for group in selected:
-        executions = manifest.group_executions(group.group_id)
-        statuses = {
-            execution.execution_id: _execution_status(manifest, execution)
-            for execution in executions
-        }
-        counts = Counter(statuses.values())
-        successful = tuple(
-            execution
-            for execution in executions
-            if statuses[execution.execution_id] == SUCCESS
+    for group in manifest.groups:
+        counts = Counter(
+            _execution_status(manifest, execution)
+            for execution in manifest.group_executions(group.group_id)
         )
-        report_dir = output / "groups" / group.group_id
-        result = "No successful results"
-        if successful:
-            try:
-                report_dir.mkdir(parents=True, exist_ok=True)
-                _report_group(
-                    manifest, group, successful, report_dir, engine_options or []
-                )
-                generated += 1
-                result = _markdown_link("report", report_dir / "report.txt", output)
-            except (OSError, ValueError, subprocess.CalledProcessError) as error:
-                failed = True
-                result = "Reporting failed"
-                print(f"Group {group.group_id}: {error}", file=sys.stderr)
+        report = output / "groups" / group.group_id / "report.txt"
+        result = outcomes.get(group.group_id)
+        if result is None:
+            result = (
+                _markdown_link("report", report, output)
+                if report.is_file()
+                else "Not generated" if counts[SUCCESS] else "No successful results"
+            )
         source = manifest.group_path(group)
         settings = " / ".join(
             _markdown_link(name, source / name, output)
@@ -467,8 +506,14 @@ def report_batch(
         lines.append(
             f"| {group.group_id} | {group.kind} | {settings} | {states} | {result} |"
         )
-    (output / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return int(failed or not generated)
+    # Publish the index atomically so interruption cannot leave a truncated index.
+    descriptor, temporary = tempfile.mkstemp(prefix=".index-", dir=output)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write("\n".join(lines) + "\n")
+        os.replace(temporary, output / "index.md")
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def _report_group(
@@ -516,6 +561,8 @@ def route_batch_report(args: argparse.Namespace, kind: str, argv: list[str]) -> 
         return False
     if len(args.input_dirs) != 1 or args.from_csv:
         raise ValueError("A prepared batch must be the sole raw reporting input")
+    if getattr(args, "test_parse", None):
+        raise ValueError("--test-parse cannot report a prepared batch")
     options = []
     index = 0
     while index < len(argv):

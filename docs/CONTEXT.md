@@ -400,6 +400,8 @@ workload kinds. Prepared batches save ordered groups locally, freeze common
 resources, and permanently seal their manifest before first external mutation.
 One global ledger owns statuses; group snapshots and artifacts remain isolated
 through dispatch, collection, resume, and unified filesystem reporting.
+Reporters share option definitions; the unified entry point routes by workload
+kind and retains other groups' index links across filtered runs.
 Kubernetes helper loading is idempotent: repeated preflight/dispatch loads must
 preserve readonly constants and active ownership maps.
 Status emits one scoped progress view with collection state and next action.

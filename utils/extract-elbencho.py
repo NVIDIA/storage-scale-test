@@ -68,6 +68,11 @@ if str(_REPO_ROOT) not in sys.path:
 # pylint: disable=wrong-import-position
 from lib.env_used_yaml import apply_env_used_to_metrics, load_env_used_yaml
 from lib.filesystem_batch import route_batch_report
+from lib.filesystem_report_options import (
+    add_analysis_arguments,
+    add_report_destination_arguments,
+    validate_analysis_arguments,
+)
 from lib.elbencho_live_report import (
     DomainAnalysis,
     LiveAnalysis,
@@ -4471,120 +4476,16 @@ def main() -> None:
         nargs="*",
         help="Directories containing elbencho output files (optional if --from-csv is provided)",
     )
-    parser.add_argument(
-        "--to-csv",
-        action="store_true",
-        help="Write metrics to a CSV file in the first input directory (filename will be auto-generated)",
-    )
-    parser.add_argument(
-        "--from-csv",
-        metavar="FILE",
-        help="Read metrics from this CSV file instead of parsing benchmark files",
-    )
-    parser.add_argument(
-        "--only-threads",
-        metavar="THREADS",
-        help="Only include benchmarks with these thread counts (comma-separated, can include ranges like 1-10)",
-    )
-    parser.add_argument(
-        "--only-nodes",
-        metavar="NODES",
-        help="Only include benchmarks with these node counts (comma-separated, can include ranges like 1-10)",
-    )
-    parser.add_argument(
-        "--only-sizes",
-        action="append",
-        metavar="SIZE",
-        help=(
-            "Only include benchmarks with these IO sizes (repeat flag for multiple). "
-            "Commas are not split, so compound elbencho sizes like 1M,r64K are one value. "
-            "Within one argument, separate multiple sizes with ';' (e.g. '1M,r64K;4K'). "
-            "Former comma-separated lists must use ';' or multiple --only-sizes flags."
-        ),
-    )
-    parser.add_argument(
-        "--only-iodepths",
-        metavar="IODEPTHS",
-        help="Only include benchmarks with these IO depth values (comma-separated, can include ranges like 1-4)",
-    )
-    parser.add_argument(
-        "--test-parse",
-        metavar="FILE",
-        help="Test the parse_elbencho_file function on a specific file",
-    )
-    parser.add_argument(
-        "--markdown",
-        action="store_true",
-        help="Format output as Markdown for easy import into Google Docs (report to stdout, progress to stderr)",
-    )
-    parser.add_argument(
-        "--no-dual-y-axis",
-        action="store_true",
-        help="Generate separate single-axis plots instead of dual y-axis plots for IOPS/Throughput vs Latency",
-    )
-    parser.add_argument(
-        "--per-client-plots",
-        action="store_true",
-        help=(
-            "Investigate client startup, slowdown, failover, and imbalance with "
-            "live percentile, outlier, heatmap, and summary reports (adds a "
-            "second CSV scan)"
-        ),
-    )
-    parser.add_argument(
-        "--client-outlier-threshold",
-        type=float,
-        default=2.0,
-        help="Negative z-score magnitude used to identify underperforming clients",
-    )
-    parser.add_argument(
-        "--client-min-underperform-segments",
-        type=int,
-        default=1,
-        help=(
-            "Minimum slow, missing, or skipped live intervals required to select "
-            "a client"
-        ),
-    )
-    parser.add_argument(
-        "--client-max-timeseries-lines",
-        type=int,
-        default=10,
-        help="Maximum individual client lines in each live time-series plot",
-    )
-    parser.add_argument(
-        "--client-max-heatmap-rows",
-        type=int,
-        default=50,
-        help="Maximum clients displayed in each live underperformance heatmap",
-    )
-
-    parser.add_argument(
-        "--groups", help="Select comma-separated prepared batch group IDs"
-    )
-    parser.add_argument(
-        "--output-dir", help="Write reports and plots to this directory"
-    )
+    add_analysis_arguments(parser, "io")
+    add_report_destination_arguments(parser)
     args = parser.parse_args()
     try:
+        validate_analysis_arguments(args)
         route_batch_report(args, "io", sys.argv[1:])
     except (OSError, ValueError) as error:
         parser.error(str(error))
     if args.from_csv and args.input_dirs:
         parser.error("--from-csv cannot be combined with input directories")
-
-    positive_live_options = (
-        ("--client-outlier-threshold", args.client_outlier_threshold),
-        (
-            "--client-min-underperform-segments",
-            args.client_min_underperform_segments,
-        ),
-        ("--client-max-timeseries-lines", args.client_max_timeseries_lines),
-        ("--client-max-heatmap-rows", args.client_max_heatmap_rows),
-    )
-    for option_name, value in positive_live_options:
-        if value <= 0:
-            parser.error(f"{option_name} must be greater than zero")
 
     # Check if input_dir is required but not provided
     if not args.input_dirs and not args.from_csv and not args.test_parse:

@@ -18,6 +18,7 @@
 import argparse
 from dataclasses import FrozenInstanceError
 import hashlib
+import importlib.util
 from pathlib import Path
 import shlex
 import subprocess
@@ -40,6 +41,11 @@ from lib.filesystem_batch import (
     report_batch,
     route_batch_report,
     stage_group_inputs,
+)
+from lib.filesystem_report_options import (
+    REPORT_OPTIONS,
+    add_analysis_arguments,
+    options_by_kind,
 )
 
 DATESTAMP = "20260930Z120000"
@@ -314,10 +320,341 @@ def test_selection_and_no_successful_results(tmp_path):
         engine.assert_not_called()
     index = (manifest.root / "reports/index.md").read_text(encoding="utf-8")
     assert "| 0002 | mdtest |" in index
-    assert "| 0001 |" not in index
+    assert "| 0001 | io |" in index
     assert "PENDING: 1" in index
     with pytest.raises(ValueError, match="Unknown batch groups"):
         report_batch(manifest.root, groups="9999")
+
+
+@pytest.fixture(name="unified_reporter")
+def unified_reporter_fixture():
+    """Load the public front door without spawning an analyzer."""
+    path = Path(__file__).resolve().parents[1] / "utils/extract-filesystem.py"
+    spec = importlib.util.spec_from_file_location("filesystem_report_front_door", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_unified_reporter_routes_common_and_kind_specific_options(
+    tmp_path, unified_reporter
+):
+    manifest = _create_batch(tmp_path / "batch")
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+    called = {}
+
+    def report(_manifest, group, _successful, output, options):
+        called[group.group_id] = options
+        (output / "report.txt").write_text(group.kind, encoding="utf-8")
+
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert (
+            unified_reporter.main(
+                [
+                    "--normalize-to",
+                    "1",
+                    "--only-nodes=1,2",
+                    str(manifest.root),
+                    "--only-sizes",
+                    "1M,r4K;4K",
+                    "--only-sizes=1M",
+                    "--markdown",
+                    "--per-client-plots",
+                    "--client-max-heatmap-rows",
+                    "12",
+                    "--to-csv",
+                ]
+            )
+            == 0
+        )
+    common = {"--only-nodes=1,2", "--markdown", "--to-csv"}
+    assert set(called["0002"]) == common | {"--normalize-to=1"}
+    assert set(called["0001"]) == common | {
+        "--only-sizes=1M,r4K;4K",
+        "--only-sizes=1M",
+        "--per-client-plots",
+        "--client-max-heatmap-rows=12",
+    }
+    assert called["0001"] == called["0003"]
+
+
+@pytest.mark.parametrize("option", REPORT_OPTIONS, ids=lambda option: option.flag)
+def test_all_analysis_options_share_registration_and_routing(option):
+    parser = argparse.ArgumentParser()
+    add_analysis_arguments(parser, "all", explicit_only=True)
+    value = "3" if "type" in option.settings else "a path,with spaces"
+    arguments = [option.flag]
+    if option.settings.get("action") != "store_true":
+        arguments.append(value)
+    args = parser.parse_args(arguments)
+    routed = options_by_kind(args, {"io", "mdtest"})
+    expected = arguments[:1] if len(arguments) == 1 else [f"{option.flag}={value}"]
+    if option.settings.get("type") is float:
+        expected = [f"{option.flag}=3.0"]
+    for kind in ("io", "mdtest"):
+        assert routed[kind] == (expected if option.scope in ("common", kind) else [])
+        native = argparse.ArgumentParser()
+        add_analysis_arguments(native, kind)
+        native.parse_args(routed[kind])
+        if option.scope in ("common", kind):
+            assert option.help in " ".join(native.format_help().split())
+
+
+@pytest.mark.parametrize(
+    "arguments, message",
+    [
+        (["--kind", "io", "--normalize-to", "1"], "no selected mdtest group"),
+        (["--groups", "0002", "--per-client-plots"], "no selected io group"),
+        (["--kind", "mdtest", "--only-sizes", "1M"], "no selected io group"),
+        (["--kind", "io", "--groups", "0002"], "No batch groups match"),
+        (["--normalize-to", "0"], "positive integer"),
+        (["--client-max-heatmap-rows", "0"], "greater than zero"),
+        (["--client-outlier-threshold", "nan"], "greater than zero"),
+        (["--client-outlier-threshold", "inf"], "greater than zero"),
+        (["--from-csv", "saved.csv"], "cannot report a prepared batch"),
+        (["--test-parse", "result.csv"], "cannot report a prepared batch"),
+    ],
+)
+def test_unified_option_errors_precede_report_mutation(
+    tmp_path, unified_reporter, capsys, arguments, message
+):
+    manifest = _create_batch(tmp_path / "batch")
+    with mock.patch("lib.filesystem_batch._report_group") as engine:
+        with pytest.raises(SystemExit) as exited:
+            unified_reporter.main([str(manifest.root), *arguments])
+        engine.assert_not_called()
+    assert exited.value.code == 2
+    assert message in capsys.readouterr().err
+    assert not (manifest.root / "reports").exists()
+
+
+def test_filtered_reports_preserve_other_kinds_groups_and_index(
+    tmp_path, unified_reporter
+):
+    manifest = _create_batch(tmp_path / "batch")
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+    calls = []
+
+    def report(_manifest, group, _successful, output, options):
+        calls.append(group.group_id)
+        (output / "report.txt").write_text(str(options), encoding="utf-8")
+
+    output = tmp_path / "custom reports"
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert (
+            unified_reporter.main(
+                [
+                    str(manifest.root),
+                    "--kind",
+                    "mdtest",
+                    "--normalize-to",
+                    "1",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            == 0
+        )
+        metadata_report = (output / "groups/0002/report.txt").read_bytes()
+        assert (
+            unified_reporter.main(
+                [
+                    str(manifest.root),
+                    "--groups",
+                    "0001,0003",
+                    "--only-nodes",
+                    "1",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            == 0
+        )
+        assert (output / "groups/0002/report.txt").read_bytes() == metadata_report
+        assert (
+            unified_reporter.main(
+                [
+                    str(manifest.root),
+                    "--groups",
+                    "0001",
+                    "--only-threads",
+                    "1",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            == 0
+        )
+    assert calls == ["0002", "0001", "0003", "0001"]
+    index = (output / "index.md").read_text(encoding="utf-8")
+    for identifier in ("0001", "0002", "0003"):
+        assert f"groups/{identifier}/report.txt" in index
+        assert f"| {identifier} |" in index
+    assert not list(output.glob(".index-*"))
+
+
+def test_failed_filtered_report_retains_other_report_links(tmp_path):
+    manifest = _create_batch(tmp_path / "batch")
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+
+    def report(_manifest, group, _successful, output, _options):
+        (output / "report.txt").write_text(group.kind, encoding="utf-8")
+
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert report_batch(manifest.root) == 0
+    with mock.patch(
+        "lib.filesystem_batch._report_group", side_effect=ValueError("bad report")
+    ):
+        assert report_batch(manifest.root, groups="0002") == 1
+    index = (manifest.root / "reports/index.md").read_text(encoding="utf-8")
+    assert "Reporting failed" in index
+    assert "groups/0001/report.txt" in index
+    assert "groups/0003/report.txt" in index
+
+
+def test_interrupted_index_publication_preserves_previous_index(tmp_path):
+    manifest = _create_batch(tmp_path / "batch", kinds=("io",))
+    output = manifest.root / "reports"
+    output.mkdir()
+    index = output / "index.md"
+    index.write_text("previous complete index", encoding="utf-8")
+    with mock.patch(
+        "lib.filesystem_batch.os.replace", side_effect=OSError("full disk")
+    ):
+        with pytest.raises(OSError, match="full disk"):
+            report_batch(manifest.root)
+    assert index.read_text(encoding="utf-8") == "previous complete index"
+    assert not list(output.glob(".index-*"))
+
+
+@pytest.mark.parametrize("kind", ["io", "mdtest"])
+@pytest.mark.parametrize("mode", ["--from-csv", "--test-parse"])
+def test_unified_front_door_delegates_native_input_modes(
+    tmp_path, unified_reporter, kind, mode
+):
+    path = tmp_path / "a 'quoted' file.csv"
+    option = "--only-iodepths=1" if kind == "io" else "--normalize-to=1"
+    with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+        engine.return_value.returncode = 7
+        assert (
+            unified_reporter.main(
+                ["--kind", kind, mode, str(path), option, "--markdown"]
+            )
+            == 7
+        )
+    command = engine.call_args.args[0]
+    assert command[1].endswith(
+        "extract-elbencho.py" if kind == "io" else "extract-mdtest-elbencho.py"
+    )
+    assert f"{mode}={path}" in command
+    assert option in command
+    assert "--markdown" in command
+
+
+def test_unified_ordinary_directory_inference_and_options(tmp_path, unified_reporter):
+    results = tmp_path / "mdtest-elbencho-example"
+    with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+        engine.return_value.returncode = 0
+        assert (
+            unified_reporter.main(
+                [
+                    str(results),
+                    "--normalize-to=2",
+                    "--to-csv",
+                    "--output-dir",
+                    str(tmp_path),
+                ]
+            )
+            == 0
+        )
+    command = engine.call_args.args[0]
+    assert command[1].endswith("extract-mdtest-elbencho.py")
+    assert "--normalize-to=2" in command
+    assert "--to-csv" in command
+    assert command[2] == str(results)
+
+
+@pytest.mark.parametrize(
+    "arguments, message",
+    [
+        ([], "results_dir is required"),
+        (["--from-csv", "cached.csv"], "requires --kind"),
+        (["--test-parse", "raw.csv"], "requires --kind"),
+        (["--kind", "mdtest", "--from-csv", "cache", "raw"], "cannot be combined"),
+        (
+            ["--kind", "mdtest", "--from-csv", "cache", "--test-parse", "raw"],
+            "cannot be combined",
+        ),
+        (["--kind", "io", "--normalize-to", "1", "raw"], "no selected mdtest group"),
+    ],
+)
+def test_unified_ordinary_option_errors(unified_reporter, capsys, arguments, message):
+    with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+        with pytest.raises(SystemExit) as exited:
+            unified_reporter.main(arguments)
+        engine.assert_not_called()
+    assert exited.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_unified_real_metadata_report_exports_and_reimports_normalized_metrics(
+    tmp_path, reporting_checkout
+):
+    """Exercise actual engines and wrappers, not just option-forwarding mocks."""
+    from tests.test_extract_mdtest_elbencho import _DENSE_CSV, _DENSE_OUT
+
+    manifest = _create_batch(tmp_path / "batch", kinds=("mdtest",))
+    group = manifest.groups[0]
+    source = _publish_result(manifest, group)
+    (source / f"{MD_STEM}.csv").write_text(_DENSE_CSV, encoding="utf-8")
+    (source / f"{MD_STEM}.out").write_text(_DENSE_OUT, encoding="utf-8")
+    wrapper = reporting_checkout / "utils/extract-filesystem.sh"
+    completed = subprocess.run(
+        [
+            "bash",
+            str(wrapper),
+            "--normalize-to",
+            "1",
+            "--only-nodes",
+            "2",
+            "--only-threads",
+            "4",
+            "--to-csv",
+            "--markdown",
+            str(manifest.root),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    report = manifest.root / "reports/groups/0001/report.txt"
+    assert "normalized to 1 node" in report.read_text(encoding="utf-8")
+    exported = list(report.parent.glob("mdtest-elbencho-metrics-*.csv"))
+    assert len(exported) == 1
+    completed = subprocess.run(
+        [
+            "bash",
+            str(wrapper),
+            "--kind",
+            "mdtest",
+            "--from-csv",
+            str(exported[0]),
+            "--normalize-to",
+            "1",
+            "--markdown",
+            "--output-dir",
+            str(tmp_path / "cached"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "normalized to 1 node" in completed.stdout
 
 
 def test_legacy_reporter_batch_routing_forwards_options(tmp_path):

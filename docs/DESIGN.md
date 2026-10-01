@@ -385,6 +385,10 @@ per group. It snapshots only authoritative successful evidence into temporary
 inputs, writes disjoint group reports and an index, and never averages across
 group boundaries or contacts the cluster. The specialized reporter entry points
 share this batch routing while preserving legacy and cached-input behavior.
+All three entry points share analysis option definitions. The unified reporter
+routes common options to both kinds and type-specific options only to matching
+selected groups, rejecting unused options. Filtered runs atomically rebuild the
+whole-batch index from current cell states and retained group reports.
 
 ### 4.5 Remote Scriptlet and Result-Transfer Patterns
 
