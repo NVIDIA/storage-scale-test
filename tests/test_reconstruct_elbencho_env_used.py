@@ -66,6 +66,21 @@ class TestReconstructElbenchoEnvUsed(unittest.TestCase):
 
         self.assertIn("sweep_write_no_read: 1\n", rendered)
 
+    def test_run_to_completion_is_explicit_in_reconstructed_configuration(self) -> None:
+        summary = _MODULE.parse_summary_block("Run to Completion: Yes\n")
+        self.assertEqual(summary["run_to_completion_option"], 1)
+        rendered = _MODULE.build_yaml(summary, source_files=[], warnings=[])
+        self.assertIn("run_to_completion_option: 1\n", rendered)
+
+    def test_old_single_flag_does_not_claim_completion_based_reads(self) -> None:
+        rows = _MODULE.parse_sbatch_tail(
+            "sbatch/_nv-elbencho-size-threads-sweep.sh /tmp/results dio 0 1 4K 0 0"
+        )
+        merged = {}
+        # pylint: disable-next=protected-access
+        _MODULE._merge_apply_sbatch(merged, rows, [])
+        self.assertEqual(merged["run_to_completion_option"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

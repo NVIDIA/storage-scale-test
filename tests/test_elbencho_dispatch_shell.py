@@ -75,7 +75,7 @@ def _make_dispatch_batch(parent: Path) -> Path:
             f"export ELBENCHO_EXECUTION_KIND={kind}\n"
             f"export nodes={4 if kind == 'mdtest' else 2}\n"
             "export tasks_per_node=3 io_size=4K thread_count=1 io_depth=1\n"
-            "export dio_or_bio=dio use_random=0 force_single=0\n"
+            "export dio_or_bio=dio use_random=0 run_to_completion=0\n"
             f"export ELBENCHO_BATCH_GROUP_ID={identity}\n"
             f"export ELBENCHO_BATCH_OUTPUT_RELATIVE={relative}\n"
             f"export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=/target-{identity}\n"
@@ -527,7 +527,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         export io_depth=4
         export dio_or_bio=dio
         export use_random=0
-        export force_single=1
+        export run_to_completion=1
         export ELBENCHO_FILE_LAYOUT=shared-directory
         export ELBENCHO_FILES_PER_NODE=8
         export ELBENCHO_FILE_SIZE=64G
@@ -579,7 +579,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         io_depth=4
         dio_or_bio=dio
         use_random=0
-        force_single=1
+        run_to_completion=1
         health_hook() {{ printf 'health:%s\n' "$1" >> "$tmp/hooks"; }}
         publish_hook() {{
             printf 'publish:%s:%s:%s\n' "$1" "$2" "$3" >> "$tmp/hooks"
@@ -591,7 +591,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         run_elbencho_io_sweep_iteration() {{
             printf 'bound:%s:%s:%s:%s:%s:%s:%s\n' \
                 "$output_dir" "$io_size" "$thread_count" "$io_depth" \
-                "$dio_or_bio" "$use_random" "$force_single" >> "$tmp/hooks"
+                "$dio_or_bio" "$use_random" "$run_to_completion" >> "$tmp/hooks"
             mkdir -p "$output_dir"
             printf 'scratch-only\n' > "$output_dir/artifact"
             _elbencho_run_service_health_hook write
@@ -610,7 +610,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         io_depth=999
         dio_or_bio=corrupted
         use_random=999
-        force_single=999
+        run_to_completion=999
 
         BENCHMARK_RC=17
         PUBLISH_RC=23
@@ -673,14 +673,14 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         io_depth=4
         dio_or_bio=dio
         use_random=0
-        unset force_single
+        unset run_to_completion
         ! elbencho_set_cell_run_context 0007 2 host-a,host-b \
             /mnt/a,/mnt/b "$tmp/scratch" "$tmp/durable" \
             _elbencho_noop_cell_hook _elbencho_noop_cell_hook \
             2> "$tmp/missing-coordinate"
-        grep -q 'lacks saved coordinate: force_single' "$tmp/missing-coordinate"
+        grep -q 'lacks saved coordinate: run_to_completion' "$tmp/missing-coordinate"
 
-        force_single=1
+        run_to_completion=1
         ! elbencho_set_cell_run_context 0007 2 host-a \
             /mnt/a,/mnt/b "$tmp/scratch" "$tmp/durable" \
             _elbencho_noop_cell_hook _elbencho_noop_cell_hook \
@@ -1541,8 +1541,8 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         io_size=r64K
         thread_count=8
         io_depth=2
-        force_single=0
-        single_option=0
+        run_to_completion=0
+        run_to_completion_option=0
         use_random=0
         dio_or_bio=dio
         elbencho_set_cell_run_context 0001 1 host-a "$tmp/read-from" \
@@ -1588,8 +1588,8 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         io_size=r64K
         thread_count=8
         io_depth=2
-        force_single=0
-        single_option=0
+        run_to_completion=0
+        run_to_completion_option=0
         use_random=0
         dio_or_bio=dio
         elbencho_set_cell_run_context 0001 1 host-a "$tmp/read-from" \
@@ -1641,8 +1641,8 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         io_size=r64K
         thread_count=8
         io_depth=2
-        force_single=0
-        single_option=0
+        run_to_completion=0
+        run_to_completion_option=0
         use_random=0
         dio_or_bio=dio
         elbencho_set_cell_run_context 0001 1 host-a "$tmp/read-from" \
@@ -2073,7 +2073,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             export SAVED_CONFIG=1
             export dio_or_bio=dio
             export rand_option=0
-            export single_option=0
+            export run_to_completion_option=0
             export sweep_write_only=0
             export sweep_write_no_read=0
             export sweep_read_from=
@@ -2149,7 +2149,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             export ELBENCHO_FILE_SIZE=64G
             export dio_or_bio=dio
             export rand_option=0
-            export single_option=1
+            export run_to_completion_option=1
             export sweep_write_only=0
             export sweep_write_no_read=0
             export sweep_read_from=

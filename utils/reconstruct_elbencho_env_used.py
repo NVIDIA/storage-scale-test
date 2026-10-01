@@ -74,10 +74,7 @@ _RE_IO_DEPTHS = re.compile(r"^\s*IO Depths:\s+(.+)$", re.MULTILINE)
 _RE_IO_SIZES_SUMMARY = re.compile(r"^\s*IO Sizes:\s+(.+)$", re.MULTILINE)
 _RE_IO_TYPE = re.compile(r"^\s*IO Type:\s+(DIO|BIO)\s*$", re.MULTILINE)
 _RE_IO_PATTERN_SUMMARY = re.compile(r"^\s*IO Pattern:\s+(.+)$", re.MULTILINE)
-_RE_FORCE_SINGLE_SUMMARY = re.compile(r"^\s*Force Single:\s+(Yes|No)\s*$", re.MULTILINE)
-_RE_FORCE_SINGLE_ITER = re.compile(
-    r"^\s*Force Single Run:\s+(Yes|No)\s*$", re.MULTILINE
-)
+_RE_TO_COMPLETION = re.compile(r"^\s*Run to Completion:\s+(Yes|No)\s*$", re.MULTILINE)
 _RE_WRITE_NO_READ_SUMMARY = re.compile(r"^\s*Write-no-read:\s*Yes\s*$", re.MULTILINE)
 _RE_DATESTAMP_LINE = re.compile(r"^\s*Datestamp:\s+(\d{8}Z\d{6})\s*$", re.MULTILINE)
 _RE_SINGLE_BIG_FILE_LINE = re.compile(r"^Single big file:\s+(.+)$", re.MULTILINE)
@@ -268,14 +265,11 @@ def _parse_summary_depths_and_sizes(text: str) -> Dict[str, Any]:
     return out
 
 
-def _parse_summary_single_option_flags(text: str) -> Dict[str, Any]:
+def _parse_summary_run_to_completion_option_flags(text: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
-    m = _RE_FORCE_SINGLE_SUMMARY.search(text)
+    m = _RE_TO_COMPLETION.search(text)
     if m:
-        out["single_option"] = 1 if m.group(1) == "Yes" else 0
-    m = _RE_FORCE_SINGLE_ITER.search(text)
-    if m and "single_option" not in out:
-        out["single_option"] = 1 if m.group(1) == "Yes" else 0
+        out["run_to_completion_option"] = 1 if m.group(1) == "Yes" else 0
     if _RE_WRITE_NO_READ_SUMMARY.search(text):
         out["sweep_write_no_read"] = 1
     return out
@@ -288,7 +282,7 @@ def parse_summary_block(text: str) -> Dict[str, Any]:
     iop = _sweep_level_io_pattern_description(text)
     if iop:
         d["_io_pattern_summary"] = iop
-    d.update(_parse_summary_single_option_flags(text))
+    d.update(_parse_summary_run_to_completion_option_flags(text))
     return d
 
 
@@ -434,11 +428,13 @@ def _merge_apply_sbatch(
     if not sb_rows:
         return
     first = sb_rows[0]
-    dio, rand, single = first[1], first[2], first[3]
+    dio, rand = first[1], first[2]
     wo, wnr, rf = first[5], first[6], first[7]
     merged.setdefault("dio_or_bio", dio)
     merged.setdefault("rand_option", rand)
-    merged.setdefault("single_option", single)
+    # Historical sbatch flags bounded writes only, not both phases. A new
+    # Run to Completion log record must explicitly establish completion-based reads.
+    merged.setdefault("run_to_completion_option", 0)
     if wo:
         merged["sweep_write_only"] = 1
     if wnr:
@@ -464,9 +460,9 @@ def _merge_summary_block_into(
         if k.startswith("_"):
             merged[k] = v
             continue
-        if k == "single_option" and k in merged and merged[k] != v:
+        if k == "run_to_completion_option" and k in merged and merged[k] != v:
             warn.append(
-                f"single_option: summary {v} vs earlier {merged[k]} (keeping summary)"
+                f"run_to_completion_option: summary {v} vs earlier {merged[k]} (keeping summary)"
             )
         merged[k] = v
 
@@ -595,8 +591,8 @@ def _default_merged_scalars(merged: Dict[str, Any]) -> None:
         merged["sweep_write_no_read"] = 0
     if "sweep_read_from" not in merged:
         merged["sweep_read_from"] = ""
-    if "single_option" not in merged:
-        merged["single_option"] = 0
+    if "run_to_completion_option" not in merged:
+        merged["run_to_completion_option"] = 0
     if "dio_or_bio" not in merged:
         merged["dio_or_bio"] = "dio"
     if "ELBENCHO_READ_AFTER_WRITE_PAUSE" not in merged:
@@ -712,7 +708,7 @@ def _build_yaml_elbencho_value_lines(merged: Dict[str, Any]) -> List[str]:
         "",
         f'dio_or_bio: {_yaml_quote(str(g("dio_or_bio") or "dio"))}',
         f"rand_option: {int(g('rand_option', 0))}",
-        f"single_option: {int(g('single_option', 0))}",
+        f"run_to_completion_option: {int(g('run_to_completion_option', 0))}",
         f"sweep_write_only: {int(g('sweep_write_only', 0))}",
         f"sweep_write_no_read: {int(g('sweep_write_no_read', 0))}",
         f'sweep_read_from: {_yaml_quote(str(g("sweep_read_from") or ""))}',

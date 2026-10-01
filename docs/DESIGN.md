@@ -501,9 +501,13 @@ Cartesian sweep and result naming, but termination and cleanup semantics differ.
 workload. In its usual single-target form, mkdir is separate, write runs with
 `--infloop` and `--timelimit`, and read has the same time ceiling. Direct IO
 reads add `--infloop`, while buffered IO reads make one logical pass to avoid
-measuring repeated page-cache hits. The `-s/--single` or multiple-target branch
-instead derives a fixed file count from configured throughput/IOPS estimates;
-the write completes that count, while the read retains its time ceiling.
+measuring repeated page-cache hits. Multiple targets derive finite write counts
+while reads remain time-bounded. `--run-to-completion` removes both phases' benchmark
+time limits and repetition. Each thread visits every weighted target.
+`ELBENCHO_FILES_PER_NODE` budgets the total per node, rounded to the nearest
+multiple of threads times summed weights (ties upward, minimum one file per
+thread per target). Without an explicit count, FS budgets and duration derive
+finite counts, with the duration serving as a sizing input, not a deadline.
 
 Unless `ELBENCHO_FILE_SIZE` is set, generated file size is the write block size
 times `ELBENCHO_FILE_SIZE_MULTIPLIER` (default 1024). The CLI modes are:

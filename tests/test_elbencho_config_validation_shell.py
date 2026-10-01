@@ -72,6 +72,8 @@ class TestElbenchoConfigValidationShell(unittest.TestCase):
         source "{_ENV_FUNCTIONS}"
         unset ELBENCHO_FILE_LAYOUT ELBENCHO_FILES_PER_NODE ELBENCHO_FILE_SIZE
         validate_elbencho_file_workload_env
+        ELBENCHO_FILE_LAYOUT=worker-directories
+        validate_elbencho_file_workload_env
         ELBENCHO_FILE_LAYOUT=shared-directory
         ELBENCHO_FILES_PER_NODE=8
         ELBENCHO_FILE_SIZE=64G
@@ -83,7 +85,6 @@ class TestElbenchoConfigValidationShell(unittest.TestCase):
     def test_rejects_invalid_layout_count_pairing_and_size(self) -> None:
         cases = (
             ("invalid", "", "", "ELBENCHO_FILE_LAYOUT"),
-            ("worker-directories", "1", "", "requires ELBENCHO_FILE_LAYOUT"),
             ("shared-directory", "0", "", "canonical positive"),
             ("shared-directory", "01", "", "canonical positive"),
             ("shared-directory", "+1", "", "canonical positive"),

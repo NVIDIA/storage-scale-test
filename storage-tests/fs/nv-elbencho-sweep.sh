@@ -115,8 +115,9 @@ Flags:
   -h, --help          Show this help message and exit
   -b, --bio           Use bio instead of the default dio (direct IO)
   -r, --rand          Use random IO patterns (default: sequential IO; not with ELBENCHO_SINGLE_BIG_FILE=1)
-  -s, --single        Use computed file counts for a generated legacy one-target sweep;
-                      inactive for shared-directory, --read-from, and single-file modes
+  --run-to-completion Complete each requested write/read phase without
+                      benchmark time limits or repetition; size the dataset
+                      with ELBENCHO_FILES_PER_NODE and ELBENCHO_FILE_SIZE
 
 Examples:
   $0 --nodes 1,2,4,6,8
@@ -134,7 +135,7 @@ EOF
 # Initialize flags (if any)
 g_bio_or_dio="dio"
 rand_option="0"
-single_option="0"
+run_to_completion_option="0"
 nodes_spec=""
 sweep_write_only="0"
 sweep_write_no_read="0"
@@ -168,12 +169,12 @@ while [[ $# -gt 0 ]]; do
             rand_option="1"
             shift
             ;;
-        -s|--single)
-            [[ "$single_option" == 0 ]] || {
-                echo "Error: --single may be specified only once" >&2
+        --run-to-completion)
+            [[ "$run_to_completion_option" == 0 ]] || {
+                echo "Error: --run-to-completion may be specified only once" >&2
                 exit 1
             }
-            single_option="1"
+            run_to_completion_option="1"
             shift
             ;;
         --nodes)
@@ -293,7 +294,7 @@ done
 
 _has_workload_options() {
     [[ "$g_bio_or_dio" != dio || "$rand_option" != 0 \
-        || "$single_option" != 0 || -n "$nodes_spec" \
+        || "$run_to_completion_option" != 0 || -n "$nodes_spec" \
         || "$sweep_write_only" != 0 || "$sweep_write_no_read" != 0 \
         || -n "$sweep_read_from" || -n "$delete_only_path" ]]
 }
@@ -334,6 +335,10 @@ _select_operation() {
             SWEEP_OPERATION=collect
         fi
     elif [[ -n "$delete_only_path" ]]; then
+        if [[ "$run_to_completion_option" == 1 ]]; then
+            echo "Error: --run-to-completion is not applicable to --delete-only" >&2
+            return 1
+        fi
         SWEEP_OPERATION=delete-only
     else
         SWEEP_OPERATION=submit
@@ -582,7 +587,7 @@ if [[ -n "$resume_dir" ]]; then
     g_bio_or_dio="$dio_or_bio"
     _validate_elbencho_sweep_environment || exit 1
     validate_elbencho_sweep_workload_mode \
-        "$g_bio_or_dio" "$rand_option" "$sweep_read_from" || exit 1
+        "$g_bio_or_dio" "$rand_option" "$sweep_read_from" "$run_to_completion_option" || exit 1
 
     # Per-resume log file (separate from the original run's runner log so we
     # preserve forensics from both attempts in the same dir).
@@ -673,7 +678,7 @@ done
 # Complete all CLI/mode-aware validation before selecting DS or creating any
 # output. Invalid exact-workload requests must leave no partial result run.
 validate_elbencho_sweep_workload_mode \
-    "$g_bio_or_dio" "$rand_option" "$sweep_read_from" || exit 1
+    "$g_bio_or_dio" "$rand_option" "$sweep_read_from" "$run_to_completion_option" || exit 1
 
 if [[ "$sweep_write_only" == "1" || -n "$sweep_read_from" ]]; then
     validate_elbencho_sweep_single_test_dirs_key || exit 1
@@ -694,7 +699,7 @@ OUTPUT_DIR=${ELBENCHO_BATCH_PREPARE_DIR:-"${RESULTS_DIR}/elbencho-${DS}"}
 mkdir -p "$OUTPUT_DIR"
 
 write_elbencho_env_used "${OUTPUT_DIR}/env_used.yaml" \
-    "$g_bio_or_dio" "$rand_option" "$single_option" \
+    "$g_bio_or_dio" "$rand_option" "$run_to_completion_option" \
     "$sweep_write_only" "$sweep_write_no_read" "$sweep_read_from" "$nodes_spec"
 
 # Log output to file as well as the invoking stdout/stderr streams
@@ -728,7 +733,7 @@ fi
 # canonical record of what the run will execute, and is the unit of
 # resumability if interrupted.
 if ! reify_all_elbencho_executions "$OUTPUT_DIR" "$nodes_spec" \
-        "$g_bio_or_dio" "$rand_option" "$single_option" \
+        "$g_bio_or_dio" "$rand_option" "$run_to_completion_option" \
         "$sweep_write_only" "$sweep_write_no_read" "$sweep_read_from"; then
     echo "Error: failed to reify executions" >&2
     exit 1

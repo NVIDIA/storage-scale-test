@@ -1050,7 +1050,9 @@ kubectl_map_generated_csv() {
         _coordinator_validate_pvc_path "$mapped" || return 1
         output+=("$mapped")
     done
-    IFS=, printf '%s' "${output[*]}"
+    # Set IFS before expanding the array, not as a command-local assignment.
+    local IFS=,
+    printf '%s' "${output[*]}"
 }
 
 _coordinator_validate_pvc_path() {

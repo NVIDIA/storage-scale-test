@@ -406,6 +406,19 @@ def _default_dio() -> FilesystemScenarioSpec:
                     WorkloadPhase.REMOVE_FILES,
                 ),
             ),
+            _step(
+                "explicit-completion-based",
+                ("--run-to-completion", "--nodes", "1,2"),
+                _override_env(
+                    _WORKER_ENV,
+                    {
+                        "ELBENCHO_FILES_PER_NODE": "export ELBENCHO_FILES_PER_NODE=5",
+                        "ELBENCHO_FILE_SIZE": 'export ELBENCHO_FILE_SIZE="1M"',
+                    },
+                ),
+                _coordinates((1, 2), ("4K",), (1,), (1,)),
+                _NORMAL_PHASES,
+            ),
         ),
     )
 
@@ -826,8 +839,8 @@ def _ssh_weighted_roots() -> FilesystemScenarioSpec:
         _SSH_ONLY,
         (
             _step(
-                "active-single-sizing",
-                ("--bio", "--single", "--nodes", "1"),
+                "completion-based-automatic-sizing",
+                ("--bio", "--run-to-completion", "--nodes", "1"),
                 env_lines,
                 _coordinates((1,), ("4K",), (1,), (1,)),
                 _NORMAL_PHASES,

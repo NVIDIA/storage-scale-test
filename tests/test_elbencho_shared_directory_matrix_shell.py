@@ -54,7 +54,7 @@ io_size=4K
 io_depth=1
 dio_or_bio=dio
 use_random=0
-force_single=1
+run_to_completion=1
 run_an_elbencho() {{
     printf '%s\n' "$*" >>"$CAPTURE"
     local phase= json_path= arg
@@ -120,7 +120,7 @@ class TestElbenchoSharedDirectoryMatrixShell(unittest.TestCase):
             """)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_duration_capacity_and_legacy_single_option_do_not_change_work(
+    def test_duration_capacity_and_legacy_run_to_completion_option_do_not_change_work(
         self,
     ) -> None:
         result = _run(_HARNESS + """

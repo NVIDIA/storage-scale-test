@@ -23,7 +23,7 @@ IO sweep** (`storage-tests/fs/nv-elbencho-sweep.sh`).
 
 For full documentation on the variables, IO size syntax (the `r` prefix for
 random IO, comma-separated write/read sizes), and the test workflow, see
-[README.md](README.md) and the comments in
+[filesystem guide](docs/FILESYSTEM_TESTING.md) and the comments in
 [env.sh.template](env.sh.template).
 
 ---
@@ -83,6 +83,18 @@ rather than sustained performance.
 | Production single-node sweep | 120–300 seconds |
 | Production multi-node sweep | 120–300 seconds |
 | Quick post-maintenance check | 30–60 seconds |
+
+For completion-based writes and reads on any number of roots, use
+`--run-to-completion`. Set `ELBENCHO_FILES_PER_NODE` for a total per-node budget and
+`ELBENCHO_FILE_SIZE` to fix file size. The budget rounds to the nearest multiple
+of `threads * sum(TEST_DIRS weights)`, ties upward, with at least one file per
+thread per weighted target. Each cell prints the effective count. For example,
+on one root with weight 1, 8 files per node, 1G files, and threads
+`("1" "4")` writes and reads `nodes * 8 GiB` once per cell, without time
+limits or repetition. If the count is unset, the FS budgets and duration
+calculate it automatically across the weighted targets. Duration then controls
+sizing, not runtime; `ELBENCHO_FILE_SIZE` still fixes file size.
+Generated shared-directory mode already has completion-based phases.
 
 ### IO Depth
 

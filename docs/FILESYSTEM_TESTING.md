@@ -78,12 +78,50 @@ depth values for the scale sweep:
 Ordinary sweeps default to direct IO; `-b/--bio` selects buffered IO.
 `-r/--rand` makes write and read access random; `r`-prefixed IO-size entries
 can instead select random access per phase. Random IO is incompatible with
-single-shared-file mode. `-s/--single` uses computed file counts for generated
-worker-directory writes on one test root; reads remain time-bounded. It does
-not mean one file and has no effect on shared-directory, `--read-from`, or
-single-shared-file workloads; multiple roots already use computed counts.
+single-shared-file mode. `--run-to-completion` writes every generated file
+once, then reads every file once, without benchmark time limits or repetition.
+With `--read-from`, it reads the existing dataset once; write-only modes still skip
+reads. Shared-directory and generated single-file workloads already complete
+their phases without time limits. The old `-s/--single` flags are removed.
 `ELBENCHO_FILE_SIZE` fixes each generated file's size in ordinary sweeps too;
 otherwise, size is the write block size times `ELBENCHO_FILE_SIZE_MULTIPLIER`.
+
+### Finite dataset sizing
+
+`--run-to-completion` supports one or multiple weighted roots. Prefer an
+explicit per-node file-count budget and file size:
+
+```bash
+TEST_DIRS=(["/path/to/test"]=1)
+export ELBENCHO_FILES_PER_NODE=8
+export ELBENCHO_FILE_SIZE=1G
+export ELBENCHO_SCALE_THREAD_LIST=("1" "4")
+# Worker-directory layout; each cell writes and reads nodes * 8 GiB.
+./storage-tests/fs/nv-elbencho-sweep.sh --run-to-completion --nodes 1,2
+```
+
+In worker-directory mode, each thread visits every weighted target.
+Let `G = threads * sum(TEST_DIRS weights)`: the actual count per node is the
+nearest multiple of G to the requested budget, ties upward, with a minimum
+of G files. Elbencho receives `actual / G` files per thread per directory.
+For example, budget 1,000, 16 threads, and weights 2:1 produce 1,008 files per
+node, split 672:336. Small budgets may round up substantially; each cell prints
+requested and effective counts. File counts can vary with the thread count.
+
+Explicit counts in worker-directory mode require `--run-to-completion`.
+Shared-directory mode is always completion-based and keeps exact counts:
+one root with weight 1, with the count at least and divisible by every thread
+count. Neither setting redefines a staged read dataset.
+
+With the count unset, ordinary `--run-to-completion` computes a per-thread
+file count from `FS_MAX_AGG_THROUGHPUT`, `FS_MAX_NODE_THROUGHPUT_GBPS`,
+`FS_MAX_NODE_IOPS`, file/block sizes, topology, and
+`ELBENCHO_SCALE_READ_WRITE_DURATION`. That duration sizes the dataset, not a
+deadline. Counts divide across nodes, threads, and weighted targets and round
+up, with at least one file per thread per target. Without
+`--run-to-completion`, finite writes retain the ordinary timed-read policy.
+No benchmark deadline means a large dataset can take a long time: size it
+deliberately and allow sufficient Slurm allocation time.
 
 All sweep scripts accept comma-separated positive integers and ascending
 inclusive ranges: `X`, `X-Y`, or `X-Y+Z`. The endpoint is included even when
@@ -91,9 +129,9 @@ the step does not land on it; for example, `3-10+2` expands to
 `3,5,7,9,10`. The order is preserved. Run a script with `--help` for its full
 mode and argument contract.
 
-The default worker-directory workload is time-based. Set
-`ELBENCHO_SCALE_READ_WRITE_DURATION` long enough to measure sustained I/O;
-60 seconds is useful for exploration, while 300 seconds or more is a typical
+Without `--run-to-completion`, the default worker-directory workload is
+time-based. Set `ELBENCHO_SCALE_READ_WRITE_DURATION` long enough to measure
+sustained I/O; 60 seconds is useful for exploration, while 300 seconds or more is a typical
 starting point for publishable runs. Generated shared-directory workloads are
 completion-based instead.
 
@@ -246,8 +284,9 @@ file, transferring `nodes * file_size` bytes. The default is direct I/O; pass
 
 With `--read-from`, pass a file, not a directory. Its metadata supplies the
 extent, so `ELBENCHO_SINGLE_BIG_FILE_SIZE` is optional. Direct reads repeat
-until the time limit; buffered reads make at most one logical pass to avoid
-re-reading warm page cache. Host assignment rotates between read cells to
+until the time limit unless `--run-to-completion` is set. Buffered reads make at most
+one logical pass to avoid re-reading warm page cache. Host assignment rotates
+between read cells to
 reduce cross-run client-cache reuse.
 
 `utils/extract-elbencho.sh` handles these results normally. See Recipe 4 in
@@ -372,6 +411,22 @@ selected reports without dropping other groups from the index:
 
 Use `--help` for all options. Cached CSV input and single-file parsing require
 `--kind io|mdtest` and are not batch-reporting modes.
+
+| Scope | Option | Purpose |
+| --- | --- | --- |
+| Both | `--only-nodes LIST`, `--only-threads LIST` | Select counts with comma lists or ranges |
+| Both | `--to-csv`, `--from-csv FILE` | Export/reload analyzed metrics |
+| Both | `--markdown` | Markdown on stdout; progress on stderr |
+| Both | `--test-parse FILE` | Inspect one raw result without reporting |
+| IO | `--only-sizes SIZE` | Repeat or separate with `;`; preserve compound-size commas |
+| IO | `--only-iodepths LIST` | Select depths with comma lists or ranges |
+| IO | `--no-dual-y-axis` | Separate throughput and latency axes |
+| IO | `--per-client-plots` | Analyze extended live client capture |
+| IO | `--client-outlier-threshold Z` | Underperformance z-score magnitude (default 2.0) |
+| IO | `--client-min-underperform-segments N` | Require N underperforming live intervals (default 1) |
+| IO | `--client-max-timeseries-lines N` | Limit client lines per plot (default 10) |
+| IO | `--client-max-heatmap-rows N` | Limit clients per heatmap (default 50) |
+| Metadata | `--normalize-to N` | Scale rates/stddev to N nodes, not latency |
 
 Both analysis wrappers accept one or more result directories, filters, CSV
 export/import, and `--markdown`. These are `extract-elbencho.sh` and

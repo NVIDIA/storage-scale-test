@@ -57,10 +57,10 @@ def apply_env_used_to_metrics(env: dict, metrics: List[Any]) -> None:
         return
     sbf = env.get("ELBENCHO_SINGLE_BIG_FILE")
     anad = env.get("ELBENCHO_ALL_NODES_ACCESS_ALL_DATA")
-    single_opt = env.get("single_option")
+    run_to_completion_opt = env.get("run_to_completion_option")
     is_sbf = sbf in (1, "1")
     is_anad = anad in (1, "1")
-    is_single_combined_run = single_opt in (1, "1")
+    is_run_to_completion = run_to_completion_opt in (1, "1")
     for metric in metrics:
         metric.configured_file_layout = _snapshot_string(env, "ELBENCHO_FILE_LAYOUT")
         metric.configured_files_per_node = _snapshot_string(
@@ -71,5 +71,5 @@ def apply_env_used_to_metrics(env: dict, metrics: List[Any]) -> None:
             metric.is_single_big_file = True
         if is_anad:
             metric.all_nodes_all_data = True
-        if is_single_combined_run:
-            metric.sweep_single_option = True
+        if is_run_to_completion:
+            metric.sweep_run_to_completion_option = True

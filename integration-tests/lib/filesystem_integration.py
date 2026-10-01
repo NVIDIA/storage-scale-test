@@ -2277,6 +2277,9 @@ def _assert_semantic_flags(scenario: str, step: ScenarioStep, result: Path) -> N
         required = ("--norandalign",)
     elif scenario == "default-dio":
         required, forbidden = ("--direct",), ("--norandalign",)
+        if step.name == "explicit-completion-based":
+            required += ("--files=3", "--dirs=2", "--size=1M", "--write", "--read")
+            forbidden += ("--timelimit", "--infloop")
     elif scenario == "live-capture":
         required = ("--livecsv", "--livecsvex", "--liveint=10")
     elif scenario == "ssh-single-big-file" and step.name == "inferred-extent-read":

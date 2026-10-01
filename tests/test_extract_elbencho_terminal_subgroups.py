@@ -66,7 +66,7 @@ def _metric(**kwargs) -> ElbenchoMetrics:
         "phase_wall_duration_ms": 0,
         "phase_first_duration_ms": 0,
         "is_single_big_file": False,
-        "sweep_single_option": False,
+        "sweep_run_to_completion_option": False,
     }
     defaults.update(kwargs)
     return ElbenchoMetrics(**defaults)

@@ -249,12 +249,12 @@ These requirements address the infrastructure and runtime constraints the tool m
 
 | ID | Requirement | Satisfied? |
 |----|-------------|:----------:|
-| BM-1.1 | The default single-target worker-directory write and read phases and staged many-file reads shall honor a configurable time limit. The legacy computed-count or multiple-target branch shall complete its derived write file count while retaining the read time limit. Direct-IO reads may repeat until their limit; buffered reads perform at most one pass and may finish earlier. | Yes |
+| BM-1.1 | By default, single-target worker-directory phases and staged many-file reads shall honor a configurable time limit. The computed-count or multiple-target branch shall complete its derived write count while retaining the read limit. Direct reads may repeat; buffered reads may finish earlier. `--run-to-completion` shall instead finish each requested write/read phase without benchmark time limits or repetition. | Yes |
 | BM-1.2 | Results shall be written to dated output directories with a consistent naming convention. | Yes |
 | BM-1.3 | The tool shall support a configurable pause between write and read phases. | Yes |
 | BM-1.4 | Generated shared-directory data and distributed file-removal phases shall run without a time limit. The harness shall verify exact completed file and byte counts for data phases and exact completed file counts for removal before advancing. | Yes |
 | BM-1.5 | Staged many-file reads shall derive file and byte totals from the scanned tree, independently of the current reader-node topology, and may reuse an explicitly documented cached treefile. | Yes |
-| BM-1.6 | Single-shared-file workloads shall be sequential-only. Direct-IO reads of a pre-existing file may repeat until the configured time limit; buffered reads shall make at most one logical pass and may finish before that limit. | Yes |
+| BM-1.6 | Single-shared-file workloads shall be sequential-only. By default, direct reads of a pre-existing file may repeat until the configured time limit; buffered reads shall make at most one logical pass. With `--run-to-completion`, both shall finish the file without a benchmark time limit or repetition. | Yes |
 | BM-1.7 | Generated single-shared-file write and read phases shall process the explicitly configured finite file extent without a time limit. | Yes |
 
 ### BM-2: Filesystem Metadata Benchmarks

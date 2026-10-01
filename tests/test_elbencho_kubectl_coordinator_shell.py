@@ -169,7 +169,7 @@ def _write_bundle(tmp_path, execution_count=2):
                 export io_depth=1
                 export dio_or_bio=dio
                 export use_random=0
-                export force_single=0
+                export run_to_completion=0
                 export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=benchmark/target-{number}
                 export ELBENCHO_RUN_GENERATED_TEST_ROOT=benchmark
                 export ELBENCHO_RUN_TEST_DIR_SUFFIX=-test-e{number:04d}
@@ -234,6 +234,26 @@ def _run_coordinator(control, state_dir, scratch, fake, **extra_env):
         capture_output=True,
         check=False,
         env=environment,
+    )
+
+
+def test_coordinator_preserves_multiple_generated_targets_as_csv(tmp_path):
+    """PVC mapping must not collapse weighted targets into one spaced path."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path, execution_count=1)
+    definition = control / "executions" / "0001.sh"
+    definition.write_text(
+        definition.read_text(encoding="utf-8").replace(
+            "benchmark/target-1\n",
+            "benchmark/target-1,benchmark/target-2\n",
+        ),
+        encoding="utf-8",
+    )
+    _refresh_bundle_manifest(control)
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode == 0, result.stderr
+    pvc = tmp_path / "pvc"
+    assert (control.parent / "fake-record").read_text(encoding="utf-8").strip() == (
+        f"0001|1||{pvc}/benchmark/target-1,{pvc}/benchmark/target-2"
     )
 
 
@@ -1277,7 +1297,7 @@ def test_coordinator_local_context_allows_only_the_one_node_hostless_case(tmp_pa
     io_depth=1
     dio_or_bio=dio
     use_random=0
-    force_single=0
+    run_to_completion=0
     elbencho_set_cell_run_context 0001 1 '' /mnt/test \\
         {tmp_path!s}/scratch {tmp_path!s}/durable \\
         _elbencho_noop_cell_hook _elbencho_noop_cell_hook 1

@@ -295,8 +295,13 @@ their termination and cleanup contracts differ.
 In the usual single-target path, directory creation is separate; write uses
 `--infloop` plus `--timelimit`; direct reads use the same combination; buffered
 reads make at most one logical pass with the time limit as a ceiling to avoid
-measuring repeated page-cache hits. The `-s/--single` or multiple-target branch
-derives a fixed file count for writes while reads remain time-bounded.
+measuring repeated page-cache hits. Multiple targets derive finite write counts
+while reads remain time-bounded. `--run-to-completion` completes both phases
+without benchmark time limits or repetition, including staged reads. Explicit
+`ELBENCHO_FILES_PER_NODE` is a per-node budget rounded to the nearest multiple
+of threads times summed weights (ties upward, minimum one file per thread per
+weighted target). Otherwise the FS budgets and duration derive automatic
+counts. Saved coordinates and reporting record completion-based semantics.
 
 Unless `ELBENCHO_FILE_SIZE` is set, generated file size is the write block size
 times `ELBENCHO_FILE_SIZE_MULTIPLIER`.
@@ -316,8 +321,8 @@ A directory staged with `--read-from` may contain
 `.storage-scale-test-elbencho-treefile.txt`. A cache miss scans into a temporary
 file in the dataset parent and publishes it atomically only after a successful
 read; later reads reuse it without rescanning. The operator must remove the cache
-after changing the dataset. Staged directory reads remain duration-driven
-regardless of `ELBENCHO_FILE_LAYOUT`, and their aggregate file and byte totals
+after changing the dataset. Staged directory reads are duration-driven unless
+`--run-to-completion` is set, independently of `ELBENCHO_FILE_LAYOUT`. Totals
 come from the exact treefile rather than the current reader topology or
 `ELBENCHO_FILES_PER_NODE`.
 
@@ -366,9 +371,10 @@ sequential IO. Generated write/default runs require
 partitions that file among services; `ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=1`
 adds `--nosvcshare` so each node accesses the complete file.
 
-`--read-from <file>` takes the extent from file metadata and does not use a
-treescan or treefile. Direct reads repeat until the configured time limit.
-Buffered reads make one logical pass with the time limit as a ceiling.
+`--read-from <file>` takes the extent from file metadata, without a treescan.
+By default, direct reads repeat until the time limit; buffered reads use it
+as a ceiling. `--run-to-completion` reads that extent without a time limit
+or repetition.
 
 ### IO-size and cache semantics
 
