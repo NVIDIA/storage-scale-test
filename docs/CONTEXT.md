@@ -23,7 +23,9 @@ implementation journal.
 
 Use the following documents for their narrower authoritative scopes:
 
-- [README.md](../README.md): user setup and operation.
+- [README.md](../README.md): launcher setup, substrate configuration, and validation.
+- [Filesystem](FILESYSTEM_TESTING.md), [object](OBJECT_STORAGE_TESTING.md), and
+  [network](NETWORK_TESTING.md) guides: workload operation and reporting.
 - [docs/REQUIREMENTS.md](REQUIREMENTS.md): normative requirements and status.
 - [docs/DESIGN.md](DESIGN.md): detailed design and interfaces.
 - [docs/ARCHITECTURE_DIAGRAMS.md](ARCHITECTURE_DIAGRAMS.md): deployment and
