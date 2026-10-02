@@ -182,7 +182,7 @@ def test_attempt_identity_and_stable_output_contracts():
     lines = result.stdout.splitlines()
     assert lines[0] == "STORAGE_SCALE_TEST_RESULTS_DIR=/tmp/results"
     assert lines[1].startswith("STORAGE_SCALE_TEST_ATTEMPT_ID=")
-    assert lines[2] == "STORAGE_SCALE_TEST_KUBECTL_STATE=RUNNING"
+    assert lines[2] == "STATE=RUNNING"
 
 
 def test_attempt_metadata_and_current_pointer_are_atomic_and_versioned(tmp_path):

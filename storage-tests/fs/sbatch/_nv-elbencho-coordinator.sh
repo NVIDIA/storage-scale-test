@@ -37,15 +37,37 @@ while [[ "$dir" != "/" && ! -d "$dir/storage-tests" ]]; do
 done
 [[ "$dir" == "/" ]] && { echo "Error: Could not find SCALE_TEST_BASE" >&2; exit 1; }
 SCALE_TEST_BASE="$dir"
+OUTPUT_DIR="${1:?missing OUTPUT_DIR argument}"
+DISPATCH_LOCK_TOKEN="${2:?missing DISPATCH_LOCK_TOKEN argument}"
 
-if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
-        "${SCALE_TEST_BASE}/env.sh" 2>&1); then
-    printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
-    exit 1
-fi
-
+# Recognize damaged batches by their other exact markers as well. A queued
+# allocation must not fall back to current env.sh when its manifest disappears.
 # shellcheck disable=SC1091
-source "${SCALE_TEST_BASE}/env.sh"
+source "${SCALE_TEST_BASE}/lib/_batch_functions.sh" || exit 1
+if elbencho_batch_is_batch "$OUTPUT_DIR"; then
+    # Saved common settings include the frozen derived scheduling options.
+    # shellcheck disable=SC1091
+    source "${SCALE_TEST_BASE}/lib/env_functions.sh" || exit 1
+    # Submission validation cannot protect the wait between sbatch and launch.
+    # Verify every immutable input before sourcing snapshots or starting work.
+    elbencho_batch_verify_manifest "$OUTPUT_DIR" || exit 1
+    # shellcheck disable=SC1091
+    source "${OUTPUT_DIR}/env_used.sh" || exit 1
+    SCALE_TEST_BASE="$dir"
+    for module_name in "${MODULES[@]}"; do
+        if module_exists "$module_name"; then
+            module load "$module_name" || exit 1
+        fi
+    done
+else
+    if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
+            "${SCALE_TEST_BASE}/env.sh" 2>&1); then
+        printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
+        exit 1
+    fi
+    # shellcheck disable=SC1091
+    source "${SCALE_TEST_BASE}/env.sh"
+fi
 
 # If invoked for an existing sweep results dir, also source the canonical
 # env_used.sh sidecar so that the original sweep-level settings (TEST_DIRS,
@@ -53,8 +75,6 @@ source "${SCALE_TEST_BASE}/env.sh"
 # compute node has different defaults. Falls back silently if absent for
 # backward-compat with the initial-run case where the parent script has
 # already laid the sidecar down.
-OUTPUT_DIR="${1:?missing OUTPUT_DIR argument}"
-DISPATCH_LOCK_TOKEN="${2:?missing DISPATCH_LOCK_TOKEN argument}"
 if [[ -f "${OUTPUT_DIR}/env_used.sh" ]]; then
     # Explicit legacy defaults keep an older snapshot isolated from the
     # compute node's current env.sh configuration.
@@ -142,7 +162,10 @@ echo "Coordinator started: SLURM_JOB_ID=$SLURM_JOB_ID NODES=$SLURM_JOB_NUM_NODES
 echo "Allocation hosts (CSV): $ALLOC_HOSTS_CSV"
 # Compact summary so the user knows what's about to run during the (potentially
 # very long) execution loop. Sweep settings come from env_used.sh sourced above.
-if [[ "${OUTPUT_DIR##*/}" == mdtest-elbencho-* ]]; then
+if elbencho_batch_is_batch "$OUTPUT_DIR"; then
+    printf 'Filesystem batch: %s remaining execution(s)\n' \
+        "$(count_elbencho_remaining_executions "$EXECUTIONS_DIR")"
+elif [[ "${OUTPUT_DIR##*/}" == mdtest-elbencho-* ]]; then
     printf 'mdtest-elbencho-%s nodes_spec: %s tasks_spec: %s iterations: %s\n' \
         "${OUTPUT_DIR##*-}" "${nodes_spec:-?}" "${tasks_spec:-?}" \
         "${MDTEST_ITERATIONS:-?}"
@@ -162,7 +185,9 @@ SRUN_ELBENCHO_PID=""
 SRUN_ELBENCHO_PID_FILE=""
 SRUN_ELBENCHO_LOG="${OUTPUT_DIR}/elbencho-svc-j${SLURM_JOB_ID}-portdefault.log"
 ACTIVE_EXECUTION_ID=""
-if [[ "${SLURM_JOB_NUM_NODES:-1}" -gt 1 ]]; then
+if [[ "${SLURM_JOB_NUM_NODES:-1}" -gt 1 ]] \
+        && { ! elbencho_batch_is_batch "$OUTPUT_DIR" \
+            || _elbencho_execution_needs_distributed_services "$OUTPUT_DIR"; }; then
     stop_elbencho_services_srun "" || true  # initial cleanup of stale processes
     SRUN_ELBENCHO_PID_FILE="${EXECUTIONS_DIR}/.service-srun.pid"
     for attempt in 1 2; do

@@ -17,7 +17,9 @@
 
 """Shell-level tests for elbencho per-execution dispatch/resume helpers."""
 
+import hashlib
 import os
+import shlex
 import shutil
 import subprocess
 import textwrap
@@ -44,8 +46,331 @@ def _run_bash(script: str) -> subprocess.CompletedProcess:
     )
 
 
+def _make_dispatch_batch(parent: Path) -> Path:
+    """Create a committed mixed fixture with metadata before repeated IO cells."""
+    datestamp = "20260930Z010203"
+    root = parent / f"filesystem-batch-{datestamp}"
+    executions = root / "executions"
+    executions.mkdir(parents=True)
+    rows = ["version\t1", "revision\t3", f"datestamp\t{datestamp}"]
+    for index, kind in enumerate(("mdtest", "io", "io"), start=1):
+        identity = f"{index:04d}"
+        prefix = "mdtest-elbencho" if kind == "mdtest" else "elbencho"
+        relative = f"groups/{identity}/{prefix}-{datestamp}"
+        output = root / relative
+        (output / "executions").mkdir(parents=True)
+        snapshot = (
+            f"export MDTEST_ITERATIONS={index}\n"
+            "export ELBENCHO_FILE_LAYOUT=worker-directories\n"
+            "export ELBENCHO_SWEEP_WRITE_ONLY=0\n"
+            "export ELBENCHO_FILES_PER_NODE=\n"
+            "export ELBENCHO_FILE_SIZE=\n"
+            f"export ELBENCHO_SCALE_READ_WRITE_DURATION={index}s\n"
+            f"declare -gA TEST_DIRS=([{shlex.quote(str(parent / identity))}]=1)\n"
+        )
+        yaml = f"MDTEST_ITERATIONS: {index}\n"
+        (output / "env_used.sh").write_text(snapshot, encoding="utf-8")
+        (output / "env_used.yaml").write_text(yaml, encoding="utf-8")
+        definition = snapshot + (
+            f"export ELBENCHO_EXECUTION_KIND={kind}\n"
+            f"export nodes={4 if kind == 'mdtest' else 2}\n"
+            "export tasks_per_node=3 io_size=4K thread_count=1 io_depth=1\n"
+            "export dio_or_bio=dio use_random=0 force_single=0\n"
+            f"export ELBENCHO_BATCH_GROUP_ID={identity}\n"
+            f"export ELBENCHO_BATCH_OUTPUT_RELATIVE={relative}\n"
+            f"export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=/target-{identity}\n"
+        )
+        (executions / f"{identity}.sh").write_text(definition, encoding="utf-8")
+        (executions / f"{identity}.status").write_text("PENDING\n", encoding="utf-8")
+        hashes = [
+            hashlib.sha256(value.encode()).hexdigest()
+            for value in (snapshot, yaml, definition)
+        ]
+        rows.append(f"group\t{identity}\t{kind}\t{relative}\t{hashes[0]}\t{hashes[1]}")
+        rows.append(f"execution\t{identity}\t{identity}\t{hashes[2]}")
+    (root / "batch-manifest.tsv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return root
+
+
+def _make_slurm_batch_guard_fixture(parent: Path) -> tuple[Path, Path]:
+    """Seal snapshots whose sourcing exposes any pre-verification mutation."""
+    root = _make_dispatch_batch(parent)
+    repository = parent / "repository"
+    (repository / "storage-tests").mkdir(parents=True)
+    (repository / "lib").symlink_to(_REPO_ROOT / "lib", target_is_directory=True)
+    marker = shlex.quote(str(parent / "sourced"))
+    (repository / "env.sh").write_text(
+        f"printf current > {marker}\nexit 72\n", encoding="utf-8"
+    )
+    (root / "env_used.sh").write_text(
+        f"printf saved > {marker}\nexit 73\n", encoding="utf-8"
+    )
+    (root / "common-env.sh").write_text(
+        "export EXECUTION_SUBSTRATE=slurm\n", encoding="utf-8"
+    )
+    (root / "common-fields.tsv").write_text(
+        "EXECUTION_SUBSTRATE\tslurm\n", encoding="utf-8"
+    )
+    profile = "".join(
+        f"{name}\t{hashlib.sha256((root / name).read_bytes()).hexdigest()}\n"
+        for name in ("common-env.sh", "common-fields.tsv")
+    )
+    (root / "batch-profile.tsv").write_text(profile, encoding="utf-8")
+    for snapshot, seal in (
+        ("batch-manifest.tsv", "batch-sealed.sha256"),
+        ("env_used.sh", "batch-sealed-environment.sha256"),
+    ):
+        (root / seal).write_text(
+            hashlib.sha256((root / snapshot).read_bytes()).hexdigest() + "\n",
+            encoding="utf-8",
+        )
+    return root, repository
+
+
+def _run_slurm_batch_guard(root: Path, repository: Path) -> subprocess.CompletedProcess:
+    """Run the real allocation entrypoint only through its initial snapshot gate."""
+    environment = os.environ.copy()
+    environment.update(
+        SLURM_JOB_ID="1234", SLURM_SUBMIT_DIR=str(repository), SLURM_JOB_NUM_NODES="4"
+    )
+    return subprocess.run(
+        [_BASH, str(_SLURM_COORDINATOR), str(root), "test-token"],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
 class TestElbenchoDispatchShell(unittest.TestCase):
     """Dispatch helpers preserve per-execution state across retries."""
+
+    def test_slurm_batch_revalidates_queued_immutable_inputs(self) -> None:
+        mutations = (
+            "missing-manifest",
+            "group-snapshot",
+            "definition",
+            "common-snapshot",
+            "root-snapshot",
+        )
+        for mutation in mutations:
+            with self.subTest(
+                mutation=mutation
+            ), tempfile.TemporaryDirectory() as temporary:
+                parent = Path(temporary)
+                root, repository = _make_slurm_batch_guard_fixture(parent)
+                if mutation == "missing-manifest":
+                    (root / "batch-manifest.tsv").unlink()
+                else:
+                    targets = {
+                        "group-snapshot": "groups/0001/mdtest-elbencho-20260930Z010203/env_used.sh",
+                        "definition": "executions/0001.sh",
+                        "common-snapshot": "common-env.sh",
+                        "root-snapshot": "env_used.sh",
+                    }
+                    target = root / targets[mutation]
+                    target.write_text(
+                        target.read_text(encoding="utf-8")
+                        + "# changed after submission\n",
+                        encoding="utf-8",
+                    )
+                result = _run_slurm_batch_guard(root, repository)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(
+                    (parent / "sourced").exists(), result.stdout + result.stderr
+                )
+                for identity in ("0001", "0002", "0003"):
+                    self.assertEqual(
+                        (root / "executions" / f"{identity}.status").read_text(
+                            encoding="utf-8"
+                        ),
+                        "PENDING\n",
+                    )
+                    self.assertFalse((root / "executions" / f"{identity}.log").exists())
+
+    def test_slurm_verified_batch_ignores_current_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root, repository = _make_slurm_batch_guard_fixture(parent)
+            result = _run_slurm_batch_guard(root, repository)
+            self.assertEqual(result.returncode, 73, result.stdout + result.stderr)
+            self.assertEqual((parent / "sourced").read_text(encoding="utf-8"), "saved")
+
+    def test_batch_remaining_capacity_and_services_include_later_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = _make_dispatch_batch(Path(temporary))
+            script = f"""
+            set -e
+            source "{_ENV_FUNCTIONS}"
+            source "{_ELBENCHO_FUNCTIONS}"
+            root={shlex.quote(str(root))}
+            [[ "$(max_nodes_remaining_executions "$root/executions")" == 4 ]]
+            _elbencho_execution_needs_distributed_services "$root"
+            printf 'SUCCESS\\n' > "$root/executions/0001.status"
+            [[ "$(max_nodes_remaining_executions "$root/executions")" == 2 ]]
+            printf 'SUCCESS\\n' > "$root/executions/0002.status"
+            _elbencho_execution_needs_distributed_services "$root"
+            printf 'SUCCESS\\n' > "$root/executions/0003.status"
+            ! _elbencho_execution_needs_distributed_services "$root"
+            """
+            result = _run_bash(textwrap.dedent(script))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_batch_slurm_cells_restore_context_and_group_core_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = _make_dispatch_batch(Path(temporary))
+            script = f"""
+            set -e
+            source "{_ENV_FUNCTIONS}"
+            source "{_ELBENCHO_FUNCTIONS}"
+            root={shlex.quote(str(root))}
+            export ELBENCHO_SWEEP_WRITE_ONLY=1 MDTEST_ITERATIONS=99
+            _elbencho_required_result_artifacts_for_execution() {{ :; }}
+            run_elbencho_metadata_benchmark() {{
+                [[ "$MDTEST_ITERATIONS" == 1 && "$ELBENCHO_SWEEP_WRITE_ONLY" == 0 ]]
+                [[ "$ELBENCHO_RUN_HOSTS_CSV" == a,b,c,d ]]
+                [[ "$ELBENCHO_RUN_SCRATCH_OUTPUT_DIR" == "$root/groups/0001/"* ]]
+                printf 'metadata\\n' > "$ELBENCHO_RUN_SCRATCH_OUTPUT_DIR/executions/0001.core"
+            }}
+            run_elbencho_cell() {{
+                [[ "$MDTEST_ITERATIONS" == "$((10#$ELBENCHO_RUN_EXECUTION_ID))" ]]
+                [[ "$ELBENCHO_SWEEP_WRITE_ONLY" == 0 ]]
+                [[ "$ELBENCHO_RUN_HOSTS_CSV" == a,b ]]
+                [[ "$ELBENCHO_RUN_SCRATCH_OUTPUT_DIR" == "$root/groups/$ELBENCHO_RUN_EXECUTION_ID/"* ]]
+                printf 'io\\n' > "$ELBENCHO_RUN_SCRATCH_OUTPUT_DIR/executions/$ELBENCHO_RUN_EXECUTION_ID.core"
+            }}
+            for id in 0001 0002 0003; do
+                coordinator_run_one_execution "$root/executions" "$id" a,b,c,d "$root"
+                [[ "$(cat "$root/executions/$id.status")" == SUCCESS ]]
+                [[ ! -e "$root/executions/$id.core" ]]
+            done
+            [[ "$MDTEST_ITERATIONS" == 99 && "$ELBENCHO_SWEEP_WRITE_ONLY" == 1 ]]
+            elbencho_batch_verify_manifest "$root"
+            """
+            result = _run_bash(textwrap.dedent(script))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_batch_ssh_stops_at_failure_and_preserves_success_on_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = _make_dispatch_batch(Path(temporary))
+            script = f"""
+            set -e
+            source "{_ENV_FUNCTIONS}"
+            source "{_ELBENCHO_FUNCTIONS}"
+            root={shlex.quote(str(root))}
+            SSH_ALL_HOSTS=(a b c d)
+            _ssh_update_active_hosts() {{ :; }}
+            ensure_all_ssh_nodes_can_elbencho() {{ :; }}
+            _ssh_start_services_on_all_hosts() {{ printf 'services\\n' >> "$root/calls"; }}
+            _ssh_dispatch_one_execution() {{
+                printf '%s\\n' "$2" >> "$root/calls"
+                if [[ "$2" == 0002 && ! -e "$root/retry" ]]; then
+                    _atomic_write_sentinel "$root/executions/$2.status" FAILED
+                    return 7
+                fi
+                _atomic_write_sentinel "$root/executions/$2.status" SUCCESS
+            }}
+            started=0
+            rc=0
+            _dispatch_ssh_executions_owned "$root" started || rc=$?
+            [[ "$rc" == 7 && "$started" == 1 ]]
+            [[ "$(cat "$root/executions/0001.status")" == SUCCESS ]]
+            [[ "$(cat "$root/executions/0002.status")" == FAILED ]]
+            [[ "$(cat "$root/executions/0003.status")" == PENDING ]]
+            touch "$root/retry"
+            _dispatch_ssh_executions_owned "$root" started
+            [[ "$(cat "$root/calls")" == $'services\\n0001\\n0002\\nservices\\n0002\\n0003' ]]
+            """
+            result = _run_bash(textwrap.dedent(script))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_batch_ssh_retrieval_and_cleanup_stay_inside_owning_group(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="group's results ") as temporary:
+            parent = Path(temporary)
+            root = _make_dispatch_batch(parent / "local")
+            remote = parent / "remote"
+            remote.mkdir()
+            script = f"""
+            set -e
+            source "{_ENV_FUNCTIONS}"
+            source "{_ELBENCHO_FUNCTIONS}"
+            root={shlex.quote(str(root))}
+            remote={shlex.quote(str(remote))}
+            for id in 0002 0003; do
+                group=$(elbencho_batch_execution_output_dir "$root" "$id")
+                remote_group="$remote/${{root##*/}}/${{group#"$root/"}}"
+                mkdir -p "$remote_group/executions"
+                artifacts=$(_elbencho_result_artifacts_for_execution \
+                    "$root" "$root/executions/$id.sh")
+                while IFS= read -r artifact; do
+                    mkdir -p "$(dirname "$artifact")"
+                    printf 'local-%s\\n' "$id" > "$artifact"
+                    printf 'remote-%s\\n' "$id" > "$remote_group/${{artifact#"$group/"}}"
+                done <<< "$artifacts"
+                printf 'core-%s\\n' "$id" > "$remote_group/executions/$id.core"
+            done
+            other=$(_elbencho_result_artifacts_for_execution \
+                "$root" "$root/executions/0003.sh" | head -n 1)
+            run_ssh_single() {{
+                local rc_file="$2" stdout_file="$3" scriptlet="$5" remote_rc=0
+                shift 5
+                (cd "$remote" && bash -s -- "$@" <<< "$scriptlet") \
+                    > "$stdout_file" || remote_rc=$?
+                printf '%s\\n' "$remote_rc" > "$rc_file"
+            }}
+            group=$(elbencho_batch_execution_output_dir "$root" 0002)
+            remote_group="${{root##*/}}/${{group#"$root/"}}"
+            _ssh_retrieve_remote_output a "$root" "$remote_group" 0002 \
+                "$root/executions/0002.sh"
+            first=$(_elbencho_result_artifacts_for_execution \
+                "$root" "$root/executions/0002.sh" | head -n 1)
+            [[ "$(cat "$first")" == remote-0002 ]]
+            [[ "$(cat "$other")" == local-0003 ]]
+            [[ -f "$group/executions/0002.core" ]]
+            [[ ! -e "$root/executions/0002.core" ]]
+            _cleanup_local_elbencho_result_artifacts_for_execution \
+                "$root" 0002 "$root/executions/0002.sh"
+            [[ ! -e "$first" ]]
+            [[ "$(cat "$other")" == local-0003 ]]
+            elbencho_batch_verify_manifest "$root"
+            other_group=$(elbencho_batch_execution_output_dir "$root" 0003)
+            ! _cleanup_local_elbencho_result_artifacts_for_execution \
+                "$other_group" 0002 "$root/executions/0002.sh"
+            [[ "$(cat "$other")" == local-0003 ]]
+            ln -s "$root" "$root/../batch-alias"
+            aliased=$(_elbencho_result_artifacts_for_execution \
+                "$root/../batch-alias" "$root/../batch-alias/executions/0003.sh" | head -n 1)
+            [[ "$aliased" == "$other" ]]
+            """
+            result = _run_bash(textwrap.dedent(script))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ssh_scriptlet_preserves_literal_positional_arguments(self) -> None:
+        script = f"""
+        set -e
+        source "{_ENV_FUNCTIONS}"
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        ssh() {{
+            while [[ "$1" == -* ]]; do
+                if [[ "$1" == -o ]]; then shift 2; else shift; fi
+            done
+            shift
+            bash -c "$*"
+        }}
+        values=("group with spaces" "group's result" '' '$(false)' 'semi;colon')
+        run_ssh_single host-a "$tmp/rc" "$tmp/stdout" "$tmp/stderr" \
+            'printf "%s\\n" "$@"' "${{values[@]}}"
+        [[ "$(cat "$tmp/rc")" == 0 ]]
+        mapfile -t actual < "$tmp/stdout"
+        [[ "${{#actual[@]}}" == "${{#values[@]}}" ]]
+        for index in "${{!values[@]}}"; do
+            [[ "${{actual[$index]}}" == "${{values[$index]}}" ]]
+        done
+        """
+        result = _run_bash(textwrap.dedent(script))
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_slurm_metadata_cell_installs_core_dump_context(self) -> None:
         script = f"""

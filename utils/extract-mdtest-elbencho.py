@@ -46,12 +46,19 @@ if str(_REPO_ROOT) not in sys.path:
 from lib.env_used_yaml import (  # pylint: disable=wrong-import-position
     load_env_used_yaml,
 )
+from lib.filesystem_batch import (
+    route_batch_report,
+)  # pylint: disable=wrong-import-position
+from lib.filesystem_report_options import (  # pylint: disable=wrong-import-position
+    add_analysis_arguments,
+    add_report_destination_arguments,
+    validate_analysis_arguments,
+)
 from lib.join_datestamps import (  # pylint: disable=wrong-import-position
     join_datestamps as join_datestamps_lib,
     join_datestamps_for_filename,
 )
 from lib.reporting_common import (  # pylint: disable=wrong-import-position
-    add_common_report_arguments,
     discover_result_pairs,
     filter_metrics_by_scale,
     format_decimal_aligned_latency_ms,
@@ -2285,34 +2292,14 @@ def main() -> None:
         nargs="*",
         help="Directories containing mdtest-elbencho result files",
     )
-    parser.add_argument(
-        "--to-csv",
-        action="store_true",
-        help="Write aggregated metrics to CSV file in first input directory",
-    )
-    add_common_report_arguments(parser)
-    parser.add_argument(
-        "--normalize-to",
-        type=int,
-        metavar="N",
-        default=None,
-        help=(
-            "Normalize rate/stddev numbers in the rates table and summary peaks "
-            "to N nodes (each value is multiplied by N/<actual node count>). "
-            "Latency tables are unaffected. The Nodes column is rendered as "
-            "'N (<actual>)'."
-        ),
-    )
-    parser.add_argument(
-        "--test-parse",
-        metavar="FILE",
-        help="Test parsing a single CSV file (provide path without extension)",
-    )
-
+    add_analysis_arguments(parser, "mdtest")
+    add_report_destination_arguments(parser)
     args = parser.parse_args()
-
-    if args.normalize_to is not None and args.normalize_to <= 0:
-        parser.error("--normalize-to must be a positive integer")
+    try:
+        validate_analysis_arguments(args)
+        route_batch_report(args, "mdtest", sys.argv[1:])
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
 
     # Handle test-parse mode
     if args.test_parse:
@@ -2405,9 +2392,13 @@ def main() -> None:
         output_dir = args.input_dirs[0]
     elif args.from_csv:
         output_dir = os.path.dirname(os.path.abspath(args.from_csv)) or "."
+    output_dir = args.output_dir or output_dir
+    os.makedirs(output_dir, exist_ok=True)
 
     if not test_configuration:
-        configuration_dirs = args.input_dirs or [output_dir]
+        configuration_dirs = args.input_dirs or [
+            os.path.dirname(os.path.abspath(args.from_csv)) or "."
+        ]
         test_configuration = load_mdtest_configuration(configuration_dirs)
 
     # Export to CSV if requested

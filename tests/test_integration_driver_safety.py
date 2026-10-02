@@ -43,6 +43,105 @@ _DRIVER = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _DRIVER
 _SPEC.loader.exec_module(_DRIVER)
 _FILESYSTEM = sys.modules["filesystem_integration"]
+
+
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("collected", [False, True])
+@pytest.mark.parametrize(
+    "fault", [None, "local-source", "pvc-source", "total", "missing"]
+)
+def test_mixed_batch_progress_contract_distinguishes_resumed_subset(
+    failed, collected, fault
+):
+    """The fixture checks remote progress, not stale local or whole-batch counts."""
+    counts = (1, 0, 1, 1) if failed else (0, 0, 2, 0)
+    output = {
+        "EXECUTION_SCOPE": "CURRENT_ATTEMPT",
+        "PROGRESS_SOURCE": "LOCAL" if collected else "PVC",
+        "RESULT_COLLECTION": "COMPLETE" if collected else "PENDING",
+        **{
+            f"EXECUTIONS_{state}": str(count)
+            for state, count in zip(
+                ("PENDING", "RUNNING", "SUCCEEDED", "FAILED"), counts, strict=True
+            )
+        },
+    }
+    if fault == "local-source":
+        output["EXECUTION_SCOPE"] = "BATCH"
+    elif fault == "pvc-source":
+        output["PROGRESS_SOURCE"] = "PVC" if collected else "LOCAL"
+    elif fault == "total":
+        output["EXECUTIONS_SUCCEEDED"] = "3"
+    elif fault == "missing":
+        del output["EXECUTIONS_PENDING"]
+    text = "\n".join(f"{key}={value}" for key, value in output.items())
+    if fault:
+        with pytest.raises(_FILESYSTEM.IntegrationTestError):
+            _FILESYSTEM._assert_mixed_batch_kubectl_progress(
+                text, failed=failed, collected=collected
+            )
+    else:
+        _FILESYSTEM._assert_mixed_batch_kubectl_progress(
+            text, failed=failed, collected=collected
+        )
+
+
+@pytest.mark.parametrize("selector", ("ssh", "slurm", "kubectl"))
+def test_mixed_batch_adapter_starts_metadata_and_resumes_io(
+    monkeypatch, tmp_path, selector
+):
+    """Kubernetes collection brackets resume; each operation uses its launcher."""
+    calls = []
+    specification = _FILESYSTEM.SCENARIO_SPECS_BY_NAME["mixed-batch"]
+    runtime = SimpleNamespace(
+        scenario=specification, selector=selector, values={}, workspace=str(tmp_path)
+    )
+    root = str(tmp_path / "batch")
+
+    def command(_runner, _config, _fixture, _runtime, step, _logs, **options):
+        operation = step.arguments[0]
+        calls.append(
+            (operation, step.workload_kind, options.get("expected_failure", False))
+        )
+        identity = "aaaaaaaa" if operation == "--start" else "bbbbbbbb"
+        return (
+            f"STORAGE_SCALE_TEST_RESULTS_DIR={root}\n"
+            f"STORAGE_SCALE_TEST_ATTEMPT_ID={identity}\n"
+        )
+
+    monkeypatch.setattr(_FILESYSTEM, "_mixed_batch_command", command)
+    monkeypatch.setattr(
+        _FILESYSTEM,
+        "_mixed_batch_collect",
+        lambda *args, failed: calls.append(("collect", failed)),
+    )
+    monkeypatch.setattr(_FILESYSTEM, "_copy_scenario_result", lambda *args: Path(root))
+    monkeypatch.setattr(_FILESYSTEM, "_assert_mixed_batch", lambda *args: None)
+    monkeypatch.setattr(
+        _FILESYSTEM, "_hash_mixed_batch_success", lambda *args: {"saved": "digest"}
+    )
+    monkeypatch.setattr(_FILESYSTEM, "_assert_dataset_state", lambda *args: None)
+    monkeypatch.setattr(_FILESYSTEM, "_mixed_batch_report", lambda *args: None)
+    _FILESYSTEM._finish_mixed_batch(None, None, None, runtime, root, tmp_path, tmp_path)
+    expected = [("--start", "mdtest", selector != "kubectl")]
+    if selector == "kubectl":
+        expected.append(("collect", True))
+    expected.append(("--resume", "filesystem", False))
+    if selector == "kubectl":
+        expected.append(("collect", False))
+    assert calls == expected
+
+
+def test_mixed_batch_failure_targets_the_second_metadata_cell():
+    """The existing binary wrapper must let the first IO group succeed."""
+    runtime = SimpleNamespace(
+        scenario=_FILESYSTEM.SCENARIO_SPECS_BY_NAME["mixed-batch"]
+    )
+    assert (
+        _FILESYSTEM._failure_target_argument(runtime) == "mdtest-elbencho-c_002-t_001"
+    )
+
+
 _bootstrap_state_dir = getattr(_DRIVER, "_bootstrap_state_dir")
 _acquire_lock = getattr(_DRIVER, "_acquire_lock")
 _check_docker_capacity = getattr(_DRIVER, "_check_docker_capacity")
@@ -203,6 +302,270 @@ def _kubectl_fixture() -> object:
     )
 
 
+_COORDINATOR_LOSS_CONTAINER_ID = "a" * 64
+
+
+def _coordinator_loss_config():
+    """Return the private cluster configuration for mutation command tests."""
+    return SimpleNamespace(
+        kubeconfig=Path("private-config"),
+        namespace="test-namespace",
+        cluster_name="fixture-cluster",
+    )
+
+
+def _coordinator_loss_pod(*, uid="coordinator-uid", exit_code=None):
+    """Build the exact coordinator identity and observed container lifecycle."""
+    state = (
+        {"running": {}}
+        if exit_code is None
+        else {"terminated": {"exitCode": exit_code}}
+    )
+    return {
+        "metadata": {
+            "name": "coordinator-pod",
+            "uid": uid,
+            "labels": {
+                "storage-scale-test.nvidia.com/run": "1234abcd",
+                "app.kubernetes.io/component": "coordinator",
+            },
+        },
+        "spec": {"nodeName": "fixture-node"},
+        "status": {
+            "containerStatuses": [
+                {
+                    "name": "coordinator",
+                    "state": state,
+                    "containerID": "containerd://" + _COORDINATOR_LOSS_CONTAINER_ID,
+                }
+            ]
+        },
+    }
+
+
+class _CoordinatorLossRunner:
+    """Record crash commands and expose separately supplied API evidence."""
+
+    def __init__(self, observed_pod, *, initial_pod=None, exec_code=137):
+        self.initial_pod = initial_pod or _coordinator_loss_pod()
+        self.observed_pod = observed_pod
+        self.exec_code = exec_code
+        self.calls = []
+        self.process_code = 0
+        self.killed = False
+        self.kind_labels = {"io.x-k8s.kind.cluster": "fixture-cluster"}
+        self.runtime_document = {
+            "ID": _COORDINATOR_LOSS_CONTAINER_ID,
+            "Labels": {
+                "io.kubernetes.pod.name": "coordinator-pod",
+                "io.kubernetes.pod.uid": "coordinator-uid",
+                "io.kubernetes.pod.namespace": "test-namespace",
+                "io.kubernetes.container.name": "coordinator",
+            },
+        }
+
+    @property
+    def operations(self):
+        """Summarize API, process verification, and runtime calls in order."""
+        return [
+            command[5] if command[0] == "kubectl" else command[1]
+            for command, _options in self.calls
+        ]
+
+    def _docker_run(self, command):
+        """Keep runtime kill's return code independent from terminal Pod proof."""
+        if command[1] == "inspect":
+            document = self.kind_labels
+        elif command[6] == "containers":
+            document = self.runtime_document
+        else:
+            assert command[6:8] == ["tasks", "kill"]
+            self.killed = True
+            return SimpleNamespace(returncode=self.exec_code, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout=json.dumps(document), stderr="")
+
+    def run(self, command, **options):
+        """Keep exec's return code independent from the authoritative Pod state."""
+        command = [str(argument) for argument in command]
+        self.calls.append((command, options))
+        if command[0] == "docker":
+            return self._docker_run(command)
+        operation = command[5]
+        if operation == "exec":
+            return SimpleNamespace(returncode=self.process_code, stdout="", stderr="")
+        if operation == "get":
+            document = (
+                {"items": [self.initial_pod]}
+                if command[6] == "pods"
+                else self.observed_pod if self.killed else self.initial_pod
+            )
+            return SimpleNamespace(returncode=0, stdout=json.dumps(document), stderr="")
+        assert operation == "delete"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+@pytest.mark.parametrize("exec_code", (0, 1, 137))
+def test_coordinator_loss_sigkills_verified_pid1_before_deleting(exec_code):
+    """An exec disconnect is accepted only after the selected UID exited 137."""
+    runner = _CoordinatorLossRunner(
+        _coordinator_loss_pod(exit_code=137), exec_code=exec_code
+    )
+    config = _coordinator_loss_config()
+    _FILESYSTEM._kubectl_delete_coordinator_pod(runner, config, "1234abcd")
+
+    assert runner.operations == [
+        "get",
+        "get",
+        "inspect",
+        "exec",
+        "exec",
+        "exec",
+        "get",
+        "delete",
+    ]
+    command, options = runner.calls[4]
+    assert command[6:12] == [
+        "coordinator-pod",
+        "-c",
+        "coordinator",
+        "--",
+        "/bin/bash",
+        "-ceu",
+    ]
+    assert command[-4:] == [
+        "coordinator-loss",
+        "coordinator-uid",
+        "coordinator-pod",
+        "1234abcd",
+    ]
+    script = command[12]
+    assert "KUBECTL_COORDINATOR_POD_UID" in script
+    assert "KUBECTL_COORDINATOR_POD_NAME" in script
+    assert "/proc/1/cmdline" in script
+    assert '*/"$3"/control/coordinator.sh' in script
+    assert '${coordinator_argv[5]} == "$3"' in script
+    assert "kill -KILL 1" not in script
+    assert "kill -TERM" not in script
+    assert options == {"check": False, "timeout": 20}
+    command, options = runner.calls[5]
+    assert command == [
+        "docker",
+        "exec",
+        "fixture-node",
+        "ctr",
+        "-n",
+        "k8s.io",
+        "tasks",
+        "kill",
+        "--signal",
+        "SIGKILL",
+        _COORDINATOR_LOSS_CONTAINER_ID,
+    ]
+    assert options == {"check": False, "timeout": 20}
+
+
+@pytest.mark.parametrize("invalid", ("uid", "attempt", "component"))
+def test_coordinator_loss_rejects_initial_identity_before_exec(invalid):
+    """The label selector alone does not authorize a destructive mutation."""
+    pod = _coordinator_loss_pod()
+    if invalid == "uid":
+        pod["metadata"]["uid"] = ""
+    else:
+        key = (
+            "storage-scale-test.nvidia.com/run"
+            if invalid == "attempt"
+            else "app.kubernetes.io/component"
+        )
+        pod["metadata"]["labels"][key] = "unowned"
+    runner = _CoordinatorLossRunner(
+        _coordinator_loss_pod(exit_code=137), initial_pod=pod
+    )
+    config = _coordinator_loss_config()
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="ownership evidence"):
+        _FILESYSTEM._kubectl_delete_coordinator_pod(runner, config, "1234abcd")
+    assert runner.operations == ["get"]
+
+
+@pytest.mark.parametrize(
+    ("uid", "exit_code", "message"),
+    (
+        ("replacement-uid", 137, "ownership evidence"),
+        ("coordinator-uid", 143, "without SIGKILL evidence"),
+    ),
+)
+def test_coordinator_loss_rejects_unproven_exec_137(uid, exit_code, message):
+    """Exit 137 from exec never overrides replacement or graceful Pod evidence."""
+    runner = _CoordinatorLossRunner(_coordinator_loss_pod(uid=uid, exit_code=exit_code))
+    config = _coordinator_loss_config()
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match=message):
+        _FILESYSTEM._kubectl_delete_coordinator_pod(runner, config, "1234abcd")
+    assert runner.operations[-1] == "get"
+    assert "delete" not in runner.operations
+
+
+def test_coordinator_loss_bounds_missing_termination_evidence(monkeypatch):
+    """A disconnected exec cannot lead to graceful deletion of a running Pod."""
+    clock = iter((0, 0, 0, 31, 31))
+    monkeypatch.setattr(
+        _FILESYSTEM,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(clock), sleep=lambda _seconds: None),
+    )
+    runner = _CoordinatorLossRunner(_coordinator_loss_pod())
+    config = _coordinator_loss_config()
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="evidence timed out"):
+        _FILESYSTEM._kubectl_delete_coordinator_pod(runner, config, "1234abcd")
+    assert runner.operations[-1] == "get"
+    assert "delete" not in runner.operations
+
+
+def test_coordinator_loss_rejects_process_identity_failure():
+    """A Pod-resident UID or cmdline rejection is an operational failure."""
+    runner = _CoordinatorLossRunner(_coordinator_loss_pod(exit_code=137))
+    runner.process_code = 64
+    config = _coordinator_loss_config()
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="process ownership"):
+        _FILESYSTEM._kubectl_delete_coordinator_pod(runner, config, "1234abcd")
+    assert runner.operations == ["get", "get", "inspect", "exec", "exec"]
+    assert not runner.killed
+
+
+@pytest.mark.parametrize("invalid", ("node", "container", "uid", "namespace", "name"))
+def test_coordinator_loss_rejects_runtime_ownership_before_process_mutation(invalid):
+    """Ancestor namespace access never permits touching another fixture's task."""
+    runner = _CoordinatorLossRunner(_coordinator_loss_pod(exit_code=137))
+    if invalid == "node":
+        runner.kind_labels["io.x-k8s.kind.cluster"] = "another-fixture"
+    elif invalid == "container":
+        runner.runtime_document["ID"] = "b" * 64
+    else:
+        runner.runtime_document["Labels"][f"io.kubernetes.pod.{invalid}"] = "unowned"
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="fixture|ownership"):
+        _FILESYSTEM._kubectl_delete_coordinator_pod(
+            runner, _coordinator_loss_config(), "1234abcd"
+        )
+    assert not runner.killed
+    assert "delete" not in runner.operations
+
+
+@pytest.mark.parametrize("invalid", ("node", "container"))
+def test_coordinator_loss_rejects_invalid_runtime_identifiers(invalid):
+    """Node option injection and non-containerd IDs fail before Docker access."""
+    pod = _coordinator_loss_pod()
+    if invalid == "node":
+        pod["spec"]["nodeName"] = "--unowned"
+    else:
+        pod["status"]["containerStatuses"][0]["containerID"] = "docker://unowned"
+    runner = _CoordinatorLossRunner(
+        _coordinator_loss_pod(exit_code=137), initial_pod=pod
+    )
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="runtime identity"):
+        _FILESYSTEM._kubectl_delete_coordinator_pod(
+            runner, _coordinator_loss_config(), "1234abcd"
+        )
+    assert runner.operations == ["get", "get"]
+
+
 def test_kubectl_renderer_uses_logical_roots_and_private_fixture_values():
     """Kubernetes rendering cannot inherit SSH or Slurm configuration by fallthrough."""
     overrides, support = _override_block(
@@ -237,7 +600,7 @@ def test_kubectl_lifecycle_output_is_strict_and_machine_readable():
         (
             "STORAGE_SCALE_TEST_RESULTS_DIR=/tmp/results/elbencho-1",
             "STORAGE_SCALE_TEST_ATTEMPT_ID=1234abcd",
-            "STORAGE_SCALE_TEST_KUBECTL_STATE=RUNNING",
+            "STATE=RUNNING",
         )
     )
 
@@ -364,9 +727,9 @@ def test_kubectl_adapter_drives_submit_status_and_collect_handoffs(tmp_path):
             command = [str(item) for item in arguments]
             calls.append(command)
             if "--status" in command:
-                output = "STORAGE_SCALE_TEST_KUBECTL_STATE=SUCCESS\n"
+                output = "STATE=SUCCESS\n"
             elif "--collect" in command:
-                output = "STORAGE_SCALE_TEST_KUBECTL_STATE=SUCCESS\n"
+                output = "STATE=SUCCESS\n"
             else:
                 output = "\n".join(
                     (
@@ -419,7 +782,7 @@ def test_kubectl_status_poll_retries_transient_command_failure(tmp_path, monkeyp
                 return SimpleNamespace(returncode=1, stdout="", stderr="timeout")
             return SimpleNamespace(
                 returncode=0,
-                stdout="STORAGE_SCALE_TEST_KUBECTL_STATE=SUCCESS\n",
+                stdout="STATE=SUCCESS\n",
                 stderr="",
             )
 
@@ -444,7 +807,7 @@ def test_kubectl_command_accepts_only_declared_terminal_failure(tmp_path):
         def run(self, _arguments, **_kwargs):
             return SimpleNamespace(
                 returncode=1,
-                stdout="STORAGE_SCALE_TEST_KUBECTL_STATE=FAILED\n",
+                stdout="STATE=FAILED\n",
                 stderr="",
             )
 
@@ -474,7 +837,7 @@ def test_kubectl_command_rejects_zero_exit_for_declared_failure(tmp_path):
         def run(self, _arguments, **_kwargs):
             return SimpleNamespace(
                 returncode=0,
-                stdout="STORAGE_SCALE_TEST_KUBECTL_STATE=FAILED\n",
+                stdout="STATE=FAILED\n",
                 stderr="",
             )
 
@@ -538,7 +901,10 @@ def test_kubectl_generated_inputs_are_created_under_the_storage_mount(monkeypatc
     assert "/mnt/storage-scale-test/integration-regression/run/primary" in commands[0]
 
 
-def test_kubectl_cleanup_reports_lifecycle_failure(tmp_path):
+@pytest.mark.parametrize(
+    "detail", ["boom", "STORAGE_SCALE_TEST_DIAGNOSTIC_LOCAL_STATE=SUBMISSION_FAILED\n"]
+)
+def test_kubectl_cleanup_reports_lifecycle_failure(tmp_path, detail):
     """An incomplete attempt cannot silently pass when cleanup fails."""
     config = _config(tmp_path / "state", tmp_path / "export")
     runtime = SimpleNamespace(
@@ -550,10 +916,30 @@ def test_kubectl_cleanup_reports_lifecycle_failure(tmp_path):
     class _Runner:
         def run(self, arguments, **_kwargs):
             commands.append([str(item) for item in arguments])
-            return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+            return SimpleNamespace(returncode=1, stdout="", stderr=detail)
 
     with pytest.raises(_FILESYSTEM.IntegrationTestError, match="cleanup --cancel"):
         _cleanup_kubectl_attempt(_Runner(), config, runtime)
+    assert len(commands) == 1
+
+
+def test_kubectl_cleanup_accepts_exact_failed_submission_state(tmp_path):
+    """Only the public field proves completed rollback, not diagnostic context."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    runtime = SimpleNamespace(
+        workspace=str(tmp_path / "workspace"),
+        values={"kubectl_result_root": "/tmp/results/elbencho-1"},
+    )
+    commands = []
+
+    class _Runner:
+        def run(self, arguments, **_kwargs):
+            commands.append(arguments)
+            return SimpleNamespace(
+                returncode=1, stdout="STATE=SUBMISSION_FAILED\n", stderr=""
+            )
+
+    _cleanup_kubectl_attempt(_Runner(), config, runtime)
     assert len(commands) == 1
 
 
@@ -3750,6 +4136,43 @@ def test_fixture_build_does_not_force_registry_refresh(tmp_path, monkeypatch):
     )
     assert checked == [base]
     assert "--pull" not in build
+
+
+def test_slurm_login_restart_preserves_operator_managed_template(tmp_path, monkeypatch):
+    """Replace the login Pod, then wait for its ready successor without a rollout."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    calls = []
+    names = iter(("login-original", "login-successor"))
+
+    def login(*_args):
+        name = next(names)
+        calls.append(("ready", name))
+        return name
+
+    class _LoginRunner:
+        def run(self, arguments, **kwargs):
+            calls.append(("delete", [str(item) for item in arguments], kwargs))
+
+    monkeypatch.setattr(_DRIVER, "_login_pod", login)
+    _DRIVER._restart_slinky_login(_LoginRunner(), config)
+    assert calls[0] == ("ready", "login-original")
+    assert calls[1] == (
+        "delete",
+        [
+            "kubectl",
+            "--kubeconfig",
+            str(config.kubeconfig),
+            "-n",
+            config.namespace,
+            "delete",
+            "pod",
+            "login-original",
+            "--wait=true",
+            "--timeout=180s",
+        ],
+        {"timeout": 210},
+    )
+    assert calls[2] == ("ready", "login-successor")
 
 
 def test_slurm_install_preloads_verified_mariadb_and_helper_images(

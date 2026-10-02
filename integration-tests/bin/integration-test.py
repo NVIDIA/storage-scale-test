@@ -4481,28 +4481,23 @@ def _login_pod(runner: Runner, config: Config) -> str:
 
 def _restart_slinky_login(runner: Runner, config: Config) -> None:
     """Restart the configless login client after accounting is available."""
+    # Slinky reconciles the Deployment template. A rollout-restart annotation
+    # can be reverted by the operator, replacing the ready Pod a second time.
+    login = _login_pod(runner, config)
     runner.run(
         _kubectl(
             config,
             "-n",
             config.namespace,
-            "rollout",
-            "restart",
-            "deployment/slurm-login-test",
-        )
-    )
-    runner.run(
-        _kubectl(
-            config,
-            "-n",
-            config.namespace,
-            "rollout",
-            "status",
-            "deployment/slurm-login-test",
+            "delete",
+            "pod",
+            login,
+            "--wait=true",
             "--timeout=180s",
         ),
         timeout=210,
     )
+    _login_pod(runner, config)
 
 
 def _sacctmgr_rows(

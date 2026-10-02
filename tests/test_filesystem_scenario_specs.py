@@ -22,6 +22,8 @@ import sys
 
 import pytest
 
+from tests.integration_scenario_test_helpers import EXPECTED_SCENARIO_NAMES
+
 _MODULE_PATH = (
     Path(__file__).resolve().parents[1]
     / "integration-tests"
@@ -54,23 +56,7 @@ WorkloadPhase = _SCENARIOS.WorkloadPhase
 validate_scenario_specs = _SCENARIOS.validate_scenario_specs
 
 
-EXPECTED_NAMES = {
-    "baseline",
-    "mdtest-sweep",
-    "default-dio",
-    "failure-resume",
-    "retained-lifecycle",
-    "live-capture",
-    "slurm-cartesian",
-    "ssh-single-big-file",
-    "ssh-weighted-roots",
-    "ssh-shared-home",
-    "slurm-scheduling",
-    "kubectl-retained-read",
-    "kubectl-cancel",
-    "kubectl-coordinator-loss",
-    "kubectl-endpoint-drift",
-}
+EXPECTED_NAMES = set(EXPECTED_SCENARIO_NAMES)
 
 
 def _scenario(name):
@@ -188,6 +174,26 @@ def test_mdtest_sweep_is_small_and_runs_on_each_substrate():
         "--resume",
         "/results/mdtest",
     )
+
+
+def test_mixed_batch_prepares_changed_groups_with_repeated_coordinates():
+    """The bounded batch changes provenance while retaining comparable IO cells."""
+    scenario = _scenario("mixed-batch")
+    first, metadata, repeated = scenario.steps
+    assert scenario.substrates == {"ssh", "slurm", "kubectl"}
+    assert [step.workload_kind for step in scenario.steps] == [
+        "filesystem",
+        "mdtest",
+        "filesystem",
+    ]
+    assert first.arguments[0] == "--batch"
+    assert metadata.arguments[0] == repeated.arguments[0] == "--append"
+    assert [step.executions[0].coordinate.nodes for step in scenario.steps] == [1, 2, 1]
+    assert first.executions[0].coordinate == repeated.executions[0].coordinate
+    assert first.env_lines != repeated.env_lines
+    assert "{test_root_secondary}" in "\n".join(metadata.env_lines)
+    assert metadata.failure_injection is FailureInjection.FAIL_AFTER_WRITE_ONCE
+    assert metadata.executions[0].status is ExecutionStatus.FAILED
 
 
 def test_default_dio_uses_worker_layout_and_derived_file_size():

@@ -62,6 +62,145 @@ def _identity(root: Path) -> str:
     """
 
 
+def test_repeated_helper_loading_preserves_constants_and_active_locks(tmp_path):
+    """Preflight followed by dispatch must neither warn nor reset ownership."""
+    result = _bash(f"""
+        set -euo pipefail
+        root={str(tmp_path / 'kubernetes')!r}
+        kubectl_local_lock_acquire "$root" fd
+        saved_root=${{KUBECTL_LOCAL_LOCK_ROOTS[$fd]}}
+        KUBECTL_BATCH_VALIDATION_PATHS=(one two)
+        source {_FUNCTIONS!s}
+        [[ "$KUBECTL_SWEEP_MOUNT_ROOT" == /mnt/storage-scale-test ]]
+        [[ "${{KUBECTL_LOCAL_LOCK_ROOTS[$fd]}}" == "$saved_root" ]]
+        [[ "${{KUBECTL_BATCH_VALIDATION_PATHS[*]}}" == 'one two' ]]
+        kubectl_local_lock_release "$fd"
+        """)
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("remote_state", ["PREPARED", "RUNNING", "FAILED", "SUCCESS"])
+def test_remote_execution_progress_counts_only_current_attempt(tmp_path, remote_state):
+    """Read live cells, not uncollected local states or a predecessor's cells."""
+    run = tmp_path / "run"
+    definitions = run / "control/executions"
+    ledger = run / "state/executions"
+    definitions.mkdir(parents=True)
+    ledger.mkdir(parents=True)
+    for execution, status in zip(
+        ["0002", "0004", "0006", "0008"],
+        ["PENDING", "RUNNING", "SUCCESS", "FAILED"],
+    ):
+        (definitions / f"{execution}.sh").write_text("definition\n")
+        (ledger / f"{execution}.status").write_text(status + "\n")
+    (ledger / "0001.status").write_text("SUCCESS\n")
+    result = _bash(f"""
+        kubectl_attempt_remote_root() {{ printf '%s' {str(run)!r}; }}
+        kubectl_remote_tree_guard_script() {{ printf 'run=$1; attempt=$2; run_real=$1\n'; }}
+        kubectl_pvc_exec() {{ shift 2; "$@"; }}
+        kubectl_read_remote_execution_progress test-ns helper 1234abcd {remote_state}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "1 1 1 1\n"
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["startup", "missing", "invalid", "symlink-file", "symlink-directory", "no-cells"],
+)
+def test_remote_execution_progress_handles_startup_and_rejects_invalid_state(
+    tmp_path, fault
+):
+    """Only PREPARED can have an as-yet uninitialized execution ledger."""
+    run = tmp_path / "run"
+    definitions = run / "control/executions"
+    ledger = run / "state/executions"
+    definitions.mkdir(parents=True)
+    ledger.mkdir(parents=True)
+    (definitions / "0001.sh").write_text("definition\n")
+    status = ledger / "0001.status"
+    if fault == "invalid":
+        status.write_text("nonsense\n")
+    elif fault == "symlink-file":
+        target = tmp_path / "external.status"
+        target.write_text("SUCCESS\n")
+        status.symlink_to(target)
+    elif fault == "symlink-directory":
+        ledger.rmdir()
+        target = tmp_path / "external"
+        target.mkdir()
+        (target / "0001.status").write_text("SUCCESS\n")
+        ledger.symlink_to(target)
+    elif fault == "no-cells":
+        (definitions / "0001.sh").unlink()
+    elif fault == "startup":
+        ledger.rmdir()
+    remote_state = "PREPARED" if fault == "startup" else "RUNNING"
+    result = _bash(f"""
+        kubectl_attempt_remote_root() {{ printf '%s' {str(run)!r}; }}
+        kubectl_remote_tree_guard_script() {{ printf 'run=$1; attempt=$2; run_real=$1\n'; }}
+        kubectl_pvc_exec() {{ shift 2; "$@"; }}
+        kubectl_read_remote_execution_progress test-ns helper 1234abcd {remote_state}
+        """)
+    assert (result.returncode == 0) is (fault == "startup"), result.stderr
+    if fault == "startup":
+        assert result.stdout == "1 0 0 0\n"
+    else:
+        assert not result.stdout
+
+
+@pytest.mark.parametrize(
+    "missing_evidence", ["none", "lease", "remote", "resource", "intent", "predecessor"]
+)
+def test_failed_batch_submission_retry_requires_complete_rollback(
+    tmp_path: Path, missing_evidence: str
+) -> None:
+    """Only a clean initial failure may create a replacement batch attempt."""
+    root = tmp_path / "kubernetes"
+    setup = ""
+    if missing_evidence != "lease":
+        setup += (
+            'kubectl_attempt_journal_step "$root" "$fd" 1234abcd release-pvc-lease\n'
+        )
+    if missing_evidence == "remote":
+        setup += 'printf "reservation\\n" > "$root/attempts/1234abcd/remote-reservation.sh"\n'
+    if missing_evidence == "resource":
+        setup += (
+            'printf "resource\\n" > "$root/attempts/1234abcd/resources/workers.sh"\n'
+        )
+    if missing_evidence == "intent":
+        setup += 'printf "intent\\n" > "$root/attempts/1234abcd/creation-intents/worker.sh"\n'
+    if missing_evidence == "predecessor":
+        setup += (
+            'printf "aaaabbbb\\n" > "$root/attempts/1234abcd/predecessor-attempt"\n'
+        )
+    result = _bash(_identity(root) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd SUBMISSION_FAILED
+        mkdir -p "$root/attempts/1234abcd/resources" "$root/attempts/1234abcd/creation-intents"
+        {setup}
+        _kubectl_batch_failed_submission_retryable "$root" 1234abcd
+        """)
+    assert (result.returncode == 0) is (missing_evidence == "none"), result.stderr
+
+
+def test_runtime_validation_does_not_require_a_results_directory() -> None:
+    """Ordinary environment validation works before any sweep is prepared."""
+    result = _bash("""
+        set -u
+        unset results_dir
+        declare -gA TEST_DIRS=([benchmark]=1)
+        KUBECTL_NODE_SELECTOR=benchmark=true
+        kubectl_validate_cluster_identity() { return 0; }
+        kubectl_discover_candidate_nodes() { printf 'reached-discovery\\n'; return 1; }
+        if kubectl_validate_runtime_pod; then exit 1; fi
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "reached-discovery" in result.stdout
+    assert "unbound variable" not in result.stderr
+
+
 def test_ordinary_pvc_exec_does_not_attach_interactive_terminal(
     tmp_path: Path,
 ) -> None:
@@ -452,8 +591,8 @@ def test_resume_interprets_collected_state_with_current_coordinator() -> None:
     assert "control-bundle/coordinator.sh" not in body
 
 
-def test_collected_manifest_accepts_complete_success_evidence(tmp_path: Path) -> None:
-    """A complete cell ledger and required workload output are collectible."""
+def _complete_publication_fixture(tmp_path: Path):
+    """Build complete cell and manifest evidence for collection tests."""
     state = tmp_path / "state"
     executions = state / "executions"
     result_dir = state / "results/0001/executions"
@@ -504,6 +643,12 @@ def test_collected_manifest_accepts_complete_success_evidence(tmp_path: Path) ->
     (state / "publication-manifest.tsv").write_text(
         "\n".join(rows) + "\n", encoding="utf-8"
     )
+    return state, definitions
+
+
+def test_collected_manifest_accepts_complete_success_evidence(tmp_path: Path) -> None:
+    """A complete cell ledger and required workload output are collectible."""
+    state, definitions = _complete_publication_fixture(tmp_path)
     result = _bash(
         f"_kubectl_validate_collected_publication {str(state)!r} "
         f"1234abcd terminal {str(definitions)!r} >/dev/null; [[ $terminal == SUCCESS ]]"
@@ -820,9 +965,364 @@ def test_collection_stream_uses_its_operation_sized_deadline(tmp_path: Path) -> 
             "$KUBECTL_PROCESS_TIMEOUT_SECONDS"
         }}
         kubectl_stream_remote_attempt test-ns collector 1234abcd {str(archive)!r}
-        test "$(cat {str(archive)!r})" = $'123\t183'
+        read -r request process < {str(archive)!r}
+        [[ "$request" -gt 0 && "$request" -le 123 && "$process" == "$request" ]]
         """)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "error: unexpected EOF",
+        "read tcp: connection reset by peer",
+        "error: HTTP 429 Too Many Requests",
+        "error: HTTP 503 Service Unavailable",
+        "error: stream error: INTERNAL_ERROR",
+        "tar: 1234abcd/state/results/0001/report.out: file changed as we read it\n"
+        "command terminated with exit code 1",
+        "tar: 1234abcd/state: file changed as we read it",
+    ],
+)
+def test_collection_retries_transient_transfer_and_publishes_complete_results(
+    tmp_path: Path, error: str
+) -> None:
+    """[R-03] A retry restarts receipt and still verifies the full publication."""
+    state, definitions = _complete_publication_fixture(tmp_path)
+    payload = tmp_path / "remote.tar"
+    with tarfile.open(payload, "w") as archive:
+        archive.add(state, arcname="1234abcd/state")
+    received = tmp_path / "received.tar"
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    (tmp_path / "published").mkdir()
+    calls = tmp_path / "calls"
+    staging = tmp_path / ".kubernetes-collect-1234abcd.A1"
+    result = _bash(f"""
+        set -euo pipefail
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        kubectl_pvc_exec() {{
+            printf 'call\\n' >> {str(calls)!r}
+            if [[ $(wc -l < {str(calls)!r}) -eq 1 ]]; then
+                printf partial
+                printf '%s\\n' "$injected_error" >&2
+                return 1
+            fi
+            test ! -e {str(received)!r} || [[ ! -s {str(received)!r} ]]
+            cat {str(payload)!r}
+        }}
+        injected_error=$(printf '%b' {error!r})
+        kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(received)!r} {str(metadata / 'state.sh')!r}
+        kubectl_extract_attempt_archive {str(received)!r} 1234abcd \
+            {str(tmp_path)!r} {str(staging)!r}
+        _kubectl_validate_collected_publication {str(staging / '1234abcd/state')!r} \
+            1234abcd terminal {str(definitions)!r} >/dev/null
+        [[ "$terminal" == SUCCESS ]]
+        _kubectl_merge_collected_results {str(staging / '1234abcd/state')!r} \
+            {str(tmp_path / 'published')!r} 1234abcd reason
+        """)
+    assert result.returncode == 0, result.stderr
+    assert len(calls.read_text().splitlines()) == 2
+    assert received.read_bytes() == payload.read_bytes()
+    assert (tmp_path / "published/executions/0001.status").read_text() == "SUCCESS\n"
+    bundles = list((metadata / "diagnostics").glob("collection-stream.*"))
+    assert len(bundles) == 1
+    assert (bundles[0] / "transfer-1.stderr").read_text().strip() == error
+    assert "attempt_id\t1234abcd" in (bundles[0] / "bundle.tsv").read_text()
+    assert "\t1\t0\t" in (bundles[0] / "transfers.tsv").read_text()
+    assert "\t0\t0\tSUCCESS" in (bundles[0] / "transfers.tsv").read_text()
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "error,rc,reason",
+    [
+        ("Unauthorized: token expired; timeout", 1, "AUTH"),
+        ("Error: collector not found", 1, "IDENTITY_MISMATCH"),
+        ("Error: path escapes PVC mount", 1, "PATH_REJECTED"),
+        ("tar: unexpected EOF in archive", 1, "TRANSFER_FAILED"),
+        (
+            "tar: 1234abcd/state/run.status: file changed as we read it\n"
+            "tar: read error: Permission denied",
+            1,
+            "TRANSFER_FAILED",
+        ),
+        (
+            "tar: other/state/run.status: file changed as we read it",
+            1,
+            "TRANSFER_FAILED",
+        ),
+        (
+            "tar: 1234abcd/control/executions/0002.sh: file changed as we read it",
+            1,
+            "TRANSFER_FAILED",
+        ),
+        (
+            "tar: 1234abcd/state/../control: file changed as we read it",
+            1,
+            "TRANSFER_FAILED",
+        ),
+        (
+            "tar: 1234abcd/state/run.status: file changed as we read it",
+            2,
+            "TRANSFER_FAILED",
+        ),
+        ("command terminated with exit code 2: timeout", 1, "TRANSFER_FAILED"),
+        ("unknown remote failure", 1, "TRANSFER_FAILED"),
+        ("unknown remote timeout", 1, "TRANSFER_FAILED"),
+        ("", 137, "TRANSFER_FAILED"),
+    ],
+)
+def test_collection_never_retries_permanent_or_unknown_remote_errors(
+    tmp_path: Path, error: str, rc: int, reason: str
+) -> None:
+    """[R-03] Transport retries never hide auth, safety, or remote failures."""
+    archive = tmp_path / "attempt.tar"
+    calls = tmp_path / "calls"
+    result = _bash(f"""
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        kubectl_pvc_exec() {{
+            printf 'call\\n' >> {str(calls)!r}
+            printf partial
+            printf '%b\\n' {error!r} >&2
+            return {rc}
+        }}
+        ! kubectl_stream_remote_attempt test-ns collector 1234abcd {str(archive)!r}
+        test ! -e {str(archive)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert len(calls.read_text().splitlines()) == 1
+    assert f"STORAGE_SCALE_TEST_DIAGNOSTIC_REASON={reason}" in result.stderr
+    assert f"producer_rc={rc} consumer_rc=0" in result.stderr
+
+
+def test_collection_stream_reads_only_published_state(tmp_path: Path) -> None:
+    """Unused control files and locks cannot make terminal receipt fail."""
+    attempt = tmp_path / "1234abcd"
+    state = attempt / "state"
+    state.mkdir(parents=True)
+    (state / "run.status").write_text("SUCCESS\n")
+    control = attempt / "control/executions"
+    control.mkdir(parents=True)
+    (control / "0002.sh").write_text("immutable definition\n")
+    (attempt / "coordinator.lock").write_text("lock\n")
+    archive = tmp_path / "received.tar"
+    result = _bash(f"""
+        kubectl_attempt_remote_root() {{ printf '%s\\n' {str(attempt)!r}; }}
+        kubectl_remote_tree_guard_script() {{ printf 'run="$1"\\n'; }}
+        kubectl_pvc_exec() {{ shift 2; "$@"; }}
+        kubectl_stream_remote_attempt test-ns collector 1234abcd {str(archive)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    with tarfile.open(archive) as received:
+        assert set(received.getnames()) == {
+            "1234abcd/state",
+            "1234abcd/state/run.status",
+        }
+
+
+def test_changed_source_retry_still_rejects_content_corruption(tmp_path: Path) -> None:
+    """[R-07] Clean tar completion cannot override publication digests."""
+    state, definitions = _complete_publication_fixture(tmp_path)
+    (state / "results/0001/executions/0001.workload.tsv").write_text("changed\n")
+    payload = tmp_path / "corrupt.tar"
+    with tarfile.open(payload, "w") as archive:
+        archive.add(state, arcname="1234abcd/state")
+    received = tmp_path / "received.tar"
+    calls = tmp_path / "calls"
+    staging = tmp_path / ".kubernetes-collect-1234abcd.A1"
+    result = _bash(f"""
+        set -euo pipefail
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        kubectl_pvc_exec() {{
+            printf 'call\\n' >> {str(calls)!r}
+            if [[ $(wc -l < {str(calls)!r}) -eq 1 ]]; then
+                printf partial
+                echo 'tar: 1234abcd/state/run.status: file changed as we read it' >&2
+                return 1
+            fi
+            cat {str(payload)!r}
+        }}
+        kubectl_stream_remote_attempt test-ns collector 1234abcd {str(received)!r}
+        kubectl_extract_attempt_archive {str(received)!r} 1234abcd \
+            {str(tmp_path)!r} {str(staging)!r}
+        ! _kubectl_validate_collected_publication {str(staging / '1234abcd/state')!r} \
+            1234abcd terminal {str(definitions)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert len(calls.read_text().splitlines()) == 2
+
+
+def test_tar_changed_file_warning_can_be_metadata_only(tmp_path: Path) -> None:
+    """A real tar warning does not prove that benchmark bytes were modified."""
+    source = tmp_path / "report.out"
+    source.write_bytes(b"unchanged content\n" * 65536)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    archive = tmp_path / "metadata-change.tar"
+    result = _bash(f"""
+        export TAR_SOURCE={str(source)!r}
+        LC_ALL=C _kubectl_local_tar --checkpoint=1 \
+            --checkpoint-action='exec=touch -m -t 200001010000 "$TAR_SOURCE"' \
+            -cf {str(archive)!r} -C {str(tmp_path)!r} report.out
+        """)
+    assert result.returncode == 1, result.stderr
+    assert "file changed as we read it" in result.stderr
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == digest
+    with tarfile.open(archive) as received:
+        assert (
+            hashlib.sha256(received.extractfile("report.out").read()).hexdigest()
+            == digest
+        )
+
+
+def test_collection_changed_source_exhaustion_preserves_remote_data(
+    tmp_path: Path,
+) -> None:
+    """[R-03] Persistently changing source never becomes a valid receipt."""
+    archive = tmp_path / "attempt.tar"
+    calls = tmp_path / "calls"
+    result = _bash(f"""
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        kubectl_pvc_exec() {{
+            printf 'call\\n' >> {str(calls)!r}
+            printf partial
+            echo 'tar: 1234abcd/state/run.status: file changed as we read it' >&2
+            return 1
+        }}
+        ! kubectl_stream_remote_attempt test-ns collector 1234abcd {str(archive)!r}
+        test ! -e {str(archive)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert calls.read_text().count("call") == 3
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=TRANSFER_FAILED" in result.stderr
+    assert r"remote\ results\ were\ retained" in result.stderr
+
+
+def test_collection_retry_limit_keeps_bounded_error_history(tmp_path: Path) -> None:
+    """[R-03] Exhaustion preserves each failed transfer without partial data."""
+    archive = tmp_path / "attempt.tar"
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    result = _bash(f"""
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        kubectl_pvc_exec() {{
+            printf partial
+            printf 'error: unexpected EOF\\n' >&2
+            head -c 2097152 /dev/zero | tr '\\0' E >&2
+            return 1
+        }}
+        ! kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(archive)!r} {str(metadata / 'state.sh')!r}
+        test ! -e {str(archive)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    bundle = next((metadata / "diagnostics").glob("collection-stream.*"))
+    errors = list(bundle.glob("transfer-*.stderr"))
+    assert len(errors) == 3
+    assert all(path.stat().st_size <= 131072 for path in errors)
+    assert len((bundle / "transfers.tsv").read_text().splitlines()) == 3
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_PATH=" in result.stderr
+
+
+def test_collection_retries_share_one_deadline(tmp_path: Path) -> None:
+    """[R-04] Backoff cannot extend the collection operation's deadline."""
+    calls = tmp_path / "calls"
+    result = _bash(f"""
+        KUBECTL_COLLECTION_TIMEOUT_SECONDS=30
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=60
+        kubectl_pvc_exec() {{
+            printf 'call\\n' >> {str(calls)!r}
+            printf 'error: unexpected EOF\\n' >&2
+            return 1
+        }}
+        sleep() {{ echo 'unexpected sleep' >&2; return 99; }}
+        ! kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(tmp_path / 'attempt.tar')!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert len(calls.read_text().splitlines()) == 1
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=TIMEOUT" in result.stderr
+    assert "unexpected sleep" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "consumer_rc,reason", [(65, "ARCHIVE_INVALID"), (74, "LOCAL_IO")]
+)
+def test_collection_does_not_retry_consumer_failures(
+    tmp_path: Path, consumer_rc: int, reason: str
+) -> None:
+    """A transient-looking producer error cannot override local receive failure."""
+    calls = tmp_path / "calls"
+    result = _bash(f"""
+        kubectl_pvc_exec() {{
+            printf 'call\\n' >> {str(calls)!r}
+            printf 'error: HTTP 503 Service Unavailable\\n' >&2
+            return 1
+        }}
+        _kubectl_write_bounded_collection_stream() {{ return {consumer_rc}; }}
+        ! kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(tmp_path / 'attempt.tar')!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert len(calls.read_text().splitlines()) == 1
+    assert f"STORAGE_SCALE_TEST_DIAGNOSTIC_REASON={reason}" in result.stderr
+    assert f"consumer_rc={consumer_rc}" in result.stderr
+
+
+def test_collection_retry_diagnostics_are_bounded_and_keep_current_bundle(
+    tmp_path: Path,
+) -> None:
+    """Equal timestamps cannot prune the error currently being captured."""
+    metadata = tmp_path / "metadata"
+    root = metadata / "diagnostics"
+    root.mkdir(parents=True)
+    for number in range(10):
+        (root / f"z-old-{number}").mkdir()
+    result = _bash(f"""
+        kubectl_pvc_exec() {{ printf 'Forbidden\\n' >&2; return 1; }}
+        _kubectl_local_path_mtime() {{ printf '0\\n'; }}
+        ! kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(tmp_path / 'attempt.tar')!r} {str(metadata / 'state.sh')!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert len(list(root.iterdir())) == 8
+    bundle = next(root.glob("collection-stream.*"))
+    assert (bundle / "transfer-1.stderr").read_text() == "Forbidden\n"
+
+
+def test_collection_retry_uses_remaining_deadline_and_tolerates_diagnostic_failure(
+    tmp_path: Path,
+) -> None:
+    """Retries do not restart the clock or depend on a writable diagnostic path."""
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    (metadata / "diagnostics").write_text("not a directory")
+    calls = tmp_path / "calls"
+    archive = tmp_path / "attempt.tar"
+    result = _bash(f"""
+        KUBECTL_COLLECTION_TIMEOUT_SECONDS=30
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        sleep() {{ SECONDS=$((SECONDS + 5)); }}
+        kubectl_pvc_exec() {{
+            printf '%s\\n' "$KUBECTL_PROCESS_TIMEOUT_SECONDS" >> {str(calls)!r}
+            if [[ $(wc -l < {str(calls)!r}) == 1 ]]; then
+                printf partial
+                printf 'error: unexpected EOF\\n' >&2
+                return 1
+            fi
+            printf complete
+        }}
+        kubectl_stream_remote_attempt test-ns collector 1234abcd \
+            {str(archive)!r} {str(metadata / 'state.sh')!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    deadlines = [int(value) for value in calls.read_text().splitlines()]
+    assert len(deadlines) == 2
+    assert 0 < deadlines[1] <= deadlines[0] - 5
+    assert archive.read_text() == "complete"
+    assert "diagnostics could not be saved" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=" not in result.stderr
 
 
 def test_collection_stream_failure_removes_partial_and_reports_auth(
@@ -2065,7 +2565,7 @@ def test_collection_recovers_lease_delete_before_release_journal(
           return 1
         }}
         output=$(kubectl_lifecycle_operation collect {str(results)!r})
-        [[ "$output" == *STORAGE_SCALE_TEST_KUBECTL_STATE=SUCCESS* ]]
+        [[ "$output" == *STATE=SUCCESS* ]]
         kubectl_attempt_load_metadata "$root/attempts/1234abcd"
         [[ "$KUBECTL_LIFECYCLE_STATE" == COLLECTED ]]
         kubectl_attempt_step_done "$root" 1234abcd release-pvc-lease
@@ -2956,12 +3456,15 @@ def test_collected_terminal_status_is_a_successful_query(
         : > "$root/attempts/1234abcd/configuration.sh"
         kubectl_local_lock_release "$fd"
         kubectl_cleanup_ephemeral_helpers() {{ :; }}
-        _kubectl_validate_collected_publication() {{ printf -v "$3" {terminal}; }}
+        _kubectl_validate_collected_publication() {{
+            printf 'execution\t0001\tFAILED\n' > "$1/publication-manifest.tsv"
+            printf -v "$3" {terminal}
+        }}
         _kubectl_verify_saved_cluster_identity() {{ return 99; }}
         kubectl_lifecycle_operation status {str(results)!r}
         """)
     assert result.returncode == 0, result.stderr
-    assert f"STORAGE_SCALE_TEST_KUBECTL_STATE={terminal}" in result.stdout
+    assert f"STATE={terminal}" in result.stdout
 
 
 def test_repeated_collect_preserves_failed_benchmark_exit_semantics(
@@ -2981,11 +3484,14 @@ def test_repeated_collect_preserves_failed_benchmark_exit_semantics(
         : > "$root/attempts/1234abcd/configuration.sh"
         kubectl_local_lock_release "$fd"
         kubectl_cleanup_ephemeral_helpers() {{ :; }}
-        _kubectl_validate_collected_publication() {{ printf -v "$3" FAILED; }}
+        _kubectl_validate_collected_publication() {{
+            printf 'execution\t0001\tFAILED\n' > "$1/publication-manifest.tsv"
+            printf -v "$3" FAILED
+        }}
         ! kubectl_lifecycle_operation collect {str(results)!r}
         """)
     assert result.returncode == 0, result.stderr
-    assert "STORAGE_SCALE_TEST_KUBECTL_STATE=FAILED" in result.stdout
+    assert "STATE=FAILED" in result.stdout
 
 
 def test_status_projects_published_collection_after_remote_cleanup(
@@ -3005,16 +3511,17 @@ def test_status_projects_published_collection_after_remote_cleanup(
         : > "$root/attempts/1234abcd/configuration.sh"
         kubectl_local_lock_release "$fd"
         kubectl_cleanup_ephemeral_helpers() {{ :; }}
-        _kubectl_validate_collected_publication() {{ printf -v "$3" FAILED; }}
+        _kubectl_validate_collected_publication() {{
+            printf 'execution\t0001\tFAILED\n' > "$1/publication-manifest.tsv"
+            printf -v "$3" FAILED
+        }}
         _kubectl_verify_saved_cluster_identity() {{ return 99; }}
         kubectl_lifecycle_operation status {str(results)!r}
         """)
     assert result.returncode == 0, result.stderr
-    assert "STORAGE_SCALE_TEST_KUBECTL_STATE=FAILED" in result.stdout
-    assert (
-        "STORAGE_SCALE_TEST_KUBECTL_LOCAL_STATE=COLLECTION_IN_PROGRESS" in result.stdout
-    )
-    assert "STORAGE_SCALE_TEST_COLLECT_COMMAND=" in result.stdout
+    assert "STATE=FAILED" in result.stdout
+    assert "RESULT_COLLECTION=CLEANUP_PENDING" in result.stdout
+    assert "NEXT_ACTION=COLLECT" in result.stdout
 
 
 def test_collect_active_attempt_reports_terminal_gate_and_next_action(
@@ -3138,13 +3645,139 @@ EOF
         _kubectl_verify_saved_worker_endpoints() {{ :; }}
         kubectl_preserve_storage_failure_diagnostics() {{ printf diagnose- >> "$events"; }}
         kubectl_recover_lost_coordinator() {{ printf recover- >> "$events"; }}
+        kubectl_read_remote_execution_progress() {{
+            [[ "$4" == FAILED ]] || return 1
+            printf progress- >> "$events"
+            printf '1 0 0 0\n'
+        }}
         _kubectl_remove_inspector() {{ printf remove- >> "$events"; }}
         kubectl_emit_state() {{ printf 'STATE=%s\n' "$1"; }}
         kubectl_lifecycle_operation status {str(results)!r}
-        [[ $(cat "$events") == diagnose-recover-remove- ]]
+        [[ $(cat "$events") == diagnose-recover-progress-remove- ]]
     """)
     assert result.returncode == 0, result.stderr
     assert "STATE=FAILED" in result.stdout
+    assert "EXECUTIONS_PENDING=1" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "failure,reason",
+    [
+        (None, None),
+        ("return 1", "LEDGER_INCONSISTENT"),
+        ("echo Forbidden >&2; return 1", "AUTH"),
+        ("return 124", "TIMEOUT"),
+        (
+            "echo 'invalid Kubernetes execution status' >&2; return 1",
+            "LEDGER_INCONSISTENT",
+        ),
+    ],
+)
+@pytest.mark.parametrize("warning", [False, True])
+def test_public_status_reads_progress_before_removing_inspector(
+    tmp_path, failure, reason, warning
+):
+    """Live progress uses the existing helper and leaves client cells untouched."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    result = _bash(_identity(state) + f"""
+        set -e
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        printf 'export KUBECTL_NAMESPACE=test-ns\n' > "$root/attempts/1234abcd/configuration.sh"
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
+          Job sweep test-ns job-uid 0123456789abcdef0123456789abcdef
+        kubectl_local_lock_release "$fd"
+        mkdir -p {str(results / 'executions')!r}
+        printf PENDING > {str(results / 'executions/0001.status')!r}
+        events={str(tmp_path / 'events')!r}
+        kubectl_cleanup_ephemeral_helpers() {{ :; }}
+        _kubectl_verify_saved_cluster_identity() {{ :; }}
+        kubectl_verify_journaled_pvc_lease() {{ :; }}
+        _kubectl_create_inspector() {{ printf -v "$1" helper; printf -v "$2" uid; }}
+        kubectl_read_remote_status() {{ printf RUNNING; }}
+        kubectl_job_terminal_state() {{ return 2; }}
+        _kubectl_verify_saved_worker_endpoints() {{ :; }}
+        kubectl_read_remote_execution_progress() {{
+            [[ "$1:$2:$3:$4" == test-ns:helper:1234abcd:RUNNING ]] || return 2
+            printf progress- >> "$events"
+            {"echo 'Warning: version difference between client and server' >&2" if warning else ":"}
+            {failure or "printf '0 1 0 0\\n'"}
+        }}
+        _kubectl_remove_inspector() {{ printf remove- >> "$events"; }}
+        outcome=0
+        kubectl_lifecycle_operation status {str(results)!r} || outcome=$?
+        [[ "$outcome" == {1 if failure else 0} ]]
+        [[ $(cat "$events") == progress-remove- ]]
+        [[ $(cat {str(results / 'executions/0001.status')!r}) == PENDING ]]
+        """)
+    assert result.returncode == 0, result.stderr
+    if failure:
+        assert "STORAGE_SCALE_TEST_DIAGNOSTIC_PHASE=execution-progress" in result.stderr
+        assert f"STORAGE_SCALE_TEST_DIAGNOSTIC_REASON={reason}" in result.stderr
+        assert "EXECUTIONS_RUNNING=" not in result.stdout
+    else:
+        assert "STATE=RUNNING" in result.stdout
+        assert "EXECUTIONS_RUNNING=1" in result.stdout
+        assert "Warning:" not in result.stdout
+        if warning:
+            assert "Warning: version difference" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "outcome,counts,collection,expected,next_action",
+    [
+        ("PREPARED", "30 0 0 0", "PENDING", "PREPARING", "WAIT"),
+        ("RUNNING", "8 1 21 0", "PENDING", "RUNNING", "WAIT"),
+        ("RUNNING", "8 0 22 0", "PENDING", "BETWEEN_EXECUTIONS", "WAIT"),
+        ("RUNNING", "0 0 30 0", "PENDING", "AWAITING_COMPLETION", "WAIT"),
+        ("RUNNING", "29 0 0 1", "PENDING", "BETWEEN_EXECUTIONS", "WAIT"),
+        ("SUCCESS", "0 0 30 0", "PENDING", "SUCCESS", "COLLECT"),
+        ("FAILED", "1 0 1 1", "CLEANUP_PENDING", "FAILED", "COLLECT"),
+        ("FAILED", "1 0 1 1", "COMPLETE", "FAILED", "RESUME"),
+        ("CANCELLED", "0 0 2 0", "COMPLETE", "CANCELLED", "NONE"),
+        ("SUCCESS", "0 0 2 0", "COMPLETE", "SUCCESS", "NONE"),
+    ],
+)
+def test_status_view_separates_execution_progress_from_collection(
+    tmp_path, outcome, counts, collection, expected, next_action
+):
+    """One scoped progress view; zero running cells never proves collectibility."""
+    result = _bash(f"""
+        kubectl_emit_status_view {str(tmp_path)!r} 1234abcd {outcome} \
+            PVC {collection} '{counts}'
+        """)
+    assert result.returncode == 0, result.stderr
+    fields = dict(line.split("=", 1) for line in result.stdout.splitlines())
+    assert fields["STATE"] == expected
+    assert fields["NEXT_ACTION"] == next_action
+    assert fields["EXECUTION_SCOPE"] == "CURRENT_ATTEMPT"
+    assert fields["EXECUTIONS_TOTAL"] == str(sum(map(int, counts.split())))
+    assert fields["RESULT_COLLECTION"] == collection
+    assert not any(key.startswith("STORAGE_SCALE_TEST_") for key in fields)
+
+
+def test_status_refreshes_outcome_and_counts_after_completion(tmp_path):
+    """The final state read wins over the earlier RUNNING observation."""
+    events = tmp_path / "events"
+    result = _bash(f"""
+        events={str(events)!r}
+        kubectl_read_remote_execution_progress() {{
+            printf '%s\n' "$4" >> "$events"
+            [[ "$4" == RUNNING ]] && printf '0 1 29 0' || printf '0 0 30 0'
+        }}
+        kubectl_read_remote_status() {{ printf SUCCESS; }}
+        progress=$(kubectl_read_refreshed_execution_progress ns pod 1234abcd RUNNING)
+        [[ "$progress" == 'SUCCESS 0 0 30 0' ]]
+        kubectl_emit_status_view {str(tmp_path)!r} 1234abcd "${{progress%% *}}" \
+            PVC PENDING "${{progress#* }}"
+        """)
+    assert result.returncode == 0, result.stderr
+    assert events.read_text().splitlines() == ["RUNNING", "SUCCESS"]
+    assert "STATE=SUCCESS\n" in result.stdout
+    assert "EXECUTIONS_RUNNING=0\n" in result.stdout
+    assert "NEXT_ACTION=COLLECT\n" in result.stdout
 
 
 def test_status_reports_incomplete_cancellation_as_retryable_failure(
@@ -3170,7 +3803,7 @@ EOF
         ! kubectl_lifecycle_operation status {str(results)!r}
     """)
     assert result.returncode == 0, result.stderr
-    assert "STORAGE_SCALE_TEST_KUBECTL_STATE=CANCEL_REQUESTED" in result.stdout
+    assert "STATE=CANCEL_REQUESTED" in result.stdout
     assert (
         "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=CANCELLATION_INCOMPLETE" in result.stderr
     )
@@ -3204,8 +3837,10 @@ EOF
     assert "do\\ not\\ cancel\\ by\\ label" in result.stderr
 
 
+@pytest.mark.parametrize("terminal_on_refresh", [False, True])
 def test_completed_job_with_nonterminal_ledger_is_diagnosed(
     tmp_path: Path,
+    terminal_on_refresh: bool,
 ) -> None:
     """[T-05] Complete Job plus nonterminal PVC state is diagnosed."""
     results = tmp_path / "results"
@@ -3224,15 +3859,31 @@ EOF
         _kubectl_verify_saved_cluster_identity() {{ :; }}
         kubectl_verify_journaled_pvc_lease() {{ :; }}
         _kubectl_create_inspector() {{ printf -v "$1" helper; printf -v "$2" uid; }}
-        kubectl_read_remote_status() {{ printf RUNNING; }}
+        status_calls={str(tmp_path / 'calls')!r}
+        kubectl_read_remote_status() {{
+            printf x >> "$status_calls"
+            if [[ $(wc -c < "$status_calls") -gt 1 && {1 if terminal_on_refresh else 0} == 1 ]]; then
+                printf SUCCESS
+            else
+                printf RUNNING
+            fi
+        }}
         kubectl_job_terminal_state() {{ printf -v "$1" COMPLETE; }}
+        kubectl_read_remote_execution_progress() {{ printf '0 0 1 0\n'; }}
         _kubectl_verify_saved_worker_endpoints() {{ :; }}
         _kubectl_remove_inspector() {{ :; }}
-        ! kubectl_lifecycle_operation status {str(results)!r}
+        {"" if terminal_on_refresh else "! "}kubectl_lifecycle_operation status {str(results)!r}
     """)
     assert result.returncode == 0, result.stderr
-    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=LEDGER_INCONSISTENT" in result.stderr
-    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_EXPECTED_UID=job-uid" in result.stderr
+    if terminal_on_refresh:
+        assert "STATE=SUCCESS\n" in result.stdout
+        assert "NEXT_ACTION=COLLECT\n" in result.stdout
+        assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=" not in result.stderr
+    else:
+        assert (
+            "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=LEDGER_INCONSISTENT" in result.stderr
+        )
+        assert "STORAGE_SCALE_TEST_DIAGNOSTIC_EXPECTED_UID=job-uid" in result.stderr
 
 
 def test_missing_worker_daemonset_emits_identity_diagnostics(tmp_path: Path) -> None:

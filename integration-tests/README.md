@@ -136,7 +136,10 @@ selection, failure and resume, retained write/read/delete data, extended live
 CSV capture, and mdtest-Elbencho sweeps over one and two nodes and one and two
 tasks per node on SSH, Slurm, and Kubernetes. The MD scenario checks both raw
 result files, injects one failed cell, and resumes while checking that the
-earlier successful cell is preserved. Focused cases
+earlier successful cell is preserved. `mixed-batch` prepares IO → metadata → IO
+with different roots and repeated coordinates, starts through the other launcher,
+injects a failure, resumes without rerunning successful cells, and verifies
+separate group reports on all three substrates. Focused cases
 add a multidimensional Slurm sweep, Slurm include/exclude and exclusive-user
 allocation behavior, SSH weighted roots, generated and staged single-file
 work, and shared SSH homes. Workloads stay deliberately small; assertions

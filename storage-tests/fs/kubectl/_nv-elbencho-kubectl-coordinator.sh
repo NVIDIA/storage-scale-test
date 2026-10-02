@@ -34,6 +34,9 @@
 # artifacts, terminal state, and summary are durable; it is the collection
 # commit point.
 
+# Each execution runs in a subshell so its complete group snapshot cannot
+# change the parent coordinator's common profile or another group's settings.
+# shellcheck disable=SC2030,SC2031
 set -uo pipefail
 
 readonly KUBECTL_COORDINATOR_SCHEMA=1
@@ -137,6 +140,38 @@ _coordinator_verify_bundle() {
         _coordinator_error "bundle manifest has no execution definitions"
         return 1
     }
+    # Enumeration must never pick up an execution omitted from the verified
+    # bundle. Reject unlisted files rather than treating directory contents as
+    # another source of execution membership.
+    local bundle_files
+    bundle_files=$(_coordinator_relative_files "$CONTROL_DIR") || return 1
+    while IFS= read -r relative; do
+        [[ "$relative" == bundle-manifest.tsv || -v seen["$relative"] ]] || return 1
+    done <<< "$bundle_files"
+    if [[ -v seen[batch-manifest.tsv] ]]; then
+        [[ -v seen[_batch_functions.sh] && -v seen[batch-sealed.sha256] ]] || return 1
+        # shellcheck disable=SC1090,SC1091  # The library digest was checked above.
+        source "$CONTROL_DIR/_batch_functions.sh" || return 1
+        elbencho_batch_verify_manifest "$CONTROL_DIR" subset || return 1
+        for relative in "${!seen[@]}"; do
+            [[ "$relative" == executions/[0-9][0-9][0-9][0-9].sh ]] || continue
+            local execution_id="${relative#executions/}" expected_output expected_group expected_kind
+            execution_id="${execution_id%.sh}"
+            expected_output=$(elbencho_batch_execution_output_dir "$CONTROL_DIR" "$execution_id") || return 1
+            expected_output="${expected_output#"$CONTROL_DIR"/}"
+            expected_group="${expected_output#groups/}"
+            expected_group="${expected_group%%/*}"
+            expected_kind=$(awk -F '\t' -v id="$expected_group" '$1 == "group" && $2 == id {print $3}' "$CONTROL_DIR/batch-manifest.tsv") || return 1
+            (
+                unset ELBENCHO_BATCH_GROUP_ID ELBENCHO_BATCH_OUTPUT_RELATIVE ELBENCHO_EXECUTION_KIND
+                # shellcheck disable=SC1090  # The execution digest was checked above.
+                source "$CONTROL_DIR/$relative" || exit 1
+                [[ "${ELBENCHO_BATCH_GROUP_ID:-}" == "$expected_group" \
+                    && "${ELBENCHO_BATCH_OUTPUT_RELATIVE:-}" == "$expected_output" \
+                    && "${ELBENCHO_EXECUTION_KIND:-}" == "$expected_kind" ]]
+            ) || return 1
+        done
+    fi
 }
 
 _coordinator_load_run_metadata() {
@@ -148,7 +183,7 @@ _coordinator_load_run_metadata() {
         case "$key" in
             output_basename)
                 [[ -z "${COORDINATOR_OUTPUT_BASENAME:-}" \
-                    && "$value" =~ ^(elbencho|mdtest-elbencho)-[0-9]{8}Z[0-9]{6}$ ]] || return 1
+                    && "$value" =~ ^(elbencho|mdtest-elbencho|filesystem-batch)-[0-9]{8}Z[0-9]{6}$ ]] || return 1
                 COORDINATOR_OUTPUT_BASENAME="$value"
                 ;;
             attempt_id) [[ "$value" == "$ATTEMPT_ID" ]] || return 1 ;;
@@ -244,9 +279,18 @@ _coordinator_set_control_layout() {
 _coordinator_initialize_snapshots() {
     local allow_create="${1:-1}" snapshot
     [[ "$allow_create" =~ ^[01]$ ]] || return 1
-    for snapshot in env_used.sh env_used.yaml; do
+    local -a snapshots=(env_used.sh env_used.yaml)
+    if [[ -f "$CONTROL_DIR/batch-manifest.tsv" ]]; then
+        snapshots+=(batch-manifest.tsv batch-sealed.sha256)
+        local relative
+        while IFS= read -r relative; do
+            snapshots+=("$relative/env_used.sh" "$relative/env_used.yaml")
+        done < <(awk -F '\t' '$1 == "group" {print $4}' "$CONTROL_DIR/batch-manifest.tsv")
+    fi
+    for snapshot in "${snapshots[@]}"; do
         if [[ ! -e "$STATE_DIR/$snapshot" ]]; then
             [[ "$allow_create" -eq 1 ]] || return 1
+            mkdir -p -- "$(dirname "$STATE_DIR/$snapshot")" || return 1
             cp -- "$CONTROL_DIR/$snapshot" "$STATE_DIR/$snapshot" || return 1
         elif [[ ! -f "$STATE_DIR/$snapshot" || -L "$STATE_DIR/$snapshot" ]] \
                 || ! cmp -s -- "$CONTROL_DIR/$snapshot" "$STATE_DIR/$snapshot"; then
@@ -435,7 +479,9 @@ _coordinator_copy_scratch_results() {
     local durable="$STATE_DIR/results/$id"
     [[ -d "$scratch" && ! -L "$scratch" ]] || return 1
     mkdir -p "$durable" || return 1
-    local relative source destination destination_dir tmp
+    local relative source destination destination_dir tmp scratch_files
+    scratch_files=$(_coordinator_relative_files "$scratch") || return 1
+    [[ -n "$scratch_files" ]] || return 0
     while IFS= read -r relative; do
         source="$scratch/$relative"
         destination="$durable/$relative"
@@ -443,7 +489,7 @@ _coordinator_copy_scratch_results() {
         mkdir -p "$destination_dir" || return 1
         tmp="$destination.tmp.${BASHPID:-$$}.${RANDOM}"
         cp -- "$source" "$tmp" && mv -f -- "$tmp" "$destination" || return 1
-    done < <(_coordinator_relative_files "$scratch")
+    done <<< "$scratch_files"
 }
 
 _coordinator_append_manifest_file() {
@@ -462,7 +508,7 @@ _coordinator_publish_manifest() {
         printf 'schema\t%s\n' "$KUBECTL_COORDINATOR_SCHEMA"
         printf 'attempt_id\t%s\n' "$ATTEMPT_ID"
     } > "$tmp" || return 1
-    local id status result_root relative
+    local id status result_root relative output_relative
     while IFS= read -r id; do
         status=$(cat "$STATE_DIR/executions/$id.status") || return 1
         case "$status" in
@@ -482,11 +528,19 @@ _coordinator_publish_manifest() {
                 "executions/$id.workers.tsv" "executions/$id.workers.tsv" || return 1
         fi
         result_root="$STATE_DIR/results/$id"
+        output_relative=""
+        if [[ -f "$CONTROL_DIR/batch-manifest.tsv" ]]; then
+            output_relative=$(elbencho_batch_execution_output_dir "$CONTROL_DIR" "$id") || return 1
+            output_relative="${output_relative#"$CONTROL_DIR"/}/"
+        fi
         if [[ -d "$result_root" ]]; then
+            local result_files
+            result_files=$(_coordinator_relative_files "$result_root") || return 1
+            [[ -n "$result_files" ]] || continue
             while IFS= read -r relative; do
                 _coordinator_append_manifest_file "$tmp" result \
-                    "results/$id/$relative" "$relative" || return 1
-            done < <(_coordinator_relative_files "$result_root")
+                    "results/$id/$relative" "$output_relative$relative" || return 1
+            done <<< "$result_files"
         fi
     done < <(_coordinator_execution_ids "$CONTROL_DIR/executions" .sh)
     _coordinator_append_manifest_file "$tmp" ledger run.status run.status || return 1
@@ -497,6 +551,16 @@ _coordinator_publish_manifest() {
         _coordinator_append_manifest_file "$tmp" ledger coordinator-loss.tsv coordinator-loss.tsv || return 1
     _coordinator_append_manifest_file "$tmp" snapshot env_used.sh env_used.sh || return 1
     _coordinator_append_manifest_file "$tmp" snapshot env_used.yaml env_used.yaml || return 1
+    if [[ -f "$CONTROL_DIR/batch-manifest.tsv" ]]; then
+        _coordinator_append_manifest_file "$tmp" snapshot batch-manifest.tsv batch-manifest.tsv || return 1
+        _coordinator_append_manifest_file "$tmp" snapshot batch-sealed.sha256 batch-sealed.sha256 || return 1
+        while IFS= read -r relative; do
+            _coordinator_append_manifest_file "$tmp" snapshot \
+                "$relative/env_used.sh" "$relative/env_used.sh" || return 1
+            _coordinator_append_manifest_file "$tmp" snapshot \
+                "$relative/env_used.yaml" "$relative/env_used.yaml" || return 1
+        done < <(awk -F '\t' '$1 == "group" {print $4}' "$CONTROL_DIR/batch-manifest.tsv")
+    fi
     mv -f -- "$tmp" "$STATE_DIR/publication-manifest.tsv" || return 1
     _coordinator_integration_crash_after after-manifest
 }
@@ -515,6 +579,10 @@ _coordinator_write_summary() {
             *) _coordinator_error "invalid execution state for summary: $id"; return 1 ;;
         esac
     done < <(_coordinator_execution_ids "$CONTROL_DIR/executions" .sh)
+    if [[ "$terminal" =~ ^(SUCCESS|FAILED|CANCELLED)$ && "$running" -ne 0 ]]; then
+        _coordinator_error "refusing terminal attempt publication with RUNNING executions"
+        return 1
+    fi
     {
         printf 'schema\t%s\n' "$KUBECTL_COORDINATOR_SCHEMA"
         printf 'attempt_id\t%s\n' "$ATTEMPT_ID"
@@ -610,8 +678,10 @@ _coordinator_require_success_artifacts() {
 _coordinator_finish_prebenchmark_failure() {
     local id="$1" scratch="$2" rc="${3:-1}"
     [[ "$rc" -ne 0 ]] || rc=1
-    [[ -d "$scratch" && ! -L "$scratch" ]] \
-        && _coordinator_copy_scratch_results "$id" "$scratch" || true
+    if [[ -d "$scratch" && ! -L "$scratch" ]] \
+            && ! _coordinator_copy_scratch_results "$id" "$scratch"; then
+        _coordinator_error "could not preserve partial scratch results for execution $id"
+    fi
     _coordinator_atomic_write "$STATE_DIR/executions/$id.exitcode" "$rc" || return 1
     _coordinator_atomic_write "$STATE_DIR/executions/$id.status" FAILED || return 1
     _coordinator_write_summary FAILED "$id" "$rc" || return 1
@@ -634,14 +704,20 @@ _coordinator_signal_handler() {
     local signal_name="$1" rc=143
     [[ "$signal_name" == INT ]] && rc=130
     trap - INT TERM
+    if [[ -n "${COORDINATOR_ACTIVE_PID:-}" ]]; then
+        kill -TERM "$COORDINATOR_ACTIVE_PID" 2>/dev/null || true
+        wait "$COORDINATOR_ACTIVE_PID" 2>/dev/null || true
+    fi
     if [[ -n "${COORDINATOR_ACTIVE_ID:-}" \
             && "$(cat "$STATE_DIR/executions/$COORDINATOR_ACTIVE_ID.status" 2>/dev/null || true)" == RUNNING ]]; then
         _coordinator_finish_prebenchmark_failure "$COORDINATOR_ACTIVE_ID" \
-            "${COORDINATOR_ACTIVE_SCRATCH:-$SCRATCH_DIR}" "$rc" || true
+            "$COORDINATOR_ACTIVE_SCRATCH" "$rc" || {
+                _coordinator_error "cannot finalize interrupted execution $COORDINATOR_ACTIVE_ID"
+                exit "$rc"
+            }
     fi
-    _coordinator_write_summary FAILED "${COORDINATOR_ACTIVE_ID:-}" "$rc" || true
-    _coordinator_atomic_write "$STATE_DIR/run.status" FAILED || true
-    _coordinator_publish_manifest || true
+    _coordinator_finalize_run "$rc" "${COORDINATOR_ACTIVE_ID:-}" || \
+        _coordinator_error "cannot finalize signalled attempt; durable state retained for recovery"
     exit "$rc"
 }
 
@@ -675,9 +751,9 @@ _coordinator_integration_crash_after() {
     local boundary="$1"
     [[ "${KUBECTL_INTEGRATION_CRASH_AFTER:-}" == "$boundary" ]] || return 0
     [[ "${STORAGE_SCALE_TEST_INTEGRATION:-}" == 1 ]] || return 1
-    # $$ identifies the coordinator process even when this helper is called
-    # from a function; BASHPID may instead identify a command substitution.
-    kill -KILL "$$"
+    # A cell runs in an isolated process. Kill it with the coordinator so no
+    # child can publish beyond the injected crash boundary.
+    kill -KILL "$$" "$BASHPID"
 }
 
 _coordinator_run_overlay() {
@@ -755,17 +831,55 @@ _coordinator_validate_mdtest_targets() {
     done
 }
 
-_coordinator_run_one() {
+_coordinator_prepare_active_execution() {
+    local id="$1" output_basename="$COORDINATOR_OUTPUT_BASENAME" group_output
+    if [[ -f "$CONTROL_DIR/batch-manifest.tsv" ]]; then
+        group_output=$(elbencho_batch_execution_output_dir "$CONTROL_DIR" "$id") || return 1
+        output_basename="${group_output##*/}"
+    fi
+    COORDINATOR_ACTIVE_ID="$id"
+    COORDINATOR_ACTIVE_SCRATCH="$SCRATCH_DIR/$id/$output_basename"
+    # The parent must own both the path and RUNNING checkpoint before dispatch.
+    # Child-local assignments cannot inform signal or abnormal-exit recovery.
+    _coordinator_atomic_write "$STATE_DIR/executions/$id.status" RUNNING || return 1
+    _coordinator_write_summary RUNNING
+}
+
+_coordinator_complete_active_execution() {
+    local rc="$1" id="$COORDINATOR_ACTIVE_ID" status
+    status=$(cat "$STATE_DIR/executions/$id.status") || return 1
+    case "$status" in
+        RUNNING)
+            [[ "$rc" -ne 0 ]] || rc=1
+            _coordinator_error "execution $id exited before terminal cell publication (rc=$rc)"
+            _coordinator_finish_prebenchmark_failure "$id" "$COORDINATOR_ACTIVE_SCRATCH" "$rc" \
+                || return 1
+            ;;
+        SUCCESS) ;;
+        FAILED)
+            if [[ "$rc" -eq 0 ]]; then
+                rc=$(cat "$STATE_DIR/executions/$id.exitcode") || return 1
+                [[ "$rc" =~ ^[1-9][0-9]*$ ]] || return 1
+            fi
+            ;;
+        *) _coordinator_error "invalid execution state after child exit: $id=$status"; return 1 ;;
+    esac
+    return "$rc"
+}
+
+_coordinator_run_one() (
     local id="$1"
     local definition="$CONTROL_DIR/executions/$id.sh"
     local workers="$STATE_DIR/executions/$id.workers.tsv"
-    local scratch="$SCRATCH_DIR/$id/$COORDINATOR_OUTPUT_BASENAME"
+    local scratch="$COORDINATOR_ACTIVE_SCRATCH"
+    COORDINATOR_OUTPUT_BASENAME="${scratch##*/}"
     local durable="$STATE_DIR/results/$id"
     local rc=0
-    _coordinator_atomic_write "$STATE_DIR/executions/$id.status" RUNNING || return 1
-    _coordinator_write_summary RUNNING || return 1
-    rm -rf -- "${SCRATCH_DIR:?}/$id"
-    mkdir -p "$scratch" "$durable" || return 1
+    local runtime_overlay="${KUBECTL_INTEGRATION_FAILURE_OVERLAY:-}"
+    local runtime_fake="${KUBECTL_INTEGRATION_FAKE_ELBENCHO:-}"
+    COORDINATOR_ACTIVE_PID=""
+    trap '_coordinator_signal_handler INT' INT
+    trap '_coordinator_signal_handler TERM' TERM
     unset ELBENCHO_EXECUTION_KIND tasks_per_node MDTEST_LAYOUT
     unset MDTEST_SINGLE_DIR_TARGET_FILES MDTEST_SINGLE_DIR_FILES_PER_WORKER
     unset MDTEST_BRANCH_FACTOR MDTEST_ITEMS_PER_DIR MDTEST_ITERATIONS
@@ -774,6 +888,18 @@ _coordinator_run_one() {
         _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
         return 1
     }
+    # Group snapshots carry the submitting host's executable path. Workloads
+    # always execute the binary provided by the pinned coordinator image.
+    export ELBENCHO=/usr/bin/elbencho
+    # Bundle preparation relocates an integration overlay into this attempt,
+    # and resume removes it. Saved group snapshots contain launch-host paths,
+    # so retain only the already validated attempt-level runtime hooks.
+    unset KUBECTL_INTEGRATION_FAILURE_OVERLAY KUBECTL_INTEGRATION_FAKE_ELBENCHO
+    [[ -z "$runtime_overlay" ]] || export KUBECTL_INTEGRATION_FAILURE_OVERLAY="$runtime_overlay"
+    [[ -z "$runtime_fake" ]] || export KUBECTL_INTEGRATION_FAKE_ELBENCHO="$runtime_fake"
+    rm -rf -- "${SCRATCH_DIR:?}/$id"
+    mkdir -p "$scratch" "$durable" || return 1
+    COORDINATOR_ACTIVE_SCRATCH="$scratch"
     [[ "${nodes:-}" =~ ^[1-9][0-9]*$ ]] || {
         _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
         return 1
@@ -913,7 +1039,7 @@ _coordinator_run_one() {
         _coordinator_result_publication_hook "$rc" "$scratch" "$durable" || true
     fi
     return "$rc"
-}
+)
 
 kubectl_map_generated_csv() {
     local csv="$1" item mapped output=()
@@ -948,6 +1074,15 @@ _coordinator_finalize_run() {
     local rc="$1" failed_id="${2:-}"
     local final=SUCCESS
     [[ "$rc" -eq 0 ]] || final=FAILED
+    if [[ "$final" == FAILED && ( -z "$failed_id" \
+            || "$(cat "$STATE_DIR/executions/$failed_id.status" 2>/dev/null)" != FAILED ) ]]; then
+        # Infrastructure failure after a successful checkpoint must preserve
+        # that cell, but still supply attempt-level failure evidence to collect.
+        _coordinator_atomic_write "$STATE_DIR/startup-error.txt" \
+            "coordinator interrupted outside a failed cell (execution=${failed_id:-none}, rc=$rc)" \
+            || return 1
+        failed_id=""
+    fi
     _coordinator_write_summary "$final" "$failed_id" "$rc" || return 1
     _coordinator_atomic_write "$STATE_DIR/run.status" "$final" || return 1
     _coordinator_publish_manifest
@@ -1217,6 +1352,7 @@ _coordinator_main() {
     _coordinator_integration_crash_after after-run-status
     COORDINATOR_ACTIVE_ID=""
     COORDINATOR_ACTIVE_SCRATCH=""
+    COORDINATOR_ACTIVE_PID=""
     trap '_coordinator_signal_handler INT' INT
     trap '_coordinator_signal_handler TERM' TERM
     local id status rc=0 failed_id=""
@@ -1244,9 +1380,15 @@ _coordinator_main() {
                 break
                 ;;
         esac
-        COORDINATOR_ACTIVE_ID="$id"
-        COORDINATOR_ACTIVE_SCRATCH="$SCRATCH_DIR/$id/$COORDINATOR_OUTPUT_BASENAME"
-        _coordinator_run_one "$id" || rc=$?
+        _coordinator_prepare_active_execution "$id" || {
+            _coordinator_error "cannot prepare execution $id; durable state retained for recovery"
+            return 1
+        }
+        _coordinator_run_one "$id" &
+        COORDINATOR_ACTIVE_PID=$!
+        wait "$COORDINATOR_ACTIVE_PID" || rc=$?
+        COORDINATOR_ACTIVE_PID=""
+        _coordinator_complete_active_execution "$rc" || rc=$?
         if [[ "$rc" -ne 0 ]]; then
             failed_id="$id"
             break

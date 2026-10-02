@@ -23,7 +23,9 @@ implementation journal.
 
 Use the following documents for their narrower authoritative scopes:
 
-- [README.md](../README.md): user setup and operation.
+- [README.md](../README.md): launcher setup, substrate configuration, and validation.
+- [Filesystem](FILESYSTEM_TESTING.md), [object](OBJECT_STORAGE_TESTING.md), and
+  [network](NETWORK_TESTING.md) guides: workload operation and reporting.
 - [docs/REQUIREMENTS.md](REQUIREMENTS.md): normative requirements and status.
 - [docs/DESIGN.md](DESIGN.md): detailed design and interfaces.
 - [docs/ARCHITECTURE_DIAGRAMS.md](ARCHITECTURE_DIAGRAMS.md): deployment and
@@ -91,6 +93,8 @@ The test CLI selects substrates and scenarios independently. Its planner batches
 shared-home SSH cases behind a crash-recoverable transition; separate homes are
 canonical. Pod work uses `tester` UID/GID 2000, matching the all-squashed NFS
 export and Slurm account.
+Restart the Slinky login Pod, not its operator-managed Deployment template;
+the operator can revert rollout annotations and kill an in-flight probe.
 
 The harness builds the ordinary deployment archive from an immutable tracked
 snapshot, caches it by snapshot, architecture, fixed recipe, and seeded
@@ -110,7 +114,11 @@ state machines, invariants, fault matrix, and unsupported cases are frozen in
 Attempts publish their local `PREPARED` pointer before external mutation so an
 interrupted setup remains recoverable; resume uses compare-and-swap against the
 collected predecessor. Collection waits for the exact journaled Job to
-become inactive, uses a transfer-sized deadline, and recovers coordinator loss
+become inactive, uses one transfer deadline with bounded transient-only retries,
+and retains bounded transfer stderr and exit history even after recovery.
+Only published state is transferred, not uploaded control files. An isolated tar
+changed-source warning retries from scratch; manifest hashes still gate import.
+Unknown remote errors are not diagnosed as API outages. It recovers coordinator loss
 from either PREPARED or RUNNING. Derived workload paths are resolved against
 live PVC symlinks, and endpoint checks freeze Node, Pod, address, architecture,
 and image identity. Ordinary PVC commands detach stdin; only finite bundle
@@ -396,7 +404,20 @@ workload kind, parameters, and distinct generated target paths. SSH and Slurm
 resume non-successful cells from `env_used.sh` while retaining successful
 results; Kubernetes uses the asynchronous status/cancel/collect lifecycle and
 requires collection before resume. The shared dispatch protocol accepts both
-workload kinds; adding cells to an existing run is not yet supported.
+workload kinds. Prepared batches save ordered groups locally, freeze common
+resources, and permanently seal their manifest before first external mutation.
+One global ledger owns statuses; group snapshots and artifacts remain isolated
+through dispatch, collection, resume, and unified filesystem reporting.
+The Kubernetes parent owns each active cell's group-specific scratch path and
+finalizes abnormal child exits before publishing a terminal attempt.
+Reporters share option definitions; the unified entry point routes by workload
+kind and retains other groups' index links across filtered runs only when
+their canonical batch, immutable group, and report-content identity match.
+Kubernetes helper loading is idempotent: repeated preflight/dispatch loads must
+preserve readonly constants and active ownership maps.
+Status emits one scoped progress view with collection state and next action.
+Kubernetes counts its current attempt from the PVC until local publication;
+zero running cells do not imply terminality or collection readiness.
 Because elbencho appends to existing result files, a metadata retry removes
 all per-iteration `.out`/`.csv` pairs before target preparation. Every
 substrate requires nonempty, nonsymlink result pairs and an atomic completion
@@ -415,8 +436,8 @@ The default layout pre-creates a wide branched tree and gives each thread
 uses elbencho `-n 0`, placing uniquely named worker files directly in one flat
 directory. Dense mode requires one node count, one task count, and one generated
 target. Elbencho assigns a uniform integer file count to every worker, so the
-actual total is the closest achievable whole-worker total; both requested and
-actual values are recorded.
+actual total is the closest whole-worker multiple with at least one file per
+worker. Both requested and actual values are recorded.
 
 The analyzer aggregates a result pair only when its CSV contains complete
 `WRITE`, `STAT`, and `RMFILES` records and its `.out` file contains all three

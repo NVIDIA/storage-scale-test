@@ -19,6 +19,8 @@
 
 import sys
 from dataclasses import replace
+from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -71,6 +73,44 @@ def test_from_csv_rejects_raw_result_directories(monkeypatch, tmp_path):
             str(tmp_path / "raw-results"),
         )
     assert raised.value.code == 2
+
+
+def test_unified_front_door_reports_real_cached_io_metrics(tmp_path):
+    """Verify native IO filters, CSV export, and plotting through the front door."""
+    source = tmp_path / "cached.csv"
+    _EXTRACT.write_csv(str(source), [_metric()])
+    output = tmp_path / "reports"
+    entry = Path(__file__).resolve().parents[1] / "utils/extract-filesystem.py"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(entry),
+            "--kind",
+            "io",
+            "--from-csv",
+            str(source),
+            "--only-nodes",
+            "1",
+            "--only-threads",
+            "1",
+            "--only-sizes",
+            "4K",
+            "--only-iodepths",
+            "1",
+            "--to-csv",
+            "--markdown",
+            "--no-dual-y-axis",
+            "--output-dir",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "WRITE" in completed.stdout
+    assert (output / "elbencho-metrics.csv").is_file()
+    assert list(output.glob("*.png"))
 
 
 @pytest.mark.parametrize(
