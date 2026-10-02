@@ -84,6 +84,12 @@ global lock and owner record protect fixed NFS configuration. Cached upstream
 images must match their pinned digest and runner architecture. NFS CSI misses try
 `registry.k8s.io` and `gcr.io/k8s-staging-sig-storage`; its chart tags exist only
 inside kind. Kind node and other image misses use bounded host-Docker retries.
+The SBX binary-extraction path shares those verified image acquisitions. Setup
+acquires all Slinky OCI charts before installing releases, caching validated
+archives with source/version/checksum manifests. Image and chart pulls retry only
+recognized transient failures, with exponential backoff, jitter, and a four-minute
+deadline. Sanitized errors and retry history remain in setup logs; authentication,
+corruption, and unknown failures remain fatal.
 Interrupted private aliases are reconciled; MariaDB and Slinky's Alpine helpers
 use preloaded fixture-private tags. Cleanup recovers partial bootstrap, removes
 only owned resources, restores prior NFS state, verifies unmounts, and does not

@@ -282,6 +282,15 @@ logs and rendered manifests are retained in the state directory. Add
 backend, Kubernetes node, pod, and event diagnostics without printing
 Kubernetes Secrets.
 
+Image pulls reuse digest- and architecture-verified host Docker caches. Slinky
+charts are downloaded and validated before any release is installed, then cached
+with source, version, and checksum records. Recognized transient pull failures
+receive up to four attempts per registry reference, with exponential backoff and
+jitter within a shared four-minute deadline per acquisition. Setup logs retain
+sanitized errors and retry history. Authentication, corrupt artifacts, and
+unknown errors fail immediately; retries cannot overcome a persistent registry
+outage.
+
 For CI workers or any host where retained fixture data is not wanted, run:
 
 ```bash

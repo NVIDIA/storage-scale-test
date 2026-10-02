@@ -3789,11 +3789,184 @@ def test_pinned_fixture_base_uses_cache_before_network(monkeypatch):
         "context deadline exceeded",
         "connection reset by peer",
         "unexpected status from registry: 503 Service Unavailable",
+        "lookup registry on 127.0.0.1:53: server misbehaving",
     ),
 )
 def test_transient_image_pull_failures_are_retryable(detail):
     """Only temporary registry and transport failures enter the retry loop."""
     assert _transient_image_pull_failure(detail)
+
+
+@pytest.mark.parametrize(
+    "detail",
+    (
+        "connection to registry: unauthorized",
+        "request timed out: manifest unknown",
+        "503 Bad Gateway: no space left on device",
+        "connection refused: permission denied",
+        "Bad Gateway: digest mismatch",
+        "connection certificate verification failed",
+        "unknown remote failure",
+    ),
+)
+def test_permanent_image_errors_override_transient_words(detail):
+    """Never retry permanent acquisition failures because of incidental wording."""
+    assert not _transient_image_pull_failure(detail)
+
+
+def test_bare_gateway_failure_is_retryable():
+    """OCI registries and restricted proxies can emit no numeric HTTP status."""
+    assert _transient_image_pull_failure("Error: Bad Gateway")
+
+
+@pytest.mark.parametrize(
+    "detail",
+    (
+        "503 at https://secret-user:secret-password@registry.example/v2/token?token=secret-query#secret-fragment",
+        "503 at https://registry.example?token=secret-query/secret-suffix",
+        "Authorization: Bearer secret-authorization\nHTTP status 503",
+        "request failed with bearer secret-bearer, status code 503",
+        b"Authorization=Basic secret-basic\nBad Gateway",
+        '"Authorization": "Basic secret-json"\nHTTP status 503',
+    ),
+)
+def test_acquisition_evidence_redacts_registry_credentials(detail):
+    """Retained proxy/registry errors cannot publish auth or signed URL secrets."""
+    sanitized = _DRIVER.image_acquisition.sanitize_acquisition_evidence(detail)
+    assert "secret-" not in sanitized
+    assert "503" in sanitized or "Bad Gateway" in sanitized
+
+
+def test_image_acquisition_suppresses_raw_runner_output_and_sanitizes_errors(
+    monkeypatch, caplog
+):
+    """Both retry logs and terminal errors contain only sanitized registry output."""
+    reference = "docker.io/library/fixture:1@sha256:index"
+
+    class _CredentialRunner:
+        def __init__(self):
+            self.pulls = 0
+
+        def run(self, command, **kwargs):
+            assert kwargs["sensitive"] is True
+            if command[:3] == ["docker", "image", "inspect"]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="No such image")
+            assert command[:2] == ["docker", "pull"]
+            self.pulls += 1
+            status = "503 Bad Gateway" if self.pulls == 1 else "401 unauthorized"
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr=f"{status}: https://secret-user:secret-password@registry.example/v2/?token=secret-query",
+            )
+
+    runner = _CredentialRunner()
+    monkeypatch.setattr(_DRIVER, "_check_platform", lambda: "amd64")
+    monkeypatch.setattr(_DRIVER.time, "sleep", lambda _delay: None)
+    with pytest.raises(_DRIVER.ProvisionError) as captured:
+        _ensure_pinned_image(runner, reference)
+    assert runner.pulls == 2
+    assert "secret-" not in str(captured.value)
+    assert "secret-" not in caplog.text
+    assert "registry.example/v2/" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "architecture,platform", [("x86_64", "amd64"), ("aarch64", "arm64")]
+)
+def test_sbx_runtime_extraction_uses_verified_shared_acquisition(
+    tmp_path, monkeypatch, architecture, platform
+):
+    """Runtime extraction verifies the platform before any container mutation."""
+    calls = []
+
+    def acquire(runner, reference, selected):
+        calls.append((runner, reference, selected))
+        return reference
+
+    class _StopAfterAcquisition:
+        def run(self, command, **_kwargs):
+            assert command[:2] == ["docker", "create"]
+            raise RuntimeError("stop extraction after acquisition")
+
+    runner = _StopAfterAcquisition()
+    monkeypatch.setattr(_FILESYSTEM, "ensure_pinned_image", acquire)
+    with pytest.raises(RuntimeError, match="stop extraction"):
+        _FILESYSTEM._extract_container_elbencho(
+            runner, tmp_path, tmp_path / "binary", tmp_path / "runtime", architecture
+        )
+    assert calls == [(runner, _FILESYSTEM.ELBENCHO_CONTAINER, platform)]
+
+
+def test_sbx_runtime_acquisition_failure_prevents_container_creation(
+    tmp_path, monkeypatch
+):
+    """Registry errors remain primary and cannot trigger unverified extraction."""
+
+    def fail(*_args):
+        raise _FILESYSTEM.AcquisitionError("registry authentication required")
+
+    monkeypatch.setattr(_FILESYSTEM, "ensure_pinned_image", fail)
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="authentication"):
+        _FILESYSTEM._extract_container_elbencho(
+            object(), tmp_path, tmp_path / "binary", tmp_path / "runtime", "aarch64"
+        )
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_sbx_runtime_extraction_reuses_cache_or_retries_verified_pull(
+    tmp_path, monkeypatch, cached
+):
+    """The actual SBX call path honors verified caches and bounded acquisition."""
+    digest = _FILESYSTEM.ELBENCHO_CONTAINER.rpartition("@")[2]
+
+    class _RuntimeRunner:
+        def __init__(self):
+            self.present = cached
+            self.pulls = 0
+            self.inspects = 0
+
+        def run(self, command, **_kwargs):
+            if command[:3] == ["docker", "image", "inspect"]:
+                self.inspects += 1
+                return SimpleNamespace(
+                    returncode=0 if self.present else 1,
+                    stdout=(
+                        json.dumps(
+                            {
+                                "Architecture": "arm64",
+                                "RepoDigests": [f"image@{digest}"],
+                            }
+                        )
+                        if self.present
+                        else ""
+                    ),
+                    stderr="" if self.present else "No such image",
+                )
+            if command[:2] == ["docker", "pull"]:
+                assert command[2:4] == ["--platform", "linux/arm64"]
+                self.pulls += 1
+                self.present = self.pulls > 1
+                return SimpleNamespace(
+                    returncode=0 if self.present else 1,
+                    stdout="",
+                    stderr="" if self.present else "429 Too Many Requests",
+                )
+            assert command[:2] == ["docker", "create"]
+            assert self.present
+            raise RuntimeError("verified extraction reached")
+
+    sleeps = []
+    runner = _RuntimeRunner()
+    monkeypatch.setattr(_DRIVER.time, "sleep", sleeps.append)
+    monkeypatch.setattr(_DRIVER.secrets, "randbelow", lambda _limit: 0)
+    with pytest.raises(RuntimeError, match="verified extraction reached"):
+        _FILESYSTEM._extract_container_elbencho(
+            runner, tmp_path, tmp_path / "binary", tmp_path / "runtime", "aarch64"
+        )
+    assert runner.pulls == (0 if cached else 2)
+    assert runner.inspects == (1 if cached else 2)
+    assert sleeps == ([] if cached else [10.0])
 
 
 def test_pinned_image_pull_retries_rate_limit_then_verifies(monkeypatch):
