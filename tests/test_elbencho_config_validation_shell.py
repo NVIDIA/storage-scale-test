@@ -104,6 +104,32 @@ class TestElbenchoConfigValidationShell(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(expected, result.stderr)
 
+    def test_single_root_requires_unit_weight_in_every_file_layout(self) -> None:
+        for layout in ("worker-directories", "shared-directory"):
+            for weight in ("0", "2", "01", "invalid"):
+                with self.subTest(layout=layout, weight=weight):
+                    result = _run_bash(f"""
+                        source "{_ENV_FUNCTIONS}"
+                        declare -A TEST_DIRS=([/one]={weight!r})
+                        ELBENCHO_FILE_LAYOUT={layout!r}
+                        validate_elbencho_file_workload_env
+                        """)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        "single TEST_DIRS entry must have weight 1", result.stderr
+                    )
+
+    def test_unit_single_root_and_weighted_multiple_roots_are_valid(self) -> None:
+        result = _run_bash(f"""
+            set -e
+            source "{_ENV_FUNCTIONS}"
+            declare -A TEST_DIRS=([/one]=1)
+            validate_elbencho_file_workload_env
+            TEST_DIRS=([/one]=2 [/two]=1)
+            validate_elbencho_file_workload_env
+            """)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_accepts_maximum_shell_integer_and_rejects_larger_count(self) -> None:
         script = f"""
         set -e

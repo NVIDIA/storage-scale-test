@@ -130,7 +130,7 @@ def test_append_repeated_coordinates_keeps_own_settings_and_global_targets(check
     batch = create(checkout)
     with (checkout / "env.sh").open("a") as stream:
         stream.write(
-            '\nTEST_DIRS=(["/data/two"]=2)\nexport ELBENCHO_SCALE_READ_WRITE_DURATION=9\n'
+            '\nTEST_DIRS=(["/data/two"]=1)\nexport ELBENCHO_SCALE_READ_WRITE_DURATION=9\n'
         )
     result = launch(checkout, IO, "--append", batch, "--nodes", "1")
     assert result.returncode == 0, result.stderr

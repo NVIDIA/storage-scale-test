@@ -923,6 +923,16 @@ _elbencho_validate_exact_io_sizes() {
     return 0
 }
 
+# Resolve new requests once; saved executions retain their recorded policy.
+resolve_elbencho_completion_mode() {
+    local access="$1" explicit="$2"
+    if [[ "$explicit" == 1 || "$access" == bio || ${#TEST_DIRS[@]} -gt 1 ]]; then
+        printf '1\n'
+    else
+        printf '0\n'
+    fi
+}
+
 # Validate the complete generated/staged workload mode after CLI parsing.
 # Usage: validate_elbencho_sweep_workload_mode <dio_or_bio> <global_random> <read_from> [run_to_completion]
 validate_elbencho_sweep_workload_mode() {
@@ -934,7 +944,7 @@ validate_elbencho_sweep_workload_mode() {
     _elbencho_validate_workload_pairing "$layout" "$files_per_node" || return 1
     if [[ "$layout" == worker-directories && -n "$files_per_node" && -z "$read_from" ]]; then
         [[ "${4:-0}" == 1 ]] || {
-            echo "Error: ELBENCHO_FILES_PER_NODE with worker-directories requires --run-to-completion" >&2
+            echo "Error: ELBENCHO_FILES_PER_NODE with worker-directories requires completion mode (--run-to-completion, buffered IO, or multiple TEST_DIRS roots)" >&2
             return 1
         }
         local targets threads
@@ -2514,13 +2524,9 @@ run_elbencho_io_sweep_iteration_single_big_file() {
         fi
         local elbencho_read_args=(--read --block="$this_read_size")
         elbencho_read_args+=("${common_args[@]}")
-        # DIO: --infloop repeats the read phase until --timelimit; re-reads bypass page cache.
-        # BIO: omit --infloop — with buffered IO, in-process wrap-around would re-touch warm buffer
-        # cache and distort throughput; there is no elbencho-side way to avoid that for repeats.
-        # BIO therefore does one logical pass (or stops at timelimit if slower): wall time is driven
-        # mainly by file size and aggregate read rate, not by timelimit alone. Parameter sweeps can
-        # yield a wide spread of actual runtimes. (Host rotation across sweep jobs is unrelated; it
-        # only affects *separate* invocations — see ELBENCHO_READ_HOST_ROTATE_STEPS above.)
+        # Fresh buffered reads complete once; timed direct reads repeat.
+        # Saved historical buffered requests retain their time ceiling.
+        # Host rotation changes assignments between invocations, not repeats.
         _elbencho_io_append_read_policy elbencho_read_args
         _elbencho_io_append_rotated_hosts_for_read elbencho_read_args
         local read_rc=0
@@ -3392,9 +3398,8 @@ run_elbencho_io_sweep_iteration() {
     if [[ -z "$sweep_read_from" ]]; then
         elbencho_read_args=(--nocsvlabels "${elbencho_read_args[@]}")
     fi
-    # For DIO: use --infloop for time-bounded reads (re-reads hit disk, not cache)
-    # For BIO: skip --infloop to avoid re-reads hitting page cache (inflating throughput numbers)
-    # Reads will stop at timelimit OR after one pass through files, whichever comes first.
+    # Completion reads finish once; timed direct reads repeat until the limit.
+    # Only saved historical buffered requests retain a time ceiling.
     _elbencho_io_append_read_policy elbencho_read_args
     # Rotate hosts for read phase to avoid caching effects (node B reads node A's data)
     # Note: --rotatehosts only works within a single elbencho invocation with multiple phases.
@@ -3409,6 +3414,8 @@ run_elbencho_io_sweep_iteration() {
     fi
 
     local target_file_count
+    # New multi-root requests are resolved to completion before reification.
+    # Retain the historical finite-write branch for saved pre-policy executions.
     # Multi-bench-path / run_to_completion: mkdir+write+read use --files counts; reads do not
     # use --treescan/--treefile (no per-job treescan file for stats in this branch).
     if [[ ( ${#test_dirs[@]} -gt 1 || "$run_to_completion" = "1" ) && -z "$sweep_read_from" ]]; then

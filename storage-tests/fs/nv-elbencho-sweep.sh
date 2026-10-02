@@ -118,6 +118,8 @@ Flags:
   --run-to-completion Complete each requested write/read phase without
                       benchmark time limits or repetition; size the dataset
                       with ELBENCHO_FILES_PER_NODE and ELBENCHO_FILE_SIZE
+                      Buffered IO and multiple TEST_DIRS roots imply this mode.
+                      Otherwise, one-root direct IO is time-limited.
 
 Examples:
   $0 --nodes 1,2,4,6,8
@@ -677,6 +679,24 @@ done
 
 # Complete all CLI/mode-aware validation before selecting DS or creating any
 # output. Invalid exact-workload requests must leave no partial result run.
+completion_reason=explicit
+if [[ "$run_to_completion_option" == 0 ]]; then
+    if [[ "$g_bio_or_dio" == bio ]]; then
+        completion_reason="buffered IO"
+    else
+        completion_reason="multiple TEST_DIRS roots"
+    fi
+fi
+run_to_completion_option=$(resolve_elbencho_completion_mode \
+    "$g_bio_or_dio" "$run_to_completion_option") || exit 1
+if [[ -z "$sweep_read_from" && ( "${ELBENCHO_FILE_LAYOUT:-worker-directories}" == shared-directory \
+        || "${ELBENCHO_SINGLE_BIG_FILE:-0}" == 1 ) ]]; then
+    echo "Termination: completion (generated shared dataset)"
+elif [[ "$run_to_completion_option" == 1 ]]; then
+    echo "Termination: completion ($completion_reason); duration sizes automatic datasets, not runtime"
+else
+    echo "Termination: time-limited (single-root direct IO)"
+fi
 validate_elbencho_sweep_workload_mode \
     "$g_bio_or_dio" "$rand_option" "$sweep_read_from" "$run_to_completion_option" || exit 1
 

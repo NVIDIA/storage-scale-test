@@ -292,16 +292,19 @@ their termination and cleanup contracts differ.
 ### Worker directories
 
 `ELBENCHO_FILE_LAYOUT=worker-directories` is the default many-file workload.
-In the usual single-target path, directory creation is separate; write uses
-`--infloop` plus `--timelimit`; direct reads use the same combination; buffered
-reads make at most one logical pass with the time limit as a ceiling to avoid
-measuring repeated page-cache hits. Multiple targets derive finite write counts
-while reads remain time-bounded. `--run-to-completion` completes both phases
-without benchmark time limits or repetition, including staged reads. Explicit
-`ELBENCHO_FILES_PER_NODE` is a per-node budget rounded to the nearest multiple
-of threads times summed weights (ties upward, minimum one file per thread per
-weighted target). Otherwise the FS budgets and duration derive automatic
-counts. Saved coordinates and reporting record completion-based semantics.
+Directory creation is separate. In worker-directory layout, one root with
+weight 1 and direct IO uses timed writes and reads by default. Buffered IO,
+multiple distinct roots, and
+`--run-to-completion` select completion mode for both phases: each requested
+phase processes its finite dataset without a benchmark time limit or repetition.
+A sole `TEST_DIRS` root must have weight 1. Explicit `ELBENCHO_FILES_PER_NODE`
+is a per-node budget rounded to the nearest multiple of threads times summed
+weights (ties upward, minimum one file per thread per weighted target). Without
+an explicit count, the FS budgets and duration derive automatic counts; in
+completion mode duration sizes the dataset rather than limiting runtime. The
+effective mode is saved with execution coordinates; its reason is printed
+during initial staging. Resume preserves the recorded semantics rather than
+reinterpreting the request.
 
 Unless `ELBENCHO_FILE_SIZE` is set, generated file size is the write block size
 times `ELBENCHO_FILE_SIZE_MULTIPLIER`.
@@ -321,10 +324,10 @@ A directory staged with `--read-from` may contain
 `.storage-scale-test-elbencho-treefile.txt`. A cache miss scans into a temporary
 file in the dataset parent and publishes it atomically only after a successful
 read; later reads reuse it without rescanning. The operator must remove the cache
-after changing the dataset. Staged directory reads are duration-driven unless
-`--run-to-completion` is set, independently of `ELBENCHO_FILE_LAYOUT`. Totals
-come from the exact treefile rather than the current reader topology or
-`ELBENCHO_FILES_PER_NODE`.
+after changing the dataset. Direct IO staged directory reads are time-limited
+by default; buffered IO or `--run-to-completion` reads the scanned dataset to
+completion. Totals come from the exact treefile rather than the current reader
+topology or `ELBENCHO_FILES_PER_NODE`.
 
 ### Generated shared directory
 
@@ -372,9 +375,8 @@ partitions that file among services; `ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=1`
 adds `--nosvcshare` so each node accesses the complete file.
 
 `--read-from <file>` takes the extent from file metadata, without a treescan.
-By default, direct reads repeat until the time limit; buffered reads use it
-as a ceiling. `--run-to-completion` reads that extent without a time limit
-or repetition.
+By default, direct reads repeat until the time limit. Buffered IO or
+`--run-to-completion` reads the file extent without a time limit or repetition.
 
 ### IO-size and cache semantics
 

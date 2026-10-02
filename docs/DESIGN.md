@@ -497,17 +497,21 @@ Cartesian sweep and result naming, but termination and cleanup semantics differ.
 
 #### Worker-directory workload (default)
 
-`ELBENCHO_FILE_LAYOUT=worker-directories` preserves the historical many-file
-workload. In its usual single-target form, mkdir is separate, write runs with
-`--infloop` and `--timelimit`, and read has the same time ceiling. Direct IO
-reads add `--infloop`, while buffered IO reads make one logical pass to avoid
-measuring repeated page-cache hits. Multiple targets derive finite write counts
-while reads remain time-bounded. `--run-to-completion` removes both phases' benchmark
-time limits and repetition. Each thread visits every weighted target.
+`ELBENCHO_FILE_LAYOUT=worker-directories` preserves the many-file workload.
+Mkdir is separate. In this layout, a single `TEST_DIRS` root with weight 1
+and direct IO uses timed writes and reads by default. Buffered IO, multiple
+distinct roots, or `--run-to-completion` selects completion mode for both
+phases; each requested
+phase processes its finite dataset without benchmark time limits or repetition.
+A sole `TEST_DIRS` root must have weight 1. Each thread visits every weighted
+target.
 `ELBENCHO_FILES_PER_NODE` budgets the total per node, rounded to the nearest
 multiple of threads times summed weights (ties upward, minimum one file per
 thread per target). Without an explicit count, FS budgets and duration derive
-finite counts, with the duration serving as a sizing input, not a deadline.
+automatic counts. In completion mode, duration sizes the dataset rather than
+limiting runtime. The effective mode is saved with execution coordinates; its
+reason is printed during initial staging. Resume preserves the recorded
+semantics rather than reinterpreting the request.
 
 Unless `ELBENCHO_FILE_SIZE` is set, generated file size is the write block size
 times `ELBENCHO_FILE_SIZE_MULTIPLIER` (default 1024). The CLI modes are:
@@ -524,11 +528,9 @@ times `ELBENCHO_FILE_SIZE_MULTIPLIER` (default 1024). The CLI modes are:
 For directory `--read-from`, a successful initial scan can publish
 `.storage-scale-test-elbencho-treefile.txt` in the dataset. Later sweeps reuse it;
 the operator removes it after modifying the dataset. The per-execution workload
-metadata records dataset totals and cache hit/miss behavior. These staged reads
-remain duration-driven for direct IO (`--infloop` plus `--timelimit`) and
-single-pass-with-time-ceiling for buffered IO; selecting
-`ELBENCHO_FILE_LAYOUT=shared-directory` does not make a staged read
-completion-based.
+metadata records dataset totals and cache hit/miss behavior. Direct IO staged
+reads are time-limited by default. Buffered IO or `--run-to-completion` reads
+the scanned dataset to completion, regardless of `ELBENCHO_FILE_LAYOUT`.
 
 #### Generated shared-directory workload
 
@@ -561,8 +563,9 @@ services. `ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=1` adds `--nosvcshare`, making eve
 node access the whole file independently.
 
 With `--read-from <file>`, the file's metadata supplies its extent and no treescan
-or treefile is used. Direct IO repeats until the configured time limit; buffered
-IO makes one logical pass with that limit as a ceiling.
+or treefile is used. Direct IO repeats until the configured time limit.
+Buffered IO or `--run-to-completion` reads the file extent without a time limit
+or repetition.
 
 #### IO pattern and cache controls
 
@@ -575,9 +578,10 @@ An IO-size entry encodes both sizes and access patterns:
 For multi-node reads, the host list is rotated so readers do not retain the same
 writer-to-file or writer-to-slice assignment. Reified filesystem IO executions
 also advance the rotation between separate invocations. This reduces client-cache
-reuse across phases and cells, but it is independent of whether buffered reads
-omit `--infloop`. Direct IO remains the recommended baseline when page-cache
-effects are not part of the workload being measured.
+reuse across phases and cells. Buffered IO runs to completion without
+repetition to avoid repeatedly measuring the same warm page-cache data; this
+does not guarantee cold caches. Direct IO remains the recommended baseline
+when page-cache effects are not part of the workload being measured.
 
 ### 7.2 Filesystem Metadata (mdtest-elbencho)
 

@@ -78,18 +78,30 @@ depth values for the scale sweep:
 Ordinary sweeps default to direct IO; `-b/--bio` selects buffered IO.
 `-r/--rand` makes write and read access random; `r`-prefixed IO-size entries
 can instead select random access per phase. Random IO is incompatible with
-single-shared-file mode. `--run-to-completion` writes every generated file
-once, then reads every file once, without benchmark time limits or repetition.
-With `--read-from`, it reads the existing dataset once; write-only modes still skip
-reads. Shared-directory and generated single-file workloads already complete
-their phases without time limits. The old `-s/--single` flags are removed.
+single-shared-file mode. A sole `TEST_DIRS` root with weight other than 1 is
+rejected. The following policy applies to worker-directory IO; generated
+shared-directory and generated single-file datasets always run to completion.
+
+| Configuration | Phase behavior |
+|---|---|
+| One weight-1 root, direct IO | Timed by default |
+| Buffered IO, any root count | Complete writes and reads |
+| Multiple distinct roots, direct IO | Complete writes and reads |
+| `--run-to-completion` | Complete writes and reads |
+
+Completion mode processes each requested phase's finite dataset without a
+benchmark time limit or repetition. For staged `--read-from`, buffered IO or
+`--run-to-completion` reads the existing dataset to completion; direct IO
+without the flag remains time-limited. Buffered IO completes without repetition
+to avoid repeatedly measuring the same warm page-cache data; this does not
+guarantee cold caches. Write-only modes still skip reads.
 `ELBENCHO_FILE_SIZE` fixes each generated file's size in ordinary sweeps too;
 otherwise, size is the write block size times `ELBENCHO_FILE_SIZE_MULTIPLIER`.
 
 ### Finite dataset sizing
 
-`--run-to-completion` supports one or multiple weighted roots. Prefer an
-explicit per-node file-count budget and file size:
+For a sized finite workload, prefer an explicit per-node file-count budget and
+file size:
 
 ```bash
 TEST_DIRS=(["/path/to/test"]=1)
@@ -108,18 +120,18 @@ For example, budget 1,000, 16 threads, and weights 2:1 produce 1,008 files per
 node, split 672:336. Small budgets may round up substantially; each cell prints
 requested and effective counts. File counts can vary with the thread count.
 
-Explicit counts in worker-directory mode require `--run-to-completion`.
-Shared-directory mode is always completion-based and keeps exact counts:
-one root with weight 1, with the count at least and divisible by every thread
+Explicit counts in worker-directory mode require completion mode. Generated
+shared-directory mode is always completion-based and keeps exact counts: one
+root with weight 1, with the count at least and divisible by every thread
 count. Neither setting redefines a staged read dataset.
 
-With the count unset, ordinary `--run-to-completion` computes a per-thread
-file count from `FS_MAX_AGG_THROUGHPUT`, `FS_MAX_NODE_THROUGHPUT_GBPS`,
+With the count unset, completion mode computes a per-thread file count from
+`FS_MAX_AGG_THROUGHPUT`, `FS_MAX_NODE_THROUGHPUT_GBPS`,
 `FS_MAX_NODE_IOPS`, file/block sizes, topology, and
 `ELBENCHO_SCALE_READ_WRITE_DURATION`. That duration sizes the dataset, not a
 deadline. Counts divide across nodes, threads, and weighted targets and round
-up, with at least one file per thread per target. Without
-`--run-to-completion`, finite writes retain the ordinary timed-read policy.
+up, with at least one file per thread per target. In timed direct IO mode,
+reads retain the configured time limit.
 No benchmark deadline means a large dataset can take a long time: size it
 deliberately and allow sufficient Slurm allocation time.
 
@@ -129,11 +141,10 @@ the step does not land on it; for example, `3-10+2` expands to
 `3,5,7,9,10`. The order is preserved. Run a script with `--help` for its full
 mode and argument contract.
 
-Without `--run-to-completion`, the default worker-directory workload is
-time-based. Set `ELBENCHO_SCALE_READ_WRITE_DURATION` long enough to measure
-sustained I/O; 60 seconds is useful for exploration, while 300 seconds or more is a typical
-starting point for publishable runs. Generated shared-directory workloads are
-completion-based instead.
+Set `ELBENCHO_SCALE_READ_WRITE_DURATION` long enough to measure sustained I/O
+for timed direct IO; 60 seconds is useful for exploration, while 300 seconds or
+more is a typical starting point for publishable runs. In completion mode,
+duration sizes the automatic dataset; it does not limit runtime.
 
 The default lifecycle is mkdir, write, read, and cleanup.
 `--write-no-read` skips the read and still cleans up; the staged-data modes
@@ -259,15 +270,16 @@ saving rank, set both `F` and `T` to the rank count per node and use I/O depth
 `1`.
 
 Generated shared-directory phases are completion-based. They make one pass,
-ignore duration and `-s`, and verify exact file and byte counts. Normal and
+ignore duration and verify exact file and byte counts. Normal and
 `--write-no-read` runs delete with distributed elbencho workers;
 `--write-only` retains the dataset. `ELBENCHO_FILE_SIZE` is optional; otherwise
 the write block size and `ELBENCHO_FILE_SIZE_MULTIPLIER` determine it. Direct or
 random I/O requires the file size to be divisible by the effective block size.
 
 With `--read-from <directory>`, the scanned tree defines aggregate file and
-byte counts; the configured layout and file count do not repartition it.
-Staged reads remain time-based.
+byte counts; the configured layout and file count do not repartition it. Direct
+IO staged reads are time-limited by default; buffered IO or
+`--run-to-completion` reads the scanned dataset to completion.
 
 See Recipe 5 in [BENCHMARK_RECIPES_FILESYSTEM.md](../BENCHMARK_RECIPES_FILESYSTEM.md).
 
@@ -284,10 +296,11 @@ file, transferring `nodes * file_size` bytes. The default is direct I/O; pass
 
 With `--read-from`, pass a file, not a directory. Its metadata supplies the
 extent, so `ELBENCHO_SINGLE_BIG_FILE_SIZE` is optional. Direct reads repeat
-until the time limit unless `--run-to-completion` is set. Buffered reads make at most
-one logical pass to avoid re-reading warm page cache. Host assignment rotates
-between read cells to
-reduce cross-run client-cache reuse.
+until the time limit. Buffered IO or `--run-to-completion` reads the file to
+completion without repetition or a benchmark time limit. Buffered IO uses this
+rule to avoid repeatedly measuring the same warm page-cache data; it does not
+guarantee cold caches. Host assignment rotates between read cells to reduce
+cross-run client-cache reuse.
 
 `utils/extract-elbencho.sh` handles these results normally. See Recipe 4 in
 [BENCHMARK_RECIPES_FILESYSTEM.md](../BENCHMARK_RECIPES_FILESYSTEM.md).

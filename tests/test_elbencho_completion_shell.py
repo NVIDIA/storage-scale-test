@@ -106,7 +106,7 @@ def test_run_to_completion_phases_have_finite_counts_and_no_repeat_or_deadline(
 
 
 @pytest.mark.parametrize("access", ["dio", "bio"])
-def test_ordinary_timed_mode_keeps_its_read_policy(tmp_path, access):
+def test_saved_timed_mode_keeps_its_original_read_policy(tmp_path, access):
     result = _run(
         _harness(tmp_path, access=access, counts="automatic", run_to_completion=0)
         + "run_elbencho_io_sweep_iteration\n"
@@ -118,6 +118,82 @@ def test_ordinary_timed_mode_keeps_its_read_policy(tmp_path, access):
     assert "--timelimit=999" in write and "--infloop" in write
     assert "--timelimit=999" in read
     assert ("--infloop" in read) == (access == "dio")
+
+
+@pytest.mark.parametrize(
+    "access,explicit,roots,expected",
+    [
+        ("dio", 0, "[/one]=1", "0"),
+        ("dio", 1, "[/one]=1", "1"),
+        ("bio", 0, "[/one]=1", "1"),
+        ("bio", 1, "[/one]=1", "1"),
+        ("dio", 0, "[/one]=1 [/two]=1", "1"),
+        ("dio", 0, "[/one]=2 [/two]=1", "1"),
+        ("bio", 0, "[/one]=2 [/two]=1", "1"),
+        ("dio", 0, "[/one]=2", "0"),
+    ],
+)
+def test_completion_mode_resolves_access_flag_and_distinct_roots(
+    access, explicit, roots, expected
+):
+    result = _run(f"""
+set -e
+source {shlex.quote(str(_FUNCTIONS))}
+declare -A TEST_DIRS=({roots})
+resolve_elbencho_completion_mode {access} {explicit}
+""")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+
+
+@pytest.mark.parametrize(
+    "access,roots",
+    [("bio", "[/one]=1"), ("dio", "[/one]=2 [/two]=1")],
+)
+def test_implicit_completion_allows_explicit_dataset_budget(access, roots):
+    result = _run(f"""
+set -e
+source {shlex.quote(str(_FUNCTIONS))}
+declare -A TEST_DIRS=({roots})
+ELBENCHO_FILE_LAYOUT=worker-directories ELBENCHO_FILES_PER_NODE=7
+ELBENCHO_FILE_SIZE=4K ELBENCHO_SCALE_THREAD_LIST=(2 4)
+ELBENCHO_SCALE_IO_SIZES=(4K) ELBENCHO_SINGLE_BIG_FILE=0
+completion=$(resolve_elbencho_completion_mode {access} 0)
+validate_elbencho_sweep_workload_mode {access} 0 '' "$completion"
+""")
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "access,counts,roots",
+    [
+        ("bio", "explicit", "[/one]=1"),
+        ("dio", "explicit-weighted", "[/one]=1 [/two]=1"),
+        ("dio", "weighted", "[/one]=2 [/two]=1"),
+    ],
+)
+def test_implicit_completion_runs_finite_write_and_read_phases(
+    tmp_path, access, counts, roots
+):
+    result = _run(
+        _harness(tmp_path, access=access, counts=counts, run_to_completion=0) + f"""
+declare -A TEST_DIRS=({roots})
+run_to_completion=$(resolve_elbencho_completion_mode {access} 0)
+run_elbencho_io_sweep_iteration
+"""
+    )
+    assert result.returncode == 0, result.stderr
+    phases = [
+        line
+        for line in (tmp_path / "calls").read_text().splitlines()
+        if line.startswith("--")
+    ]
+    assert len(phases) == 3
+    assert any("--write" in phase for phase in phases)
+    assert any("--read" in phase for phase in phases)
+    for phase in phases:
+        assert "--files=" in phase and "--size=4K" in phase
+        assert "--timelimit" not in phase and "--infloop" not in phase
 
 
 def test_run_to_completion_preserves_write_failure_and_skips_read(tmp_path):
@@ -205,6 +281,23 @@ printf '%s\\n' "${{args[@]}}"
     assert "--size" not in result.stdout
 
 
+def test_staged_buffered_read_implicitly_completes_existing_dataset():
+    result = _run(f"""
+set -e
+source {shlex.quote(str(_FUNCTIONS))}
+declare -A TEST_DIRS=([/one]=1)
+dio_or_bio=bio node_count=1 ELBENCHO_SCALE_READ_WRITE_DURATION=999
+run_to_completion=$(resolve_elbencho_completion_mode "$dio_or_bio" 0)
+args=()
+_elbencho_staged_build_read_args args 4K /cache cache_hit /dataset 0 --threads=2
+printf '%s\\n' "${{args[@]}}"
+""")
+    assert result.returncode == 0, result.stderr
+    assert "--treefile\n/cache" in result.stdout
+    assert "--timelimit" not in result.stdout and "--infloop" not in result.stdout
+    assert "--size" not in result.stdout
+
+
 @pytest.mark.parametrize(
     "termination,limit,completion",
     [
@@ -256,11 +349,11 @@ run_elbencho_io_sweep_iteration_single_big_file
 @pytest.mark.parametrize(
     "extra,expected",
     [
-        ("run_to_completion=0", "requires --run-to-completion"),
+        ("run_to_completion=0", "requires completion mode"),
         ("TEST_DIRS=([/one]=0)", "weight"),
         ("ELBENCHO_FILES_PER_NODE=0", "positive integers"),
         (
-            "ELBENCHO_SCALE_THREAD_LIST=(9223372036854775807); TEST_DIRS=([/one]=2)",
+            "ELBENCHO_SCALE_THREAD_LIST=(9223372036854775807); TEST_DIRS=([/one]=1 [/two]=1)",
             "threads times weighted targets",
         ),
         ("ELBENCHO_SINGLE_BIG_FILE=1", "not applicable"),

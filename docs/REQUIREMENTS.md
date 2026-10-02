@@ -66,7 +66,7 @@ These requirements are driven by the primary use cases of an **NVIDIA Storage Sc
 | UC-2.6 | The tool shall support both sequential and random IO patterns, configurable per IO size. | Yes |
 | UC-2.7 | The tool shall support both direct IO and buffered IO modes. | Yes |
 | UC-2.8 | The tool shall support asymmetric write/read configurations (e.g., sequential 1M writes with random 4K reads in the same run). | Yes |
-| UC-2.9 | Filesystem IO phase termination shall match the selected workload: legacy generated and staged-read modes support a configurable time limit, while generated shared-directory and generated single-shared-file modes process a finite configured dataset. | Yes |
+| UC-2.9 | Filesystem IO phase termination shall follow the effective mode: worker-directory direct IO with one root of weight 1 defaults to a configurable time limit; buffered IO, multiple distinct roots, and `--run-to-completion` process finite datasets without benchmark time limits or repetition. Generated shared-directory and single-file workloads also process finite datasets. | Yes |
 
 ### UC-3: Single-Node Filesystem Metadata
 
@@ -249,12 +249,12 @@ These requirements address the infrastructure and runtime constraints the tool m
 
 | ID | Requirement | Satisfied? |
 |----|-------------|:----------:|
-| BM-1.1 | By default, single-target worker-directory phases and staged many-file reads shall honor a configurable time limit. The computed-count or multiple-target branch shall complete its derived write count while retaining the read limit. Direct reads may repeat; buffered reads may finish earlier. `--run-to-completion` shall instead finish each requested write/read phase without benchmark time limits or repetition. | Yes |
+| BM-1.1 | Worker-directory IO with one `TEST_DIRS` root of weight 1 and direct IO shall default to timed phases. Buffered IO, multiple distinct roots, or `--run-to-completion` shall select completion mode for both requested phases, without benchmark time limits or repetition. A sole root with weight other than 1 shall be rejected. Resume shall preserve the recorded effective mode. | Yes |
 | BM-1.2 | Results shall be written to dated output directories with a consistent naming convention. | Yes |
 | BM-1.3 | The tool shall support a configurable pause between write and read phases. | Yes |
 | BM-1.4 | Generated shared-directory data and distributed file-removal phases shall run without a time limit. The harness shall verify exact completed file and byte counts for data phases and exact completed file counts for removal before advancing. | Yes |
 | BM-1.5 | Staged many-file reads shall derive file and byte totals from the scanned tree, independently of the current reader-node topology, and may reuse an explicitly documented cached treefile. | Yes |
-| BM-1.6 | Single-shared-file workloads shall be sequential-only. By default, direct reads of a pre-existing file may repeat until the configured time limit; buffered reads shall make at most one logical pass. With `--run-to-completion`, both shall finish the file without a benchmark time limit or repetition. | Yes |
+| BM-1.6 | Single-shared-file workloads shall be sequential-only. By default, direct reads of a pre-existing file may repeat until the configured time limit. Buffered IO or `--run-to-completion` shall read the file to completion without a benchmark time limit or repetition. | Yes |
 | BM-1.7 | Generated single-shared-file write and read phases shall process the explicitly configured finite file extent without a time limit. | Yes |
 
 ### BM-2: Filesystem Metadata Benchmarks

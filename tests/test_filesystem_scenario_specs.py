@@ -205,7 +205,7 @@ def test_default_dio_uses_worker_layout_and_derived_file_size():
     assert 'ELBENCHO_FILE_LAYOUT="worker-directories"' in environment
     assert "ELBENCHO_FILE_SIZE=" in environment
     assert "ELBENCHO_FILE_SIZE_MULTIPLIER=4096" in environment
-    assert WorkloadPhase.TREE_SCAN in step.required_phases
+    assert WorkloadPhase.TREE_SCAN not in step.required_phases
 
 
 def test_failure_resume_preserves_overlay_through_resume():
@@ -307,7 +307,10 @@ def test_worker_directories_exercise_explicit_run_to_completion_on_every_substra
     assert scenario.substrates == {"ssh", "slurm", "kubectl"}
     assert step.arguments == ("--run-to-completion", "--nodes", "1,2")
     assert "export ELBENCHO_FILES_PER_NODE=5" in step.env_lines
-    assert 'declare -A TEST_DIRS=(["{test_root}"]=2)' in step.env_lines
+    assert (
+        'declare -A TEST_DIRS=(["{test_root}"]=1 ["{test_root_secondary}"]=1)'
+        in step.env_lines
+    )
     assert 'export ELBENCHO_FILE_SIZE="1M"' in step.env_lines
     assert 'export ELBENCHO_FILE_LAYOUT="worker-directories"' in step.env_lines
 

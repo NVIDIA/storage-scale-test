@@ -3592,6 +3592,16 @@ validate_elbencho_file_workload_env() {
     local file_size="${ELBENCHO_FILE_SIZE:-}"
     local validation_failed=0
 
+    if declare -p TEST_DIRS &>/dev/null && [[ ${#TEST_DIRS[@]} -eq 1 ]]; then
+        local root
+        for root in "${!TEST_DIRS[@]}"; do
+            if [[ "${TEST_DIRS[$root]}" != 1 ]]; then
+                echo "Error: a single TEST_DIRS entry must have weight 1; weights distribute work across multiple roots." >&2
+                validation_failed=1
+            fi
+        done
+    fi
+
     if [[ "$layout" != "$worker_layout" && "$layout" != "$shared_layout" ]]; then
         echo "Error: ELBENCHO_FILE_LAYOUT='${layout}' must be '${worker_layout}' or '${shared_layout}'" >&2
         validation_failed=1

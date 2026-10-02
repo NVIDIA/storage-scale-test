@@ -2276,10 +2276,10 @@ def _assert_semantic_flags(scenario: str, step: ScenarioStep, result: Path) -> N
     if scenario == "baseline" or scenario == "ssh-shared-home":
         required = ("--norandalign",)
     elif scenario == "default-dio":
-        required, forbidden = ("--direct",), ("--norandalign",)
+        required = ("--direct", "--dirs=2", "--write", "--read")
+        forbidden = ("--norandalign", "--timelimit", "--infloop")
         if step.name == "explicit-completion-based":
-            required += ("--files=3", "--dirs=2", "--size=1M", "--write", "--read")
-            forbidden += ("--timelimit", "--infloop")
+            required += ("--files=3", "--size=1M")
     elif scenario == "live-capture":
         required = ("--livecsv", "--livecsvex", "--liveint=10")
     elif scenario == "ssh-single-big-file" and step.name == "inferred-extent-read":

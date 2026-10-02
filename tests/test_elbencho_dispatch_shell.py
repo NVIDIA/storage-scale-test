@@ -2061,7 +2061,9 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 [[ "$ELBENCHO_FILE_LAYOUT" == worker-directories ]]
                 [[ -z "$ELBENCHO_FILES_PER_NODE" ]]
                 [[ -z "$ELBENCHO_FILE_SIZE" ]]
+                [[ "$1" == bio && "$4" == 0 ]]
             }
+            resolve_elbencho_completion_mode() { return 99; }
             dispatch_slurm_executions() { printf 'RESTORED_DISPATCH:%s\n' "$1"; }
             """.replace("__FAKE_ROOT__", str(fake_root))
             (fake_root / "env.sh").write_text(
@@ -2071,7 +2073,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             unset TEST_DIRS
             declare -gA TEST_DIRS=([__SAVED_DIR__]=1)
             export SAVED_CONFIG=1
-            export dio_or_bio=dio
+            export dio_or_bio=bio
             export rand_option=0
             export run_to_completion_option=0
             export sweep_write_only=0
@@ -2172,7 +2174,9 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("SHARED_DISPATCH:", result.stdout)
 
-    def test_slurm_warning_uses_largest_requested_node_count(self) -> None:
+    def test_fresh_sweep_resolves_completion_before_validation_and_snapshot(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fake_root = Path(tmp) / "repo"
             script_dir = fake_root / "storage-tests" / "fs"
@@ -2185,45 +2189,68 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 sweep_script,
             )
             (lib_dir / "_elbencho_functions.sh").write_text("", encoding="utf-8")
-            env_text = """
+            env_text = (
+                """
+            source "__FUNCTIONS__"
             SCALE_TEST_BASE=__FAKE_ROOT__
             RESULTS_DIR=__RESULTS_DIR__
             EXECUTION_SUBSTRATE=slurm
             SLURM_ENABLED=1
             SSH_ENABLED=
             declare -gA TEST_DIRS=([/tmp/fs]=1)
+            if [[ "${MULTIPLE_ROOTS:-0}" == 1 ]]; then
+                TEST_DIRS=([/tmp/fs]=2 [/tmp/second]=1)
+            fi
             validate_integer_array() { return 0; }
             validate_elbencho_io_sizes() { return 0; }
             validate_elbencho_duration() { return 0; }
             validate_elbencho_live_csv() { return 0; }
             validate_elbencho_file_workload_env() { return 0; }
             validate_elbencho_single_big_file_env() { return 0; }
-            validate_elbencho_sweep_workload_mode() { return 0; }
+            validate_elbencho_sweep_workload_mode() { printf 'VALIDATED=%s\\n' "$4"; }
             validate_elbencho_sweep_single_test_dirs_key() { return 0; }
             validate_elbencho_sweep_one_generated_target_dir() { return 0; }
             parse_range_specification() { tr ',' '\\n' <<< "$1"; }
-            write_elbencho_env_used() { return 0; }
+            write_elbencho_env_used() { printf 'SAVED=%s\\n' "$4"; }
             print_slurm_node_warnings() { printf 'WARNING_NODES=%s\\n' "$1"; }
-            reify_all_elbencho_executions() { return 0; }
+            reify_all_elbencho_executions() { printf 'REIFIED=%s\\n' "$5"; }
             dispatch_slurm_executions() { return 0; }
-            """.replace("__FAKE_ROOT__", str(fake_root)).replace(
-                "__RESULTS_DIR__", str(Path(tmp) / "results")
+            """.replace("__FAKE_ROOT__", str(fake_root))
+                .replace("__RESULTS_DIR__", str(Path(tmp) / "results"))
+                .replace("__FUNCTIONS__", str(_ELBENCHO_FUNCTIONS))
             )
             (fake_root / "env.sh").write_text(
                 textwrap.dedent(env_text), encoding="utf-8"
             )
             env = os.environ.copy()
             env["SHELL"] = _BASH
-            result = subprocess.run(
-                [str(sweep_script), "--nodes", "1024,820,616,412,208"],
-                check=False,
-                cwd=fake_root,
-                env=env,
-                text=True,
-                capture_output=True,
+            cases = (
+                ([], "0", "0", "time-limited"),
+                (["--bio"], "0", "1", "completion (buffered IO)"),
+                (["--run-to-completion"], "0", "1", "completion (explicit)"),
+                ([], "1", "1", "completion (multiple TEST_DIRS roots)"),
             )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("WARNING_NODES=1024", result.stdout)
+            for flags, multiple_roots, completion, reason in cases:
+                with self.subTest(flags=flags, multiple_roots=multiple_roots):
+                    env["MULTIPLE_ROOTS"] = multiple_roots
+                    result = subprocess.run(
+                        [
+                            str(sweep_script),
+                            "--nodes",
+                            "1024,820,616,412,208",
+                            *flags,
+                        ],
+                        check=False,
+                        cwd=fake_root,
+                        env=env,
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("WARNING_NODES=1024", result.stdout)
+                    self.assertIn(f"Termination: {reason}", result.stdout)
+                    for label in ("VALIDATED", "SAVED", "REIFIED"):
+                        self.assertIn(f"{label}={completion}", result.stdout)
 
 
 if __name__ == "__main__":

@@ -178,7 +178,7 @@ _SHARED_ENV = (
 
 _WORKER_ENV = (
     "unset TEST_DIRS",
-    'declare -A TEST_DIRS=(["{test_root}"]=2)',
+    'declare -A TEST_DIRS=(["{test_root}"]=1 ["{test_root_secondary}"]=1)',
     'export ELBENCHO_FILE_LAYOUT="worker-directories"',
     "export ELBENCHO_FILES_PER_NODE=",
     "export ELBENCHO_FILE_SIZE=",
@@ -398,13 +398,7 @@ def _default_dio() -> FilesystemScenarioSpec:
                 ("--nodes", "1,2"),
                 _WORKER_ENV,
                 _coordinates((1, 2), ("4K",), (1,), (1,)),
-                (
-                    WorkloadPhase.DIRECTORY_CREATE,
-                    WorkloadPhase.WRITE,
-                    WorkloadPhase.TREE_SCAN,
-                    WorkloadPhase.READ,
-                    WorkloadPhase.REMOVE_FILES,
-                ),
+                _NORMAL_PHASES,
             ),
             _step(
                 "explicit-completion-based",
