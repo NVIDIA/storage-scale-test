@@ -110,7 +110,9 @@ Cartesian sweeps, single-file and weighted-root behavior, shared SSH homes, and
 Slurm scheduling. Fast tests cover parsing, precedence, path and workload safety,
 sizing, scheduler boundaries, failure contracts, and reporting. On-demand CI
 runs the full NFS-backed catalog concurrently on amd64 and arm64 with
-repeatable-teardown headroom; SBX is a supported local backend.
+repeatable-teardown headroom; SBX is a supported local backend. Integration CI
+installs runtime requirements into `.venv` and uses that interpreter for both
+startup smoke checks and the lifecycle; `.venv-ci` is not a runtime bootstrap.
 
 The kubectl filesystem sweep's implemented decisions and tradeoffs are retained
 in the historical

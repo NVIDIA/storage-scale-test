@@ -25,8 +25,9 @@ control for the storage-worker label. The two worker nodes run storage clients.
 The current setup target is Ubuntu 24.04 on x86-64 or ARM64 with at least two
 CPUs, 8 GiB total RAM, 6 GiB available RAM, and 20 GiB free on the selected
 backend's filesystem. Python 3.12 and an accessible rootful Docker daemon are
-prerequisites. The driver installs its other host packages and pinned client
-tools when needed. It also builds small derived Slinky login and compute images
+prerequisites. Install the pinned Python runtime requirements before using the
+driver; it installs other host packages and pinned client tools when needed.
+It also builds small derived Slinky login and compute images
 containing the fixed integration workload account; the login image additionally
 provides the standard `file` package required by `validate_env.sh`.
 
@@ -35,6 +36,9 @@ profile invokes passwordless `sudo` itself only for package installation and
 the dedicated export, loop-device, firewall, and systemd operations:
 
 ```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+source .venv/bin/activate
 sudo -v
 integration-tests/bin/integration-test.py setup
 ```
@@ -252,11 +256,12 @@ than assuming it is preinstalled — see "Checks (run before committing)" in
 ## On-demand CI
 
 The `Filesystem integration` GitHub Actions workflow runs independent amd64
-and arm64 jobs concurrently. Each job runs setup twice, stops and restarts the
-fixture, proves that root lifecycle execution is rejected, runs `test` as the
-ordinary runner account, and tears down twice. A final status job requires both
-architectures to pass. The workflow is deliberately absent from ordinary
-pull-request, push, and default-branch events.
+and arm64 jobs concurrently. Each job installs `requirements.txt` in an isolated
+runtime venv and smoke-tests driver startup before provisioning. It runs setup
+twice, stops and restarts the fixture, proves that root lifecycle execution is
+rejected, runs `test` as the ordinary runner account, and tears down twice. A
+final status job requires both architectures to pass. The workflow runs only
+on demand, not on pull-request, push, or default-branch events.
 
 To run it, open **Actions**, choose **Filesystem integration**, and select
 **Run workflow**. Choose the workflow ref, then optionally enter a different

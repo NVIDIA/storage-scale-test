@@ -44,6 +44,8 @@ jobs:
     timeout-minutes: 135
     permissions:
       contents: read
+    env:
+      INTEGRATION_PYTHON: ${{ github.workspace }}/.venv/bin/python
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -61,6 +63,11 @@ jobs:
           enable-pip: "true"
           enable-conda: "false"
           enable-pypi-anaconda: "false"
+      - name: Install integration Python dependencies
+        run: |
+          python3 -m venv .venv
+          "$INTEGRATION_PYTHON" -m pip install -r requirements.txt
+          "$INTEGRATION_PYTHON" integration-tests/bin/integration-test.py --help
       - name: Verify privileged runner prerequisites
         run: |
           sudo -n true
