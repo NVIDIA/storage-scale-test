@@ -544,12 +544,16 @@ python3 utils/compress_json_for_context.py < result.json
 `utils/build_tarball.sh` creates `storage-scale-test.tar.gz` for a user to move
 into a benchmark environment. It:
 
-- downloads pinned upstream elbencho `v3.1-11` static archives for x86_64 and
+- downloads pinned upstream elbencho `v3.2-1` static archives for x86_64 and
   aarch64 when needed and verifies architecture-specific SHA-256 values;
 - builds stripped static s3test binaries from `utils/build/s3-test.c` when
   missing or stale; and
 - includes existing Warp binaries but does not download or automatically build
   them, warning when an architecture is missing.
+
+Metadata phases use `-s 0` without `-b 0`: Elbencho 3.2 rejects zero block
+sizes even for zero-byte files. Existing custom binaries remain untouched by
+the deployment builder unless `--force-download` is supplied.
 
 `utils/build/build_s3test_from_source.sh` tries suitable local compilers, Docker,
 and Docker Buildx. Failure to produce one architecture warns and permits tarball

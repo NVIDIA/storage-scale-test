@@ -45,6 +45,20 @@ _SPEC.loader.exec_module(_DRIVER)
 _FILESYSTEM = sys.modules["filesystem_integration"]
 
 
+@pytest.mark.parametrize("architecture", ["x86_64", "aarch64"])
+def test_deployment_and_fixture_elbencho_release_pins_agree(architecture):
+    """Download versions and archive identities must agree across both paths."""
+    builder = (_REPO_ROOT / "utils/build_tarball.sh").read_text(encoding="utf-8")
+    version = _FILESYSTEM.ELBENCHO_VERSION
+    assert f"ELBENCHO_VERSION_TAG='{version}'" in builder
+    archive, digest, _ = _FILESYSTEM.ELBENCHO_ARCHIVES[architecture]
+    assert archive == f"elbencho-static-{architecture}.tar.gz"
+    assert f'ELBENCHO_SHA256_{architecture.upper()}="{digest}"' in builder
+    assert f"elbencho:{version}@sha256:" in _FILESYSTEM.ELBENCHO_CONTAINER
+    environment = (_REPO_ROOT / "env.sh.template").read_text(encoding="utf-8")
+    assert f"KUBECTL_ELBENCHO_IMAGE=docker.io/breuner/elbencho:{version}" in environment
+
+
 @pytest.mark.parametrize("failed", [False, True])
 @pytest.mark.parametrize("collected", [False, True])
 @pytest.mark.parametrize(
@@ -5019,8 +5033,8 @@ def test_markerless_sbx_elbencho_bundle_is_rebuilt(tmp_path, monkeypatch):
     cache = tmp_path / "test-cache"
     cache.mkdir()
     binary_name = "elbencho.aarch64"
-    binary = cache / f"v3.1-11-{binary_name}"
-    runtime = cache / f"v3.1-11-{binary_name}.runtime"
+    binary = cache / f"v3.2-1-{binary_name}"
+    runtime = cache / f"v3.2-1-{binary_name}.runtime"
     binary.write_text("stale wrapper\n", encoding="utf-8")
     runtime.mkdir()
     calls = []
@@ -5037,7 +5051,7 @@ def test_markerless_sbx_elbencho_bundle_is_rebuilt(tmp_path, monkeypatch):
     _ensure_elbencho(object(), config, "aarch64", "sbx-shared")
 
     assert calls == ["aarch64"]
-    marker = cache / f"v3.1-11-{binary_name}.bundle.json"
+    marker = cache / f"v3.2-1-{binary_name}.bundle.json"
     document = json.loads(marker.read_text(encoding="utf-8"))
     assert document["container"] == _FILESYSTEM.ELBENCHO_CONTAINER
     assert document["recipe"] == _FILESYSTEM.SBX_ELBENCHO_BUNDLE_RECIPE
