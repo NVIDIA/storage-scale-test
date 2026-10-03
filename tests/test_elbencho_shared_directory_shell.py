@@ -297,7 +297,7 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
             ELBENCHO_SWEEP_WRITE_NO_READ=0
             ELBENCHO_SWEEP_READ_FROM=
             io_size=4K thread_count=4 io_depth=1 dio_or_bio=dio
-            use_random=0 force_single=1
+            use_random=0 run_to_completion=1
             printf '0\n' >"$tmp/tick-index"
             _elbencho_monotonic_milliseconds() {{
                 local index
@@ -368,7 +368,7 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
             ELBENCHO_SWEEP_WRITE_NO_READ=0
             ELBENCHO_SWEEP_READ_FROM=
             io_size=4K thread_count=1 io_depth=1 dio_or_bio=dio
-            use_random=0 force_single=1
+            use_random=0 run_to_completion=1
             stale="$output_dir/executions/0002.write.json"
             printf '%s\n' stale duplicate >"$stale"
             compute_target_file_count_per_thread() {{ exit 91; }}
@@ -435,7 +435,7 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
             ELBENCHO_SWEEP_WRITE_NO_READ=1
             ELBENCHO_SWEEP_READ_FROM=
             io_size=4K thread_count=1 io_depth=1 dio_or_bio=bio
-            use_random=0 force_single=0
+            use_random=0 run_to_completion=0
             run_an_elbencho() {{
                 local phase= path= arg
                 for arg in "$@"; do
@@ -570,7 +570,7 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
             ELBENCHO_SCALE_READ_WRITE_DURATION=1
             ELBENCHO_LIVE_CSV_EXTENDED=0
             io_size=4K thread_count=1 io_depth=1 dio_or_bio=bio use_random=0
-            force_single=0
+            run_to_completion=0
             run_an_elbencho() {{
                 local tree= arg
                 while [[ $# -gt 0 ]]; do
@@ -614,7 +614,7 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
             ELBENCHO_SCALE_READ_WRITE_DURATION=1
             ELBENCHO_LIVE_CSV_EXTENDED=0
             io_size=4K thread_count=1 io_depth=1 dio_or_bio=bio use_random=0
-            force_single=0
+            run_to_completion=0
             run_an_elbencho() {{
                 local tree= arg
                 while [[ $# -gt 0 ]]; do

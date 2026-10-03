@@ -72,6 +72,8 @@ class TestElbenchoConfigValidationShell(unittest.TestCase):
         source "{_ENV_FUNCTIONS}"
         unset ELBENCHO_FILE_LAYOUT ELBENCHO_FILES_PER_NODE ELBENCHO_FILE_SIZE
         validate_elbencho_file_workload_env
+        ELBENCHO_FILE_LAYOUT=worker-directories
+        validate_elbencho_file_workload_env
         ELBENCHO_FILE_LAYOUT=shared-directory
         ELBENCHO_FILES_PER_NODE=8
         ELBENCHO_FILE_SIZE=64G
@@ -83,7 +85,6 @@ class TestElbenchoConfigValidationShell(unittest.TestCase):
     def test_rejects_invalid_layout_count_pairing_and_size(self) -> None:
         cases = (
             ("invalid", "", "", "ELBENCHO_FILE_LAYOUT"),
-            ("worker-directories", "1", "", "requires ELBENCHO_FILE_LAYOUT"),
             ("shared-directory", "0", "", "canonical positive"),
             ("shared-directory", "01", "", "canonical positive"),
             ("shared-directory", "+1", "", "canonical positive"),
@@ -102,6 +103,32 @@ class TestElbenchoConfigValidationShell(unittest.TestCase):
                 result = _run_bash(textwrap.dedent(script))
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(expected, result.stderr)
+
+    def test_single_root_requires_unit_weight_in_every_file_layout(self) -> None:
+        for layout in ("worker-directories", "shared-directory"):
+            for weight in ("0", "2", "01", "invalid"):
+                with self.subTest(layout=layout, weight=weight):
+                    result = _run_bash(f"""
+                        source "{_ENV_FUNCTIONS}"
+                        declare -A TEST_DIRS=([/one]={weight!r})
+                        ELBENCHO_FILE_LAYOUT={layout!r}
+                        validate_elbencho_file_workload_env
+                        """)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        "single TEST_DIRS entry must have weight 1", result.stderr
+                    )
+
+    def test_unit_single_root_and_weighted_multiple_roots_are_valid(self) -> None:
+        result = _run_bash(f"""
+            set -e
+            source "{_ENV_FUNCTIONS}"
+            declare -A TEST_DIRS=([/one]=1)
+            validate_elbencho_file_workload_env
+            TEST_DIRS=([/one]=2 [/two]=1)
+            validate_elbencho_file_workload_env
+            """)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_accepts_maximum_shell_integer_and_rejects_larger_count(self) -> None:
         script = f"""

@@ -205,7 +205,7 @@ def test_default_dio_uses_worker_layout_and_derived_file_size():
     assert 'ELBENCHO_FILE_LAYOUT="worker-directories"' in environment
     assert "ELBENCHO_FILE_SIZE=" in environment
     assert "ELBENCHO_FILE_SIZE_MULTIPLIER=4096" in environment
-    assert WorkloadPhase.TREE_SCAN in step.required_phases
+    assert WorkloadPhase.TREE_SCAN not in step.required_phases
 
 
 def test_failure_resume_preserves_overlay_through_resume():
@@ -289,15 +289,30 @@ def test_single_file_sequence_uses_inferred_read_extent():
     assert delete.dataset is DatasetExpectation.REMOVED
 
 
-def test_weighted_roots_activates_single_sizing_with_bounded_limits():
+def test_weighted_roots_activates_run_to_completion_sizing_with_bounded_limits():
     """The SSH sizing case uses both weighted roots and deliberately low limits."""
     step = _scenario("ssh-weighted-roots").steps[0]
     environment = "\n".join(step.env_lines)
 
-    assert step.arguments == ("--bio", "--single", "--nodes", "1")
+    assert step.arguments == ("--bio", "--run-to-completion", "--nodes", "1")
     assert '["{test_root}"]=1' in environment
     assert '["{test_root_secondary}"]=2' in environment
     assert "FS_MAX_NODE_IOPS=100" in environment
+
+
+def test_worker_directories_exercise_explicit_run_to_completion_on_every_substrate():
+    """Real transport coverage supplements the fast native argument tests."""
+    scenario = _scenario("default-dio")
+    step = scenario.steps[1]
+    assert scenario.substrates == {"ssh", "slurm", "kubectl"}
+    assert step.arguments == ("--run-to-completion", "--nodes", "1,2")
+    assert "export ELBENCHO_FILES_PER_NODE=5" in step.env_lines
+    assert (
+        'declare -A TEST_DIRS=(["{test_root}"]=1 ["{test_root_secondary}"]=1)'
+        in step.env_lines
+    )
+    assert 'export ELBENCHO_FILE_SIZE="1M"' in step.env_lines
+    assert 'export ELBENCHO_FILE_LAYOUT="worker-directories"' in step.env_lines
 
 
 def test_slurm_scheduling_renders_include_and_ignore_files():

@@ -52,6 +52,7 @@ from failure_injection import (
 )
 from fixture_images import ELBENCHO_UPSTREAM_IMAGE
 from fixture_images import ELBENCHO_FIXTURE_IMAGE
+from image_acquisition import AcquisitionError, ensure_pinned_image
 from fixture_capacity import (
     MAX_DEPLOYMENT_CONTENT_BYTES,
     MAX_LIVE_CAPTURE_DATASET_BYTES,
@@ -875,7 +876,13 @@ def _extract_container_elbencho(
     runner: Any, cache: Path, binary: Path, runtime: Path, architecture: str
 ) -> None:
     """Build a portable wrapper from the digest-pinned upstream image."""
-    runner.run(["docker", "pull", ELBENCHO_CONTAINER], timeout=300)
+    docker_architecture = {"x86_64": "amd64", "aarch64": "arm64"}.get(architecture)
+    if docker_architecture is None:
+        raise IntegrationTestError(f"unsupported elbencho architecture: {architecture}")
+    try:
+        ensure_pinned_image(runner, ELBENCHO_CONTAINER, docker_architecture)
+    except AcquisitionError as error:
+        raise IntegrationTestError(str(error)) from error
     container = runner.run(
         ["docker", "create", "--entrypoint", "sleep", ELBENCHO_CONTAINER, "infinity"]
     ).stdout.strip()
@@ -2276,7 +2283,10 @@ def _assert_semantic_flags(scenario: str, step: ScenarioStep, result: Path) -> N
     if scenario == "baseline" or scenario == "ssh-shared-home":
         required = ("--norandalign",)
     elif scenario == "default-dio":
-        required, forbidden = ("--direct",), ("--norandalign",)
+        required = ("--direct", "--dirs=2", "--write", "--read")
+        forbidden = ("--norandalign", "--timelimit", "--infloop")
+        if step.name == "explicit-completion-based":
+            required += ("--files=3", "--size=1M")
     elif scenario == "live-capture":
         required = ("--livecsv", "--livecsvex", "--liveint=10")
     elif scenario == "ssh-single-big-file" and step.name == "inferred-extent-read":

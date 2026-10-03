@@ -75,7 +75,7 @@ def _make_dispatch_batch(parent: Path) -> Path:
             f"export ELBENCHO_EXECUTION_KIND={kind}\n"
             f"export nodes={4 if kind == 'mdtest' else 2}\n"
             "export tasks_per_node=3 io_size=4K thread_count=1 io_depth=1\n"
-            "export dio_or_bio=dio use_random=0 force_single=0\n"
+            "export dio_or_bio=dio use_random=0 run_to_completion=0\n"
             f"export ELBENCHO_BATCH_GROUP_ID={identity}\n"
             f"export ELBENCHO_BATCH_OUTPUT_RELATIVE={relative}\n"
             f"export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=/target-{identity}\n"
@@ -527,7 +527,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         export io_depth=4
         export dio_or_bio=dio
         export use_random=0
-        export force_single=1
+        export run_to_completion=1
         export ELBENCHO_FILE_LAYOUT=shared-directory
         export ELBENCHO_FILES_PER_NODE=8
         export ELBENCHO_FILE_SIZE=64G
@@ -579,7 +579,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         io_depth=4
         dio_or_bio=dio
         use_random=0
-        force_single=1
+        run_to_completion=1
         health_hook() {{ printf 'health:%s\n' "$1" >> "$tmp/hooks"; }}
         publish_hook() {{
             printf 'publish:%s:%s:%s\n' "$1" "$2" "$3" >> "$tmp/hooks"
@@ -591,7 +591,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         run_elbencho_io_sweep_iteration() {{
             printf 'bound:%s:%s:%s:%s:%s:%s:%s\n' \
                 "$output_dir" "$io_size" "$thread_count" "$io_depth" \
-                "$dio_or_bio" "$use_random" "$force_single" >> "$tmp/hooks"
+                "$dio_or_bio" "$use_random" "$run_to_completion" >> "$tmp/hooks"
             mkdir -p "$output_dir"
             printf 'scratch-only\n' > "$output_dir/artifact"
             _elbencho_run_service_health_hook write
@@ -610,7 +610,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         io_depth=999
         dio_or_bio=corrupted
         use_random=999
-        force_single=999
+        run_to_completion=999
 
         BENCHMARK_RC=17
         PUBLISH_RC=23
@@ -673,14 +673,14 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         io_depth=4
         dio_or_bio=dio
         use_random=0
-        unset force_single
+        unset run_to_completion
         ! elbencho_set_cell_run_context 0007 2 host-a,host-b \
             /mnt/a,/mnt/b "$tmp/scratch" "$tmp/durable" \
             _elbencho_noop_cell_hook _elbencho_noop_cell_hook \
             2> "$tmp/missing-coordinate"
-        grep -q 'lacks saved coordinate: force_single' "$tmp/missing-coordinate"
+        grep -q 'lacks saved coordinate: run_to_completion' "$tmp/missing-coordinate"
 
-        force_single=1
+        run_to_completion=1
         ! elbencho_set_cell_run_context 0007 2 host-a \
             /mnt/a,/mnt/b "$tmp/scratch" "$tmp/durable" \
             _elbencho_noop_cell_hook _elbencho_noop_cell_hook \
@@ -1541,8 +1541,8 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         io_size=r64K
         thread_count=8
         io_depth=2
-        force_single=0
-        single_option=0
+        run_to_completion=0
+        run_to_completion_option=0
         use_random=0
         dio_or_bio=dio
         elbencho_set_cell_run_context 0001 1 host-a "$tmp/read-from" \
@@ -1588,8 +1588,8 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         io_size=r64K
         thread_count=8
         io_depth=2
-        force_single=0
-        single_option=0
+        run_to_completion=0
+        run_to_completion_option=0
         use_random=0
         dio_or_bio=dio
         elbencho_set_cell_run_context 0001 1 host-a "$tmp/read-from" \
@@ -1641,8 +1641,8 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         io_size=r64K
         thread_count=8
         io_depth=2
-        force_single=0
-        single_option=0
+        run_to_completion=0
+        run_to_completion_option=0
         use_random=0
         dio_or_bio=dio
         elbencho_set_cell_run_context 0001 1 host-a "$tmp/read-from" \
@@ -2061,7 +2061,9 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 [[ "$ELBENCHO_FILE_LAYOUT" == worker-directories ]]
                 [[ -z "$ELBENCHO_FILES_PER_NODE" ]]
                 [[ -z "$ELBENCHO_FILE_SIZE" ]]
+                [[ "$1" == bio && "$4" == 0 ]]
             }
+            resolve_elbencho_completion_mode() { return 99; }
             dispatch_slurm_executions() { printf 'RESTORED_DISPATCH:%s\n' "$1"; }
             """.replace("__FAKE_ROOT__", str(fake_root))
             (fake_root / "env.sh").write_text(
@@ -2071,9 +2073,9 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             unset TEST_DIRS
             declare -gA TEST_DIRS=([__SAVED_DIR__]=1)
             export SAVED_CONFIG=1
-            export dio_or_bio=dio
+            export dio_or_bio=bio
             export rand_option=0
-            export single_option=0
+            export run_to_completion_option=0
             export sweep_write_only=0
             export sweep_write_no_read=0
             export sweep_read_from=
@@ -2149,7 +2151,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             export ELBENCHO_FILE_SIZE=64G
             export dio_or_bio=dio
             export rand_option=0
-            export single_option=1
+            export run_to_completion_option=1
             export sweep_write_only=0
             export sweep_write_no_read=0
             export sweep_read_from=
@@ -2172,7 +2174,9 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("SHARED_DISPATCH:", result.stdout)
 
-    def test_slurm_warning_uses_largest_requested_node_count(self) -> None:
+    def test_fresh_sweep_resolves_completion_before_validation_and_snapshot(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fake_root = Path(tmp) / "repo"
             script_dir = fake_root / "storage-tests" / "fs"
@@ -2185,45 +2189,68 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 sweep_script,
             )
             (lib_dir / "_elbencho_functions.sh").write_text("", encoding="utf-8")
-            env_text = """
+            env_text = (
+                """
+            source "__FUNCTIONS__"
             SCALE_TEST_BASE=__FAKE_ROOT__
             RESULTS_DIR=__RESULTS_DIR__
             EXECUTION_SUBSTRATE=slurm
             SLURM_ENABLED=1
             SSH_ENABLED=
             declare -gA TEST_DIRS=([/tmp/fs]=1)
+            if [[ "${MULTIPLE_ROOTS:-0}" == 1 ]]; then
+                TEST_DIRS=([/tmp/fs]=2 [/tmp/second]=1)
+            fi
             validate_integer_array() { return 0; }
             validate_elbencho_io_sizes() { return 0; }
             validate_elbencho_duration() { return 0; }
             validate_elbencho_live_csv() { return 0; }
             validate_elbencho_file_workload_env() { return 0; }
             validate_elbencho_single_big_file_env() { return 0; }
-            validate_elbencho_sweep_workload_mode() { return 0; }
+            validate_elbencho_sweep_workload_mode() { printf 'VALIDATED=%s\\n' "$4"; }
             validate_elbencho_sweep_single_test_dirs_key() { return 0; }
             validate_elbencho_sweep_one_generated_target_dir() { return 0; }
             parse_range_specification() { tr ',' '\\n' <<< "$1"; }
-            write_elbencho_env_used() { return 0; }
+            write_elbencho_env_used() { printf 'SAVED=%s\\n' "$4"; }
             print_slurm_node_warnings() { printf 'WARNING_NODES=%s\\n' "$1"; }
-            reify_all_elbencho_executions() { return 0; }
+            reify_all_elbencho_executions() { printf 'REIFIED=%s\\n' "$5"; }
             dispatch_slurm_executions() { return 0; }
-            """.replace("__FAKE_ROOT__", str(fake_root)).replace(
-                "__RESULTS_DIR__", str(Path(tmp) / "results")
+            """.replace("__FAKE_ROOT__", str(fake_root))
+                .replace("__RESULTS_DIR__", str(Path(tmp) / "results"))
+                .replace("__FUNCTIONS__", str(_ELBENCHO_FUNCTIONS))
             )
             (fake_root / "env.sh").write_text(
                 textwrap.dedent(env_text), encoding="utf-8"
             )
             env = os.environ.copy()
             env["SHELL"] = _BASH
-            result = subprocess.run(
-                [str(sweep_script), "--nodes", "1024,820,616,412,208"],
-                check=False,
-                cwd=fake_root,
-                env=env,
-                text=True,
-                capture_output=True,
+            cases = (
+                ([], "0", "0", "time-limited"),
+                (["--bio"], "0", "1", "completion (buffered IO)"),
+                (["--run-to-completion"], "0", "1", "completion (explicit)"),
+                ([], "1", "1", "completion (multiple TEST_DIRS roots)"),
             )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("WARNING_NODES=1024", result.stdout)
+            for flags, multiple_roots, completion, reason in cases:
+                with self.subTest(flags=flags, multiple_roots=multiple_roots):
+                    env["MULTIPLE_ROOTS"] = multiple_roots
+                    result = subprocess.run(
+                        [
+                            str(sweep_script),
+                            "--nodes",
+                            "1024,820,616,412,208",
+                            *flags,
+                        ],
+                        check=False,
+                        cwd=fake_root,
+                        env=env,
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("WARNING_NODES=1024", result.stdout)
+                    self.assertIn(f"Termination: {reason}", result.stdout)
+                    for label in ("VALIDATED", "SAVED", "REIFIED"):
+                        self.assertIn(f"{label}={completion}", result.stdout)
 
 
 if __name__ == "__main__":

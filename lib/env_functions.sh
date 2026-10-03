@@ -1114,13 +1114,13 @@ _wait_for_s3test_ssh() {
 }
 
 # Print a summary of the elbencho sweep parameters
-# Usage: print_elbencho_sweep_summary node_count nodelist dio_or_bio use_random force_single ds output_dir [job_id]
+# Usage: print_elbencho_sweep_summary node_count nodelist dio_or_bio use_random run_to_completion ds output_dir [job_id]
 # Arguments:
 #   node_count: number of nodes in the sweep
 #   nodelist: comma-separated list of node names
 #   dio_or_bio: "dio" or "bio"
 #   use_random: "1" for random IO, "0" for sequential
-#   force_single: "1" to force single combined run, "0" otherwise
+#   run_to_completion: "1" for completion-based phases, "0" for ordinary timing
 #   ds: datestamp identifier
 #   output_dir: output directory path
 #   job_id: (optional) SLURM job ID
@@ -1133,7 +1133,7 @@ print_elbencho_sweep_summary() {
     local nodelist="$2"
     local dio_or_bio="$3"
     local use_random="$4"
-    local force_single="$5"
+    local run_to_completion="$5"
     local ds="$6"
     local output_dir="$7"
     local job_id="${8:-}"
@@ -1152,7 +1152,16 @@ print_elbencho_sweep_summary() {
     echo "  Threads:         ${ELBENCHO_SCALE_THREAD_LIST[*]}"
     echo "  IO Depths:       ${ELBENCHO_IODEPTH_LIST[*]}"
     echo "  IO Sizes:        ${ELBENCHO_SCALE_IO_SIZES[*]}"
-    if [[ -n "$sweep_read_from" ]]; then
+    if [[ "$run_to_completion" == 1 ]]; then
+        echo "  Benchmark time limits: none (--run-to-completion)"
+        if [[ -n "$sweep_read_from" ]]; then
+            echo "  Read-from:       ${sweep_read_from}"
+        elif [[ -n "${ELBENCHO_FILES_PER_NODE:-}" ]]; then
+            echo "  Files per node:  $ELBENCHO_FILES_PER_NODE (requested; see effective count per cell)"
+        elif [[ "${ELBENCHO_SINGLE_BIG_FILE:-0}" != 1 ]]; then
+            echo "  Automatic count sizing duration: $ELBENCHO_SCALE_READ_WRITE_DURATION"
+        fi
+    elif [[ -n "$sweep_read_from" ]]; then
         echo "  Read-from:       ${sweep_read_from}"
         echo "  Read IO Duration: $ELBENCHO_SCALE_READ_WRITE_DURATION"
         if [[ "${ELBENCHO_SINGLE_BIG_FILE:-0}" != "1" ]]; then
@@ -1193,7 +1202,7 @@ print_elbencho_sweep_summary() {
         io_pattern="Sequential (unless overridden in IO Sizes)"
     fi
     echo "  IO Pattern:      $io_pattern"
-    echo "  Force Single:    $([ "$force_single" = "1" ] && echo "Yes" || echo "No")"
+    echo "  Run to Completion:        $([ "$run_to_completion" = "1" ] && echo "Yes" || echo "No")"
     if [ -n "$job_id" ]; then
         echo "  JobID:           $job_id"
     fi
@@ -1289,9 +1298,10 @@ print_elbencho_sweep_compact_summary() {
         rf_part=" rf=${summary_sweep_read_from}"
     fi
 
-    if [[ -z "$summary_sweep_read_from" \
+    if [[ "${run_to_completion:-${run_to_completion_option:-0}}" == 1 \
+            || ( -z "$summary_sweep_read_from" \
             && "$file_layout" == shared-directory \
-            && -n "$files_per_node" ]]; then
+            && -n "$files_per_node" ) ]]; then
         printf '%selbencho-%s configured_dur: %s (inactive; completion-based) nodes_spec: %s\n' \
             "$prefix" "$ds" "${ELBENCHO_SCALE_READ_WRITE_DURATION:-?}" \
             "$nodes_spec"
@@ -1333,7 +1343,7 @@ _yaml_flow_seq() {
 # canonical artifact for --resume rehydration since YAML parsing in shell is
 # expensive). The YAML form is preserved as the human/external-tool snapshot.
 #
-# Usage: write_elbencho_env_used <out_file> <dio_or_bio> <rand_option> <single_option> \
+# Usage: write_elbencho_env_used <out_file> <dio_or_bio> <rand_option> <run_to_completion_option> \
 #            <sweep_write_only> <sweep_write_no_read> <sweep_read_from> <nodes_spec> [records_dir]
 _elbencho_env_used_treefile_cache_path() {
     local sweep_read_from="$1"
@@ -1396,7 +1406,7 @@ write_elbencho_env_used() {
     local out_file="$1"
     local dio_or_bio="$2"
     local rand_option="$3"
-    local single_option="$4"
+    local run_to_completion_option="$4"
     local sweep_write_only="$5"
     local sweep_write_no_read="$6"
     local sweep_read_from="$7"
@@ -1468,7 +1478,7 @@ write_elbencho_env_used() {
 
         printf '\ndio_or_bio: "%s"\n' "$dio_or_bio"
         printf 'rand_option: %s\n' "$rand_option"
-        printf 'single_option: %s\n' "$single_option"
+        printf 'run_to_completion_option: %s\n' "$run_to_completion_option"
         printf 'sweep_write_only: %s\n' "$sweep_write_only"
         printf 'sweep_write_no_read: %s\n' "$sweep_write_no_read"
         printf 'sweep_read_from: "%s"\n' "$sweep_read_from"
@@ -1488,7 +1498,7 @@ write_elbencho_env_used() {
         sh_path="${out_file}.sh"
     fi
     _write_elbencho_env_used_sh "$sh_path" \
-        "$dio_or_bio" "$rand_option" "$single_option" \
+        "$dio_or_bio" "$rand_option" "$run_to_completion_option" \
         "$sweep_write_only" "$sweep_write_no_read" "$sweep_read_from" "$nodes_spec" \
         "$cache_path" "$records_dir" || return 1
     return 0
@@ -1533,7 +1543,7 @@ _write_elbencho_env_used_sh() {
     local sh_path="$1"
     local dio_or_bio="$2"
     local rand_option="$3"
-    local single_option="$4"
+    local run_to_completion_option="$4"
     local sweep_write_only="$5"
     local sweep_write_no_read="$6"
     local sweep_read_from="$7"
@@ -1605,7 +1615,7 @@ _write_elbencho_env_used_sh() {
         printf '# Names match the local variables used in nv-elbencho-sweep.sh.\n'
         printf 'export dio_or_bio=%q\n' "$dio_or_bio"
         printf 'export rand_option=%q\n' "$rand_option"
-        printf 'export single_option=%q\n' "$single_option"
+        printf 'export run_to_completion_option=%q\n' "$run_to_completion_option"
         printf 'export sweep_write_only=%q\n' "$sweep_write_only"
         printf 'export sweep_write_no_read=%q\n' "$sweep_write_no_read"
         printf 'export sweep_read_from=%q\n' "$sweep_read_from"
@@ -1632,7 +1642,7 @@ update_elbencho_env_used_treefile_cache_usage() {
         # shellcheck disable=SC1090
         source "$snapshot_sh" || exit 1
         write_elbencho_env_used "${tmp_dir}/env_used.yaml" \
-            "$dio_or_bio" "$rand_option" "$single_option" \
+            "$dio_or_bio" "$rand_option" "$run_to_completion_option" \
             "$sweep_write_only" "$sweep_write_no_read" "$sweep_read_from" "$nodes_spec" \
             "${output_dir}/executions"
     ) || {
@@ -3582,6 +3592,16 @@ validate_elbencho_file_workload_env() {
     local file_size="${ELBENCHO_FILE_SIZE:-}"
     local validation_failed=0
 
+    if declare -p TEST_DIRS &>/dev/null && [[ ${#TEST_DIRS[@]} -eq 1 ]]; then
+        local root
+        for root in "${!TEST_DIRS[@]}"; do
+            if [[ "${TEST_DIRS[$root]}" != 1 ]]; then
+                echo "Error: a single TEST_DIRS entry must have weight 1; weights distribute work across multiple roots." >&2
+                validation_failed=1
+            fi
+        done
+    fi
+
     if [[ "$layout" != "$worker_layout" && "$layout" != "$shared_layout" ]]; then
         echo "Error: ELBENCHO_FILE_LAYOUT='${layout}' must be '${worker_layout}' or '${shared_layout}'" >&2
         validation_failed=1
@@ -3596,10 +3616,6 @@ validate_elbencho_file_workload_env() {
             local maximum
             maximum=$(_elbencho_shell_signed_integer_max) || return 1
             echo "Error: ELBENCHO_FILES_PER_NODE='${files_per_node}' exceeds this shell's signed integer maximum (${maximum})" >&2
-            validation_failed=1
-        fi
-        if [[ "$layout" != "$shared_layout" ]]; then
-            echo "Error: ELBENCHO_FILES_PER_NODE requires ELBENCHO_FILE_LAYOUT='${shared_layout}'" >&2
             validation_failed=1
         fi
     fi

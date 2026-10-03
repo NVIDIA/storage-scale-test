@@ -76,6 +76,9 @@ sandbox. In a pre-provisioned, network-restricted sandbox, set `CI_BOOTSTRAP=0`
 and use `CI_PYTHON` or `CI_SHELLCHECK` to select installed tools.
 Run tests and lint through this script or an environment populated from both
 requirements files; never treat ambient Python tooling as authoritative.
+When changing runtime imports or CI entry points, reproduce the workflow's
+dependency bootstrap and smoke-test its command in a clean environment.
+Preloaded sandbox or `.venv-ci` packages do not prove CI readiness.
 
 `black` must be 25.9.0+; `pylint` must score 10.00/10. Details and rationale:
 [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md).

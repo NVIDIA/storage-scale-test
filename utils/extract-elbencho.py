@@ -203,8 +203,8 @@ class ElbenchoMetrics:
     phase_wall_duration_ms: int = 0
     # Measured time to first completion from CSV: time ms [first]; pairs with elbencho [first] IOPS/MiB/s stats
     phase_first_duration_ms: int = 0
-    # nv-elbencho-sweep -s/--single (env_used.yaml single_option: 1): one combined elbencho run for the sweep
-    sweep_single_option: bool = False
+    # Completion-based sweep phases selected by --run-to-completion.
+    sweep_run_to_completion_option: bool = False
 
     # Optional sweep log annotations (from nv-elbencho-sweep / _elbencho_functions.sh .out text)
     write_only_data_dir: str = ""  # path from ELBENCHO_WRITE_ONLY_DATA_DIR=
@@ -1008,7 +1008,7 @@ def _metric_should_show_csv_phase_dur(metric: ElbenchoMetrics) -> bool:
     - **DurTot** uses ``phase_wall_duration_ms`` (CSV ``time ms [last]``), total wall time to last
       completion.
 
-    - If ``env_used.yaml`` has ``single_option: 1`` (nv-elbencho-sweep ``-s`` / ``--single``), we show
+    - If ``env_used.yaml`` has ``run_to_completion_option: 1`` (``--run-to-completion``), we show
       these columns whenever at least one of the phase times is set (see ``apply_env_used_to_metrics``).
     - Single-big-file **buffered** IO: the read phase omits ``--infloop``, so wall time is driven by one
       logical pass (file size / aggregate rate), not by ``--timelimit`` even when timelimit appears in
@@ -1019,7 +1019,7 @@ def _metric_should_show_csv_phase_dur(metric: ElbenchoMetrics) -> bool:
     """
     if metric.phase_wall_duration_ms <= 0 and metric.phase_first_duration_ms <= 0:
         return False
-    if metric.sweep_single_option:
+    if metric.sweep_run_to_completion_option:
         return True
     if metric.is_single_big_file and metric.direct_io == 0:
         return True
@@ -2694,7 +2694,7 @@ def _elbencho_csv_apply_backward_compat_defaults(row: Dict[str, Any]) -> None:
     _csv_row_set_if_absent_or_empty(row, "io_duration_sec", "0")
     _csv_row_set_if_absent_or_empty(row, "phase_wall_duration_ms", "0")
     _csv_row_set_if_absent_or_empty(row, "phase_first_duration_ms", "0")
-    _csv_row_set_if_absent_or_empty(row, "sweep_single_option", "False")
+    _csv_row_set_if_absent_or_empty(row, "sweep_run_to_completion_option", "False")
     _csv_row_set_if_absent_or_empty(row, "write_only_data_dir", "")
     _csv_row_set_if_absent_or_empty(row, "treescan_size_stats_line", "")
     _csv_row_set_if_absent_or_empty(row, "sweep_read_from_path", "")
@@ -2749,7 +2749,7 @@ def read_csv(csv_file: str) -> List[ElbenchoMetrics]:
                     "io_duration_sec",
                     "phase_wall_duration_ms",
                     "phase_first_duration_ms",
-                    "sweep_single_option",
+                    "sweep_run_to_completion_option",
                     "write_only_data_dir",
                     "sweep_read_from_path",
                     "treescan_size_stats_line",

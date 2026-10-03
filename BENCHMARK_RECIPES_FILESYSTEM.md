@@ -23,7 +23,7 @@ IO sweep** (`storage-tests/fs/nv-elbencho-sweep.sh`).
 
 For full documentation on the variables, IO size syntax (the `r` prefix for
 random IO, comma-separated write/read sizes), and the test workflow, see
-[README.md](README.md) and the comments in
+[filesystem guide](docs/FILESYSTEM_TESTING.md) and the comments in
 [env.sh.template](env.sh.template).
 
 ---
@@ -83,6 +83,28 @@ rather than sustained performance.
 | Production single-node sweep | 120–300 seconds |
 | Production multi-node sweep | 120–300 seconds |
 | Quick post-maintenance check | 30–60 seconds |
+
+Completion mode is selected by buffered IO, multiple distinct `TEST_DIRS`
+roots, or `--run-to-completion`; a single root must have weight 1. The
+single-root timed default applies to worker-directory direct IO. Generated
+shared-directory and generated single-file workloads are also completion-based.
+Set
+`ELBENCHO_FILES_PER_NODE` for a total per-node budget and `ELBENCHO_FILE_SIZE`
+to fix file size. The budget rounds to the nearest multiple
+of `threads * sum(TEST_DIRS weights)`, ties upward, with at least one file per
+thread per weighted target. Each cell prints the effective count. For example,
+on one root with weight 1, 8 files per node, 1G files, and threads
+`("1" "4")` writes and reads `nodes * 8 GiB` once per cell, without time
+limits or repetition. If the count is unset, the FS budgets and duration
+calculate it automatically across the weighted targets. In completion mode,
+duration controls sizing, not runtime; `ELBENCHO_FILE_SIZE` still fixes file
+size. Use `--run-to-completion` explicitly when the sweep should remain
+completion-based if IO mode or root count changes.
+
+Buffered IO completes the finite dataset without repetition to avoid repeatedly
+measuring the same warm page-cache data. This does not guarantee cold caches;
+preceding writes and earlier runs can still affect results.
+Generated shared-directory mode already has completion-based phases.
 
 ### IO Depth
 
@@ -506,8 +528,7 @@ file and byte counts before advancing. `ELBENCHO_SCALE_READ_WRITE_DURATION`
 remains in the configuration snapshot but is inactive for this mode. Size
 Slurm walltime for the configured node count, `ELBENCHO_FILES_PER_NODE`,
 `ELBENCHO_FILE_SIZE`, filesystem throughput, read-after-write pause, and
-cleanup. The `-s` option is accepted and recorded but does not change the file
-count or call the legacy capacity-based sizing path.
+cleanup.
 
 For a checkpoint written by 12,000 single-threaded saving ranks, one per GPU,
 with four GPUs per node, 3,000 nodes, one approximately 2.5 GiB file per rank,
@@ -599,11 +620,11 @@ three nodes:
 In staged mode, an inherited `ELBENCHO_FILES_PER_NODE` is inactive: it is not
 divided by the current thread count, passed to elbencho, or reported as an
 effective count. Files per reader node are not applicable because custom-tree
-assignment can be uneven and can split large files among workers. Staged reads
-retain their existing time-based/repeat behavior and ignore
-`ELBENCHO_FILE_SIZE`. A nonempty inherited file count still requires
-`ELBENCHO_FILE_LAYOUT=shared-directory`, even though staged execution does not
-use that count.
+assignment can be uneven and can split large files among workers. Direct IO
+staged reads are time-limited by default; buffered IO or
+`--run-to-completion` reads the scanned dataset to completion. Staged reads
+ignore `ELBENCHO_FILE_SIZE` and any inherited file count; neither repartitions
+the scanned dataset.
 
 The first read scans the directory into the existing treefile cache. Later
 reads reuse the cached tree without rescanning and derive totals from that

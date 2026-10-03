@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Superset of Python dependencies for utils/ analysis tools.
+# Runtime Python dependencies for analysis tools and the integration driver.
 # Installed by setup_python_venv() into repo-root .venv/
 # Pinned to current upstream releases as of 2026-08-03. NumPy 2.5.1 requires
 # Python 3.12 or newer, which sets the runtime floor for these analysis tools.
 #
 # Consumers: extract-elbencho.sh, extract-warp.sh, extract-mdtest-elbencho.sh,
-# extract-netbench.sh, summarize-elbencho.sh
+# extract-netbench.sh, summarize-elbencho.sh, integration-tests/bin/integration-test.py
 matplotlib==3.11.1
 numpy==2.5.1
 PyYAML==6.0.3
