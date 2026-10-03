@@ -420,6 +420,8 @@ results; Kubernetes uses the asynchronous status/cancel/collect lifecycle and
 requires collection before resume. The shared dispatch protocol accepts both
 workload kinds. Prepared batches save ordered groups locally, freeze common
 resources, and permanently seal their manifest before first external mutation.
+Batch preflight validates each group's saved completion policy, not current
+launcher settings.
 One global ledger owns statuses; group snapshots and artifacts remain isolated
 through dispatch, collection, resume, and unified filesystem reporting.
 The Kubernetes parent owns each active cell's group-specific scratch path and

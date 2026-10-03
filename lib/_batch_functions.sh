@@ -574,7 +574,8 @@ _elbencho_batch_validate_cell() (
     else
         validate_elbencho_file_workload_env || exit 1
         validate_elbencho_single_big_file_env "${ELBENCHO_SWEEP_READ_FROM:-}" || exit 1
-        validate_elbencho_sweep_workload_mode "$dio_or_bio" "$use_random" "${ELBENCHO_SWEEP_READ_FROM:-}" || exit 1
+        validate_elbencho_sweep_workload_mode "$dio_or_bio" "$use_random" \
+            "${ELBENCHO_SWEEP_READ_FROM:-}" "$run_to_completion" || exit 1
         [[ -z "${ELBENCHO_SWEEP_READ_FROM:-}" ]] || validate_elbencho_sweep_read_from_path "$ELBENCHO_SWEEP_READ_FROM" || exit 1
     fi
 )

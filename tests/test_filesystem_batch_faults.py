@@ -94,6 +94,37 @@ def _fake_ssh(base, monkeypatch):
     return attempts
 
 
+@pytest.mark.parametrize("completion_flags", [("--run-to-completion",), ("-b",), ()])
+@pytest.mark.parametrize("entry", [IO, MD])
+def test_explicit_file_count_batch_start_and_resume_use_saved_completion_mode(
+    fault_checkout, monkeypatch, completion_flags, entry
+):
+    """Real batch preflight must retain explicit and implicit completion policy."""
+    base = fault_checkout
+    with (base / "env.sh").open("a", encoding="utf-8") as stream:
+        stream.write(
+            "\nexport ELBENCHO_FILES_PER_NODE=8 ELBENCHO_FILE_SIZE=1M\n"
+            "export ELBENCHO_SCALE_THREAD_LIST=(1 4)\n"
+        )
+        if not completion_flags:
+            stream.write('TEST_DIRS=(["/data/one"]=1 ["/data/two"]=1)\n')
+    prepared = launch(base, IO, "--batch", "--nodes", "1", *completion_flags)
+    assert prepared.returncode == 0, prepared.stdout + prepared.stderr
+    batch = next((base / "results").glob("filesystem-batch-*"))
+    # Changed launcher configuration must not replace the saved group policy.
+    with (base / "env.sh").open("a", encoding="utf-8") as stream:
+        stream.write("\nexport ELBENCHO_FILES_PER_NODE=\n")
+    attempts = _fake_ssh(base, monkeypatch)
+    for operation in ("--start", "--resume"):
+        before = attempts.read_bytes() if attempts.exists() else b""
+        result = launch(base, entry, operation, batch)
+        assert result.returncode != 0  # The fake remote adapter intentionally fails.
+        assert "requires completion mode" not in result.stderr
+        assert attempts.exists(), result.stdout + result.stderr
+        assert len(attempts.read_bytes()) > len(before)
+        assert (batch / SEAL).is_file()
+
+
 @pytest.mark.parametrize("initial", [True, False])
 @pytest.mark.parametrize("boundary", ["before", "after"])
 def test_publication_interruption_has_one_manifest_commit_boundary(
