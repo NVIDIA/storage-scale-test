@@ -17,7 +17,9 @@
 
 """Shell-level tests for exact generated shared-directory execution."""
 
+import json
 import subprocess
+import tempfile
 import textwrap
 import unittest
 from pathlib import Path
@@ -34,6 +36,76 @@ def _run(script: str) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
     )
+
+
+def _v32_record(phase: str, entries: str, elapsed: str, size: str = "") -> str:
+    """One compact Elbencho v3.2-1 phase record with its nested fields.
+
+    Shaped like the records in the v3.2-1 CI artifacts: config with an escaped
+    command line, and latency objects whose own "entries" keys must not be
+    mistaken for the last_done counter.
+    """
+    done = {"elapsed_time_ms": elapsed, "entries/s": "14", "entries": entries}
+    if size:
+        done.update({"iops": "4096", "bytes/s": "409044000", "bytes": size})
+    done["cpu%"] = "11"
+    histogram = {"buckets": [{"range": "7-8us", "count": "1"}]}
+    latency = {
+        "entries": {
+            "min_us": "1",
+            "avg_us": "2",
+            "max_us": "3",
+            "histogram": histogram,
+        },
+        "IO": {"min_us": "7", "avg_us": "15", "max_us": "4361", "histogram": histogram},
+    }
+    record = {
+        "phase_type": phase,
+        "phase_id": "dc68d046-4da7-46a8-beeb-396a080b31e3",
+        "iso_start_date": "2026-10-05T19:30:49.817+0000",
+        "config": {
+            "path_type": "dir",
+            "files": "1",
+            "file_size": "16777216",
+            "version": "3.2-1",
+            "command": '"/usr/bin/elbencho" "--write" "--jsonfile=/r/0001.write.json"',
+        },
+        "first_done": done,
+        "last_done": {**done, "latency": latency} if phase != "SYNC" else done,
+    }
+    return json.dumps(record, separators=(",", ":"))
+
+
+_V32_SYNC = _v32_record("SYNC", "0", "0")
+_V32_PHASES = {
+    "WRITE": (_v32_record("WRITE", "1", "41", "16777216"), "1\t16777216\t41"),
+    "READ": (_v32_record("READ", "1", "46", "16777216"), "1\t16777216\t46"),
+    "RMFILES": (_v32_record("RMFILES", "12000", "37"), "12000\tnull\t37"),
+}
+
+
+def _parse_phase_files(files: dict[str, tuple[str, str]]) -> dict[str, str]:
+    """Parse each named (content, phase); map names to parser output or FAIL."""
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, (content, _) in files.items():
+            Path(tmp, name).write_text(content, encoding="utf-8", newline="")
+        checks = "".join(
+            f"check {name} {phase}\n" for name, (_, phase) in files.items()
+        )
+        result = _run(f"""
+            source "{_FUNCTIONS}"
+            check() {{
+                local out
+                if out=$(_elbencho_parse_phase_json "{tmp}/$1" "$2" 2>/dev/null); then
+                    printf '%s=%s\\n' "$1" "$out"
+                else
+                    printf '%s=FAIL\\n' "$1"
+                fi
+            }}
+            {checks}
+            """)
+    assert result.returncode == 0, result.stderr
+    return dict(line.split("=", 1) for line in result.stdout.splitlines())
 
 
 class TestElbenchoSharedDirectoryShell(unittest.TestCase):
@@ -161,6 +233,45 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
             ! _elbencho_parse_phase_json "$tmp/absent" WRITE
             """)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_json_parser_skips_v32_whitespace_separator_lines(self) -> None:
+        """Elbencho v3.2-1 separates and follows its phase records with blank lines."""
+        layouts = {
+            # The exact layout of the v3.2-1 CI artifacts.
+            "ci": "{sync}\n\n{phase}\n\n{sync}\n\n",
+            "leading": "\n \n\t\n\r\n{sync}\n{phase}\n{sync}\n",
+            "mixed": "{sync}\n \t\r\n{phase}\r\n\r\n\t\n{sync}\r\n \n",
+            "adjacent": "\n{sync}{phase}\n\n{sync}",
+        }
+        files = {
+            f"{phase}-{layout}": (template.format(sync=_V32_SYNC, phase=record), phase)
+            for phase, (record, _) in _V32_PHASES.items()
+            for layout, template in layouts.items()
+        }
+        parsed = _parse_phase_files(files)
+        for name, (_, phase) in files.items():
+            self.assertEqual(parsed[name], _V32_PHASES[phase][1], name)
+
+    def test_json_parser_blank_separators_do_not_relax_validation(self) -> None:
+        """Skipping whitespace lines must not accept empty or ambiguous streams."""
+        write, _ = _V32_PHASES["WRITE"]
+        rmfiles, _ = _V32_PHASES["RMFILES"]
+        rejected = {
+            "WRITE-whitespace": "\n \n\t\n\r\n",
+            "WRITE-duplicate": f"{write}\n\n{write}\n\n",
+            "WRITE-sync-only": f"{_V32_SYNC}\n\n{_V32_SYNC}\n\n",
+            "WRITE-malformed": f"{_V32_SYNC}\n\n{{broken\n\n",
+            "WRITE-no-bytes": f"\n{_v32_record('WRITE', '1', '41')}\n\n",
+            "WRITE-negative": f"\n{_v32_record('WRITE', '-1', '41', '4')}\n\n",
+            "WRITE-noncanonical": f"\n{_v32_record('WRITE', '1', '041', '4')}\n\n",
+            "WRITE-wrong-phase": f"{_V32_SYNC}\n\n{rmfiles}\n\n",
+            "RMFILES-with-bytes": f"\n{_v32_record('RMFILES', '1', '37', '0')}\n\n",
+            "WRITE-split-record": f"{write[:40]}\n\n{write[40:]}\n",
+        }
+        parsed = _parse_phase_files(
+            {name: (content, name.split("-")[0]) for name, content in rejected.items()}
+        )
+        self.assertEqual(parsed, dict.fromkeys(rejected, "FAIL"))
 
     def test_rmfiles_json_requires_entries_and_elapsed_without_bytes(self) -> None:
         result = _run(f"""

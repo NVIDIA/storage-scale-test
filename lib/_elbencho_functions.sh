@@ -1727,7 +1727,9 @@ _elbencho_workload_update_failure_cleanup_state() {
 }
 
 # Parse elbencho streamed JSON without a runtime JSON dependency. Releases may
-# delimit top-level phase objects with newlines or write them adjacently.
+# delimit top-level phase objects with newlines or write them adjacently, and
+# v3.2 adds blank lines between and after them; whitespace-only lines are
+# skipped. A file with no phase object at all is still rejected.
 # Prints canonical "entries<TAB>bytes-or-null<TAB>elapsed-ms" for one phase.
 # WRITE/READ require bytes; RMFILES must not contain a bytes counter.
 _elbencho_parse_phase_json() {
@@ -1825,7 +1827,7 @@ _elbencho_parse_phase_json() {
     }
     BEGIN { records = 0; matches = 0; bad = 0 }
     {
-        if ($0 ~ /^[ \t\r]*$/) { fail(); next }
+        if ($0 ~ /^[ \t\r]*$/) next
         s = $0; p = 1; n = length(s); records++
         ws()
         while (p <= n && !bad) {
@@ -4208,7 +4210,6 @@ run_elbencho_metadata_benchmark() {
         -n "$dirs_per_thread"
         -N "$files_per_worker"
         -s 0                        # Zero-byte files (metadata only)
-        -b 0                        # Block size 0 (matches file size)
         --lat
         --lathisto
         --latpercent

@@ -237,7 +237,7 @@ storage, and launch both commands there.
 The NFS profile uses a size-limited, checksum-verified upstream benchmark
 archive. Docker SBX, where GitHub release assets may be unavailable, extracts
 the binary and runtime libraries from the digest-pinned upstream
-`docker.io/breuner/elbencho:v3.1-11` image and includes them only in the
+`docker.io/breuner/elbencho:v3.2-1` image and includes them only in the
 generated test deployment. Timestamped build and step logs are retained below
 the state directory's `test-runs/` directory. The test also requires successful
 execution records, exact one- and two-node workload totals, ordered worker

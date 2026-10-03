@@ -302,7 +302,7 @@ def test_attempt_configuration_freezes_the_canonical_control_root(
     result = _bash(_identity(tmp_path / "state") + """
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
         export KUBECTL_NODE_SELECTOR=storage-test=true
-        export KUBECTL_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.1-11
+        export KUBECTL_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never
         export KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
         declare -A mapped=([/mnt/storage-scale-test/zeta]=1 \
@@ -358,7 +358,7 @@ def test_attempt_templates_are_yaml_and_restrict_security_surface() -> None:
         nodes=$(kubectl_render_node_affinity_values node-a node-b)
         kubectl_render_attempt_template storage-tests/fs/kubectl/templates/worker-daemonset.yaml.tmpl \\
           NAMESPACE=test-ns RESOURCE_NAME=sst-elb-1234abcd-workers ATTEMPT_ID=1234abcd \\
-          OWNERSHIP_NONCE=0123456789abcdef0123456789abcdef IMAGE=breuner/elbencho:v3.1-11 \\
+          OWNERSHIP_NONCE=0123456789abcdef0123456789abcdef IMAGE=breuner/elbencho:v3.2-1 \\
           IMAGE_PULL_POLICY=Never RUN_AS_USER=2000 RUN_AS_GROUP=2000 PVC_NAME=test-pvc \\
           "NODE_SELECTOR_BLOCK=$selector" "NODE_AFFINITY_VALUES=$nodes"
         """)
@@ -395,7 +395,7 @@ def test_sweep_job_exposes_coordinator_identity_with_downward_api() -> None:
     result = _bash("""
         kubectl_render_attempt_template storage-tests/fs/kubectl/templates/sweep-job.yaml.tmpl \\
           NAMESPACE=test-ns RESOURCE_NAME=sst-elb-1234abcd-sweep ATTEMPT_ID=1234abcd \\
-          OWNERSHIP_NONCE=0123456789abcdef0123456789abcdef IMAGE=breuner/elbencho:v3.1-11 \\
+          OWNERSHIP_NONCE=0123456789abcdef0123456789abcdef IMAGE=breuner/elbencho:v3.2-1 \\
           IMAGE_PULL_POLICY=Never RUN_AS_USER=2000 RUN_AS_GROUP=2000 PVC_NAME=test-pvc \\
           COORDINATOR_NODE=node-a \
           REMOTE_RUN_DIRECTORY=/mnt/storage-scale-test/benchmark/.storage-scale-test/runs/1234abcd
@@ -1834,7 +1834,7 @@ def test_helper_template_is_rendered_and_removed_when_readiness_fails() -> None:
     """[R-02] An unready collector helper is removed with diagnosis."""
     result = _bash("""
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
-        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
         captured=$(mktemp)
         kubectl_create_owned_object() { printf '%s' "$7" > "$captured"; printf -v "$1" uid-1; }
@@ -1856,7 +1856,7 @@ def test_helper_creation_returns_uid_to_common_caller_variable_names() -> None:
     """Nested Bash output variables must not be shadowed by helper locals."""
     result = _bash("""
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
-        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
         kubectl_run_bounded() { :; }
         kubectl_verify_object_identity() { printf 'uid-1\n'; }
@@ -1892,7 +1892,7 @@ def test_runtime_configuration_rejects_every_invalid_field(
     result = _bash(f"""
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV='bad/pv' KUBECTL_PVC=test-pvc
         export KUBECTL_NODE_SELECTOR=storage-test=true
-        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
         export KUBECTL_PV=test-pv
         export {variable}={invalid!r}
@@ -1931,7 +1931,7 @@ def test_cluster_storage_contract_reports_expected_and_observed_values() -> None
     result = _bash("""
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
         export KUBECTL_NODE_SELECTOR=storage-test=true
-        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never
         export KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
         kubectl() { :; }
@@ -1963,7 +1963,7 @@ def test_cluster_identity_reports_denied_lease_permission() -> None:
     result = _bash(r"""
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
         export KUBECTL_NODE_SELECTOR=storage-test=true
-        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never
         export KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
         kubectl() { :; }
@@ -2018,7 +2018,7 @@ def test_prepare_reports_specific_capacity_and_path_failures(
     result = _bash(f"""
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
         export KUBECTL_NODE_SELECTOR=storage-test=true
-        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000
         export KUBECTL_RUN_AS_GROUP=2000
         declare -A mapped=([/mnt/storage-scale-test/bench]=1)
@@ -2096,10 +2096,10 @@ def test_always_pull_policy_requires_an_immutable_image_reference() -> None:
     result = _bash("""
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
         export KUBECTL_NODE_SELECTOR=storage-test=true
-        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Always KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
         ! kubectl_validate_runtime_configuration
-        export KUBECTL_ELBENCHO_IMAGE='breuner/elbencho:v3.1-11@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        export KUBECTL_ELBENCHO_IMAGE='breuner/elbencho:v3.2-1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
         kubectl_validate_runtime_configuration
         """)
     assert result.returncode == 0, result.stderr
@@ -2194,7 +2194,7 @@ def test_runtime_preflight_job_is_bounded_and_self_cleaning() -> None:
           /mnt/storage-scale-test/alpha /mnt/storage-scale-test/benchmark)
         kubectl_render_attempt_template storage-tests/fs/kubectl/templates/validation-job.yaml.tmpl \
           NAMESPACE=test-ns RESOURCE_NAME=sst-elb-1234abcd-validation ATTEMPT_ID=1234abcd \
-          OWNERSHIP_NONCE=0123456789abcdef0123456789abcdef IMAGE=breuner/elbencho:v3.1-11 \
+          OWNERSHIP_NONCE=0123456789abcdef0123456789abcdef IMAGE=breuner/elbencho:v3.2-1 \
           IMAGE_PULL_POLICY=Never RUN_AS_USER=2000 RUN_AS_GROUP=2000 PVC_NAME=test-pvc \
           NODE_NAME=node-a "TEST_ROOT_ARGUMENTS=$roots"
         """)
@@ -2841,7 +2841,7 @@ def test_fake_pre_job_lifecycle_orders_identity_reservation_and_workers(
     result = _bash(f"""
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
         export KUBECTL_NODE_SELECTOR=storage-test=true
-        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
         declare -A mapped=([/mnt/storage-scale-test/bench]=1)
         events={str(tmp_path / 'events')!r}
@@ -2882,7 +2882,7 @@ def test_prepare_failure_terminalizes_only_after_successful_rollback(
     result = _bash(f"""
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
         export KUBECTL_NODE_SELECTOR=storage-test=true
-        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
         declare -A mapped=([/mnt/storage-scale-test/bench]=1)
         events={str(tmp_path / 'events')!r}
@@ -2923,7 +2923,7 @@ def test_prepare_rollback_failure_keeps_prepared_attempt_recoverable(
     result = _bash(f"""
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
         export KUBECTL_NODE_SELECTOR=storage-test=true
-        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
         declare -A mapped=([/mnt/storage-scale-test/bench]=1)
         events={str(tmp_path / 'events')!r}
@@ -3124,7 +3124,7 @@ def test_clean_failed_resume_restores_collected_predecessor_pointer(
         kubectl_local_lock_release "$fd"
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
         export KUBECTL_NODE_SELECTOR=storage-test=true
-        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
         declare -A mapped=([/mnt/storage-scale-test/bench]=1)
         kubectl_generate_attempt_id() {{ printf aaaabbbb; }}
@@ -3168,7 +3168,7 @@ def test_deferred_prepared_recovery_restores_collected_predecessor_pointer(
         kubectl_local_lock_release "$fd"
         export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
         export KUBECTL_NODE_SELECTOR=storage-test=true
-        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
         declare -A mapped=([/mnt/storage-scale-test/bench]=1)
         kubectl_generate_attempt_id() {{ printf aaaabbbb; }}

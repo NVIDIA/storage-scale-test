@@ -164,7 +164,7 @@ class TestDenseCommandConstruction(_PhaseMixin):
     def test_zero_byte_files_and_latency_reporting_retained(self) -> None:
         for argv in self.phases:
             self.assertEqual(_flag_value(argv, "-s"), "0")
-            self.assertEqual(_flag_value(argv, "-b"), "0")
+            self.assertNotIn("-b", argv)  # Elbencho 3.2 rejects a zero block size.
             self.assertIn("--lat", argv)
             self.assertIn("--lathisto", argv)
             self.assertIn("--latpercent", argv)
@@ -242,6 +242,12 @@ class TestStandardLayoutRegression(_PhaseMixin):
             self.assertEqual(len(paths), 7, argv)
             self.assertTrue(paths[0].endswith("/b0"), paths)
             self.assertTrue(paths[-1].endswith("/b6"), paths)
+
+    def test_zero_byte_metadata_does_not_set_a_zero_block_size(self) -> None:
+        """All standard phases use the valid default block size with no data IO."""
+        for argv in self.phases:
+            self.assertEqual(_flag_value(argv, "-s"), "0")
+            self.assertNotIn("-b", argv)
 
     def test_dirs_and_files_per_thread_unchanged(self) -> None:
         for argv in self.phases:
