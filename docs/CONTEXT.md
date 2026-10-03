@@ -93,7 +93,8 @@ corruption, and unknown failures remain fatal.
 Interrupted private aliases are reconciled; MariaDB and Slinky's Alpine helpers
 use preloaded fixture-private tags. Cleanup recovers partial bootstrap, removes
 only owned resources, restores prior NFS state, verifies unmounts, and does not
-depend on writable diagnostics.
+depend on writable diagnostics. NFS worker headroom and first-timeout kernel
+diagnostics are best-effort; see `integration-tests/README.md`.
 
 The test CLI selects substrates and scenarios independently. Its planner batches
 shared-home SSH cases behind a crash-recoverable transition; separate homes are
@@ -288,7 +289,8 @@ revalidated by status and collection; the API-independent coordinator probes
 frozen addresses before each cell. Drift or coordinator loss is recovered only
 with fresh identity evidence. Collection copies PVC results to the local result
 tree. A configured namespace, existing PV/PVC, node selector, authorized kubectl
-context, and compatible CNI are prerequisites.
+context, and compatible CNI are prerequisites. Upload, health-probe, and
+collection retry limits are specified in `docs/KUBERNETES_ELBENCHO_LIFECYCLE.md`.
 Docker SBX validates the supported kind profile; dual-architecture NFS CI and
 a separately authorized external-cluster run are release acceptance gates.
 

@@ -4655,36 +4655,61 @@ def _remote_staging_operations(
 ) -> FailureInjectionOperations:
     """Return concrete PVC or SSH-pod operations for failure staging."""
 
+    wrapper_digests: dict[str, str] = {}
+
+    def _atomic_write(destination: PurePosixPath, digest: str, mode: int) -> str:
+        return (
+            f"destination={_shell(destination)}; "
+            'temporary=$(mktemp "${destination}.staging.XXXXXXXX"); '
+            "trap 'rm -f -- \"$temporary\"' EXIT; "
+            'cat > "$temporary"; '
+            f'[[ "$(sha256sum "$temporary" | cut -d " " -f 1)" == {digest} ]]; '
+            f'chmod {mode:o} -- "$temporary"; '
+            'mv -f -- "$temporary" "$destination"'
+        )
+
     def _container(_endpoint: str) -> str:
         return fixture.login_container if selector == "slurm" else "sshd"
 
     def _command(endpoint: str, command: str, *, stdin: Any = None) -> None:
         if endpoint == "local":
             return
-        runner.run(
-            [
-                *_kubectl(
-                    config,
-                    "-n",
-                    config.namespace,
-                    "exec",
-                    "-i",
-                    endpoint,
-                    "-c",
-                    _container(endpoint),
-                    "--",
-                ),
-                "runuser",
-                "-u",
-                WORKLOAD_USER,
+        arguments = [
+            *_kubectl(
+                config,
+                "-n",
+                config.namespace,
+                "exec",
+                *(("-i",) if stdin is not None else ()),
+                endpoint,
+                "-c",
+                _container(endpoint),
                 "--",
-                "bash",
-                "-ec",
-                f"umask 0007; {command}",
-            ],
-            stdin=stdin,
-            timeout=180,
-        )
+            ),
+            "timeout",
+            "--kill-after=5s",
+            "50s",
+            "runuser",
+            "-u",
+            WORKLOAD_USER,
+            "--",
+            "bash",
+            "-ec",
+            f"umask 0007; {command}",
+        ]
+        for attempt in range(3):
+            if stdin is not None:
+                stdin.seek(0)
+            try:
+                runner.run(arguments, stdin=stdin, timeout=60)
+                return
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                if attempt == 2 or not _remote_staging_failure_is_transient(error):
+                    raise
+                LOG.warning(
+                    "Transient staging failure on %s; retrying: %s", endpoint, error
+                )
+                time.sleep(attempt + 1)
 
     def make_directory(endpoint: str, path: PurePosixPath) -> None:
         if endpoint == "local":
@@ -4701,16 +4726,22 @@ def _remote_staging_operations(
         if endpoint == "local":
             local_destination = Path(destination)
             local_destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, local_destination)
-            local_destination.chmod(mode)
+            temporary = local_destination.with_name(
+                f".{local_destination.name}.{secrets.token_hex(8)}"
+            )
+            try:
+                shutil.copy2(source, temporary)
+                temporary.chmod(mode)
+                temporary.replace(local_destination)
+            finally:
+                temporary.unlink(missing_ok=True)
             return
         with tempfile.TemporaryFile() as stream:
             stream.write(source.read_bytes())
             stream.seek(0)
             _command(
                 endpoint,
-                f"cat > {_shell(destination)} && chmod {mode:o} -- "
-                f"{_shell(destination)}",
+                _atomic_write(destination, _sha256(source), mode),
                 stdin=stream,
             )
 
@@ -4731,24 +4762,41 @@ def _remote_staging_operations(
         with tempfile.TemporaryFile() as stream:
             with tarfile.open(fileobj=stream, mode="w") as archive:
                 for child in sorted(source.rglob("*")):
-                    archive.add(child, arcname=child.relative_to(source))
+                    archive.add(
+                        child, arcname=child.relative_to(source), recursive=False
+                    )
+            stream.seek(0)
+            digest = hashlib.sha256(stream.read()).hexdigest()
             stream.seek(0)
             _command(
                 endpoint,
-                f"rm -rf -- {_shell(destination)} && mkdir -p -- "
-                f"{_shell(destination)} && tar -xf - -C {_shell(destination)} "
-                f"&& chmod -R u+rwX,g+rX,o-rwx -- {_shell(destination)}",
+                f"destination={_shell(destination)}; "
+                'temporary=$(mktemp -d "${destination}.staging.XXXXXXXX"); '
+                "trap 'rm -rf -- \"$temporary\"' EXIT; "
+                'cat > "$temporary/archive.tar"; '
+                f'[[ "$(sha256sum "$temporary/archive.tar" | cut -d " " -f 1)" == {digest} ]]; '
+                'mkdir "$temporary/tree"; tar -xf "$temporary/archive.tar" -C "$temporary/tree"; '
+                'chmod -R u+rwX,g+rX,o-rwx -- "$temporary/tree"; '
+                'rm -rf -- "$destination"; mv -T -- "$temporary/tree" "$destination"',
                 stdin=stream,
             )
 
     def write_text(
         endpoint: str, destination: PurePosixPath, content: str, mode: int
     ) -> None:
+        wrapper_digests[endpoint] = hashlib.sha256(content.encode()).hexdigest()
         if endpoint == "local":
             if local_wrapper is None:
                 raise IntegrationTestError("local failure wrapper path is absent")
-            local_wrapper.write_text(content, encoding="utf-8")
-            local_wrapper.chmod(mode)
+            temporary = local_wrapper.with_name(
+                f".{local_wrapper.name}.{secrets.token_hex(8)}"
+            )
+            try:
+                temporary.write_text(content, encoding="utf-8")
+                temporary.chmod(mode)
+                temporary.replace(local_wrapper)
+            finally:
+                temporary.unlink(missing_ok=True)
             return
         if remote_wrapper is not None:
             destination = remote_wrapper
@@ -4757,27 +4805,62 @@ def _remote_staging_operations(
             stream.seek(0)
             _command(
                 endpoint,
-                f"cat > {_shell(destination)} && chmod {mode:o} -- "
-                f"{_shell(destination)}",
+                _atomic_write(destination, wrapper_digests[endpoint], mode),
                 stdin=stream,
             )
 
     def remove_tree(endpoint: str, path: PurePosixPath) -> None:
         if endpoint == "local":
-            if local_wrapper is not None and restore_binary is not None:
-                shutil.copy2(restore_binary, local_wrapper)
+            if (
+                endpoint in wrapper_digests
+                and local_wrapper is not None
+                and restore_binary is not None
+            ):
+                copy_file(restore_binary, endpoint, PurePosixPath(local_wrapper), 0o755)
             shutil.rmtree(Path(path), ignore_errors=True)
             return
-        if remote_wrapper is not None:
-            _command(
-                endpoint,
-                f"cp -- {_shell(path / 'delegate' / 'elbencho')} "
-                f"{_shell(remote_wrapper)}",
-            )
+        if remote_wrapper is not None and endpoint in wrapper_digests:
+            if restore_binary is None:
+                raise IntegrationTestError(
+                    "verified local restoration binary is absent"
+                )
+            # Restoration never trusts a remotely staged delegate. Also reconcile
+            # a wrapper publication whose kubectl acknowledgement was lost.
+            original_digest = _sha256(restore_binary)
+            with tempfile.TemporaryFile() as stream:
+                stream.write(restore_binary.read_bytes())
+                stream.seek(0)
+                _command(
+                    endpoint,
+                    f"actual=$(sha256sum {_shell(remote_wrapper)} | cut -d ' ' -f 1); "
+                    f'if [[ "$actual" == {original_digest} ]]; then cat > /dev/null; '
+                    f'elif [[ "$actual" == {wrapper_digests[endpoint]} ]]; then '
+                    f"{_atomic_write(remote_wrapper, original_digest, 0o755)}; "
+                    "else echo 'refusing to restore an unexpected wrapper' >&2; exit 1; fi",
+                    stdin=stream,
+                )
         _command(endpoint, f"rm -rf -- {_shell(path)}")
 
     return FailureInjectionOperations(
         make_directory, copy_file, copy_tree, write_text, remove_tree
+    )
+
+
+def _remote_staging_failure_is_transient(error: BaseException) -> bool:
+    """Retry transport failures and deadlines, never auth or remote script errors."""
+    if isinstance(error, subprocess.TimeoutExpired):
+        return True
+    detail = str(error).lower()
+    if re.search(
+        r"unauthorized|forbidden|permission denied|command terminated|checksum|no such file|unsafe",
+        detail,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"unexpected eof|connection reset|connection refused|i/o timeout|tls handshake timeout|too many requests|service unavailable|bad gateway|gateway timeout",
+            detail,
+        )
     )
 
 
@@ -4855,7 +4938,7 @@ def _slurm_failure_plan(
         fixture,
         runtime.selector,
         None,
-        None,
+        source_binary,
         PurePosixPath(runtime.workspace) / "utils" / binary_name,
     )
     return plan, operations

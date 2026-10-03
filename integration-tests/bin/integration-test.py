@@ -175,7 +175,7 @@ WORKLOAD_GID = 2000
 WORKLOAD_ACCOUNT = "storage-test"
 NFS_UID = WORKLOAD_UID
 NFS_GID = WORKLOAD_GID
-NFS_SERVER_THREADS = 8
+NFS_SERVER_THREADS = 32
 NFS_THREADS_PATH = Path("/proc/fs/nfsd/threads")
 NFS_SERVICE_STATE_SCHEMA = 2
 STORAGE_BACKENDS = ("nfs", "sbx-shared")
@@ -282,6 +282,21 @@ class Config:
 class Runner:
     """Run commands with bounded execution and consistent diagnostics."""
 
+    def __init__(self) -> None:
+        self.on_timeout = None
+        self.collecting_timeout = False
+
+    def _capture_timeout(self) -> None:
+        if self.on_timeout is None or self.collecting_timeout:
+            return
+        self.collecting_timeout = True
+        try:
+            self.on_timeout()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            LOG.warning("Timeout diagnostics failed: %s", exc)
+        finally:
+            self.collecting_timeout = False
+
     def run(
         self,
         args: Sequence[str | Path],
@@ -298,18 +313,45 @@ class Runner:
             command[0] + " [redacted arguments]" if sensitive else shlex.join(command)
         )
         LOG.debug("Running: %s", display)
-        result = subprocess.run(
-            command,
-            check=False,
-            stdin=stdin,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=stdin is None,
-            timeout=timeout,
-            cwd=cwd,
-        )
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                stdin=stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=stdin is None,
+                timeout=timeout,
+                cwd=cwd,
+            )
+        except subprocess.TimeoutExpired as error:
+            LOG.error(
+                "Command timed out after %ss: %s%s",
+                timeout,
+                display,
+                _failure_detail(
+                    _output_text(error.stdout), _output_text(error.stderr), sensitive
+                ),
+            )
+            self._capture_timeout()
+            raise
         stdout = _output_text(result.stdout)
         stderr = _output_text(result.stderr)
+        if check and result.returncode == 124:
+            # A Pod-resident timeout can fire before the local kubectl deadline.
+            # Preserve the same first-stall diagnostics and recovery opportunity,
+            # and keep the remote evidence that a ProvisionError would have shown.
+            LOG.error(
+                "Command reported a timeout (124): %s%s",
+                display,
+                _failure_detail(stdout, stderr, sensitive),
+            )
+            self._capture_timeout()
+            if sensitive:
+                raise subprocess.TimeoutExpired(display, timeout)
+            raise subprocess.TimeoutExpired(
+                command, timeout, output=stdout, stderr=stderr
+            )
         if stdout and not sensitive:
             LOG.debug("stdout from %s:\n%s", command[0], stdout.rstrip())
         if stderr and not sensitive:
@@ -867,6 +909,9 @@ def _select_storage_backend(config: Config) -> str:
         LOG.info(
             "Using the Docker SBX shared-path backend for the required RWX "
             "storage contract"
+        )
+        LOG.info(
+            "NFS headroom tuning skipped: shared-path backend has no owned NFS server"
         )
     else:
         LOG.info("Using full-fidelity NFS CSI storage backend")
@@ -2049,7 +2094,7 @@ def _configure_nfs(runner: Runner, config: Config, subnet: str, gateway: str) ->
         (
             NFS_DAEMON_CONFIG,
             nfs_source,
-            f"[nfsd]\nvers3 = n\nvers4 = y\nthreads = {NFS_SERVER_THREADS}\n",
+            "[nfsd]\nvers3 = n\nvers4 = y\n",
         ),
     )
     for entry in desired:
@@ -2079,7 +2124,7 @@ def _configure_nfs(runner: Runner, config: Config, subnet: str, gateway: str) ->
     _ensure_nfs_firewall(runner, config, subnet)
     runner.run([*_sudo_prefix(), "exportfs", "-rav"])
     runner.run([*_sudo_prefix(), "systemctl", "enable", "--now", "nfs-server"])
-    _set_live_nfs_threads(runner, NFS_SERVER_THREADS)
+    _ensure_nfs_headroom(runner, config)
     state = {"subnet": subnet, "gateway": gateway}
     _write_text(config.state_dir / "network.json", json.dumps(state, indent=2) + "\n")
 
@@ -2111,6 +2156,28 @@ def _set_live_nfs_threads(runner: Runner, count: int) -> None:
         raise ProvisionError(
             f"NFS worker reconciliation requested {count}, found {actual!r}"
         )
+
+
+def _ensure_nfs_headroom(runner: Runner, config: Config, *, recovering=False) -> None:
+    """Best-effort increase only; never restart the server or lower headroom."""
+    try:
+        desired = int(os.environ.get("INTEGRATION_NFS_THREADS", NFS_SERVER_THREADS))
+        if not 1 <= desired <= 256:
+            raise ValueError("INTEGRATION_NFS_THREADS must be between 1 and 256")
+        state = json.loads((config.state_dir / "nfs-service.json").read_text())
+        if state.get("was_active") and state.get("previous_threads") is None:
+            raise ProvisionError("the original NFS worker count is unknown")
+        current = _live_nfs_threads(runner)
+        if current is None:
+            raise ProvisionError("kernel NFS worker count is inaccessible")
+        target = max(current, desired)
+        if recovering:
+            target = max(current, min(256, max(target, current * 2)))
+        if target != current:
+            _set_live_nfs_threads(runner, target)
+        LOG.info("NFS worker headroom: %s -> %s", current, target)
+    except (OSError, ValueError, ProvisionError, subprocess.TimeoutExpired) as error:
+        LOG.warning("NFS headroom tuning unavailable; continuing: %s", error)
 
 
 def _systemd_unit_exists(runner: Runner, unit: str) -> bool:
@@ -2167,10 +2234,14 @@ def _record_nfs_service_state(runner: Runner, config: Config) -> None:
         "previous_threads": None,
     }
     if active:
-        previous_threads = _live_nfs_threads(runner)
+        try:
+            previous_threads = _live_nfs_threads(runner)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            LOG.warning("NFS worker inspection unavailable: %s", error)
+            previous_threads = None
         if previous_threads is None:
-            raise ProvisionError(
-                "cannot record the pre-existing NFS worker count before setup"
+            LOG.warning(
+                "Cannot record original NFS worker count; skipping headroom tuning"
             )
         state["previous_threads"] = previous_threads
     _write_text(path, json.dumps(state, sort_keys=True) + "\n")
@@ -5521,15 +5592,18 @@ def _restore_preexisting_nfs_threads(runner: Runner, config: Config) -> None:
     )
     if not was_active or not isinstance(previous, int):
         return
-    active = runner.run(
-        [*_sudo_prefix(), "systemctl", "is-active", "nfs-server"],
-        check=False,
-    )
-    if active.returncode:
-        LOG.info("Pre-existing nfs-server is inactive; worker restoration skipped")
-        return
-    _set_live_nfs_threads(runner, previous)
-    LOG.info("Restored pre-existing NFS worker count to %d", previous)
+    try:
+        active = runner.run(
+            [*_sudo_prefix(), "systemctl", "is-active", "nfs-server"],
+            check=False,
+        )
+        if active.returncode:
+            LOG.info("Pre-existing nfs-server is inactive; worker restoration skipped")
+            return
+        _set_live_nfs_threads(runner, previous)
+        LOG.info("Restored pre-existing NFS worker count to %d", previous)
+    except (OSError, ProvisionError, subprocess.TimeoutExpired) as error:
+        LOG.warning("NFS worker restoration unavailable; continuing: %s", error)
 
 
 def _restore_nfs_service_state(runner: Runner, config: Config) -> None:
@@ -5568,6 +5642,10 @@ def _diagnostic_backend(config: Config) -> str | None:
 def _collect_diagnostics(runner: Runner, config: Config) -> None:
     """Collect bounded troubleshooting state after a setup failure."""
     LOG.error("Collecting troubleshooting diagnostics")
+    prefix = _sudo_prefix() if _diagnostic_backend(config) == "nfs" else []
+    _run_diagnostic(
+        runner, [*prefix, sys.executable, INTEGRATION_LIB / "io_diagnostics.py"]
+    )
     commands: list[Sequence[str | Path]] = [
         ("free", "-h"),
         ("df", "-h", "/"),
@@ -5585,26 +5663,48 @@ def _collect_diagnostics(runner: Runner, config: Config) -> None:
                     "--no-pager",
                 ),
                 (*_sudo_prefix(), "exportfs", "-v"),
+                (*_sudo_prefix(), "dmesg", "--ctime", "--level=err,warn"),
+                (*_sudo_prefix(), "losetup", "--associated", config.nfs_image),
+                ("df", "-h", config.export_dir),
             )
         )
     for command in commands:
         if not shutil.which(str(command[0])):
             LOG.error("diagnostic command is unavailable: %s", command[0])
             continue
-        result = runner.run(command, check=False, timeout=30)
-        output = (result.stdout + result.stderr).strip()
-        if output:
-            LOG.error("diagnostic %s:\n%s", command[0], output[-12000:])
+        _run_diagnostic(runner, command)
     if config.kubeconfig.exists():
         for arguments in (
             ("get", "nodes", "-o", "wide"),
             ("get", "pods", "--all-namespaces", "-o", "wide"),
             ("get", "events", "--all-namespaces", "--sort-by=.lastTimestamp"),
         ):
-            result = runner.run(_kubectl(config, *arguments), check=False, timeout=30)
-            output = (result.stdout + result.stderr).strip()
-            if output:
-                LOG.error("kubectl diagnostic:\n%s", output[-16000:])
+            _run_diagnostic(runner, _kubectl(config, *arguments))
+
+
+def _run_diagnostic(runner: Runner, command: Sequence[str | Path], timeout=10) -> str:
+    """One unavailable or hung diagnostic must not suppress the other evidence."""
+    try:
+        result = runner.run(command, check=False, timeout=timeout)
+        output = _output_text(result.stdout) + _output_text(result.stderr)
+        if output:
+            LOG.error("diagnostic %s:\n%s", command[0], output[-65536:])
+        return output
+    except (OSError, ProvisionError, subprocess.TimeoutExpired) as error:
+        LOG.warning("Diagnostic unavailable for %s: %s", command[0], error)
+        return ""
+
+
+def _timeout_io_diagnostics(runner: Runner, config: Config) -> None:
+    """Capture host-local evidence before cleanup retries touch a blocked PVC."""
+    privileged = _diagnostic_backend(config) == "nfs"
+    prefix = _sudo_prefix() if privileged else []
+    script = INTEGRATION_LIB / "io_diagnostics.py"
+    evidence = _run_diagnostic(runner, [*prefix, sys.executable, script])
+    if privileged:
+        _run_diagnostic(runner, [*prefix, "dmesg", "--ctime", "--level=err,warn"])
+        if "Name:\tnfsd\n" in evidence:
+            _ensure_nfs_headroom(runner, config, recovering=True)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -5739,6 +5839,8 @@ def main() -> int:
         LOG.info("Detailed log: %s", log_path)
         with _acquire_lock(config):
             runner = Runner()
+            if arguments.action not in ("stop", "teardown"):
+                runner.on_timeout = lambda: _timeout_io_diagnostics(runner, config)
             if arguments.action == "stop":
                 stop_environment(runner, config)
             elif arguments.action == "teardown":

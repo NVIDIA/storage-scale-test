@@ -404,6 +404,43 @@ def test_coordinator_dispatches_mixed_io_and_mdtest_cells(
         ).read_text() == "csv\n"
 
 
+@pytest.mark.parametrize("failures", [1, 3])
+def test_health_hook_retries_same_endpoint_without_replaying_work(failures):
+    """An intermittent probe recovers; persistent failure remains authoritative."""
+    source = _COORDINATOR.read_text(encoding="utf-8")
+    body = source.split("_coordinator_health_hook() {", maxsplit=1)[1].split(
+        "\n}\n", maxsplit=1
+    )[0]
+    result = subprocess.run(
+        [
+            _BASH,
+            "-c",
+            f"""
+        _coordinator_health_hook() {{{body}
+        }}
+        COORDINATOR_SELECTED_ENDPOINTS=(127.0.0.2)
+        calls=0
+        sleep() {{ :; }}
+        _coordinator_error() {{ echo "$*" >&2; }}
+        _coordinator_probe_endpoint() {{
+            [[ "$1" == 127.0.0.2 ]] || return 9
+            calls=$((calls + 1))
+            ((calls > {failures}))
+        }}
+        rc=0
+        _coordinator_health_hook before-cell || rc=$?
+        printf '%s\\n' "$calls"
+        exit "$rc"
+        """,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == (0 if failures == 1 else 1), result.stderr
+    assert int(result.stdout) == (2 if failures == 1 else 3)
+
+
 def test_endpoint_probe_runs_socket_code_from_the_coordinator_file():
     """The bounded child does not carry socket code as inline shell text."""
     source = _COORDINATOR.read_text(encoding="utf-8")

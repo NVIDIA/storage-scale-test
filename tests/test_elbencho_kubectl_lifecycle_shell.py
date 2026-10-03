@@ -1319,10 +1319,115 @@ def test_collection_retry_uses_remaining_deadline_and_tolerates_diagnostic_failu
     assert result.returncode == 0, result.stderr
     deadlines = [int(value) for value in calls.read_text().splitlines()]
     assert len(deadlines) == 2
-    assert 0 < deadlines[1] <= deadlines[0] - 5
+    assert 0 < deadlines[1] <= deadlines[0] <= 10
     assert archive.read_text() == "complete"
     assert "diagnostics could not be saved" in result.stderr
     assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=" not in result.stderr
+
+
+def test_collection_hung_first_transfer_leaves_budget_for_recovery(tmp_path):
+    """A producer timeout must not consume the entire recovery deadline."""
+    calls = tmp_path / "calls"
+    archive = tmp_path / "received.tar"
+    result = _bash(f"""
+        KUBECTL_COLLECTION_TIMEOUT_SECONDS=30
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        _kubectl_stream_attempt_once() {{
+            local -n result="$9"
+            printf '%s\\n' "$8" >> {str(calls)!r}
+            : > "$5"
+            if [[ $(wc -l < {str(calls)!r}) == 1 ]]; then
+                SECONDS=$((SECONDS + $8))
+                printf partial > "$4"
+                result=(124 0)
+            else
+                printf complete > "$4"
+                result=(0 0)
+            fi
+        }}
+        kubectl_stream_remote_attempt test-ns collector 1234abcd {str(archive)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert len(calls.read_text().splitlines()) == 2
+    assert archive.read_text() == "complete"
+
+
+def test_collection_retry_after_producer_timeout_uses_remaining_deadline(tmp_path):
+    """A slow archive cut short by the reserve cap is not capped again."""
+    calls = tmp_path / "calls"
+    archive = tmp_path / "received.tar"
+    result = _bash(f"""
+        KUBECTL_COLLECTION_TIMEOUT_SECONDS=30
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        _kubectl_stream_attempt_once() {{
+            local -n result="$9"
+            printf '%s\\n' "$8" >> {str(calls)!r}
+            : > "$5"
+            if (($8 < 15)); then
+                SECONDS=$((SECONDS + $8))
+                printf partial > "$4"
+                result=(124 0)
+            else
+                printf complete > "$4"
+                result=(0 0)
+            fi
+        }}
+        kubectl_stream_remote_attempt test-ns collector 1234abcd {str(archive)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    deadlines = [int(value) for value in calls.read_text().splitlines()]
+    assert deadlines[0] == 10
+    assert 15 <= deadlines[1] <= 20
+    assert archive.read_text() == "complete"
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["eof", "noisy-eof", "lost-ack", "corrupt", "forbidden", "different-existing"],
+)
+def test_control_upload_atomic_publication_and_safe_retry(tmp_path, fault):
+    """Real helper scripts never publish partial controls or overwrite a retry."""
+    source = tmp_path / "bundle"
+    source.mkdir()
+    (source / "env_used.sh").write_text("verified controls\n")
+    remote = tmp_path / "remote"
+    (remote / "control/executions").mkdir(parents=True)
+    if fault == "different-existing":
+        (remote / "control/env_used.sh").write_text("original controls\n")
+    calls = tmp_path / "calls"
+    result = _bash(f"""
+        sleep() {{ :; }}
+        kubectl_attempt_remote_root() {{ printf '%s\\n' {str(remote)!r}; }}
+        kubectl_remote_tree_guard_script() {{ printf 'run=$1; run_real=$run;'; }}
+        kubectl_pvc_exec_stdin() {{
+            printf 'call\\n' >> {str(calls)!r}
+            shift 2
+            if [[ $(wc -l < {str(calls)!r}) == 1 ]]; then
+                case {fault!r} in
+                    eof) echo 'error: unexpected EOF' >&2; return 1 ;;
+                    noisy-eof) echo 'error: unexpected EOF' >&2; printf 'padding%.0s' {{1..4096}} >&2; return 1 ;;
+                    forbidden) echo Forbidden >&2; return 1 ;;
+                    corrupt) head -c 5 | "$@"; return $? ;;
+                    lost-ack) "$@" || return $?; echo 'error: unexpected EOF' >&2; return 1 ;;
+                esac
+            fi
+            "$@"
+        }}
+        kubectl_upload_control_bundle test-ns transfer 1234abcd {str(source)!r}
+        """)
+    expected_success = fault in {"eof", "noisy-eof", "lost-ack"}
+    assert (result.returncode == 0) == expected_success, result.stderr
+    assert len(calls.read_text().splitlines()) == (2 if expected_success else 1)
+    if expected_success:
+        assert (remote / "control/env_used.sh").read_bytes() == (
+            source / "env_used.sh"
+        ).read_bytes()
+    elif fault == "different-existing":
+        assert (remote / "control/env_used.sh").read_text() == "original controls\n"
+    else:
+        assert list((remote / "control/executions").iterdir()) == []
+    assert not list(remote.glob(".control-upload.*"))
+    assert len(result.stderr) < 9000
 
 
 def test_collection_stream_failure_removes_partial_and_reports_auth(

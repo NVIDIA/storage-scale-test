@@ -60,6 +60,29 @@ CSI provisioning themselves are infrastructure details outside this
 repository's test scope; the backend difference is environmental fidelity, not
 repository feature coverage.
 
+### NFS headroom and kernel isolation
+
+The NFS fixture raises the server to at least 32 workers
+(`INTEGRATION_NFS_THREADS`, 1-256) without lowering a larger pool or
+restarting the server, and restores the recorded original count at teardown.
+Tuning is skipped when that count cannot be recorded, and tuning or restoration
+failures are logged rather than fatal. The `sbx-shared` backend owns no NFS
+server and skips tuning.
+
+Containers share the host kernel, so the loop-backed NFS fixture can stall when
+server writes wait on commits that need the same worker pool. At each command
+timeout the driver logs bounded pressure, NFS counters, blocked-task stacks,
+and kernel warnings before cleanup touches the PVC; blocked server workers
+double the pool, up to 256. This mitigates the stall but is not isolation,
+which needs a separate NFS server VM or host. Local NFS hosts should carry the
+upstream `nfs_release_folio()` reclaim fix
+(`cce0be6eb4971456b703aaeafd571650d314bcca`); the harness never upgrades or
+reboots a shared host.
+
+Failure-injection staging publishes files through digest-verified temporary
+copies with remote deadlines and transient retries. Cleanup restores the
+wrapper from the verified local binary, never from a remote delegate.
+
 Select Docker SBX explicitly with:
 
 ```bash

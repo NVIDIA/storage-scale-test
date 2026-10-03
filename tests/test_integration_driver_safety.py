@@ -1335,8 +1335,10 @@ def test_nfs_migration_does_not_publish_a_failed_image(tmp_path, monkeypatch):
     assert not mountpoint.exists()
 
 
-def test_nfs_server_configures_eight_workers(tmp_path, monkeypatch):
-    """Rendered NFS state requests enough workers for concurrent clients."""
+def test_nfs_server_headroom_is_separate_from_required_daemon_config(
+    tmp_path, monkeypatch
+):
+    """Optional tuning failure cannot prevent the required server from starting."""
     config = replace(
         _config(tmp_path / "state", tmp_path / "export"), storage_backend="nfs"
     )
@@ -1357,8 +1359,8 @@ def test_nfs_server_configures_eight_workers(tmp_path, monkeypatch):
     daemon_config = (config.manifests_dir / "storage-scale-test-nfs.conf").read_text(
         encoding="utf-8"
     )
-    assert f"threads = {_DRIVER.NFS_SERVER_THREADS}\n" in daemon_config
-    assert _DRIVER.NFS_SERVER_THREADS == 8
+    assert "threads =" not in daemon_config
+    assert _DRIVER.NFS_SERVER_THREADS == 32
 
 
 def test_nfs_setup_rejects_another_active_v4_root(tmp_path):
@@ -1597,7 +1599,7 @@ class _NfsThreadRunner:
 
 
 def test_preexisting_nfs_worker_count_is_reconciled_and_restored(tmp_path, monkeypatch):
-    """Setup applies eight workers and teardown restores the host's prior count."""
+    """Setup applies headroom and teardown restores the host's prior count."""
     config = replace(
         _config(tmp_path / "state", tmp_path / "export"), storage_backend="nfs"
     )
@@ -1619,12 +1621,120 @@ def test_preexisting_nfs_worker_count_is_reconciled_and_restored(tmp_path, monke
         "was_active": True,
         "was_enabled": False,
     }
-    assert runner.threads == 8
+    assert runner.threads == 32
 
     _restore_nfs_service_state(runner, config)
 
     assert runner.threads == 2
     assert any("disable" in command for command in runner.commands)
+
+
+@pytest.mark.parametrize("current,desired,expected", [(2, "48", 48), (96, "32", 96)])
+def test_nfs_headroom_respects_configured_floor_and_existing_capacity(
+    tmp_path, monkeypatch, current, desired, expected
+):
+    """VM and runner reconciliation must never reduce an existing worker pool."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    config.state_dir.mkdir()
+    runner = _NfsThreadRunner(threads=current)
+    monkeypatch.setattr(_DRIVER.shutil, "which", lambda _name: "/usr/sbin/rpc.nfsd")
+    monkeypatch.setenv("INTEGRATION_NFS_THREADS", desired)
+    _record_nfs_service_state(runner, config)
+    _DRIVER._ensure_nfs_headroom(runner, config)
+    assert runner.threads == expected
+    _restore_preexisting_nfs_threads(runner, config)
+    assert runner.threads == current
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        PermissionError("container denies nfsd"),
+        subprocess.TimeoutExpired("rpc.nfsd", 60),
+    ],
+)
+def test_nfs_tuning_failure_is_logged_and_nonfatal(
+    tmp_path, monkeypatch, caplog, failure
+):
+    """Restricted Docker or runner permissions cannot turn tuning into failure."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    config.state_dir.mkdir()
+    runner = _NfsThreadRunner(threads=2)
+    _record_nfs_service_state(runner, config)
+
+    def fail(*_args):
+        raise failure
+
+    monkeypatch.setattr(_DRIVER, "_set_live_nfs_threads", fail)
+    _DRIVER._ensure_nfs_headroom(runner, config)
+    assert runner.threads == 2
+    assert "tuning unavailable; continuing" in caplog.text
+    _restore_preexisting_nfs_threads(runner, config)
+    assert "restoration unavailable; continuing" in caplog.text
+
+
+def test_nfs_recovery_is_bounded_and_preserves_original_count(tmp_path, monkeypatch):
+    """Repeated stalls can add workers without overwriting the restoration state."""
+    config = _config(tmp_path / "state", tmp_path / "export")
+    config.state_dir.mkdir()
+    runner = _NfsThreadRunner(threads=32)
+    monkeypatch.setattr(_DRIVER.shutil, "which", lambda _name: "/usr/sbin/rpc.nfsd")
+    _record_nfs_service_state(runner, config)
+    for _ in range(5):
+        _DRIVER._ensure_nfs_headroom(runner, config, recovering=True)
+    assert runner.threads == 256
+    _restore_preexisting_nfs_threads(runner, config)
+    assert runner.threads == 32
+
+
+def test_remote_command_timeout_captures_evidence_without_masking_primary_error(
+    monkeypatch, caplog
+):
+    """Pod-resident deadlines receive the same recovery as local timeouts."""
+    monkeypatch.setattr(
+        _DRIVER.subprocess,
+        "run",
+        lambda args, **_kwargs: subprocess.CompletedProcess(
+            args, 124, "partial", "remote deadline"
+        ),
+    )
+    runner = _DRIVER.Runner()
+    calls = []
+
+    def unavailable():
+        calls.append("capture")
+        raise PermissionError("kernel stacks denied")
+
+    runner.on_timeout = unavailable
+    with caplog.at_level("ERROR"):
+        with pytest.raises(subprocess.TimeoutExpired) as error:
+            runner.run(["kubectl", "exec"], timeout=60)
+    assert calls == ["capture"]
+    assert error.value.stdout == "partial"
+    assert error.value.stderr == "remote deadline"
+    assert "remote deadline" in caplog.text
+
+    with pytest.raises(subprocess.TimeoutExpired) as error:
+        runner.run(["kubectl", "--token=secret"], timeout=60, sensitive=True)
+    assert "secret" not in str(error.value)
+    assert error.value.stdout is None and error.value.stderr is None
+
+
+def test_timeout_diagnostic_cannot_recurse_or_replace_original_deadline(monkeypatch):
+    """A hung diagnostic is bounded without triggering another diagnostic loop."""
+    calls = []
+
+    def timeout(args, **_kwargs):
+        calls.append(args[0])
+        raise subprocess.TimeoutExpired(args, 10)
+
+    monkeypatch.setattr(_DRIVER.subprocess, "run", timeout)
+    runner = _DRIVER.Runner()
+    runner.on_timeout = lambda: runner.run(["diagnostic"])
+    with pytest.raises(subprocess.TimeoutExpired) as error:
+        runner.run(["original"])
+    assert calls == ["original", "diagnostic"]
+    assert error.value.cmd == ["original"]
 
 
 def test_nfs_service_records_active_and_enabled_states_independently(

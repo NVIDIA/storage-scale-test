@@ -407,9 +407,21 @@ _coordinator_probe_endpoint_request() {
 
 _coordinator_health_hook() {
     local phase_name="$1"
-    local endpoint
+    local endpoint attempt healthy
     for endpoint in "${COORDINATOR_SELECTED_ENDPOINTS[@]}"; do
-        if ! _coordinator_probe_endpoint "$endpoint"; then
+        healthy=0
+        for attempt in 1 2 3; do
+            if _coordinator_probe_endpoint "$endpoint"; then
+                healthy=1
+                break
+            fi
+            if ((attempt < 3)); then
+                printf 'Warning: worker endpoint %s probe %s/3 failed after %s; retrying\n' \
+                    "$endpoint" "$attempt" "$phase_name" >&2
+                sleep 1 || return 1
+            fi
+        done
+        if ((healthy == 0)); then
             _coordinator_error "worker endpoint $endpoint is unhealthy after $phase_name"
             return 1
         fi
