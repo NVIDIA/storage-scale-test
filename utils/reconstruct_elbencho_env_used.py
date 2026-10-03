@@ -27,7 +27,12 @@ import os
 import re
 import sys
 import tempfile
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# pylint: disable-next=wrong-import-position
+from lib.project_version import add_version_argument
 
 SCRIPT_NAME = os.path.basename(__file__)
 
@@ -816,6 +821,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         nargs="+",
         help="One or more elbencho-<DS> result directories",
     )
+    add_version_argument(parser)
     args = parser.parse_args(argv)
 
     dirs = args.directories

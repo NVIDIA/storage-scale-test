@@ -160,7 +160,8 @@ alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 | `storage-tests/network/` | Elbencho netbench entry point and substrate-specific dispatchers |
 | `lib/env_base.sh` | Derived configuration, substrate selection, executable paths, and Slurm option construction |
 | `lib/env_functions.sh` | Shared orchestration, validation, SSH, Slurm, resume, and environment-snapshot helpers |
-| `lib/_platform_functions.sh` | GNU/Linux and Homebrew coreutils command adapters shared by shell libraries |
+| `lib/_platform_functions.sh` | GNU/Linux and Homebrew coreutils command adapters and result-version records shared by shell libraries |
+| `lib/project_version.sh` | Project version resolution and archive stamping; `lib/project_version.py` wraps it for Python |
 | `lib/_elbencho_functions.sh` | Filesystem IO, metadata, execution reification, and workload-completion logic |
 | `lib/_warp_functions.sh` | Warp client lifecycle and object benchmark logic |
 | `lib/_netbench_functions.sh` | Netbench service, grouping, and traffic logic |
@@ -170,6 +171,7 @@ alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 | `utils/summarize-elbencho.py` | Self-bootstrapping Elbencho run summary command |
 | `utils/slurm/sinfo_to_node_gbps_csv.py` | Standard-library Slurm node inventory utility with optional `env.sh` setup |
 | `utils/build_tarball.sh` | User-local deployment-tarball builder |
+| `utils/build_source_release.py` | Release source archive builder and publisher used by the release workflow |
 | `utils/build/` | Helpers for building Warp and the in-tree s3test program |
 | `tests/` | Python and shell-behavior regression tests collected by `pytest` |
 | `integration-tests/` | Single-host kind, RWX storage, SSH, and Slinky fixture |
@@ -606,6 +608,17 @@ Shared Python behavior lives in `lib/`:
 - `filesystem_snapshot_summary.py`: compact IO settings from verified snapshots; and
 - `elbencho_live_report.py`: live CSV aggregation and per-client analysis.
 
+Reports begin with the versions recorded beside the results they include and
+the reporter's own version (`lib/report_provenance.py`); versions stay out of
+metric models, so reporter CSV and Warp JSON caches report `unknown`. See
+[VERSIONING.md](VERSIONING.md).
+
+Reporter argument parsers live in `lib/report_cli.py`, free of runtime
+dependencies; `lib/project_version.py` answers help and version queries from
+those parsers before `lib/python_bootstrap.py` prepares `.venv`. Network and
+object launcher help also precedes configuration, credentials, and
+execution-substrate guards.
+
 Reports preserve operation, size, random/sequential order, direct/buffered IO,
 node count, thread count, and IO depth as separate dimensions. Plot series use
 precomputed key-to-color mappings so non-contiguous equivalent configurations
@@ -654,6 +667,9 @@ it uses `https://github.com/NVIDIA/warp-minio` at `nv-main-oss`. It requires Go
 1.26.5 or newer and tries an adequate local Go, Docker, or a user-local temporary
 Go installation. User-supplied source requires both URL and ref. Version metadata
 is injected into the resulting binaries.
+
+The deployment tarball is stamped with `VERSION` and `SOURCE_SHA256`; see
+[VERSIONING.md](VERSIONING.md).
 
 These helpers are convenience tooling, not a project-operated binary supply
 chain. Users own source and toolchain selection, provenance, vulnerability

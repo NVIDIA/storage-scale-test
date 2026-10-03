@@ -209,6 +209,8 @@ class TestMdtestReification(unittest.TestCase):
             launcher = deployment / "storage-tests/fs/nv-mdtest-elbencho.sh"
             launcher.parent.mkdir(parents=True)
             shutil.copy2(_ROOT / "storage-tests/fs/nv-mdtest-elbencho.sh", launcher)
+            (deployment / "lib").mkdir()
+            shutil.copy2(_ROOT / "lib/project_version.sh", deployment / "lib")
             results = Path(temp_dir) / "results"
             test_root = Path(temp_dir) / "data"
             env_file = deployment / "env.sh"

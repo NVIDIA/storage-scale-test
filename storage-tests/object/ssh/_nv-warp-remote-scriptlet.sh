@@ -38,10 +38,11 @@ export OBJ_REGION="${14}"
 export OBJ_HOST="${15}"
 export OBJ_HOST_PORT="${16}"
 export S3_EXPRESS="${17}"
+export STORAGE_SCALE_TEST_VERSION="${18}"
 # shellcheck disable=SC2034  # s3_express is read by _build_warp_conn_args in _warp_functions.sh
 s3_express="${S3_EXPRESS:-false}"
 
-shift 17
+shift 18
 export thread_list=("$@")
 
 export WARP=./warp

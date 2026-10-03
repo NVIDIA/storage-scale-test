@@ -27,6 +27,7 @@ export MDTEST_ITEMS_PER_DIR="$6"
 export MDTEST_ITERATIONS="$7"
 single_dir_target_files="${8:-}"
 single_dir_files_per_worker="${9:-}"
+export STORAGE_SCALE_TEST_VERSION="${10:-unknown}"
 
 export ELBENCHO=./elbencho
 

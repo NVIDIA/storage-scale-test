@@ -23,6 +23,11 @@ fi
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) || exit 1
 readonly SCRIPT_DIR
+# shellcheck source=lib/project_version.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../../lib/project_version.sh" || exit 1
+project_version_option "$SCRIPT_DIR/../.." "$@"
+project_version_export "$SCRIPT_DIR/../.."
 readonly INVOKING_EXECUTION_SUBSTRATE="${EXECUTION_SUBSTRATE:-}"
 
 if [[ -f "$SCRIPT_DIR/../../lib/_batch_functions.sh" ]]; then
@@ -45,6 +50,7 @@ Usage: $0 --nodes <node_spec> --tasks <task_spec> [--single-dir-file-target <cou
        $0 --batch [--env-override <file>] --nodes <node_spec> --tasks <task_spec>
        $0 --append <batch_dir> [--env-override <file>] --nodes <node_spec> --tasks <task_spec>
        $0 --start <batch_dir>
+       $0 --version
 
 --batch prepares the first group without executing. --append adds a group only
 before first start. Either filesystem launcher can --start or --resume the
@@ -216,6 +222,7 @@ if [[ "$operation" == resume ]]; then
     resume_log="$OUTPUT_DIR/mdtest-elbencho-sweep-$DS-resume-$(date -u +%Y%m%dZ%H%M%S).log"
     exec 1> >(tee -a "$resume_log")
     exec 2> >(tee -a "$resume_log" >&2)
+    echo "storage-scale-test $STORAGE_SCALE_TEST_VERSION"
     cd "$SCALE_TEST_BASE/storage-tests/fs" || exit 1
     if [[ -n "${SLURM_ENABLED:-}" ]]; then
         dispatch_slurm_executions "$OUTPUT_DIR"; exit $?
@@ -288,6 +295,7 @@ write_mdtest_elbencho_env_used "$OUTPUT_DIR/env_used.yaml" \
 runner_log="$OUTPUT_DIR/mdtest-elbencho-sweep-$DS-runner.log"
 exec 1> >(tee -a "$runner_log")
 exec 2> >(tee -a "$runner_log" >&2)
+echo "storage-scale-test $STORAGE_SCALE_TEST_VERSION"
 print_env_override_summary
 echo "Metadata sweep: nodes=${node_counts[*]} tasks=${task_counts[*]} output=$OUTPUT_DIR"
 if [[ -n "$single_dir_target_files" ]]; then

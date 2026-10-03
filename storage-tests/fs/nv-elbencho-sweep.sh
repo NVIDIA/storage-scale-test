@@ -32,6 +32,11 @@ if [[ ! -d "${SCRIPT_DIR}" ]]; then
     exit 1
 fi
 readonly SCRIPT_DIR
+# shellcheck source=lib/project_version.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../../lib/project_version.sh" || exit 1
+project_version_option "$SCRIPT_DIR/../.." "$@"
+project_version_export "$SCRIPT_DIR/../.."
 readonly INVOKING_EXECUTION_SUBSTRATE="${EXECUTION_SUBSTRATE:-}"
 
 # Prepared batches are routed before env.sh can redefine a saved workload.
@@ -113,6 +118,7 @@ Path modes (at most one; --write-only and --read-from require a single TEST_DIRS
 
 Flags:
   -h, --help          Show this help message and exit
+  --version           Print the project version and exit
   --env-override <file>
                       Source <file> after env.sh so its filesystem workload
                       settings (TEST_DIRS, FS_MAX_*, MDTEST_*, the ELBENCHO_*
@@ -643,6 +649,7 @@ if [[ -n "$resume_dir" ]]; then
     echo "Resume log: ${resume_log}"
     exec 1> >(tee -a "${resume_log}")
     exec 2> >(tee -a "${resume_log}" >&2)
+    echo "storage-scale-test $STORAGE_SCALE_TEST_VERSION"
 
     cd "${SCALE_TEST_BASE}/storage-tests/fs" || exit 1
     export DS
@@ -772,6 +779,7 @@ write_elbencho_env_used "${OUTPUT_DIR}/env_used.yaml" \
 out_log="${OUTPUT_DIR}/elbencho-sweep-${DS}-runner.log"
 exec 1> >(tee -a "${out_log}")
 exec 2> >(tee -a "${out_log}" >&2)
+echo "storage-scale-test $STORAGE_SCALE_TEST_VERSION"
 
 print_env_override_summary
 

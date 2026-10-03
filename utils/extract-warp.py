@@ -53,6 +53,11 @@ from lib.stdout_report_file import (  # pylint: disable=wrong-import-position
     REPORT_TXT_FILENAME,
     mirror_stdout_to_file,
 )
+from lib.report_provenance import (  # pylint: disable=wrong-import-position
+    ResultVersions,
+    result_version,
+    with_versions,
+)
 
 try:
     import zstandard as zstd
@@ -3910,6 +3915,8 @@ def main():
     # Determine input directory and output directory based on arguments
     input_dir = None
     output_dir = None
+    # Analyzed JSON caches carry no versions; their results report as unknown.
+    versions = ResultVersions()
 
     if args.from_json:
         # Reading from analyzed JSON file
@@ -4086,6 +4093,7 @@ def main():
                         metric = parse_warp_json(filepath)
                         if metric:
                             metrics.append(metric)
+                            versions.add([metric], result_version(filepath))
                             print(f"  Parsed: {filename}")
                     except (KeyError, ValueError) as e:
                         print(f"  Skipping {filename}: {e}")
@@ -4098,6 +4106,7 @@ def main():
                         metric = parse_warp_file(filepath)
                         if metric:
                             metrics.append(metric)
+                            versions.add([metric], result_version(filepath))
                     except ValueError as e:
                         print(f"Warning: Skipping {filename}: {e}")
 
@@ -4157,7 +4166,7 @@ def main():
     # Print summary table last so it stays visible in terminal
     mirror_stdout_to_file(
         os.path.join(output_dir, REPORT_TXT_FILENAME),
-        print_table,
+        with_versions(print_table, versions.of(filtered_plot_metrics)),
         metrics,
         is_multi_node,
         only_sizes,

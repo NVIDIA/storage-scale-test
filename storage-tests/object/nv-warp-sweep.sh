@@ -25,34 +25,10 @@ if [[ ! -d "${SCRIPT_DIR}" ]]; then
     exit 1
 fi
 readonly SCRIPT_DIR
-
-if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
-        "${SCRIPT_DIR}/../../env.sh" 2>&1); then
-    printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
-    exit 1
-fi
-
+# shellcheck source=lib/project_version.sh
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/../../env.sh"
-
-if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
-    echo "Error: kubectl execution is not supported by nv-warp-sweep.sh" >&2
-    exit 1
-fi
-
-# Only run directly, not from within slurm unless SSH_ENABLED is set (slurm
-# may be used to get nodes to ssh to)
-if [ -n "${SLURM_JOB_ID:-}" ] && [ -z "${SSH_ENABLED:-}" ]; then
-    echo "Error: Don't run this with slurm, just run it directly." >&2
-    exit 1
-fi
-
-# NOTE: lib/env_base.sh now auto-sources object credentials into the env
-if ! [ -f "$OBJ_AUTH_FILE" ]; then
-    echo "  WARNING: MISSING CREDS FILE $OBJ_AUTH_FILE"
-    exit 1
-fi
-
+source "$SCRIPT_DIR/../../lib/project_version.sh" || exit 1
+project_version_option "$SCRIPT_DIR/../.." "$@"
 print_usage() {
     cat << EOF
 Usage: $0 [FLAGS] <max_node_count> [<increment_by>]
@@ -93,6 +69,7 @@ NEW MODE (--nodes flag):
 
 Flags:
   -h, --help          Show this help message and exit
+  --version           Print the project version and exit
   --multipart         Allow multipart uploads
   --ranged            Test range reads
   --s3-express        Enable S3 Express One Zone mode (adds --signature=IAM,
@@ -113,6 +90,39 @@ Examples:
 EOF
     exit 0
 }
+
+if project_help_requested "$@"; then
+    print_usage
+fi
+
+project_version_export "$SCRIPT_DIR/../.."
+
+if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
+        "${SCRIPT_DIR}/../../env.sh" 2>&1); then
+    printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
+    exit 1
+fi
+
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../../env.sh"
+
+if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
+    echo "Error: kubectl execution is not supported by nv-warp-sweep.sh" >&2
+    exit 1
+fi
+
+# Only run directly, not from within slurm unless SSH_ENABLED is set (slurm
+# may be used to get nodes to ssh to)
+if [ -n "${SLURM_JOB_ID:-}" ] && [ -z "${SSH_ENABLED:-}" ]; then
+    echo "Error: Don't run this with slurm, just run it directly." >&2
+    exit 1
+fi
+
+# NOTE: lib/env_base.sh now auto-sources object credentials into the env
+if ! [ -f "$OBJ_AUTH_FILE" ]; then
+    echo "  WARNING: MISSING CREDS FILE $OBJ_AUTH_FILE"
+    exit 1
+fi
 
 # Initialize flags
 multipart=false
@@ -234,6 +244,7 @@ mkdir -p "$OUTPUT_DIR"
 out_log="${OUTPUT_DIR}/warp-sweep-${DS}-runner.log"
 exec 1> >(tee -a "${out_log}")
 exec 2> >(tee -a "${out_log}" >&2)
+echo "storage-scale-test $STORAGE_SCALE_TEST_VERSION"
 
 
 cd "${SCALE_TEST_BASE}/storage-tests/object" || exit 1

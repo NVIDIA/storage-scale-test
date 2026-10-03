@@ -73,6 +73,7 @@ import numpy as np
 
 # Local import after sys.path: repo root must be on path first.
 # pylint: disable=wrong-import-position
+from lib.report_provenance import ResultVersions, result_version, with_versions
 from lib.env_used_yaml import apply_env_used_to_metrics, load_env_used_yaml
 from lib.filesystem_batch import route_batch_report
 from lib.filesystem_report_options import (
@@ -4495,6 +4496,7 @@ def main() -> None:
 
     # Read from CSV if input provided
     metrics = []
+    versions = ResultVersions()
 
     csv_loaded_count = 0
     if args.from_csv:
@@ -4534,6 +4536,7 @@ def main() -> None:
             try:
                 file_metrics = parse_elbencho_files(base_filename)
                 dir_metrics.extend(file_metrics)
+                versions.add(file_metrics, result_version(base_filename + ".out"))
             except Exception as e:  # pylint: disable=broad-exception-caught
                 eprint(f"Error parsing {base_filename}: {e}")
 
@@ -4649,11 +4652,13 @@ def main() -> None:
 
     if metrics:
         if args.markdown:
-            print_markdown_table(metrics, args.no_dual_y_axis)
+            with_versions(print_markdown_table, versions.of(metrics), markdown=True)(
+                metrics, args.no_dual_y_axis
+            )
         else:
             mirror_stdout_to_file(
                 os.path.join(output_dir, REPORT_TXT_FILENAME),
-                print_terminal_table,
+                with_versions(print_terminal_table, versions.of(metrics)),
                 metrics,
             )
 

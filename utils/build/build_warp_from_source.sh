@@ -29,6 +29,10 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd) || {
     exit 1
 }
 readonly SCRIPT_DIR
+# shellcheck source=lib/project_version.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../../lib/project_version.sh" || exit 1
+project_version_option "$SCRIPT_DIR/../.." "$@"
 REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." &>/dev/null && pwd) || {
     echo "Error: Failed to determine repository root" >&2
     exit 1
@@ -49,6 +53,7 @@ WARP_SHORT_COMMIT_ID=""
 usage() {
     cat << EOF
 Usage: $0 [<git-repo-url> <tag|branch|sha>]
+       $0 --version
 
 Builds Warp from OSS source and installs:
   ${UTILS_DIR}/warp

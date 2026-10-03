@@ -34,3 +34,19 @@ __pycache__/
 .claude
 .DS_Store
 .pytest_cache/
+
+/VERSION
+/SOURCE_SHA256
+
+# Local work and output that build_tarball.sh also leaves out. Ignoring them
+# keeps them from marking the project version as modified.
+/plans/
+/static-binaries/
+/bin-amd64/
+/bin-arm64/
+/results/
+/.ci-cache/
+
+# Written only into deployment and source archives.
+/VERSION
+/SOURCE_SHA256

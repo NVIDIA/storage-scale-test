@@ -39,6 +39,10 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd) || {
     exit 1
 }
 readonly SCRIPT_DIR
+# shellcheck source=lib/project_version.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../../lib/project_version.sh" || exit 1
+project_version_option "$SCRIPT_DIR/../.." "$@"
 REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." &>/dev/null && pwd) || {
     echo "Error: Failed to determine repository root" >&2
     exit 1
@@ -68,6 +72,7 @@ Options:
   --force           Rebuild even when binaries are current.
   --arch <arch>     Build only amd64/x86_64, arm64/aarch64, or all.
   -h, --help        Display this help message and exit.
+  --version         Print the project version and exit.
 EOF
     return 0
 }
@@ -539,7 +544,11 @@ parse_args() {
 prepare_temp_tree() {
     mkdir -p "${TMP_ROOT}/src" "${TMP_ROOT}/out" || die "Failed to create temporary build directories"
     BUILD_SOURCE="${TMP_ROOT}/src/s3-test.c"
-    cp "${SOURCE_FILE}" "${BUILD_SOURCE}" || die "Failed to copy ${SOURCE_FILE} into ${TMP_ROOT}"
+    # Embed the project version so "s3test --version" identifies its build.
+    {
+        printf '#define STORAGE_SCALE_TEST_VERSION "%s"\n' "$(project_version "$SCRIPT_DIR/../..")"
+        cat "${SOURCE_FILE}"
+    } > "${BUILD_SOURCE}" || die "Failed to copy ${SOURCE_FILE} into ${TMP_ROOT}"
     return 0
 }
 

@@ -30,10 +30,9 @@ import sys
 import tempfile
 from urllib.parse import quote
 
-import yaml
-
 from lib.filesystem_report_options import options_by_kind
 from lib.filesystem_snapshot_summary import format_io_snapshot_summary
+from lib.report_provenance import VERSION_SUFFIX
 
 MANIFEST_FILENAME = "batch-manifest.tsv"
 SEAL_FILENAME = "batch-sealed.sha256"
@@ -374,6 +373,10 @@ def _stage_execution(
         live = source / f"{stem}.live.csv"
         if live.exists():
             _copy_published(live, destination / live.name)
+        # Optional: reports show a missing or unusable version as unknown.
+        version = source / f"{stem}.out{VERSION_SUFFIX}"
+        if version.is_file() and not version.is_symlink():
+            (destination / version.name).write_bytes(version.read_bytes())
     definition = manifest.root / "executions" / f"{execution.execution_id}.sh"
     _copy_published(definition, ledger / definition.name)
     # These statuses exist only in this private, immutable reporting snapshot.
@@ -605,6 +608,9 @@ def _write_combined_report(
 
 def _parse_report_snapshot(environment: str, source: Path) -> dict:
     """Parse the digest-verified saved YAML without substituting current defaults."""
+    # Deferred so --help and --version work without the reporting dependencies.
+    import yaml  # pylint: disable=import-outside-toplevel
+
     try:
         snapshot = yaml.safe_load(environment)
     except yaml.YAMLError as error:

@@ -251,8 +251,3 @@ def test_unsupported_launcher_selects_supported_path_python(tmp_path, monkeypatc
     supported.unlink()
     with pytest.raises(RuntimeError, match="Python 3.12 or newer"):
         bootstrap._select_python()
-
-
-def test_unversioned_deployment_version_has_no_bootstrap(tmp_path):
-    assert bootstrap.project_version(tmp_path) == "unversioned source"
-    assert not (tmp_path / ".venv").exists()

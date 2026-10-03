@@ -139,7 +139,7 @@ for this_obj_size in "${OBJ_SIZES[@]}"; do
         "$multipart" "$ranged" "$SSH_NODELIST" "${WARP_RPS_BUDGET_GET:-}" "${WARP_RPS_BUDGET_PUT:-}" \
         "$WARP_RANGE_OBJ_SIZE" "${WARP_PREFIXES:-}" \
         "$OBJ_BUCKET" "$OBJ_REGION" "$OBJ_HOST" "$OBJ_HOST_PORT" \
-        "$s3_express" \
+        "$s3_express" "${STORAGE_SCALE_TEST_VERSION:-unknown}" \
         "${THREAD_LIST[@]}"
 
     # Process the exit status and retrieve files from the remote output dir to the local one

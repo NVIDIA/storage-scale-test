@@ -109,6 +109,7 @@ def test_unified_front_door_reports_real_cached_io_metrics(tmp_path):
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "WRITE" in completed.stdout
+    assert "- Produced by storage-scale-test: unknown\n" in completed.stdout
     assert (output / "elbencho-metrics.csv").is_file()
     assert list(output.glob("*.png"))
 

@@ -2274,8 +2274,8 @@ _elbencho_result_artifacts_for_execution() {
             base=$(printf '%s/mdtest-elbencho-c_%03d-t_%03d_%s' \
                 "$output_dir" "$nodes" "$tasks_per_node" "$ds")
             for ((iter = 1; iter <= MDTEST_ITERATIONS; iter++)); do
-                printf '%s_iter%d.out\n%s_iter%d.csv\n' \
-                    "$base" "$iter" "$base" "$iter"
+                printf '%s_iter%d.out\n%s_iter%d.csv\n%s_iter%d.out.project-version\n' \
+                    "$base" "$iter" "$base" "$iter" "$base" "$iter"
             done
             _mdtest_completion_path "$output_dir" "$execution_id"
             exit 0
@@ -2291,7 +2291,8 @@ _elbencho_result_artifacts_for_execution() {
             "$thread_count" "$io_depth" "$ds"
         _elbencho_io_set_treefile "$output_dir" "$io_size" "$nodes" \
             "$thread_count" "$io_depth" "$ds"
-        printf '%s\n' "$resfile" "$csvfile" "$livecsvfile" "$treefile" \
+        printf '%s\n' "$resfile" "$resfile.project-version" "$csvfile" \
+            "$livecsvfile" "$treefile" \
             "${output_dir}/executions/${execution_id}.write.json" \
             "${output_dir}/executions/${execution_id}.read.json" \
             "${output_dir}/executions/${execution_id}.delete.json" \
@@ -2310,8 +2311,10 @@ _elbencho_required_result_artifacts_for_execution() {
         output_dir=$(_elbencho_execution_output_dir_for_definition "$output_dir" "$nnnn_sh") || exit 1
         local prefix="${output_dir}/executions/${execution_id}"
         if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == mdtest ]]; then
-            _elbencho_result_artifacts_for_execution "$output_dir" "$nnnn_sh"
-            exit $?
+            # Project version records are informational, never required.
+            _elbencho_result_artifacts_for_execution "$output_dir" "$nnnn_sh" \
+                | grep -v '\.project-version$'
+            exit "${PIPESTATUS[0]}"
         fi
         if [[ -n "${ELBENCHO_SWEEP_READ_FROM:-}" \
                 && "${ELBENCHO_SINGLE_BIG_FILE:-0}" != 1 ]]; then
@@ -3195,6 +3198,7 @@ _ssh_build_execution_scriptlet() {
     printf 'esac\n'
     printf 'export output_dir="$__elbencho_remote_output_dir_abs"\n'
     printf 'export ELBENCHO=./elbencho\n'
+    printf 'export STORAGE_SCALE_TEST_VERSION=%q\n' "${STORAGE_SCALE_TEST_VERSION:-unknown}"
     printf 'source ./_elbencho_functions.sh || exit 1\n'
     printf 'set +e\n'
     if [[ "$(unset ELBENCHO_EXECUTION_KIND; source "$nnnn_sh"; printf '%s' "${ELBENCHO_EXECUTION_KIND:-io}")" == mdtest ]]; then

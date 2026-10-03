@@ -76,6 +76,11 @@ from lib.stdout_report_file import (  # pylint: disable=wrong-import-position
     REPORT_TXT_FILENAME,
     mirror_stdout_to_file,
 )
+from lib.report_provenance import (  # pylint: disable=wrong-import-position
+    result_version,
+    selected_versions,
+    with_versions,
+)
 
 
 def eprint(*args, **kwargs):
@@ -2327,6 +2332,7 @@ def main() -> None:
     # Load metrics
     aggregated_metrics: List[AggregatedMetrics] = []
     test_configuration: Dict[str, str] = {}
+    versions: List[Tuple[IterationMetrics, str]] = []
 
     if args.from_csv:
         eprint(f"Loading metrics from {args.from_csv}")
@@ -2350,6 +2356,7 @@ def main() -> None:
             )
             if m:
                 iterations.append(m)
+                versions.append((m, result_version(out_path)))
 
         eprint(f"Parsed {len(iterations)} iterations")
 
@@ -2411,8 +2418,13 @@ def main() -> None:
         eprint(f"Wrote metrics to {csv_path}")
 
     # Print output
+    produced_by = selected_versions(
+        versions,
+        aggregated_metrics,
+        lambda metric: (metric.node_count, metric.thread_count),
+    )
     if args.markdown:
-        print_markdown_report(
+        with_versions(print_markdown_report, produced_by, markdown=True)(
             aggregated_metrics,
             normalize_to=args.normalize_to,
             test_configuration=test_configuration,
@@ -2420,7 +2432,7 @@ def main() -> None:
     else:
         mirror_stdout_to_file(
             os.path.join(output_dir, REPORT_TXT_FILENAME),
-            print_terminal_table,
+            with_versions(print_terminal_table, produced_by),
             aggregated_metrics,
             normalize_to=args.normalize_to,
             test_configuration=test_configuration,

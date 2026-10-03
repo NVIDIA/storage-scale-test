@@ -93,6 +93,7 @@ get_netbench_hosts_and_count() {
 # Run a netbench elbencho command with logging
 # Usage: run_a_netbench elbencho_args...
 run_a_netbench() {
+    _write_result_version "$(_elbencho_resfile_from_args "$@")"
     printf "# elbencho %s\n" "$*"
     # Force flush stdout
     exec 1>&1

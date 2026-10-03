@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from lib.project_version import resolve_version, stamp_source
+
 CACHE_SCHEMA = 1
 DEFAULT_RECIPE = 1
 ARCHIVE_NAME = "storage-scale-test.tar.gz"
@@ -372,7 +374,11 @@ def get_or_build_deployment(
     ) as temporary:
         staging = Path(temporary)
         snapshot = staging / "source"
-        source_manifest = _copy_tracked_snapshot(runner, request.repo_root, snapshot)
+        _copy_tracked_snapshot(runner, request.repo_root, snapshot)
+        # The snapshot has no Git metadata. Stamping it carries the checkout's
+        # version into the deployment and the cache key, so a new tag rebuilds.
+        stamp_source(snapshot, resolve_version(request.repo_root))
+        source_manifest = _manifest_for_paths(snapshot, _tree_paths(snapshot))
         binary_identity, runtime_identity = _stage_binary_and_runtime(request, snapshot)
         build_input_manifest = _manifest_for_paths(snapshot, _tree_paths(snapshot))
         identity = _identity_document(

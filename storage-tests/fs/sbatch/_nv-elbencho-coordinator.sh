@@ -37,6 +37,12 @@ while [[ "$dir" != "/" && ! -d "$dir/storage-tests" ]]; do
 done
 [[ "$dir" == "/" ]] && { echo "Error: Could not find SCALE_TEST_BASE" >&2; exit 1; }
 SCALE_TEST_BASE="$dir"
+# Results record the version of the code this job runs, which can differ
+# from the submitting checkout if it changed while the job was queued.
+# shellcheck source=lib/project_version.sh
+# shellcheck disable=SC1091
+source "$SCALE_TEST_BASE/lib/project_version.sh" || exit 1
+project_version_export "$SCALE_TEST_BASE"
 OUTPUT_DIR="${1:?missing OUTPUT_DIR argument}"
 DISPATCH_LOCK_TOKEN="${2:?missing DISPATCH_LOCK_TOKEN argument}"
 

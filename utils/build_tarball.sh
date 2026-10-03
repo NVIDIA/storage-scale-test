@@ -46,6 +46,10 @@ if [[ ! -d "${SCRIPT_DIR}" ]]; then
     exit 1
 fi
 readonly SCRIPT_DIR
+# shellcheck source=lib/project_version.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../lib/project_version.sh" || exit 1
+project_version_option "${SCRIPT_DIR}/.." "$@"
 
 # Change dir to just inside our tree
 cd "${SCRIPT_DIR}/.." || exit
@@ -293,6 +297,7 @@ Usage: $(basename "$0") [--force-download] [--help | -h]
 Options:
   --force-download   Force (re-)download of the elbencho binaries, even if present.
   -h, --help         Display this help message and exit.
+  --version          Print the project version and exit.
 EOF
 }
 
@@ -316,7 +321,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "Creating deployment tarball..."
+PROJECT_VERSION=$(project_version "${SCRIPT_DIR}/..")
+echo "Creating deployment tarball for storage-scale-test ${PROJECT_VERSION}..."
 
 # Build list of elbencho binaries to download/extract. Format per entry:
 #   arch|output_path|display_name
@@ -416,7 +422,11 @@ fi
 # It is picked up with the rest of the tree; no --exclude below may match it.
 echo "  including NOTICE (third-party attribution)"
 
-$TAR_CMD czf "$OUTPUT_TARBALL" \
+# Copy the tree into staging, stamp the copy with its version and checksums,
+# and archive the stamped copy.
+staging=$(mktemp -d) || exit 1
+trap 'rm -rf "$staging"' EXIT
+if ! $TAR_CMD cf - \
     "${TAR_OPTS[@]}" \
     --exclude=*.gz \
     --exclude=*.xz \
@@ -450,10 +460,12 @@ $TAR_CMD czf "$OUTPUT_TARBALL" \
     --exclude=utils/build_tarball.sh \
     --exclude=utils/fix_up_developer_venv.sh \
     --exclude=static-binaries \
-    "${TREE_DIR_NAME}" || {
+    "${TREE_DIR_NAME}" | $TAR_CMD xf - -C "$staging" \
+    || ! project_stamp "$staging/$DEPLOY_DIR_NAME" "$PROJECT_VERSION" \
+    || ! $TAR_CMD czf "$OUTPUT_TARBALL" -C "$staging" "$DEPLOY_DIR_NAME"; then
     _error "Failed to create ${OUTPUT_TARBALL}"
     exit 1
-}
+fi
 
 # Read the whole listing rather than piping into "grep -q": an early-exiting
 # grep would SIGPIPE tar, which "set -o pipefail" reports as a build failure.

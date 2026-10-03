@@ -47,7 +47,7 @@ def discover_result_pairs(
             continue
 
         for filename in os.listdir(input_dir):
-            match = filename_pattern.match(filename)
+            match = filename_pattern.fullmatch(filename)
             if not match:
                 continue
             key = key_from_match(match)

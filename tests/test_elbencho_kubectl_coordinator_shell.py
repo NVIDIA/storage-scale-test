@@ -105,7 +105,8 @@ def _as_prepared_batch(control, kinds=("io", "io")):
         common.replace("[benchmark]=1", "[z-io]=1 [a-metadata]=1"), encoding="utf-8"
     )
     (control / "run-metadata.tsv").write_text(
-        "attempt_id\t1234abcd\noutput_basename\tfilesystem-batch-20260923Z010203\n",
+        "attempt_id\t1234abcd\noutput_basename\tfilesystem-batch-20260923Z010203\n"
+        "project_version\tv1.2.3\n",
         encoding="utf-8",
     )
     manifest = control / "batch-manifest.tsv"
@@ -130,7 +131,8 @@ def _write_bundle(tmp_path, execution_count=2):
         shutil.copy2(source, control / source.name)
     (control / "env_used.yaml").write_text("schema: test\n", encoding="utf-8")
     (control / "run-metadata.tsv").write_text(
-        "attempt_id\t1234abcd\noutput_basename\telbencho-20260923Z010203\n",
+        "attempt_id\t1234abcd\noutput_basename\telbencho-20260923Z010203\n"
+        "project_version\tv1.2.3\n",
         encoding="utf-8",
     )
     (control / "env_used.sh").write_text(

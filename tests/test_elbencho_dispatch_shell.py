@@ -2114,6 +2114,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 sweep_script,
             )
             (lib_dir / "_elbencho_functions.sh").write_text("", encoding="utf-8")
+            shutil.copy2(_REPO_ROOT / "lib/project_version.sh", lib_dir)
             env_text = """
             SCALE_TEST_BASE=__FAKE_ROOT__
             EXECUTION_SUBSTRATE=slurm
@@ -2186,6 +2187,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 sweep_script,
             )
             (lib_dir / "_elbencho_functions.sh").write_text("", encoding="utf-8")
+            shutil.copy2(_REPO_ROOT / "lib/project_version.sh", lib_dir)
             env_text = """
             SCALE_TEST_BASE=__FAKE_ROOT__
             EXECUTION_SUBSTRATE=slurm
@@ -2262,6 +2264,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 sweep_script,
             )
             (lib_dir / "_elbencho_functions.sh").write_text("", encoding="utf-8")
+            shutil.copy2(_REPO_ROOT / "lib/project_version.sh", lib_dir)
             env_text = (
                 """
             source "__FUNCTIONS__"

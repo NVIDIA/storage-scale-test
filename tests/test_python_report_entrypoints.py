@@ -23,6 +23,8 @@ import sys
 
 import pytest
 
+from lib.project_version import stamp_source
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _ENTRYPOINTS = (
     "extract-filesystem.py",
@@ -52,6 +54,7 @@ def cli_checkout_fixture(tmp_path):
     (checkout / "requirements.txt").write_text(
         "invalid requirement!\n", encoding="utf-8"
     )
+    stamp_source(checkout, "v1.2.3")
     return checkout
 
 
@@ -68,10 +71,10 @@ def test_informational_options_need_no_site_config_or_dependencies(
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
-    expected = (
-        "usage:" if option == "--help" else "storage-scale-test unversioned source"
-    )
-    assert expected in completed.stdout
+    if option == "--help":
+        assert "usage:" in completed.stdout
+    else:
+        assert completed.stdout == "v1.2.3\n"
     assert not completed.stderr
     assert not (cli_checkout / ".venv").exists()
 

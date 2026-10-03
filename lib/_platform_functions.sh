@@ -48,3 +48,39 @@ _run_command_with_timeout() {
         gtimeout --signal=TERM --kill-after=2s "${max_seconds}s" "$@"
     fi
 }
+
+# Parse --resfile from elbencho argv. Prints path to stdout (may be empty).
+# Usage: resfile=$(_elbencho_resfile_from_args "$@")
+_elbencho_resfile_from_args() {
+    local path=""
+    local skip_next=false
+    local arg
+    for arg in "$@"; do
+        if [[ "$skip_next" == true ]]; then
+            path="$arg"
+            skip_next=false
+            continue
+        fi
+        if [[ "$arg" == --resfile ]]; then
+            skip_next=true
+            continue
+        fi
+        if [[ "$arg" == --resfile=* ]]; then
+            path="${arg#--resfile=}"
+        fi
+    done
+    printf '%s' "$path"
+    return 0
+}
+
+# Record the project version that produced an elbencho result file beside it,
+# as RESULT.project-version; reports show it. Launchers and coordinators
+# export STORAGE_SCALE_TEST_VERSION (see lib/project_version.sh). The record is
+# informational, so failing to write it never fails the benchmark.
+_write_result_version() {
+    local result="$1"
+    [[ -n "$result" ]] || return 0
+    printf '%s\n' "${STORAGE_SCALE_TEST_VERSION:-unknown}" > "$result.project-version" \
+        || echo "Warning: could not record the project version for $result" >&2
+    return 0
+}

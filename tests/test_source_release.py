@@ -1,0 +1,318 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Stamped deployment tarballs, release source archives, and release publication."""
+
+import gzip
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import tarfile
+from types import SimpleNamespace
+
+import pytest
+
+from lib.project_version import ROOT, resolve_version
+from lib.source_release import (
+    build_source_archive,
+    changelog_notes,
+    publish_release,
+    release_commit,
+    smoke_source_archive,
+)
+from tests.test_project_version import git
+
+CHANGELOG = """# Changelog
+
+## [Unreleased]
+
+## [1.2.3] - 2026-10-03
+
+### Fixed
+
+- Something.
+
+## [1.2.2] - 2026-09-01
+
+- Older.
+"""
+
+
+def _deployment_source(tmp_path):
+    """Build an isolated checkout with user-provided binaries and no downloads."""
+    root = tmp_path / "tree with 'spaces'"
+    (root / "utils").mkdir(parents=True)
+    (root / "lib").mkdir()
+    shutil.copy2(ROOT / "utils/build_tarball.sh", root / "utils/build_tarball.sh")
+    shutil.copy2(ROOT / "lib/project_version.sh", root / "lib/project_version.sh")
+    (root / "NOTICE").write_text("notice\n")
+    (root / "source.txt").write_text("source\n")
+    (root / ".gitignore").write_text("utils/elbencho*\nutils/warp*\nutils/s3test*\n")
+    git(root, "init", "-q")
+    git(root, "add", ".")
+    git(root, "commit", "-qm", "Source")
+    git(root, "tag", "-a", "v1.2.3", "-m", "release")
+    for name in ("elbencho", "elbencho.aarch64", "warp", "warp.aarch64"):
+        (root / "utils" / name).write_bytes(b"custom binary " + name.encode())
+    for name in ("s3test", "s3test.aarch64"):
+        (root / "utils" / name).write_bytes(b"custom binary")
+    for binary in (root / "utils").glob("[ews]*"):
+        binary.chmod(0o755)
+    return root
+
+
+def _package(root):
+    result = subprocess.run(
+        ["bash", str(root / "utils/build_tarball.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    archive = root.parent / "storage-scale-test.tar.gz"
+    extracted = root.parent / f"extracted-{len(list(root.parent.iterdir()))}"
+    with tarfile.open(archive) as tar:
+        tar.extractall(extracted, filter="data")
+    return extracted / "storage-scale-test"
+
+
+def test_deployment_tarball_is_stamped_and_keeps_custom_binaries(tmp_path):
+    root = _deployment_source(tmp_path)
+    deployment = _package(root)
+    assert not (root / "VERSION").exists()
+    assert resolve_version(deployment) == "v1.2.3"
+    listed = (deployment / "SOURCE_SHA256").read_text()
+    assert "  source.txt\n" in listed and "utils/elbencho" not in listed
+    assert (deployment / "utils/elbencho").read_bytes() == b"custom binary elbencho"
+    (deployment / "utils/elbencho").write_bytes(b"replaced by the user")
+    assert resolve_version(deployment) == "v1.2.3"
+    (deployment / "source.txt").write_text("edited\n")
+    assert resolve_version(deployment) == "v1.2.3-modified"
+    # Deployments omit the builder; repackaging an edited one stays modified.
+    shutil.copy2(root / "utils/build_tarball.sh", deployment / "utils/build_tarball.sh")
+    repackaged = _package(deployment)
+    assert (repackaged / "VERSION").read_text() == "v1.2.3-modified\n"
+    assert resolve_version(repackaged) == "v1.2.3-modified"
+
+
+def _release_repository(tmp_path, name="release"):
+    """A minimal checkout whose commands report the project version."""
+    root = tmp_path / name
+    (root / "lib").mkdir(parents=True)
+    (root / "utils").mkdir()
+    for library in ("__init__.py", "project_version.py", "project_version.sh"):
+        shutil.copy2(ROOT / "lib" / library, root / "lib" / library)
+    (root / "validate_env.sh").write_text(
+        '#!/usr/bin/env bash\nsource "$(dirname "$0")/lib/project_version.sh"\n'
+        'project_version_option "$(dirname "$0")" "$@"\nexit 2\n'
+    )
+    (root / "utils/extract-elbencho.py").write_text(
+        "import argparse, sys\nfrom pathlib import Path\n"
+        "sys.path.insert(0, str(Path(__file__).resolve().parents[1]))\n"
+        "from lib.project_version import add_version_argument\n"
+        "parser = argparse.ArgumentParser()\nadd_version_argument(parser)\n"
+        "parser.parse_args()\nsys.exit(2)\n"
+    )
+    (root / "CHANGELOG.md").write_text(CHANGELOG)
+    git(root, "init", "-q")
+    git(root, "add", ".")
+    git(root, "commit", "-qm", "Source")
+    git(root, "tag", "-a", "v1.2.3", "-m", "release")
+    return root
+
+
+def test_release_archive_is_reproducible_stamped_and_verified(tmp_path):
+    source = _release_repository(tmp_path)
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", source.as_uri(), str(clone)], check=True)
+    (clone / "untracked.txt").write_text("not released")
+    first, checksum = build_source_archive(source, tmp_path / "first", "v1.2.3")
+    second, _ = build_source_archive(clone, tmp_path / "second", "v1.2.3")
+    assert first.name == "storage-scale-test-v1.2.3-source.tar.gz"
+    assert first.read_bytes() == second.read_bytes()
+    assert checksum.read_text().endswith(f"  {first.name}\n")
+    with tarfile.open(first) as tar:
+        names = tar.getnames()
+        assert tar.extractfile("storage-scale-test/VERSION").read() == b"v1.2.3\n"
+        assert {member.mtime for member in tar.getmembers()} == {0}
+    assert "storage-scale-test/untracked.txt" not in names
+    smoke_source_archive(first)
+
+
+@pytest.mark.parametrize(
+    "command, body",
+    [
+        ("validate_env.sh", "echo v9.9.9\n"),
+        ("utils/extract-elbencho.py", "print('v9.9.9')\n"),
+    ],
+)
+def test_smoke_test_rejects_a_command_with_the_wrong_version(tmp_path, command, body):
+    root = _release_repository(tmp_path)
+    (root / command).write_text(body)
+    git(root, "commit", "-qam", "Break")
+    git(root, "tag", "-a", "v1.2.3", "-f", "-m", "release")
+    archive, _ = build_source_archive(root, tmp_path / "out", "v1.2.3")
+    with pytest.raises(ValueError, match=f"{command} printed 'v9.9.9'"):
+        smoke_source_archive(archive)
+
+
+@pytest.mark.parametrize(
+    "tag, message",
+    [
+        ("v1.2.4", "annotated"),
+        ("v1.2.3+build.1", "not a release tag"),
+        ("v1.2.5", "no section"),
+    ],
+)
+def test_release_tags_must_be_annotated_releases_with_notes(tmp_path, tag, message):
+    root = _release_repository(tmp_path)
+    if tag == "v1.2.4":
+        git(root, "tag", tag)
+    else:
+        git(root, "tag", "-a", tag, "-m", tag)
+    with pytest.raises(ValueError, match=message):
+        build_source_archive(root, tmp_path / "out", tag)
+
+
+def test_changelog_notes_are_the_tag_section():
+    assert changelog_notes(CHANGELOG, "v1.2.3") == "### Fixed\n\n- Something."
+    assert changelog_notes(CHANGELOG, "v1.2.2") == "- Older."
+    with pytest.raises(ValueError, match="empty"):
+        changelog_notes("## [1.0.0]\n\n## [0.9.0]\n- x\n", "v1.0.0")
+
+
+def test_release_commit_is_the_tagged_commit(tmp_path):
+    root = _release_repository(tmp_path)
+    assert release_commit(root, "v1.2.3") == git(root, "rev-parse", "HEAD")
+
+
+class GitHub:
+    """Answer the GitHub CLI calls publish_release makes, without network access."""
+
+    def __init__(self, *, release=None, assets=None, tag_commit="abc", status="behind"):
+        self.release = release
+        self.assets = assets or {}
+        self.tag_commit = tag_commit
+        self.status = status
+        self.lookup_error = "HTTP 404: Not Found"
+        self.calls = []
+
+    def __call__(self, arguments, **_kwargs):
+        self.calls.append(arguments[1:])
+        output, error, status = self._answer(arguments[1:])
+        return SimpleNamespace(returncode=status, stdout=output, stderr=error)
+
+    def _answer(self, arguments):
+        if arguments[0] == "api":
+            endpoint = arguments[1]
+            if "/commits/" in endpoint:
+                return self.tag_commit, "", 0
+            if "/compare/" in endpoint:
+                return self.status, "", 0
+            if "/releases/tags/" in endpoint:
+                return "", self.lookup_error, 1
+            return "main", "", 0
+        if arguments[:2] == ["release", "view"]:
+            if self.release is None:
+                return "", "release not found", 1
+            assets = [{"name": name} for name in self.assets]
+            return json.dumps({**self.release, "assets": assets}), "", 0
+        if arguments[:2] == ["release", "download"]:
+            name = arguments[arguments.index("--pattern") + 1]
+            directory = Path(arguments[arguments.index("--dir") + 1])
+            (directory / name).write_bytes(self.assets[name])
+        return "", "", 0
+
+    def operations(self):
+        """Release subcommands in call order."""
+        return [call[1] for call in self.calls if call[0] == "release"]
+
+
+@pytest.fixture(name="assets")
+def assets_fixture(tmp_path):
+    archive = tmp_path / "storage-scale-test-v1.2.3-source.tar.gz"
+    archive.write_bytes(gzip.compress(b"tar contents", mtime=0))
+    checksum = tmp_path / (archive.name + ".sha256")
+    checksum.write_text("digest  archive\n")
+    return archive, checksum
+
+
+def _publish(github, assets, tag="v1.2.3"):
+    publish_release("example/project", tag, "abc", assets, "notes", run=github)
+
+
+@pytest.mark.parametrize("tag", ["v1.2.3", "v1.2.3-rc.1"])
+def test_new_release_is_created_with_assets_and_notes(assets, tag):
+    github = GitHub()
+    _publish(github, assets, tag)
+    create = next(call for call in github.calls if call[:2] == ["release", "create"])
+    assert [str(path) for path in assets] == create[3:5]
+    assert ("--prerelease" in create) == ("-" in tag)
+    assert github.operations() == ["view", "create"]
+
+
+@pytest.mark.parametrize(
+    "github, message",
+    [
+        (GitHub(tag_commit="def"), "does not identify"),
+        (GitHub(status="diverged"), "not on the default branch"),
+        (GitHub(status="ahead"), "not on the default branch"),
+    ],
+)
+def test_release_requires_the_merged_tagged_commit(assets, github, message):
+    with pytest.raises(ValueError, match=message):
+        _publish(github, assets)
+    assert "create" not in github.operations()
+
+
+def test_release_lookup_failure_never_creates_a_release(assets):
+    github = GitHub()
+    github.lookup_error = "HTTP 401: Bad credentials"
+    with pytest.raises(ValueError, match="cannot determine"):
+        _publish(github, assets)
+    assert "create" not in github.operations()
+
+
+def test_rerun_keeps_published_archive_and_finishes_a_draft(assets):
+    archive, checksum = assets
+    # Same tar content, different gzip bytes (another zlib): keep the published one.
+    published = gzip.compress(b"tar contents", compresslevel=1, mtime=0)
+    assert published != archive.read_bytes()
+    draft = {"isDraft": True, "isPrerelease": False}
+    github = GitHub(release=draft, assets={archive.name: published})
+    _publish(github, assets)
+    assert archive.read_bytes() == published
+    digest = hashlib.sha256(published).hexdigest()
+    assert checksum.read_text() == f"{digest}  {archive.name}\n"
+    uploads = [call[3] for call in github.calls if call[:2] == ["release", "upload"]]
+    assert uploads == [str(checksum)]
+    assert github.operations()[-1] == "edit"
+
+
+@pytest.mark.parametrize("different", ["archive", "checksum", "prerelease"])
+def test_rerun_refuses_different_published_content(assets, different):
+    archive, checksum = assets
+    published = {archive.name: archive.read_bytes()}
+    release = {"isDraft": False, "isPrerelease": different == "prerelease"}
+    if different == "archive":
+        published[archive.name] = gzip.compress(b"other source", mtime=0)
+    elif different == "checksum":
+        published[checksum.name] = b"0000  other\n"
+    github = GitHub(release=release, assets=published)
+    with pytest.raises(ValueError):
+        _publish(github, assets)
+    assert not {"upload", "edit", "create"} & set(github.operations())
