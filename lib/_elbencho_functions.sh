@@ -4090,7 +4090,6 @@ run_elbencho_metadata_benchmark() {
         -n "$dirs_per_thread"
         -N "$files_per_worker"
         -s 0                        # Zero-byte files (metadata only)
-        -b 0                        # Block size 0 (matches file size)
         --lat
         --lathisto
         --latpercent

@@ -74,7 +74,8 @@ repository browser; deployment archives omit `docs/`. The builder reuses or
 downloads pinned elbencho binaries, includes existing Warp binaries, and
 builds `s3test`. See
 [object-tool preparation](docs/OBJECT_STORAGE_TESTING.md#prepare-the-tools)
-if you need Warp. `--force-download` refreshes elbencho downloads.
+if you need Warp. Existing Elbencho binaries, including custom builds, are
+preserved unless `--force-download` is given.
 
 Download failure does not prevent archive creation: check warnings and verify
 tools for every target architecture. The repository does not ship benchmark
@@ -136,7 +137,7 @@ export KUBECTL_NAMESPACE=storage-scale-test
 export KUBECTL_PV=storage-scale-test-pv
 export KUBECTL_PVC=storage-scale-test-pvc
 export KUBECTL_NODE_SELECTOR='storage-scale-test/worker=true'
-export KUBECTL_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.1-11
+export KUBECTL_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.2-1
 export KUBECTL_IMAGE_PULL_POLICY=IfNotPresent
 export KUBECTL_RUN_AS_USER=2000
 export KUBECTL_RUN_AS_GROUP=2000

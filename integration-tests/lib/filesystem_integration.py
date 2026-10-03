@@ -74,7 +74,7 @@ from scenario_planner import (
 
 LOG = logging.getLogger("storage-scale-integration")
 
-ELBENCHO_VERSION = "v3.1-11"
+ELBENCHO_VERSION = "v3.2-1"
 ELBENCHO_RELEASE_API = (
     "https://api.github.com/repos/breuner/elbencho/releases/tags/" + ELBENCHO_VERSION
 )
@@ -87,12 +87,12 @@ SLURM_CLEANUP_MARGIN_SECONDS = 120
 ELBENCHO_ARCHIVES = {
     "x86_64": (
         "elbencho-static-x86_64.tar.gz",
-        "8d7cf885481dbd8f39908b7f4ff588d9e80cbc0fd26eeaba0b764c77587884d2",
+        "c32f9f905e879b7efed8c2f83ea9be7a362dceae43155bb46ddab3d5d6c23210",
         "elbencho",
     ),
     "aarch64": (
         "elbencho-static-aarch64.tar.gz",
-        "a744c82ab4e15d8cf4023f7f5053c2008e148f77349e2ba53d2352c4f7508683",
+        "3af09f8110586863b35da019e748c8062fcf57cc0f32e446b1c054df4500eba3",
         "elbencho.aarch64",
     ),
 }
