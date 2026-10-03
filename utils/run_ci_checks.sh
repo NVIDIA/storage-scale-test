@@ -83,6 +83,58 @@ if [[ "$TARGET" == "all" || "$TARGET" == "pytest" ]]; then
     check_macos_test_prerequisites
 fi
 
+install_requirements() {
+    local -a arguments=()
+    local requirement
+    for requirement in "$@"; do
+        arguments+=(-r "$requirement")
+    done
+    if command -v uv >/dev/null 2>&1; then
+        uv pip install --python "$VENV_DIR/bin/python" "${arguments[@]}"
+    else
+        "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check \
+            --no-compile "${arguments[@]}"
+    fi
+}
+
+target_runs_shellcheck() {
+    [[ "$TARGET" == "all" || "$TARGET" == "lint" || "$TARGET" == "shellcheck" ]]
+}
+
+install_system_shellcheck() {
+    if command -v brew >/dev/null 2>&1; then
+        brew install shellcheck
+        return
+    fi
+    command -v apt-get >/dev/null 2>&1 || return 1
+    local -a privileged=()
+    if [[ "$(id -u)" != "0" ]]; then
+        command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null || return 1
+        privileged=(sudo -n)
+    fi
+    "${privileged[@]}" apt-get install -y shellcheck \
+        || { "${privileged[@]}" apt-get update && "${privileged[@]}" apt-get install -y shellcheck; }
+}
+
+# The pinned shellcheck-py downloads its binary at build time, which restricted
+# networks often block. Fall back to a system shellcheck, installing it if possible.
+use_system_shellcheck() {
+    local pinned version
+    pinned=$(sed -n 's/^shellcheck-py==\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p' requirements-ci.txt)
+    if ! command -v shellcheck >/dev/null 2>&1; then
+        echo "shellcheck-py is unavailable; installing shellcheck with the system package manager." >&2
+        if ! install_system_shellcheck || ! command -v shellcheck >/dev/null 2>&1; then
+            echo "Error: install shellcheck $pinned (apt-get install shellcheck or brew install shellcheck), or set CI_SHELLCHECK." >&2
+            return 1
+        fi
+    fi
+    SHELLCHECK_BIN=$(command -v shellcheck)
+    version=$("$SHELLCHECK_BIN" --version | sed -n 's/^version: //p')
+    if [[ "$version" != "$pinned" ]]; then
+        echo "Warning: system shellcheck $version differs from pinned $pinned; findings may differ from CI." >&2
+    fi
+}
+
 if [[ "$BOOTSTRAP" == "1" ]]; then
     VENV_DIR="${CI_VENV_DIR:-$REPO_ROOT/.venv-ci}"
     VENV_STATE="reused"
@@ -101,17 +153,19 @@ if [[ "$BOOTSTRAP" == "1" ]]; then
     if [[ ! -f "$REQUIREMENTS_STAMP" ]] || \
        ! cmp -s <(cat requirements.txt requirements-ci.txt) "$REQUIREMENTS_STAMP"; then
         DEPENDENCY_STATE="updated"
-        if command -v uv >/dev/null 2>&1; then
-            uv pip install --python "$VENV_DIR/bin/python" \
-                -r requirements.txt -r requirements-ci.txt
-        else
-            "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check \
-                --no-compile -r requirements.txt -r requirements-ci.txt
+        if ! install_requirements requirements.txt requirements-ci.txt; then
+            echo "Warning: CI dependency installation failed; retrying without shellcheck-py." >&2
+            grep -v '^shellcheck-py' requirements-ci.txt > "$VENV_DIR/.requirements-ci-no-shellcheck"
+            install_requirements requirements.txt "$VENV_DIR/.requirements-ci-no-shellcheck"
+            DEPENDENCY_STATE="updated without shellcheck-py"
         fi
         cat requirements.txt requirements-ci.txt > "$REQUIREMENTS_STAMP"
     fi
     PYTHON_BIN="$VENV_DIR/bin/python"
     SHELLCHECK_BIN="$VENV_DIR/bin/shellcheck"
+    if [[ ! -x "$SHELLCHECK_BIN" ]] && target_runs_shellcheck; then
+        use_system_shellcheck
+    fi
     printf '\n== environment setup (success, %ss) ==\n' \
         "$((SECONDS - SETUP_STARTED))"
     printf 'Virtual environment %s; dependencies %s.\n' \

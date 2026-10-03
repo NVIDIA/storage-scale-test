@@ -215,9 +215,29 @@ Important configuration relationships:
   Object tests use a dedicated `OBJ_BUCKET`, endpoint settings, and credentials
   sourced from `OBJ_AUTH_FILE`.
 
-`env.sh`, `OBJ_AUTH_FILE`, filesystem resume snapshots, and reified execution
-definitions are sourced as Bash. They are executable trusted inputs, not passive
-configuration data.
+Filesystem launchers accept one `--env-override <file>` per new submission,
+`--batch`, or `--append`. After `env.sh`, `filesystem_env_override_declarations`
+(`lib/env_functions.sh`) sources the file in an isolated child shell seeded with
+the current allowed values. It rejects changes to anything outside
+`filesystem_env_override_names` (workload settings that `env_used.sh` records),
+except new lowercase scratch variables. It also type-checks arrays, then prints
+declarations that the caller `eval`s in its own scope, followed by
+`apply_filesystem_workload_defaults`. Design constraints:
+
+- `env_base.sh` is not re-sourced because it is not idempotent (modules, PATH,
+  Slurm queries).
+- Slurm coordinators re-source `env.sh` and then only `env_used.sh`, so names
+  outside the snapshot cannot be overridden safely.
+- Batch prepare applies the override in its own shell too, because the group
+  snapshot also captures that shell's `ELBENCHO_*`/`MDTEST_*`/`FS_MAX_*` values.
+  It stages one copy of the file so both shells read identical content.
+- `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}` provenance is
+  always written to `env_used.sh` (empty without an override) so treefile-cache
+  YAML rewrites keep it and sequentially sourced groups cannot inherit it.
+
+`env.sh`, `OBJ_AUTH_FILE`, `--env-override` files, filesystem resume snapshots,
+and reified execution definitions are sourced as Bash. They are executable
+trusted inputs, not passive configuration data.
 
 ## Execution architecture
 

@@ -367,7 +367,8 @@ is not executable. The existing dispatch-lock ownership checks protect append
 and seal operations.
 
 The common execution environment and host/scheduler-list contents are frozen at
-creation. Group workload settings may differ. Start performs non-mutating
+creation. Group workload settings may differ, either through `env.sh` edits or
+a per-group `--env-override` file restricted to workload settings. Start performs non-mutating
 preflight, checks that the manifest revision is unchanged, and permanently seals
 it before external mutation. Submission failure never reopens preparation.
 Every cell restores its own saved configuration in an isolated context. Ordinary

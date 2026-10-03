@@ -113,6 +113,13 @@ Path modes (at most one; --write-only and --read-from require a single TEST_DIRS
 
 Flags:
   -h, --help          Show this help message and exit
+  --env-override <file>
+                      Source <file> after env.sh so its filesystem workload
+                      settings (TEST_DIRS, FS_MAX_*, MDTEST_*, the ELBENCHO_*
+                      sweep lists and file controls) take precedence. Accepted
+                      once, only when submitting or with --batch/--append.
+                      Values are saved in env_used.sh at submission; later
+                      lifecycle operations never reread the file or env.sh.
   -b, --bio           Use bio instead of the default dio (direct IO)
   -r, --rand          Use random IO patterns (default: sequential IO; not with ELBENCHO_SINGLE_BIG_FILE=1)
   --run-to-completion Complete each requested write/read phase without
@@ -130,6 +137,7 @@ Examples:
   $0 --read-from /mnt/fs/elbencho-sweep-foo --nodes 8
   $0 --read-from /mnt/fs/elbencho-sweep-foo/elbencho-bigfile --nodes 8
   $0 --delete-only /mnt/fs/elbencho-sweep-foo
+  $0 --append <batch_dir> --env-override overrides/large-seq.env --nodes 1,8
 
 EOF
 }
@@ -147,6 +155,7 @@ resume_dir=""
 status_dir=""
 cancel_dir=""
 collect_dir=""
+env_override_file=""
 
 # Parse flags
 while [[ $# -gt 0 ]]; do
@@ -218,6 +227,18 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             }
             sweep_read_from="$2"
+            shift 2
+            ;;
+        --env-override)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "Error: --env-override requires a file argument" >&2
+                exit 1
+            fi
+            [[ -z "$env_override_file" ]] || {
+                echo "Error: --env-override may be specified only once" >&2
+                exit 1
+            }
+            env_override_file="$2"
             shift 2
             ;;
         --delete-only)
@@ -298,7 +319,8 @@ _has_workload_options() {
     [[ "$g_bio_or_dio" != dio || "$rand_option" != 0 \
         || "$run_to_completion_option" != 0 || -n "$nodes_spec" \
         || "$sweep_write_only" != 0 || "$sweep_write_no_read" != 0 \
-        || -n "$sweep_read_from" || -n "$delete_only_path" ]]
+        || -n "$sweep_read_from" || -n "$delete_only_path" \
+        || -n "$env_override_file" ]]
 }
 
 # Validate that --resume is the only flag in play.
@@ -313,6 +335,12 @@ _validate_resume_mutual_exclusivity() {
 
 _select_operation() {
     local lifecycle_count=0
+    if [[ -n "$env_override_file" && ( -n "$resume_dir$status_dir$cancel_dir$collect_dir" \
+            || -n "$delete_only_path" ) ]]; then
+        echo "Error: --env-override applies only to a new submission or --batch/--append;" \
+            "existing results always use their saved env_used.sh" >&2
+        return 1
+    fi
     [[ -n "$resume_dir" ]] && lifecycle_count=$((lifecycle_count + 1))
     [[ -n "$status_dir" ]] && lifecycle_count=$((lifecycle_count + 1))
     [[ -n "$cancel_dir" ]] && lifecycle_count=$((lifecycle_count + 1))
@@ -464,6 +492,23 @@ if [[ "$SWEEP_OPERATION" == resume ]]; then
     source "$OUTPUT_DIR/env_used.sh" || exit 1
     EXECUTION_SUBSTRATE="$SAVED_EXECUTION_SUBSTRATE"
     export EXECUTION_SUBSTRATE
+fi
+
+# A new submission layers its --env-override over env.sh at top level, before
+# any validation or output, so every check and snapshot sees effective values.
+if [[ "$SWEEP_OPERATION" == submit ]]; then
+    reset_env_override_provenance
+    if [[ -n "$env_override_file" ]]; then
+        env_override_file=$(resolve_env_override_file "$env_override_file") || exit 1
+        # Batch preparation passes a staged copy; record the operator's file.
+        env_override_label="$env_override_file"
+        if [[ -n "${ELBENCHO_BATCH_PREPARE_DIR:-}" ]]; then
+            env_override_label="${ELBENCHO_BATCH_ENV_OVERRIDE_ORIGIN:-$env_override_file}"
+        fi
+        env_override_declarations=$(filesystem_env_override_declarations \
+            "$env_override_file" "$env_override_label") || exit 1
+        eval "$env_override_declarations"
+    fi
 fi
 
 # shellcheck disable=SC1091
@@ -726,6 +771,8 @@ write_elbencho_env_used "${OUTPUT_DIR}/env_used.yaml" \
 out_log="${OUTPUT_DIR}/elbencho-sweep-${DS}-runner.log"
 exec 1> >(tee -a "${out_log}")
 exec 2> >(tee -a "${out_log}" >&2)
+
+print_env_override_summary
 
 cd "${SCALE_TEST_BASE}/storage-tests/fs" || exit 1
 

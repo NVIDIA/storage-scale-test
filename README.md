@@ -43,6 +43,9 @@ repository root or an unpacked deployment directory.
 
 Each run creates its own directory below `RESULTS_DIR`. Use that complete
 printed directory, not its parent, for reporting and lifecycle commands.
+Filesystem launchers can also take per-run workload settings from an
+[override file](docs/FILESYSTEM_TESTING.md#workload-override-files) instead of
+edits to `env.sh`.
 Kubernetes runs asynchronously: collect terminal results before reporting.
 
 ## Prerequisites and deployment

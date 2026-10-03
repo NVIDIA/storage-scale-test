@@ -312,6 +312,7 @@ def _step(
     failure_injection: FailureInjection = FailureInjection.NONE,
     preserve_failure_staging: bool = False,
     workload_kind: str = "filesystem",
+    support_files: tuple[SupportFile, ...] = (),
 ) -> ScenarioStep:
     """Build a sweep step with bounded defaults."""
     return ScenarioStep(
@@ -319,7 +320,7 @@ def _step(
         kind=CommandKind.SWEEP,
         arguments=arguments,
         env_lines=env_lines,
-        support_files=(),
+        support_files=support_files,
         generated_inputs=(),
         timeout_seconds=timeout_seconds,
         executions=executions,
@@ -485,8 +486,16 @@ def _failure_resume() -> FilesystemScenarioSpec:
     )
 
 
+MIXED_BATCH_METADATA_OVERRIDE = "env-overrides/mixed-metadata.env"
+MIXED_BATCH_REPEATED_OVERRIDE = "env-overrides/mixed-repeated-io.env"
+
+
 def _mixed_batch() -> FilesystemScenarioSpec:
-    """Prepare three groups with repeated IO coordinates and changed provenance."""
+    """Prepare three groups with repeated IO coordinates and changed provenance.
+
+    env.sh is identical for every step; appended groups change their workload
+    only through relative --env-override files, as a batch driver would.
+    """
     first = _step(
         "prepare-first-io",
         ("--batch", "--bio", "--nodes", "1"),
@@ -498,14 +507,17 @@ def _mixed_batch() -> FilesystemScenarioSpec:
     )
     metadata = _step(
         "append-metadata",
-        ("--append", "{batch_results_dir}", "--nodes", "2", "--tasks", "1"),
         (
-            "unset TEST_DIRS",
-            'declare -A TEST_DIRS=(["{test_root_secondary}"]=1)',
-            "export MDTEST_BRANCH_FACTOR=1",
-            "export MDTEST_ITEMS_PER_DIR=2",
-            "export MDTEST_ITERATIONS=2",
+            "--append",
+            "{batch_results_dir}",
+            "--env-override",
+            MIXED_BATCH_METADATA_OVERRIDE,
+            "--nodes",
+            "2",
+            "--tasks",
+            "1",
         ),
+        _SHARED_ENV,
         (
             ExpectedExecution(
                 ExecutionCoordinate(2, workload_kind="mdtest", tasks_per_node=1),
@@ -517,23 +529,38 @@ def _mixed_batch() -> FilesystemScenarioSpec:
         requires=("batch_results_dir",),
         failure_injection=FailureInjection.FAIL_AFTER_WRITE_ONCE,
         workload_kind="mdtest",
+        support_files=(
+            SupportFile(
+                MIXED_BATCH_METADATA_OVERRIDE,
+                'TEST_DIRS=(["{test_root_secondary}"]=1)\n'
+                "MDTEST_BRANCH_FACTOR=1\n"
+                "MDTEST_ITEMS_PER_DIR=2\n"
+                "MDTEST_ITERATIONS=2\n",
+            ),
+        ),
     )
     repeated = _step(
         "append-repeated-io",
-        ("--append", "{batch_results_dir}", "--bio", "--nodes", "1"),
-        _override_env(
-            _SHARED_ENV,
-            {
-                "ELBENCHO_FILE_SIZE": 'export ELBENCHO_FILE_SIZE="8M"',
-                "ELBENCHO_SCALE_READ_WRITE_DURATION": (
-                    "export ELBENCHO_SCALE_READ_WRITE_DURATION=2"
-                ),
-            },
+        (
+            "--append",
+            "{batch_results_dir}",
+            "--env-override",
+            MIXED_BATCH_REPEATED_OVERRIDE,
+            "--bio",
+            "--nodes",
+            "1",
         ),
+        _SHARED_ENV,
         _coordinates((1,), ("4K",), (1,), (1,)),
         _NORMAL_PHASES,
         timeout_seconds=600,
         requires=("batch_results_dir",),
+        support_files=(
+            SupportFile(
+                MIXED_BATCH_REPEATED_OVERRIDE,
+                'ELBENCHO_FILE_SIZE="8M"\nELBENCHO_SCALE_READ_WRITE_DURATION=2\n',
+            ),
+        ),
     )
     return FilesystemScenarioSpec(
         "mixed-batch", _BASELINE_SUBSTRATES, (first, metadata, repeated)

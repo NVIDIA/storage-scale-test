@@ -5238,6 +5238,36 @@ def _assert_mixed_batch_cell(
             )
 
 
+def _env_override_provenance(path: Path) -> str:
+    """Return the --env-override file recorded in a reified snapshot."""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = re.fullmatch(r"STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE=(.*)", line)
+        if match:
+            values = shlex.split(match.group(1), posix=True)
+            return values[0] if values else ""
+    raise IntegrationTestError(f"{path} lacks --env-override provenance")
+
+
+def _assert_mixed_batch_overrides(
+    result: Path, executions: list[list[str]], steps: tuple[ScenarioStep, ...]
+) -> None:
+    """Each cell records exactly the override its own append command used."""
+    for execution, step in zip(executions, steps, strict=True):
+        expected = ""
+        if "--env-override" in step.arguments:
+            expected = step.arguments[step.arguments.index("--env-override") + 1]
+        recorded = _env_override_provenance(
+            result / "executions" / f"{execution[1]}.sh"
+        )
+        if (recorded != "") != bool(expected) or not recorded.endswith(
+            f"/{expected}" if expected else ""
+        ):
+            raise IntegrationTestError(
+                f"mixed batch cell {execution[1]} recorded override "
+                f"{recorded!r}, expected {expected or 'none'}"
+            )
+
+
 def _assert_mixed_batch(
     result: Path,
     runtime: ScenarioRuntime,
@@ -5257,6 +5287,7 @@ def _assert_mixed_batch(
         groups, executions, runtime.scenario.steps, statuses, strict=True
     ):
         _assert_mixed_batch_cell(result, group, execution, step, status)
+    _assert_mixed_batch_overrides(result, executions, runtime.scenario.steps)
     settings = [
         _shell_assignments(result / "executions" / f"{row[1]}.sh") for row in executions
     ]

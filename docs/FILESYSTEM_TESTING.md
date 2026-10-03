@@ -357,8 +357,9 @@ Assemble IO and metadata sweeps before running them. Each invocation saves one
 ```bash
 ./storage-tests/fs/nv-elbencho-sweep.sh --batch --nodes 1,2
 # Set BATCH to the printed STORAGE_SCALE_TEST_BATCH_RESULTS path.
-# Edit env.sh for the next group's workload, then append it.
-./storage-tests/fs/nv-mdtest-elbencho.sh --append "$BATCH" --nodes 2,4 --tasks 4,8
+# Change the next group's workload with an override file (or by editing env.sh).
+./storage-tests/fs/nv-mdtest-elbencho.sh --append "$BATCH" \
+    --env-override overrides/md-deep-tree.env --nodes 2,4 --tasks 4,8
 ./storage-tests/fs/nv-elbencho-sweep.sh --status "$BATCH"
 ./storage-tests/fs/nv-mdtest-elbencho.sh --start "$BATCH"
 # Kubernetes: wait for terminal status, then collect before reporting.
@@ -396,6 +397,46 @@ host pool, and selected substrate's connection/allocation settings are frozen;
 append names mismatched fields. Start and resume use saved settings, not the
 current `env.sh`. Kubernetes credentials remain those of the current client.
 Its durable control directory is chosen from the union of all group test roots.
+
+### Workload override files
+
+`--env-override <file>` lets each submission, `--batch`, or `--append` vary
+its workload without editing `env.sh`, so a script can build a large batch from
+a set of named files:
+
+```bash
+# overrides/small-io-qd16.env
+ELBENCHO_SCALE_IO_SIZES=("r4K" "r16K")
+ELBENCHO_IODEPTH_LIST=(16)
+ELBENCHO_SCALE_THREAD_LIST+=(512)   # relative to env.sh
+```
+
+```bash
+BATCH=$(./storage-tests/fs/nv-elbencho-sweep.sh --batch --nodes 1-8 \
+    --env-override overrides/small-io-qd16.env |
+    sed -n 's/^STORAGE_SCALE_TEST_BATCH_RESULTS=//p')
+for override in overrides/large-seq-*.env; do
+    ./storage-tests/fs/nv-elbencho-sweep.sh --append "$BATCH" \
+        --env-override "$override" --nodes 1,8 || exit 1
+done
+./storage-tests/fs/nv-elbencho-sweep.sh --start "$BATCH"
+```
+
+The file is Bash, sourced after `env.sh`; its values win, and an `unset`
+setting gets its normal default. Only filesystem workload settings may change:
+`TEST_DIRS`, `FS_MAX_*`, `MDTEST_{BRANCH_FACTOR,ITEMS_PER_DIR,ITERATIONS}`, and
+the `ELBENCHO_*` sweep lists, file-layout, duration, live-CSV, and single-file
+settings from `env.sh.template`. Changing any other variable (substrate,
+connection, Slurm, or misspelled names) is an error. Lowercase helper variables
+that `env.sh` does not define, such as loop counters, are discarded. Settings
+that do not apply to a launcher are ignored, so IO and metadata groups can
+share a file.
+
+Use one file per invocation. Values are saved with the run or group, along with
+the file's path and SHA-256 (`env_override` in `env_used.yaml`).
+`--start`, `--resume`, `--status`, `--cancel`, `--collect`, and reporting use
+the saved values; later edits to the file or `env.sh` have no effect, and these
+commands reject `--env-override`. `--delete-only` also rejects it.
 
 ## Filesystem reporting
 

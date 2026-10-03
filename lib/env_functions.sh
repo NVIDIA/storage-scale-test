@@ -1340,6 +1340,300 @@ print_elbencho_sweep_compact_summary() {
     return 0
 }
 
+# =============================================================================
+# Filesystem workload defaults and --env-override files
+# =============================================================================
+
+# Print the filesystem workload settings an --env-override file may change,
+# one "<name>\t<kind>" row each (kind: assoc, array, or scalar). Every name is
+# defaulted by apply_filesystem_workload_defaults and recorded in the IO sweep
+# env_used.sh, so an overridden value survives every later re-source of env.sh
+# (Slurm coordinators, --resume). Substrate and transport settings are
+# deliberately excluded: they are frozen per batch and re-read on compute nodes.
+filesystem_env_override_names() {
+    printf '%s\tassoc\n' TEST_DIRS
+    printf '%s\tarray\n' ELBENCHO_SCALE_THREAD_LIST ELBENCHO_SCALE_IO_SIZES \
+        ELBENCHO_IODEPTH_LIST
+    printf '%s\tscalar\n' FS_MAX_AGG_THROUGHPUT FS_MAX_NODE_THROUGHPUT_GBPS \
+        FS_MAX_NODE_IOPS MDTEST_BRANCH_FACTOR MDTEST_ITEMS_PER_DIR \
+        MDTEST_ITERATIONS ELBENCHO_FILE_SIZE_MULTIPLIER ELBENCHO_FILE_LAYOUT \
+        ELBENCHO_FILES_PER_NODE ELBENCHO_FILE_SIZE \
+        ELBENCHO_SCALE_READ_WRITE_DURATION ELBENCHO_READ_AFTER_WRITE_PAUSE \
+        ELBENCHO_LIVE_CSV_EXTENDED ELBENCHO_LIVEINT ELBENCHO_SINGLE_BIG_FILE \
+        ELBENCHO_SINGLE_BIG_FILE_BASENAME ELBENCHO_SINGLE_BIG_FILE_SIZE \
+        ELBENCHO_ALL_NODES_ACCESS_ALL_DATA
+}
+
+# Recompute FS_ENABLED from TEST_DIRS ("" if not enabled, "1" if it is).
+filesystem_enabled_from_test_dirs() {
+    local dir
+    export FS_ENABLED=""
+    for dir in "${!TEST_DIRS[@]}"; do
+        if [ -n "$dir" ]; then
+            export FS_ENABLED="1"
+            break
+        fi
+    done
+}
+
+# Fill in defaults for unset filesystem workload settings. Only defaults are
+# applied, so this is idempotent: env_base.sh calls it once after env.sh, and an
+# --env-override file is followed by a second call that restores the default
+# for anything the override unset (exactly as if it had been unset in env.sh).
+apply_filesystem_workload_defaults() {
+    # Default values for FS_MAX_* estimates
+    # If IOR_FS_MAX_AGG_THROUGHPUT is defined, use it as the default for FS_MAX_AGG_THROUGHPUT
+    if [ -n "${IOR_FS_MAX_AGG_THROUGHPUT+x}" ]; then
+        export FS_MAX_AGG_THROUGHPUT=${FS_MAX_AGG_THROUGHPUT:-$IOR_FS_MAX_AGG_THROUGHPUT}   # Units are GB/s
+    else
+        export FS_MAX_AGG_THROUGHPUT=${FS_MAX_AGG_THROUGHPUT:-10}   # Units are GB/s
+    fi
+    export FS_MAX_NODE_THROUGHPUT_GBPS=${FS_MAX_NODE_THROUGHPUT_GBPS:-40}  # Units are Gbps
+    export FS_MAX_NODE_IOPS=${FS_MAX_NODE_IOPS:-10000}
+
+    # Set some defaults in case old env.sh files don't get updated in-place when
+    # new code comes in that defines new vars (merely a convenience)
+    export MDTEST_BRANCH_FACTOR=${MDTEST_BRANCH_FACTOR:-7}
+    export MDTEST_ITEMS_PER_DIR=${MDTEST_ITEMS_PER_DIR:-100}
+    export MDTEST_ITERATIONS=${MDTEST_ITERATIONS:-3}
+    #
+    # Set defaults for ELBENCHO settings
+    declare -p ELBENCHO_SCALE_THREAD_LIST &>/dev/null || \
+        export ELBENCHO_SCALE_THREAD_LIST=("1" "2" "4" "8" "16" "32" "64" "128" "256")
+    declare -p ELBENCHO_SCALE_IO_SIZES &>/dev/null || \
+        export ELBENCHO_SCALE_IO_SIZES=("4K" "16K" "64K" "1M" "1M,4K")
+    if ! declare -p ELBENCHO_IODEPTH_LIST &>/dev/null || \
+       [[ "${#ELBENCHO_IODEPTH_LIST[@]}" -eq 0 ]] || \
+       [[ -z "${ELBENCHO_IODEPTH_LIST[0]}" ]]; then
+        export ELBENCHO_IODEPTH_LIST=("1")  # default is to only always use 1
+    fi
+    export ELBENCHO_SCALE_READ_WRITE_DURATION=${ELBENCHO_SCALE_READ_WRITE_DURATION:-30}
+    export ELBENCHO_READ_AFTER_WRITE_PAUSE=${ELBENCHO_READ_AFTER_WRITE_PAUSE:-0}
+    export ELBENCHO_FILE_SIZE_MULTIPLIER=${ELBENCHO_FILE_SIZE_MULTIPLIER:-1024}
+    # Generated many-file layout and bounded-workload controls. Empty count/size
+    # values preserve the historical worker-directory workload.
+    # Snapshot restore helpers assign these names in isolated subshells; the
+    # parent-shell defaults here remain intentional.
+    # shellcheck disable=SC2031
+    export ELBENCHO_FILE_LAYOUT=${ELBENCHO_FILE_LAYOUT:-worker-directories} \
+        ELBENCHO_FILES_PER_NODE=${ELBENCHO_FILES_PER_NODE:-} \
+        ELBENCHO_FILE_SIZE=${ELBENCHO_FILE_SIZE:-}
+    # Single shared large file (elbencho file path mode); sequential I/O only (mutually exclusive with random)
+    export ELBENCHO_SINGLE_BIG_FILE=${ELBENCHO_SINGLE_BIG_FILE:-0}
+    export ELBENCHO_SINGLE_BIG_FILE_BASENAME=${ELBENCHO_SINGLE_BIG_FILE_BASENAME:-elbencho-bigfile}
+    # When ELBENCHO_SINGLE_BIG_FILE=1: required for write/read-after-write; optional for nv-elbencho-sweep --read-from (read omits -s)
+    export ELBENCHO_SINGLE_BIG_FILE_SIZE=${ELBENCHO_SINGLE_BIG_FILE_SIZE:-}
+    # When 1, maps to elbencho --nosvcshare (each service touches full file)
+    export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=${ELBENCHO_ALL_NODES_ACCESS_ALL_DATA:-0}
+}
+
+# Clear the provenance recorded in env_used snapshots. Launchers call this on
+# every new submission so a value inherited from a caller is never recorded.
+reset_env_override_provenance() {
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE=""
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256=""
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES=""
+}
+
+# Print the absolute path of an --env-override file, relative to the current
+# directory. Symlinks are accepted; the target must be a readable regular file.
+resolve_env_override_file() {
+    local path="$1" dir
+    if [[ -z "$path" ]]; then
+        echo "Error: --env-override requires a file argument" >&2
+        return 1
+    fi
+    if [[ ! -e "$path" ]]; then
+        echo "Error: env override file not found: $path" >&2
+        return 1
+    fi
+    if [[ ! -f "$path" || ! -r "$path" ]]; then
+        echo "Error: env override file is not a readable regular file: $path" >&2
+        return 1
+    fi
+    dir=$(cd "$(dirname -- "$path")" && pwd) || return 1
+    printf '%s/%s\n' "$dir" "$(basename -- "$path")"
+}
+
+# Child-shell program for filesystem_env_override_declarations. It restores the
+# caller's allowed settings, sources the override at top level (so `declare`
+# stays global), and prints declarations for the allowed names it changed.
+# shellcheck disable=SC2016  # Expanded by the child shell.
+_FILESYSTEM_ENV_OVERRIDE_LOADER='
+__ssto_file=$1
+__ssto_label=$2
+shift 2
+declare -A __ssto_kind=() __ssto_known=() __ssto_before=() __ssto_seen=()
+while [[ $# -ge 2 ]]; do
+    __ssto_kind[$1]=$2
+    shift 2
+done
+for __ssto_name in $__SSTO_KNOWN; do
+    __ssto_known[$__ssto_name]=1
+done
+eval "$__SSTO_BASELINE" || exit 1
+unset __SSTO_KNOWN __SSTO_BASELINE
+__ssto_ignored() {
+    case $1 in
+        __ssto_*|__SSTO_*|BASH*|_|RANDOM|SRANDOM|LINENO|SECONDS|EPOCHREALTIME \
+            |EPOCHSECONDS|PIPESTATUS|FUNCNAME|GROUPS|HISTCMD|OPTIND|OPTARG|OPTERR \
+            |SHELLOPTS|PWD|OLDPWD|REPLY|MAPFILE|COLUMNS|LINES|COMP_*) return 0 ;;
+    esac
+    return 1
+}
+for __ssto_name in $(compgen -A variable); do
+    __ssto_ignored "$__ssto_name" \
+        || __ssto_before[$__ssto_name]=$(declare -p "$__ssto_name" 2>/dev/null)
+done
+source "$__ssto_file" >&2 || {
+    printf "Error: env override file returned status %s: %s\n" "$?" "$__ssto_label" >&2
+    exit 1
+}
+__ssto_changed=() __ssto_rejected=() __ssto_invalid=()
+for __ssto_name in $(compgen -A variable) "${!__ssto_before[@]}"; do
+    [[ -z ${__ssto_seen[$__ssto_name]:-} ]] || continue
+    __ssto_seen[$__ssto_name]=1
+    ! __ssto_ignored "$__ssto_name" || continue
+    __ssto_now=$(declare -p "$__ssto_name" 2>/dev/null)
+    [[ "$__ssto_now" != "${__ssto_before[$__ssto_name]:-}" ]] || continue
+    if [[ -n ${__ssto_kind[$__ssto_name]:-} ]]; then
+        __ssto_changed+=("$__ssto_name")
+    elif [[ -z ${__ssto_known[$__ssto_name]:-} && -z ${__ssto_before[$__ssto_name]+x} \
+            && $__ssto_name =~ ^[a-z][a-z0-9_]*$ ]]; then
+        continue  # New lowercase helper variable, e.g. a loop counter: discarded.
+    else
+        __ssto_rejected+=("$__ssto_name")
+    fi
+done
+for __ssto_name in "${__ssto_changed[@]}"; do
+    __ssto_now=$(declare -p "$__ssto_name" 2>/dev/null) || continue
+    __ssto_flags=${__ssto_now#declare -}
+    __ssto_flags=${__ssto_flags%% *}
+    case ${__ssto_kind[$__ssto_name]} in
+        assoc)
+            [[ $__ssto_flags == *A* ]] \
+                || __ssto_invalid+=("$__ssto_name must be an associative array, e.g. $__ssto_name=([\"/path\"]=1)") ;;
+        array)
+            if [[ $__ssto_flags != *a* ]]; then
+                __ssto_invalid+=("$__ssto_name must be an indexed array, e.g. $__ssto_name=(\"a\" \"b\")")
+            else
+                declare -n __ssto_ref=$__ssto_name
+                for __ssto_value in "${__ssto_ref[@]}"; do
+                    if [[ $__ssto_value =~ [[:space:]] ]]; then
+                        __ssto_invalid+=("$__ssto_name element \"$__ssto_value\" contains whitespace; use one array element per value")
+                        break
+                    fi
+                done
+                unset -n __ssto_ref
+            fi ;;
+        scalar)
+            [[ $__ssto_flags != *[aA]* ]] \
+                || __ssto_invalid+=("$__ssto_name must be a scalar, not an array") ;;
+    esac
+done
+if [[ ${#__ssto_rejected[@]} -gt 0 ]]; then
+    printf "Error: env override file %s changes unsupported variable(s): %s\n" \
+        "$__ssto_label" "${__ssto_rejected[*]}" >&2
+    for __ssto_name in "${__ssto_rejected[@]}"; do
+        case $__ssto_name in
+            TEST_DIR) printf "  Use TEST_DIRS (an associative array) instead of TEST_DIR.\n" >&2 ;;
+        esac
+    done
+    printf "  Only filesystem workload settings may be overridden: %s\n" \
+        "$(printf "%s\n" "${!__ssto_kind[@]}" | LC_ALL=C sort | tr "\n" " ")" >&2
+    printf "  Substrate, transport, and path settings belong in env.sh.\n" >&2
+    printf "  Lowercase helper variables that env.sh does not define are allowed and discarded.\n" >&2
+    exit 1
+fi
+if [[ ${#__ssto_invalid[@]} -gt 0 ]]; then
+    for __ssto_value in "${__ssto_invalid[@]}"; do
+        printf "Error: env override file %s: %s\n" "$__ssto_label" "$__ssto_value" >&2
+    done
+    exit 1
+fi
+mapfile -t __ssto_changed < <(printf "%s\n" "${__ssto_changed[@]}" | LC_ALL=C sort | sed "/^$/d")
+for __ssto_name in "${__ssto_changed[@]}"; do
+    printf "unset -v %s\n" "$__ssto_name"
+    declare -p "$__ssto_name" 2>/dev/null || :
+done
+printf "STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES=%q\n" "${__ssto_changed[*]}"
+printf ": env-override-complete\n"
+'
+
+# Evaluate an --env-override file and print declarations for the caller to
+# eval in its own scope, so overrides land beside env.sh's values whether
+# env.sh was sourced at top level (launchers) or in a function (batch prepare).
+# The file runs in an isolated child shell seeded with the caller's current
+# allowed settings, so relative edits such as LIST+=(x) work. Changing any
+# other existing or uppercase variable is an error. The printed text ends by
+# re-applying workload defaults, which gives unset names their usual default.
+#
+# Usage: declarations=$(filesystem_env_override_declarations <file> [label]) || exit 1
+#        eval "$declarations"
+# <label> is the path recorded as provenance (defaults to <file>).
+filesystem_env_override_declarations() {
+    local file="$1" label="${2:-$1}" baseline="" name kind digest output
+    local -a kinds=()
+    while IFS=$'\t' read -r name kind; do
+        kinds+=("$name" "$kind")
+        baseline+="$(_elbencho_batch_emit_variable "$name")"$'\n'
+    done < <(filesystem_env_override_names)
+    digest=$(_elbencho_batch_sha256 "$file") || return 1
+    if ! output=$(__SSTO_BASELINE="$baseline" \
+            __SSTO_KNOWN="$(compgen -A variable | tr '\n' ' ')" \
+            env -u BASH_ENV -u ENV "$BASH" --noprofile --norc \
+            -c "$_FILESYSTEM_ENV_OVERRIDE_LOADER" env-override "$file" "$label" \
+            "${kinds[@]}"); then
+        printf 'Error: invalid env override file: %s\n' "$label" >&2
+        return 1
+    fi
+    if [[ "$output" != *": env-override-complete" ]]; then
+        printf 'Error: env override file exited early (remove any exit command): %s\n' \
+            "$label" >&2
+        return 1
+    fi
+    printf '%s\n' "$output"
+    printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE=%q\n' "$label"
+    printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256=%q\n' "$digest"
+    printf 'apply_filesystem_workload_defaults\n'
+    printf 'filesystem_enabled_from_test_dirs\n'
+}
+
+# Print the override applied to this submission, if any.
+print_env_override_summary() {
+    [[ -n "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE:-}" ]] || return 0
+    printf 'Env override: %s (sha256 %s): %s\n' \
+        "$STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE" \
+        "$STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256" \
+        "${STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES:-no settings changed}"
+}
+
+# Emit env_used.sh provenance. Always written, empty without an override, so
+# sourcing one group's snapshot after another's cannot inherit its provenance.
+_emit_env_override_provenance_sh() {
+    printf '# --env-override provenance (empty when none was used).\n'
+    printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE=%q\n' \
+        "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE:-}"
+    printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256=%q\n' \
+        "${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256:-}"
+    printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES=%q\n' \
+        "${STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES:-}"
+}
+
+# Emit env_used.yaml provenance: a mapping, or null without an override.
+_emit_env_override_provenance_yaml() {
+    if [[ -z "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE:-}" ]]; then
+        printf 'env_override: null\n'
+        return 0
+    fi
+    local -a variables=()
+    read -r -a variables <<< "${STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES:-}"
+    printf 'env_override:\n'
+    printf '  file: %s\n' "$(yaml_double_quote "$STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE")"
+    printf '  sha256: "%s"\n' "${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256:-}"
+    printf '  variables: [%s]\n' "$(_yaml_flow_seq "${variables[@]}")"
+}
+
 # Format bash array elements as a YAML flow sequence body: "v1", "v2", ...
 # Usage: _yaml_flow_seq "${arr[@]}"
 _yaml_flow_seq() {
@@ -1499,6 +1793,8 @@ write_elbencho_env_used() {
         printf 'sweep_write_no_read: %s\n' "$sweep_write_no_read"
         printf 'sweep_read_from: "%s"\n' "$sweep_read_from"
         printf 'nodes_spec: "%s"\n' "$nodes_spec"
+        printf '\n'
+        _emit_env_override_provenance_yaml
         printf '\ntreefile_cache:\n'
         printf '  path: "%s"\n' "$cache_path"
         _elbencho_env_used_emit_treefile_cache_yaml "$records_dir"
@@ -1626,6 +1922,8 @@ _write_elbencho_env_used_sh() {
         printf 'export ELBENCHO_SINGLE_BIG_FILE_BASENAME=%q\n' "$ELBENCHO_SINGLE_BIG_FILE_BASENAME"
         printf 'export ELBENCHO_SINGLE_BIG_FILE_SIZE=%q\n' "${ELBENCHO_SINGLE_BIG_FILE_SIZE:-}"
         printf 'export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=%q\n\n' "$ELBENCHO_ALL_NODES_ACCESS_ALL_DATA"
+        _emit_env_override_provenance_sh
+        printf '\n'
 
         printf '# Original CLI flag values (resume reconstructs sweep behavior from these).\n'
         printf '# Names match the local variables used in nv-elbencho-sweep.sh.\n'
@@ -1655,6 +1953,8 @@ update_elbencho_env_used_treefile_cache_usage() {
         ELBENCHO_FILES_PER_NODE=
         ELBENCHO_FILE_SIZE=
         export ELBENCHO_FILE_LAYOUT ELBENCHO_FILES_PER_NODE ELBENCHO_FILE_SIZE
+        # Snapshots older than --env-override carry no provenance.
+        reset_env_override_provenance
         # shellcheck disable=SC1090
         source "$snapshot_sh" || exit 1
         write_elbencho_env_used "${tmp_dir}/env_used.yaml" \
@@ -1786,6 +2086,8 @@ write_mdtest_elbencho_env_used() {
 
         printf '\nnodes_spec: "%s"\n' "$nodes_spec"
         printf 'tasks_spec: "%s"\n' "$tasks_spec"
+        printf '\n'
+        _emit_env_override_provenance_yaml
     } > "$out_file"
     _write_mdtest_elbencho_env_used_sh "${out_file%.yaml}.sh" \
         "$nodes_spec" "$tasks_spec" "$single_dir_target_files" \
@@ -1841,6 +2143,7 @@ _write_mdtest_elbencho_env_used_sh() {
         printf 'export MDTEST_SINGLE_DIR_FILES_PER_WORKER=%q\n' "$files_per_worker"
         printf 'export nodes_spec=%q\n' "$nodes_spec"
         printf 'export tasks_spec=%q\n' "$tasks_spec"
+        _emit_env_override_provenance_sh
     } > "$sh_path" || return 1
 }
 

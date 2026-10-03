@@ -190,8 +190,14 @@ def test_mixed_batch_prepares_changed_groups_with_repeated_coordinates():
     assert metadata.arguments[0] == repeated.arguments[0] == "--append"
     assert [step.executions[0].coordinate.nodes for step in scenario.steps] == [1, 2, 1]
     assert first.executions[0].coordinate == repeated.executions[0].coordinate
-    assert first.env_lines != repeated.env_lines
-    assert "{test_root_secondary}" in "\n".join(metadata.env_lines)
+    # env.sh never changes; appended groups differ only through override files.
+    assert first.env_lines == metadata.env_lines == repeated.env_lines
+    for step in (metadata, repeated):
+        override = step.arguments[step.arguments.index("--env-override") + 1]
+        assert not override.startswith("/")
+        assert [item.relative_path for item in step.support_files] == [override]
+    assert "{test_root_secondary}" in metadata.support_files[0].content
+    assert 'ELBENCHO_FILE_SIZE="8M"' in repeated.support_files[0].content
     assert metadata.failure_injection is FailureInjection.FAIL_AFTER_WRITE_ONCE
     assert metadata.executions[0].status is ExecutionStatus.FAILED
 
