@@ -506,7 +506,8 @@ if [[ "$SWEEP_OPERATION" == submit ]]; then
             env_override_label="${ELBENCHO_BATCH_ENV_OVERRIDE_ORIGIN:-$env_override_file}"
         fi
         env_override_declarations=$(filesystem_env_override_declarations \
-            "$env_override_file" "$env_override_label") || exit 1
+            "$env_override_file" "$env_override_label" \
+            "${ELBENCHO_BATCH_PREPARE_DIR:+$ELBENCHO_BATCH_PREPARE_DIR/.env-override-declarations.sh}") || exit 1
         eval "$env_override_declarations"
     fi
 fi

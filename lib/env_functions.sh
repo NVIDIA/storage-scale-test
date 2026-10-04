@@ -1568,10 +1568,15 @@ printf ": env-override-complete\n"
 # other existing or uppercase variable is an error. The printed text ends by
 # re-applying workload defaults, which gives unset names their usual default.
 #
-# Usage: declarations=$(filesystem_env_override_declarations <file> [label]) || exit 1
+# Usage: declarations=$(filesystem_env_override_declarations <file> [label] [save]) || exit 1
 #        eval "$declarations"
 # <label> is the path recorded as provenance (defaults to <file>).
+# <save> optionally saves the validated declarations for batch preparation.
 filesystem_env_override_declarations() {
+    # Capture caller names before adding implementation locals. Lowercase
+    # scratch variables must not collide with the loader's own bookkeeping.
+    local __ssto_known
+    __ssto_known=$(compgen -A variable | tr '\n' ' ')
     local file="$1" label="${2:-$1}" baseline="" name kind digest output
     local -a kinds=()
     while IFS=$'\t' read -r name kind; do
@@ -1580,7 +1585,7 @@ filesystem_env_override_declarations() {
     done < <(filesystem_env_override_names)
     digest=$(_elbencho_batch_sha256 "$file") || return 1
     if ! output=$(__SSTO_BASELINE="$baseline" \
-            __SSTO_KNOWN="$(compgen -A variable | tr '\n' ' ')" \
+            __SSTO_KNOWN="$__ssto_known" \
             env -u BASH_ENV -u ENV "$BASH" --noprofile --norc \
             -c "$_FILESYSTEM_ENV_OVERRIDE_LOADER" env-override "$file" "$label" \
             "${kinds[@]}"); then
@@ -1592,11 +1597,16 @@ filesystem_env_override_declarations() {
             "$label" >&2
         return 1
     fi
+    output+=$'\n'"$(
+        printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE=%q\n' "$label"
+        printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256=%q\n' "$digest"
+        printf 'apply_filesystem_workload_defaults\n'
+        printf 'filesystem_enabled_from_test_dirs\n'
+    )"
+    if [[ -n "${3:-}" ]]; then
+        printf '%s\n' "$output" > "$3" || return 1
+    fi
     printf '%s\n' "$output"
-    printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE=%q\n' "$label"
-    printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256=%q\n' "$digest"
-    printf 'apply_filesystem_workload_defaults\n'
-    printf 'filesystem_enabled_from_test_dirs\n'
 }
 
 # Print the override applied to this submission, if any.

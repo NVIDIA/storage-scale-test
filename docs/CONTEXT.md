@@ -230,7 +230,12 @@ declarations that the caller `eval`s in its own scope, followed by
   outside the snapshot cannot be overridden safely.
 - Batch prepare applies the override in its own shell too, because the group
   snapshot also captures that shell's `ELBENCHO_*`/`MDTEST_*`/`FS_MAX_*` values.
-  It stages one copy of the file so both shells read identical content.
+  The launcher evaluates the staged file once; prepare reuses its validated
+  declarations so relative edits and side effects are not repeated.
+- Override read context intentionally includes only allowlisted workload
+  variables and exported environment values. Nonexported site helpers are
+  unsupported; expanding this context to emulate parent-shell sourcing is
+  outside the feature's intended scope.
 - `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}` provenance is
   always written to `env_used.sh` (empty without an override) so treefile-cache
   YAML rewrites keep it and sequentially sourced groups cannot inherit it.

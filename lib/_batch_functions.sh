@@ -415,16 +415,14 @@ _elbencho_batch_prepare() (
     trap 'rm -r "$stage"' EXIT
     local -a launcher_args=("$@")
     _elbencho_batch_stage_env_override "$stage" launcher_args || exit 1
-    if [[ -n "${ELBENCHO_BATCH_ENV_OVERRIDE_ORIGIN:-}" ]]; then
-        # The group snapshot also captures this shell's workload settings, so
-        # apply the same staged override here as the launcher does.
-        local override_declarations
-        override_declarations=$(filesystem_env_override_declarations \
-            "$stage/.env-override.sh" "$ELBENCHO_BATCH_ENV_OVERRIDE_ORIGIN") || exit 1
-        eval "$override_declarations"
-    fi
     ELBENCHO_BATCH_PREPARE_DIR="$stage" ELBENCHO_BATCH_DATESTAMP="$ds" \
         "$BASH" "$launcher" "${launcher_args[@]}" || exit 1
+    if [[ -n "${ELBENCHO_BATCH_ENV_OVERRIDE_ORIGIN:-}" ]]; then
+        # Reuse the launcher's evaluated values; sourcing the original override
+        # here would repeat relative edits and any other evaluation side effects.
+        # shellcheck disable=SC1091
+        source "$stage/.env-override-declarations.sh" || exit 1
+    fi
     _elbencho_batch_validate_candidate "$stage" || exit 1
     _elbencho_batch_complete_group_snapshot "$stage" || exit 1
     _elbencho_batch_write_profile "$stage/common-fields.tsv" || exit 1
@@ -448,8 +446,8 @@ _elbencho_batch_prepare() (
 )
 
 # Copy a group's --env-override file into its staging directory exactly once
-# and point the launcher arguments at that copy, so the prepare shell and the
-# launcher read identical content even if the operator's file changes meanwhile.
+# and point the launcher arguments at that copy. The launcher evaluates it once
+# and returns declarations for the prepare shell's complete group snapshot.
 # Exports ELBENCHO_BATCH_ENV_OVERRIDE_ORIGIN (the operator's path) when present.
 _elbencho_batch_stage_env_override() {
     local stage="$1" index="" position origin

@@ -385,14 +385,26 @@ def test_validation_rejects_unbounded_timeout():
         validate_scenario_specs((broken,))
 
 
-def _file_size(step):
-    sizes = [
+def _file_size_assignments(lines):
+    return [
         line.split("=", 1)[1].strip('"')
-        for line in step.env_lines
+        for line in lines
         if line.startswith(("export ELBENCHO_FILE_SIZE=", "ELBENCHO_FILE_SIZE="))
     ]
+
+
+def _file_size(step):
+    """The effective file size: env.sh, then the step's --env-override file."""
+    sizes = _file_size_assignments(step.env_lines)
     assert len(sizes) == 1, step.env_lines
-    return sizes[0]
+    arguments = list(step.arguments)
+    if "--env-override" in arguments:
+        path = arguments[arguments.index("--env-override") + 1]
+        (override,) = [
+            item for item in step.support_files if item.relative_path == path
+        ]
+        sizes += _file_size_assignments(override.content.splitlines())
+    return sizes[-1]
 
 
 def test_structural_direct_io_scenarios_use_small_multi_block_files():

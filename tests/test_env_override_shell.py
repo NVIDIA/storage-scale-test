@@ -23,12 +23,13 @@ import importlib.util
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 
 import pytest
 import yaml
+
+from tests.filesystem_checkout_test_support import make_filesystem_checkout
 
 ROOT = Path(__file__).resolve().parents[1]
 IO = "nv-elbencho-sweep.sh"
@@ -36,40 +37,18 @@ MD = "nv-mdtest-elbencho.sh"
 OVERRIDE_FLAG = "--env-override"
 PROVENANCE = "STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE"
 SAVED_ONLY = "existing results always use their saved env_used.sh"
+MDTEST_ITEMS_SETTING = "MDTEST_ITEMS_PER_DIR"
 
 
 @pytest.fixture(name="checkout")
 def checkout_fixture(tmp_path):
     """Real launchers/libraries with a bounded, completely local environment."""
-    base = tmp_path / "checkout's space"
-    base.mkdir()
-    shutil.copytree(ROOT / "lib", base / "lib")
-    shutil.copytree(ROOT / "storage-tests/fs", base / "storage-tests/fs")
-    (base / "utils").mkdir()
-    (base / "utils/elbencho").write_text("#!/usr/bin/env bash\nexit 0\n")
-    (base / "utils/elbencho").chmod(0o755)
-    (base / "hosts").write_text("first,second\n")
+    base = make_filesystem_checkout(tmp_path, ROOT)
     # Unreachable hosts stop a direct submission right after reification.
     (base / "shim").mkdir()
     for tool in ("ssh", "scp"):
         (base / "shim" / tool).write_text("#!/bin/sh\nexit 255\n")
         (base / "shim" / tool).chmod(0o755)
-    text = (ROOT / "env.sh.template").read_text()
-    overrides = f"""
-export EXECUTION_SUBSTRATE=ssh
-export SSH_HOST_LIST={shlex.quote(str(base / 'hosts'))}
-export SSH_USER=tester
-export RESULTS_DIR={shlex.quote(str(base / 'results'))}
-export LOGS_DIR={shlex.quote(str(base / 'logs'))}
-TEST_DIRS=(["/data/one"]=1)
-export ELBENCHO_SCALE_THREAD_LIST=(1)
-export ELBENCHO_SCALE_IO_SIZES=(4K)
-export ELBENCHO_IODEPTH_LIST=(1)
-export MDTEST_BRANCH_FACTOR=1 MDTEST_ITEMS_PER_DIR=2 MDTEST_ITERATIONS=1
-"""
-    (base / "env.sh").write_text(
-        text.replace("# STORAGE_SCALE_TEST_INTEGRATION_OVERRIDES", overrides)
-    )
     (base / "overrides").mkdir()
     return base
 
@@ -159,7 +138,9 @@ def test_relative_edits_types_and_scratch_variables_are_applied(checkout):
     assert result.returncode == 0, result.stderr
     assert '([0]="1" [1]="2" [2]="4")' in result.stdout
     assert '([0]="1M" [1]="1M,4K")' in result.stdout
-    test_dirs = next(line for line in result.stdout.splitlines() if "TEST_DIRS=" in line)
+    test_dirs = next(
+        line for line in result.stdout.splitlines() if "TEST_DIRS=" in line
+    )
     assert "/data/two" in test_dirs and "/data/one" not in test_dirs
     assert "noisy output" in result.stderr
     assert (
@@ -207,6 +188,90 @@ def test_function_scope_eval_replaces_function_local_test_dirs(checkout):
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "/data/two FS_ENABLED=1"
+
+
+@pytest.mark.parametrize(
+    "helper",
+    ["name", "file", "kind", "baseline", "digest", "output", "kinds", "stage", "root"],
+)
+@pytest.mark.parametrize("entry", [IO, MD])
+def test_scratch_names_do_not_collide_with_implementation_locals(
+    checkout, helper, entry
+):
+    override = write_override(
+        checkout,
+        "helper.env",
+        f"for {helper} in 4; do MDTEST_ITEMS_PER_DIR=${helper}; done\n",
+    )
+    applied = apply_and_print(checkout, override, (MDTEST_ITEMS_SETTING,))
+    assert applied.returncode == 0, applied.stderr
+    assert 'MDTEST_ITEMS_PER_DIR="4"' in applied.stdout
+    assert "VARIABLES=MDTEST_ITEMS_PER_DIR" in applied.stdout
+    args = ("--nodes", "1") if entry == IO else ("--nodes", "1", "--tasks", "1")
+    prepared = launch(checkout, entry, "--batch", OVERRIDE_FLAG, override, *args)
+    assert prepared.returncode == 0, prepared.stderr
+
+
+@pytest.mark.parametrize("helper", ["name", "file", "kind"])
+def test_existing_site_variables_remain_protected(checkout, helper):
+    env_file = checkout / "env.sh"
+    env_file.write_text(env_file.read_text() + f"\n{helper}=site-value\n")
+    override = write_override(checkout, "protected.env", f"{helper}=changed\n")
+    result = apply_and_print(checkout, override, (MDTEST_ITEMS_SETTING,))
+    assert result.returncode != 0
+    assert f"unsupported variable(s): {helper}" in result.stderr
+
+
+@pytest.mark.parametrize("entry", [IO, MD])
+def test_batch_and_append_evaluate_relative_overrides_once(checkout, entry):
+    # Older env.sh files leave duration to env_base.sh's exported default.
+    env_file = checkout / "env.sh"
+    env_file.write_text(
+        env_file.read_text().replace("export ELBENCHO_SCALE_READ_WRITE_DURATION=60", "")
+    )
+    counter = checkout / "evaluations"
+    override = write_override(
+        checkout,
+        "relative.env",
+        f"printf 'evaluated\\n' >> {shlex.quote(str(counter))}\n"
+        "ELBENCHO_SCALE_READ_WRITE_DURATION=$((ELBENCHO_SCALE_READ_WRITE_DURATION + 1))\n"
+        "ELBENCHO_SCALE_THREAD_LIST+=(2)\n"
+        "MDTEST_ITERATIONS=$((MDTEST_ITERATIONS + 1))\n",
+    )
+    args = ("--nodes", "1") if entry == IO else ("--nodes", "1", "--tasks", "1")
+    created = launch(checkout, entry, "--batch", OVERRIDE_FLAG, override, *args)
+    assert created.returncode == 0, created.stderr
+    batch = batch_root(created.stdout)
+    assert counter.read_text().splitlines() == ["evaluated"]
+    appended = launch(
+        checkout, entry, "--append", batch, OVERRIDE_FLAG, override, *args
+    )
+    assert appended.returncode == 0, appended.stderr
+    assert counter.read_text().splitlines() == ["evaluated", "evaluated"]
+    # Both shells retain the same evaluated settings, including settings the
+    # launcher's own snapshot omits because they belong to the other workload.
+    result = shell(
+        checkout,
+        f'r={shlex.quote(str(batch))}; elbencho_batch_verify_manifest "$r"; '
+        'for id in $(list_elbencho_execution_ids "$r/executions"); do '
+        '(elbencho_batch_load_execution_context "$r" "$id"; '
+        'echo "$ELBENCHO_SCALE_READ_WRITE_DURATION $MDTEST_ITERATIONS '
+        '${ELBENCHO_SCALE_THREAD_LIST[*]}"); done',
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["31 2 1 2"] * (4 if entry == IO else 2)
+    assert not any(batch.rglob(".env-override-declarations.sh"))
+
+
+def test_override_read_context_intentionally_excludes_unexported_site_helpers(checkout):
+    env_file = checkout / "env.sh"
+    env_file.write_text(env_file.read_text() + "\nsite_count=500\n")
+    override = write_override(
+        checkout, "limited-context.env", "MDTEST_ITEMS_PER_DIR=${site_count:-100}\n"
+    )
+    result = apply_and_print(checkout, override, (MDTEST_ITEMS_SETTING,))
+    assert result.returncode == 0, result.stderr
+    assert 'MDTEST_ITEMS_PER_DIR="100"' in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -274,7 +339,8 @@ def test_batch_groups_each_save_their_own_override(checkout, entry):
     assert (checkout / "env.sh").read_text() == env_before
 
     manifest = [
-        line.split("\t") for line in (batch / "batch-manifest.tsv").read_text().splitlines()
+        line.split("\t")
+        for line in (batch / "batch-manifest.tsv").read_text().splitlines()
     ]
     groups = {row[2]: batch / row[3] for row in manifest if row[0] == "group"}
     for kind, override in (("io", io_override), ("mdtest", md_override)):
@@ -292,7 +358,7 @@ def test_batch_groups_each_save_their_own_override(checkout, entry):
     md_override.write_text("MDTEST_ITEMS_PER_DIR=777\n")
     result = shell(
         checkout,
-        f"r={shlex.quote(str(batch))}; elbencho_batch_verify_manifest \"$r\"; "
+        f'r={shlex.quote(str(batch))}; elbencho_batch_verify_manifest "$r"; '
         '_elbencho_batch_validate_cells "$r"; '
         'for id in $(list_elbencho_execution_ids "$r/executions"); do '
         '(elbencho_batch_load_execution_context "$r" "$id"; '
@@ -315,9 +381,10 @@ def test_direct_submission_saves_values_that_survive_env_sh_reloads(checkout):
     assert "Env override: " in submitted.stdout
     result = next((checkout / "results").glob("elbencho-*"))
     assert '"1M"' in (result / "executions/0001.sh").read_text()
-    assert "ELBENCHO_SCALE_READ_WRITE_DURATION=7" in (
-        result / "executions/0001.sh"
-    ).read_text()
+    assert (
+        "ELBENCHO_SCALE_READ_WRITE_DURATION=7"
+        in (result / "executions/0001.sh").read_text()
+    )
     saved = yaml.safe_load((result / "env_used.yaml").read_text())
     assert saved["env_override"]["variables"] == [
         "ELBENCHO_SCALE_IO_SIZES",
@@ -326,7 +393,7 @@ def test_direct_submission_saves_values_that_survive_env_sh_reloads(checkout):
     # Slurm coordinators and --resume source today's env.sh, then the snapshot.
     reloaded = shell(
         checkout,
-        f'source {shlex.quote(str(result))}/env_used.sh; '
+        f"source {shlex.quote(str(result))}/env_used.sh; "
         'echo "${ELBENCHO_SCALE_IO_SIZES[*]} $ELBENCHO_SCALE_READ_WRITE_DURATION"',
     )
     assert reloaded.stdout.strip() == "1M 7", reloaded.stderr
@@ -345,7 +412,9 @@ def test_direct_submission_saves_values_that_survive_env_sh_reloads(checkout):
 def test_submission_without_override_records_none(checkout):
     launch(checkout, MD, "--nodes", "1", "--tasks", "1")
     result = next((checkout / "results").glob("mdtest-elbencho-*"))
-    assert yaml.safe_load((result / "env_used.yaml").read_text())["env_override"] is None
+    assert (
+        yaml.safe_load((result / "env_used.yaml").read_text())["env_override"] is None
+    )
     assert provenance(result / "env_used.sh") == ""
 
 
@@ -359,7 +428,11 @@ def test_submission_without_override_records_none(checkout):
         (MD, ("--collect", "/missing"), SAVED_ONLY),
         (IO, ("--start", "{batch}"), "rejects workload arguments (--env-override)"),
         (IO, (OVERRIDE_FLAG, "{file}", "--nodes", "1"), "only once"),
-        (MD, ("--batch", OVERRIDE_FLAG, "{file}", "--nodes", "1", "--tasks", "1"), "only once"),
+        (
+            MD,
+            ("--batch", OVERRIDE_FLAG, "{file}", "--nodes", "1", "--tasks", "1"),
+            "only once",
+        ),
         (IO, ("--batch", "--nodes", "1"), "--env-override requires a file argument"),
     ],
 )
@@ -418,11 +491,16 @@ def test_override_names_are_snapshotted_and_cover_every_default():
 
 def _load_integration_driver():
     path = ROOT / "integration-tests/bin/integration-test.py"
-    spec = importlib.util.spec_from_file_location("integration_driver_env_override", path)
+    spec = importlib.util.spec_from_file_location(
+        "integration_driver_env_override", path
+    )
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    return sys.modules["filesystem_integration"], sys.modules["filesystem_scenario_specs"]
+    return (
+        sys.modules["filesystem_integration"],
+        sys.modules["filesystem_scenario_specs"],
+    )
 
 
 def test_mixed_batch_scenario_overrides_prepare_locally(checkout):
