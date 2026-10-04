@@ -222,7 +222,7 @@ def _run_resume_selection_case(tmp_path, current, saved_line):
             {saved_line}
             export dio_or_bio=dio
             export rand_option=0
-            export single_option=0
+            export run_to_completion_option=0
             export sweep_write_only=0
             export sweep_write_no_read=0
             export sweep_read_from=

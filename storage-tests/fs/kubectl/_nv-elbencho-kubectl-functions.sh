@@ -3492,6 +3492,12 @@ kubectl_stream_remote_attempt() {
     local collection_timeout="${KUBECTL_COLLECTION_TIMEOUT_SECONDS:-$KUBECTL_COLLECTION_TIMEOUT_SECONDS_DEFAULT}"
     local backoff="${KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS:-2}"
     [[ "$collection_timeout" =~ ^[1-9][0-9]*$ && "$backoff" =~ ^[0-9]+$ ]] || return 1
+    # Reserve room for another transfer after a hung producer. Only transfers
+    # before the first producer timeout are capped; the following transfer may
+    # use the remaining total deadline so a slow archive is not cut short twice.
+    local attempt_timeout="${KUBECTL_COLLECTION_ATTEMPT_TIMEOUT_SECONDS:-$((collection_timeout / KUBECTL_COLLECTION_STREAM_ATTEMPTS))}"
+    [[ "$attempt_timeout" == 0 ]] && attempt_timeout=1
+    [[ "$attempt_timeout" =~ ^[1-9][0-9]*$ ]] || return 1
     local remote_run error_path
     remote_run=$(kubectl_attempt_remote_root "$attempt_id") || return 1
     local guard_script
@@ -3517,7 +3523,7 @@ kubectl_stream_remote_attempt() {
         [[ ! -e "$hold_file" && ! -L "$hold_file" ]] || return 1
     fi
     local deadline=$((SECONDS + collection_timeout)) remaining attempt delay
-    local reason=TRANSFER_FAILED action diagnostic_path="" producer_output
+    local reason=TRANSFER_FAILED action diagnostic_path="" producer_output attempt_capped=1
     local -a stream_status=()
     for ((attempt = 1; attempt <= KUBECTL_COLLECTION_STREAM_ATTEMPTS; attempt++)); do
         remaining=$((deadline - SECONDS))
@@ -3525,6 +3531,7 @@ kubectl_stream_remote_attempt() {
             reason=TIMEOUT
             break
         fi
+        ((attempt_capped == 0 || remaining <= attempt_timeout)) || remaining=$attempt_timeout
         _kubectl_stream_attempt_once "$namespace" "$pod_name" "$attempt_id" \
             "$archive_path" "$error_path" "$guard_script" "$remote_run" \
             "$remaining" stream_status || stream_status=(1 74)
@@ -3538,6 +3545,7 @@ kubectl_stream_remote_attempt() {
             return 0
         fi
         producer_output=$(cat -- "$error_path") || producer_output=""
+        [[ "${stream_status[0]}" -ne 124 ]] || attempt_capped=0
         reason=TRANSFER_FAILED
         if [[ "${stream_status[1]}" -eq 65 ]]; then
             reason=ARCHIVE_INVALID
@@ -3607,6 +3615,9 @@ kubectl_stream_remote_attempt() {
 # fresh transfer must still pass all publication hashes before any cleanup.
 _kubectl_collection_transfer_is_retryable() {
     local attempt_id="$1" producer_rc="$2" output="$3" line changed_path warnings=0
+    if [[ "$producer_rc" -eq 124 && -z "$output" ]]; then
+        return 0
+    fi
     if _kubectl_collection_failure_is_transient "$output"; then
         return 0
     fi
@@ -4116,21 +4127,76 @@ kubectl_upload_control_bundle() {
         rm -f -- "$archive_path"
         return 1
     fi
-    # shellcheck disable=SC2016  # The quoted script executes in the helper Pod.
-    if ! kubectl_pvc_exec_stdin "$namespace" "$pod_name" /bin/bash -ceu "$guard_script
-            control=\"\$run/control\"
-            [[ -d \"\$control\" && ! -L \"\$control\" ]] || exit 1
-            control_real=\$(realpath -e -- \"\$control\") || exit 1
-            [[ \"\$control_real\" == \"\$run_real/control\" ]] || exit 1
-            if find -P \"\$control\" -type l -print -quit | grep -q .; then
-                exit 1
-            fi
-            exec tar -C \"\$control\" -xf -" \
-            bash "$remote_run" "$attempt_id" < "$archive_path"; then
-        rm -f -- "$archive_path"
-        return 1
-    fi
+    local upload_rc=0
+    _kubectl_upload_control_archive "$namespace" "$pod_name" "$attempt_id" \
+        "$remote_run" "$guard_script" "$archive_path" || upload_rc=$?
     rm -f -- "$archive_path"
+    return "$upload_rc"
+}
+
+_kubectl_upload_control_archive() {
+    local namespace="$1" pod_name="$2" attempt_id="$3" remote_run="$4"
+    local guard_script="$5" archive_path="$6" digest error_path error_fifo error_reader attempt rc output
+    local upload_timeout="${KUBECTL_CONTROL_UPLOAD_TIMEOUT_SECONDS:-120}"
+    [[ "$upload_timeout" =~ ^[1-9][0-9]*$ ]] || return 1
+    digest=$(_kubectl_sha256_file "$archive_path") || return 1
+    error_path=$(mktemp "${TMPDIR:-/tmp}/storage-scale-test-upload-error.XXXXXXXX") || return 1
+    error_fifo="$error_path.fifo"
+    mkfifo -m 600 -- "$error_fifo" || { rm -f -- "$error_path"; return 1; }
+    for attempt in 1 2 3; do
+        rc=0
+        { head -c 8192 > "$error_path"; cat > /dev/null; } < "$error_fifo" &
+        error_reader=$!
+        # Each retry has its own private tree. Only a complete, digest-verified
+        # archive can replace the reserved empty directory. Lost acknowledgement
+        # is reconciled by comparing the already published files, never by
+        # overwriting controls that may have been published by another process.
+        # shellcheck disable=SC2016  # Variables below belong to the helper Pod.
+        KUBECTL_REQUEST_TIMEOUT_SECONDS="$((upload_timeout + 5))" \
+            KUBECTL_PROCESS_TIMEOUT_SECONDS="$((upload_timeout + 5))" \
+            kubectl_pvc_exec_stdin "$namespace" "$pod_name" \
+            timeout --kill-after=2s "${upload_timeout}s" /bin/bash -ceu "$guard_script
+                expected_digest=\"\$3\"
+                control=\"\$run/control\"
+                [[ ! -L \"\$control\" ]] || exit 1
+                temporary=\$(mktemp -d \"\$run/.control-upload.XXXXXXXX\")
+                trap 'rm -rf -- \"\$temporary\"' EXIT
+                cat > \"\$temporary/archive.tar\"
+                actual=\$(sha256sum \"\$temporary/archive.tar\" | cut -d ' ' -f 1)
+                [[ \"\$actual\" == \"\$expected_digest\" ]] || { echo 'upload checksum mismatch' >&2; exit 1; }
+                mkdir \"\$temporary/tree\"
+                tar -C \"\$temporary/tree\" -xf \"\$temporary/archive.tar\"
+                if [[ -d \"\$control\" ]]; then
+                    if find -P \"\$control\" ! -type d ! -type f -print -quit | grep -q .; then exit 1; fi
+                    if [[ -n \$(find \"\$control\" -type f -print -quit) ]]; then
+                        [[ \$(find \"\$control\" -type f | wc -l) == \$(find \"\$temporary/tree\" -type f | wc -l) ]] || { echo 'published control file list differs' >&2; exit 1; }
+                        while IFS= read -r -d '' file; do
+                            relative=\"\${file#\"\$temporary/tree/\"}\"
+                            cmp -s -- \"\$file\" \"\$control/\$relative\" || { echo 'published control content differs' >&2; exit 1; }
+                        done < <(find \"\$temporary/tree\" -type f -print0)
+                        exit 0
+                    fi
+                    # Preparation reserves control/executions as empty directories.
+                    # Remove only empty directories; a concurrent file stops rmdir.
+                    find -P \"\$control\" -depth -type d -exec rmdir -- {} +
+                fi
+                mv -T -- \"\$temporary/tree\" \"\$control\"" \
+                bash "$remote_run" "$attempt_id" "$digest" < "$archive_path" \
+                2> "$error_fifo" || rc=$?
+        wait "$error_reader" || true
+        ((rc != 0)) || { rm -f -- "$error_path" "$error_fifo"; return 0; }
+        output=$(cat "$error_path") || output=""
+        printf 'Control upload %s/3 failed (rc=%s): %s\n' "$attempt" "$rc" "$output" >&2
+        if ((attempt == 3)) \
+                || ! { [[ "$rc" -eq 124 && -z "$output" ]] \
+                    || [[ "$output" == 'command terminated with exit code 124' ]] \
+                    || _kubectl_collection_failure_is_transient "$output"; }; then
+            break
+        fi
+        sleep "$attempt" || break
+    done
+    rm -f -- "$error_path" "$error_fifo"
+    return 1
 }
 
 kubectl_cleanup_journaled_resources() {

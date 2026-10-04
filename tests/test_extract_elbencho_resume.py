@@ -293,7 +293,7 @@ class TestExecutionWorkloadMetadata(unittest.TestCase):
                 delete_state="not_applicable",
             )
             metric = _minimal_metric("READ")
-            metric.sweep_single_option = True
+            metric.sweep_run_to_completion_option = True
 
             apply_execution_workloads(tmp, [metric])
 
@@ -453,7 +453,7 @@ class TestExecutionWorkloadMetadata(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _write_execution_metadata(Path(tmp), "0001")
             metric = _minimal_metric("WRITE")
-            metric.sweep_single_option = True
+            metric.sweep_run_to_completion_option = True
             apply_execution_workloads(tmp, [metric])
             output = io.StringIO()
 

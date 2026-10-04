@@ -90,7 +90,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_platform_functions.sh"
 # output_dir      # full path to output directory (e.g. /path/to/elbencho-20250811Z220605)
 # dio_or_bio      # "dio" or "bio"
 # use_random      # "1" or "0"
-# force_single    # "1" or "0"
+# run_to_completion       # "1" or "0"
 # io_depth        # integer
 # ELBENCHO_SCALE_READ_WRITE_DURATION # string per env.sh e.g. "5s" or "10m"
 # ELBENCHO_FILE_SIZE_MULTIPLIER # integer multiplier for file size (default 1024)
@@ -779,8 +779,12 @@ _elbencho_shared_files_per_worker() {
 _elbencho_validate_workload_pairing() {
     local layout="$1"
     local files_per_node="$2"
-    if [[ -n "$files_per_node" && "$layout" != shared-directory ]]; then
-        echo "Error: ELBENCHO_FILES_PER_NODE requires ELBENCHO_FILE_LAYOUT=shared-directory" >&2
+    case "$layout" in
+        worker-directories|shared-directory) ;;
+        *) echo "Error: invalid ELBENCHO_FILE_LAYOUT: $layout" >&2; return 1 ;;
+    esac
+    if [[ -n "$files_per_node" && "${ELBENCHO_SINGLE_BIG_FILE:-0}" == 1 ]]; then
+        echo "Error: ELBENCHO_FILES_PER_NODE is not applicable to single-shared-file mode" >&2
         return 1
     fi
     if [[ "${ELBENCHO_SINGLE_BIG_FILE:-0}" != 1 \
@@ -919,8 +923,18 @@ _elbencho_validate_exact_io_sizes() {
     return 0
 }
 
+# Resolve new requests once; saved executions retain their recorded policy.
+resolve_elbencho_completion_mode() {
+    local access="$1" explicit="$2"
+    if [[ "$explicit" == 1 || "$access" == bio || ${#TEST_DIRS[@]} -gt 1 ]]; then
+        printf '1\n'
+    else
+        printf '0\n'
+    fi
+}
+
 # Validate the complete generated/staged workload mode after CLI parsing.
-# Usage: validate_elbencho_sweep_workload_mode <dio_or_bio> <global_random> <read_from>
+# Usage: validate_elbencho_sweep_workload_mode <dio_or_bio> <global_random> <read_from> [run_to_completion]
 validate_elbencho_sweep_workload_mode() {
     local access_mode="$1"
     local global_random="$2"
@@ -928,6 +942,18 @@ validate_elbencho_sweep_workload_mode() {
     local layout="${ELBENCHO_FILE_LAYOUT:-worker-directories}"
     local files_per_node="${ELBENCHO_FILES_PER_NODE:-}"
     _elbencho_validate_workload_pairing "$layout" "$files_per_node" || return 1
+    if [[ "$layout" == worker-directories && -n "$files_per_node" && -z "$read_from" ]]; then
+        [[ "${4:-0}" == 1 ]] || {
+            echo "Error: ELBENCHO_FILES_PER_NODE with worker-directories requires completion mode (--run-to-completion, buffered IO, or multiple TEST_DIRS roots)" >&2
+            return 1
+        }
+        local targets threads
+        targets=$(_elbencho_run_to_completion_target_count) || return 1
+        for threads in "${ELBENCHO_SCALE_THREAD_LIST[@]}"; do
+            _elbencho_run_to_completion_files_per_worker \
+                "$files_per_node" "$threads" "$targets" >/dev/null || return 1
+        done
+    fi
     if [[ "$layout" == shared-directory ]]; then
         _elbencho_validate_shared_configuration "$read_from" \
             "$files_per_node" || return 1
@@ -941,6 +967,56 @@ validate_elbencho_sweep_workload_mode() {
     _elbencho_validate_exact_io_sizes "$access_mode" "$global_random"
 }
 
+# Count weighted target slots without overflowing Bash's signed arithmetic.
+_elbencho_run_to_completion_target_count() {
+    local root weight total=0 maximum
+    maximum=$(_elbencho_shell_signed_max) || return 1
+    for root in "${!TEST_DIRS[@]}"; do
+        weight="${TEST_DIRS[$root]}"
+        if ! [[ "$weight" =~ ^[1-9][0-9]*$ ]] \
+                || [[ $(_elbencho_decimal_compare "$weight" "$maximum") -gt 0 ]]; then
+            echo "Error: TEST_DIRS weight for '$root' must be a positive integer within this shell's range" >&2
+            return 1
+        fi
+        if ((total > maximum - weight)); then
+            echo "Error: summed TEST_DIRS weights exceed this shell's integer range" >&2
+            return 1
+        fi
+        total=$((total + weight))
+    done
+    ((total > 0)) || return 1
+    printf '%s\n' "$total"
+}
+
+# Completion mode gives each thread one directory per weighted target. --files is
+# per thread per directory. Round to a complete set, ties upward, minimum 1.
+_elbencho_run_to_completion_files_per_worker() {
+    local requested="$1" threads="$2" targets="$3" name value maximum
+    maximum=$(_elbencho_shell_signed_max) || return 1
+    for name in requested threads targets; do
+        value=$(_elbencho_decimal_canonicalize "${!name}") || {
+            echo "Error: invalid completion-based $name value '${!name}'; use positive integers" >&2
+            return 1
+        }
+        if [[ "$value" == 0 ]] \
+                || [[ $(_elbencho_decimal_compare "$value" "$maximum") -gt 0 ]]; then
+            echo "Error: completion-based $name value '${!name}' requires positive integers within this shell's range" >&2
+            return 1
+        fi
+        printf -v "$name" '%s' "$value"
+    done
+    if ((threads > maximum / targets)); then
+        echo "Error: threads times weighted targets exceed this shell's integer range" >&2
+        return 1
+    fi
+    local granularity=$((threads * targets))
+    local count=$((requested / granularity)) remainder=$((requested % granularity))
+    # Comparing to granularity-remainder avoids overflowing 2*remainder.
+    ((remainder < granularity - remainder)) || count=$((count + 1))
+    ((count > 0)) || count=1
+    printf '%s\n' "$count"
+}
+
 # Helper function to compute target file count for a given IO size
 compute_target_file_count_per_thread() {
     local io_size="$1"
@@ -948,6 +1024,7 @@ compute_target_file_count_per_thread() {
     local node_count="$3"
     local thread_count="$4"
     local duration="$5"
+    local targets="${6:-1}"
     local max_node_throughput="${FS_MAX_NODE_THROUGHPUT_GBPS}"
     local max_node_iops="${FS_MAX_NODE_IOPS}"
     local max_agg_throughput="${FS_MAX_AGG_THROUGHPUT}"
@@ -965,6 +1042,12 @@ compute_target_file_count_per_thread() {
     # Convert file size to bytes using existing helper function
     local file_bytes
     file_bytes=$(elbencho_size_str_to_int "$file_size") || return 1
+
+    # Elbencho clamps a block larger than a file to that file's extent. Use
+    # the same effective block for sizing; otherwise IOs per file becomes 0.
+    if ((io_bytes > file_bytes)); then
+        io_bytes="$file_bytes"
+    fi
 
     # Compute total bytes possible in the duration for both throughput limits
     local node_total_bytes
@@ -994,13 +1077,19 @@ compute_target_file_count_per_thread() {
     local max_ios
     max_ios=$((max_ios_by_iops < max_ios_by_throughput ? max_ios_by_iops : max_ios_by_throughput))
 
-    # Calculate target file count by dividing max IOs by IOs per file; also
-    # divide by node count and thread count since files are per host and thread
-    local divisor
-    divisor=$(( ios_per_file * node_count * thread_count ))
-    local target_files
-    target_files=$(( (max_ios + divisor - 1) / divisor ))
-    echo -e "target_files = ceiling(max_ios / ios_per_file / nodes / threads)\n  $target_files = ceiling($max_ios / $ios_per_file / $node_count / $thread_count)" >&2
+    # Divide by hosts, threads, and weighted targets: --files is per thread
+    # per target, while the throughput/IOPS budgets cover the whole dataset.
+    # Successive ceilings equal division by the product, without overflowing
+    # either that product or the usual numerator+divisor-1 expression.
+    local divisor target_files="$max_ios"
+    for divisor in "$ios_per_file" "$node_count" "$thread_count" "$targets"; do
+        ((divisor > 0)) || {
+            echo "Error: automatic file sizing requires positive divisors" >&2
+            return 1
+        }
+        target_files=$((target_files / divisor + (target_files % divisor != 0)))
+    done
+    echo -e "target_files = ceiling(max_ios / ios_per_file / nodes / threads / weighted_targets)\n  $target_files = ceiling($max_ios / $ios_per_file / $node_count / $thread_count / $targets)" >&2
 
     # Ensure we have at least one file
     if [ "$target_files" -lt 1 ]; then
@@ -1040,7 +1129,7 @@ elbencho_set_cell_run_context() {
     }
 
     local coordinate
-    for coordinate in io_size thread_count io_depth dio_or_bio use_random force_single; do
+    for coordinate in io_size thread_count io_depth dio_or_bio use_random run_to_completion; do
         if [[ -z "${!coordinate+x}" || -z "${!coordinate}" ]]; then
             echo "Error: elbencho cell context lacks saved coordinate: $coordinate" >&2
             return 1
@@ -1061,7 +1150,7 @@ elbencho_set_cell_run_context() {
     export ELBENCHO_RUN_IO_DEPTH="$io_depth"
     export ELBENCHO_RUN_DIO_OR_BIO="$dio_or_bio"
     export ELBENCHO_RUN_USE_RANDOM="$use_random"
-    export ELBENCHO_RUN_FORCE_SINGLE="$force_single"
+    export ELBENCHO_RUN_TO_COMPLETION="$run_to_completion"
     export ELBENCHO_RUN_CONTEXT_READY=1
     if ! _elbencho_validate_cell_run_context; then
         unset ELBENCHO_RUN_CONTEXT_READY
@@ -1139,13 +1228,17 @@ _elbencho_validate_cell_run_context() {
         fi
     done
     local coordinate
-    for coordinate in IO_SIZE THREAD_COUNT IO_DEPTH DIO_OR_BIO USE_RANDOM FORCE_SINGLE; do
+    for coordinate in IO_SIZE THREAD_COUNT IO_DEPTH DIO_OR_BIO USE_RANDOM TO_COMPLETION; do
         local snapshot="ELBENCHO_RUN_${coordinate}"
         if [[ -z "${!snapshot+x}" || -z "${!snapshot}" ]]; then
             echo "Error: elbencho cell context lacks saved coordinate: $coordinate" >&2
             return 1
         fi
     done
+    [[ "$ELBENCHO_RUN_TO_COMPLETION" =~ ^[01]$ ]] || {
+        echo "Error: invalid saved completion-based coordinate" >&2
+        return 1
+    }
     return 0
 }
 
@@ -1243,7 +1336,7 @@ run_elbencho_cell() {
     local io_depth="$ELBENCHO_RUN_IO_DEPTH"
     local dio_or_bio="$ELBENCHO_RUN_DIO_OR_BIO"
     local use_random="$ELBENCHO_RUN_USE_RANDOM"
-    local force_single="$ELBENCHO_RUN_FORCE_SINGLE"
+    local run_to_completion="$ELBENCHO_RUN_TO_COMPLETION"
     run_elbencho_io_sweep_iteration || run_rc=$?
     _elbencho_run_result_publication_hook "$run_rc" || publication_rc=$?
     if [[ "$run_rc" -ne 0 ]]; then
@@ -1321,6 +1414,15 @@ _elbencho_io_append_rotated_hosts_for_read() {
         rotated_hosts=$(rotate_csv_list "$hosts_csv" $((1 + extra)))
         _elbencho_read_args_ref+=(--hosts "$rotated_hosts")
     fi
+}
+
+# Completion-based reads never use a benchmark deadline or wrap around.
+_elbencho_io_append_read_policy() {
+    local -n read_policy_args="$1"
+    [[ "${run_to_completion:-0}" == 1 ]] && return 0
+    read_policy_args+=(--timelimit="$ELBENCHO_SCALE_READ_WRITE_DURATION")
+    [[ "$dio_or_bio" != dio ]] || read_policy_args+=(--infloop)
+    return 0
 }
 
 # Set resfile and csvfile for standard IO sweep naming. Caller must: local resfile csvfile
@@ -2421,18 +2523,11 @@ run_elbencho_io_sweep_iteration_single_big_file() {
             return 1
         fi
         local elbencho_read_args=(--read --block="$this_read_size")
-        elbencho_read_args+=(--timelimit="$ELBENCHO_SCALE_READ_WRITE_DURATION")
         elbencho_read_args+=("${common_args[@]}")
-        # DIO: --infloop repeats the read phase until --timelimit; re-reads bypass page cache.
-        # BIO: omit --infloop — with buffered IO, in-process wrap-around would re-touch warm buffer
-        # cache and distort throughput; there is no elbencho-side way to avoid that for repeats.
-        # BIO therefore does one logical pass (or stops at timelimit if slower): wall time is driven
-        # mainly by file size and aggregate read rate, not by timelimit alone. Parameter sweeps can
-        # yield a wide spread of actual runtimes. (Host rotation across sweep jobs is unrelated; it
-        # only affects *separate* invocations — see ELBENCHO_READ_HOST_ROTATE_STEPS above.)
-        if [ "$dio_or_bio" = "dio" ]; then
-            elbencho_read_args+=(--infloop)
-        fi
+        # Fresh buffered reads complete once; timed direct reads repeat.
+        # Saved historical buffered requests retain their time ceiling.
+        # Host rotation changes assignments between invocations, not repeats.
+        _elbencho_io_append_read_policy elbencho_read_args
         _elbencho_io_append_rotated_hosts_for_read elbencho_read_args
         local read_rc=0
         run_an_elbencho "${elbencho_read_args[@]}" "$big_path" || read_rc=$?
@@ -2605,6 +2700,11 @@ _elbencho_staged_workload_begin() {
     local duration_seconds
     duration_seconds=$(_elbencho_duration_to_seconds_exact \
         "$ELBENCHO_SCALE_READ_WRITE_DURATION") || return 1
+    local effective_limit="$duration_seconds" completion_state=not_applicable_time_based
+    if [[ "$termination" == completion ]]; then
+        effective_limit=null
+        completion_state=not_applicable
+    fi
     _elbencho_workload_begin "$path"
     local pair
     local -a pairs=(
@@ -2615,14 +2715,14 @@ _elbencho_staged_workload_begin() {
         reader_threads_per_node "$thread_count" reader_iodepth "$io_depth"
         files_per_reader_node null termination_mode "$termination"
         configured_duration_seconds "$duration_seconds"
-        effective_timelimit_seconds "$duration_seconds"
-        completion_state not_applicable_time_based failure_cleanup_state not_needed
+        effective_timelimit_seconds "$effective_limit"
+        completion_state "$completion_state" failure_cleanup_state not_needed
         write_expected_files null write_expected_bytes null
         write_completed_files null write_completed_bytes null
         write_elapsed_time_ms null write_completion_state not_applicable
         read_expected_files null
         read_expected_bytes null read_completed_files null read_completed_bytes null
-        read_elapsed_time_ms null read_completion_state not_applicable_time_based
+        read_elapsed_time_ms null read_completion_state "$completion_state"
         delete_expected_files null delete_completed_files null
         delete_elapsed_time_ms null delete_completion_state not_applicable
         write_delete_elapsed_time_ms null lifecycle_elapsed_time_ms null
@@ -2713,11 +2813,9 @@ _elbencho_staged_build_read_args() {
     local sweep_read_from="$5"
     local use_random_read="$6"
     shift 6
-    args_ref=(--read --block="$this_read_size"
-        --timelimit="$ELBENCHO_SCALE_READ_WRITE_DURATION" "$@"
-        --treefile "$tree_path")
+    args_ref=(--read --block="$this_read_size" "$@" --treefile "$tree_path")
     [[ "$tree_source" != cache_hit ]] && args_ref+=(--treescan "$sweep_read_from")
-    [[ "$dio_or_bio" == dio ]] && args_ref+=(--infloop)
+    _elbencho_io_append_read_policy args_ref
     [[ "$use_random_read" == 1 ]] && args_ref+=(--rand)
     _elbencho_io_append_rotated_hosts_for_read args_ref
 }
@@ -2788,6 +2886,7 @@ run_elbencho_io_sweep_iteration_staged() {
         tree_path tree_source outcome use_cache || return 1
     local termination=single_pass_with_time_ceiling
     [[ "$dio_or_bio" == dio ]] && termination=time_bounded_repeat
+    [[ "${run_to_completion:-0}" != 1 ]] || termination=completion
     _elbencho_staged_workload_begin "$workload" "$tree_source" "$outcome" "$termination" || return 1
     local files bytes
     _elbencho_staged_record_cache_hit_totals \
@@ -3224,7 +3323,7 @@ run_elbencho_io_sweep_iteration() {
             "$([ "$use_random_write" = "1" ] && echo "rand" || echo "seq")" \
             "$([ "$use_random_read" = "1" ] && echo "rand" || echo "seq")"
     fi
-    echo "Force Single Run: $([ "$force_single" = "1" ] && echo "Yes" || echo "No")"
+    echo "Run to Completion: $([ "$run_to_completion" = "1" ] && echo "Yes" || echo "No")"
 
     local resfile
     local csvfile
@@ -3294,18 +3393,14 @@ run_elbencho_io_sweep_iteration() {
     local elbencho_read_args=(
         --read
         --block="$this_read_size"
-        --timelimit="$ELBENCHO_SCALE_READ_WRITE_DURATION"
         "${common_args[@]}"
     )
     if [[ -z "$sweep_read_from" ]]; then
         elbencho_read_args=(--nocsvlabels "${elbencho_read_args[@]}")
     fi
-    # For DIO: use --infloop for time-bounded reads (re-reads hit disk, not cache)
-    # For BIO: skip --infloop to avoid re-reads hitting page cache (inflating throughput numbers)
-    # Reads will stop at timelimit OR after one pass through files, whichever comes first.
-    if [ "$dio_or_bio" = "dio" ]; then
-        elbencho_read_args+=(--infloop)
-    fi
+    # Completion reads finish once; timed direct reads repeat until the limit.
+    # Only saved historical buffered requests retain a time ceiling.
+    _elbencho_io_append_read_policy elbencho_read_args
     # Rotate hosts for read phase to avoid caching effects (node B reads node A's data)
     # Note: --rotatehosts only works within a single elbencho invocation with multiple phases.
     # Since we run write and read as separate invocations, we must manually rotate the hosts list.
@@ -3319,14 +3414,37 @@ run_elbencho_io_sweep_iteration() {
     fi
 
     local target_file_count
-    # Multi-bench-path / force_single: mkdir+write+read use --files counts; reads do not
+    # New multi-root requests are resolved to completion before reification.
+    # Retain the historical finite-write branch for saved pre-policy executions.
+    # Multi-bench-path / run_to_completion: mkdir+write+read use --files counts; reads do not
     # use --treescan/--treefile (no per-job treescan file for stats in this branch).
-    if [[ ( ${#test_dirs[@]} -gt 1 || "$force_single" = "1" ) && -z "$sweep_read_from" ]]; then
+    if [[ ( ${#test_dirs[@]} -gt 1 || "$run_to_completion" = "1" ) && -z "$sweep_read_from" ]]; then
         # Compute target file count from write size
-        target_file_count=$(compute_target_file_count_per_thread \
-            "$this_write_size" "$this_file_size" "$node_count" \
-            "$thread_count" "$ELBENCHO_SCALE_READ_WRITE_DURATION") || return 1
-        echo "Using computed target file count: $target_file_count"
+        if [[ "$run_to_completion" == 1 && -n "${ELBENCHO_FILES_PER_NODE:-}" ]]; then
+            target_file_count=$(_elbencho_run_to_completion_files_per_worker \
+                "$ELBENCHO_FILES_PER_NODE" "$thread_count" "${#test_dirs[@]}") || return 1
+            local effective_count
+            effective_count=$(_elbencho_decimal_multiply \
+                "$target_file_count" "$thread_count") || return 1
+            effective_count=$(_elbencho_decimal_multiply \
+                "$effective_count" "${#test_dirs[@]}") || return 1
+            echo "Completion-mode files per node: requested=$ELBENCHO_FILES_PER_NODE effective=$effective_count; files per thread per weighted target=$target_file_count"
+        else
+            local sizing_targets=1
+            [[ "$run_to_completion" != 1 ]] || sizing_targets="${#test_dirs[@]}"
+            target_file_count=$(compute_target_file_count_per_thread \
+                "$this_write_size" "$this_file_size" "$node_count" \
+                "$thread_count" "$ELBENCHO_SCALE_READ_WRITE_DURATION" "$sizing_targets") || return 1
+            echo "Using computed target file count per worker: $target_file_count"
+        fi
+        if [[ "$run_to_completion" == 1 ]]; then
+            # Elbencho rotates directory indices across benchmark paths.
+            # Visiting every weighted target per thread honors weights even
+            # when there are fewer threads than targets.
+            elbencho_mkdir_args+=(--dirs="${#test_dirs[@]}")
+            elbencho_write_args+=(--dirs="${#test_dirs[@]}")
+            elbencho_read_args+=(--dirs="${#test_dirs[@]}")
+        fi
         elbencho_mkdir_args+=(
             --files="$target_file_count"
         )
@@ -3477,7 +3595,7 @@ _elbencho_sweep_running_to_pending() {
 
 # Reify one execution definition file.
 # Usage: reify_elbencho_execution <out_path> <nodes> <io_size> <thread_count> <io_depth> \
-#                                 <rotate_steps> <dio_or_bio> <use_random> <force_single> \
+#                                 <rotate_steps> <dio_or_bio> <use_random> <run_to_completion> \
 #                                 <sweep_write_only> <sweep_write_no_read> <sweep_read_from>
 # Captures both per-execution (varying) values and shared scalars so that any
 # single NNNN.sh is fully self-describing (forensic readability) and source-able
@@ -3492,7 +3610,7 @@ reify_elbencho_execution() {
     local rotate_steps="$6"
     local dio_or_bio="$7"
     local use_random="$8"
-    local force_single="$9"
+    local run_to_completion="$9"
     local sweep_write_only="${10}"
     local sweep_write_no_read="${11}"
     local sweep_read_from="${12}"
@@ -3555,7 +3673,7 @@ reify_elbencho_execution() {
         printf '# Sweep-level scalars (same across all NNNN.sh files in this run):\n'
         printf 'export dio_or_bio="%s"\n' "$dio_or_bio"
         printf 'export use_random=%s\n' "$use_random"
-        printf 'export force_single=%s\n' "$force_single"
+        printf 'export run_to_completion=%s\n' "$run_to_completion"
         printf 'export ELBENCHO_SWEEP_WRITE_ONLY=%s\n' "$sweep_write_only"
         printf 'export ELBENCHO_SWEEP_WRITE_NO_READ=%s\n' "$sweep_write_no_read"
         printf 'export ELBENCHO_SWEEP_READ_FROM=%q\n' "$sweep_read_from"
@@ -3595,7 +3713,7 @@ reify_elbencho_execution() {
 # inside a fixed (nodes, io_size). Factored out of reify_all_elbencho_executions
 # to keep each function's cognitive complexity within the project limit of 15.
 # Usage: _reify_inner_threads_iodepth <executions_dir> <nodes> <io_size> \
-#            <dio_or_bio> <use_random> <force_single> \
+#            <dio_or_bio> <use_random> <run_to_completion> \
 #            <sweep_write_only> <sweep_write_no_read> <sweep_read_from> <seq_var_name>
 _reify_inner_threads_iodepth() {
     local executions_dir="$1"
@@ -3603,7 +3721,7 @@ _reify_inner_threads_iodepth() {
     local io_size="$3"
     local dio_or_bio="$4"
     local use_random="$5"
-    local force_single="$6"
+    local run_to_completion="$6"
     local sweep_write_only="$7"
     local sweep_write_no_read="$8"
     local sweep_read_from="$9"
@@ -3628,7 +3746,7 @@ _reify_inner_threads_iodepth() {
                     "${executions_dir}/${nnnn}.sh" \
                     "$nodes" "$io_size" "$thread_count" "$io_depth" \
                     "$rotate_steps" \
-                    "$dio_or_bio" "$use_random" "$force_single" \
+                    "$dio_or_bio" "$use_random" "$run_to_completion" \
                     "$sweep_write_only" "$sweep_write_no_read" "$sweep_read_from"; then
                 echo "Error: failed to reify execution ${nnnn}" >&2
                 return 1
@@ -3643,14 +3761,14 @@ _reify_inner_threads_iodepth() {
 # Reify every (nodes, io_size, thread_count, io_depth) cell as executions/NNNN.sh
 # plus NNNN.status=PENDING. Writes 1-indexed, zero-padded NNNN files.
 # Usage: reify_all_elbencho_executions <output_dir> <nodes_spec> \
-#            <dio_or_bio> <use_random> <force_single> \
+#            <dio_or_bio> <use_random> <run_to_completion> \
 #            <sweep_write_only> <sweep_write_no_read> <sweep_read_from>
 reify_all_elbencho_executions() {
     local output_dir="$1"
     local nodes_spec="$2"
     local dio_or_bio="$3"
     local use_random="$4"
-    local force_single="$5"
+    local run_to_completion="$5"
     local sweep_write_only="$6"
     local sweep_write_no_read="$7"
     local sweep_read_from="$8"
@@ -3677,7 +3795,7 @@ reify_all_elbencho_executions() {
         for io_size in "${ELBENCHO_SCALE_IO_SIZES[@]}"; do
             if ! _reify_inner_threads_iodepth \
                     "$executions_dir" "$nodes" "$io_size" \
-                    "$dio_or_bio" "$use_random" "$force_single" \
+                    "$dio_or_bio" "$use_random" "$run_to_completion" \
                     "$sweep_write_only" "$sweep_write_no_read" "$sweep_read_from" \
                     seq; then
                 return 1

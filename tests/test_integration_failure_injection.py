@@ -20,7 +20,7 @@ import shutil
 import signal
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
@@ -40,6 +40,78 @@ from failure_injection import (  # pylint: disable=wrong-import-position
 import filesystem_integration as _INTEGRATION  # pylint: disable=wrong-import-position
 
 TARGET_ARGUMENT = "/mnt/storage-test/results-e0002"
+
+
+class _StagingRunner:
+    """Execute the real remote script with a damaged stream or lost reply."""
+
+    def __init__(self, *, corrupt=False, lose_reply=False):
+        self.corrupt = corrupt
+        self.lose_reply = lose_reply
+        self.commands = []
+
+    def run(self, arguments, *, stdin=None, **_kwargs):
+        self.commands.append(arguments)
+        payload = stdin.read() if stdin is not None else None
+        if self.corrupt and payload is not None:
+            payload = payload[:3]
+        result = subprocess.run(
+            ["bash", "-ec", arguments[-1]],
+            input=payload,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode:
+            raise RuntimeError("command terminated with exit code 1: checksum")
+        if self.lose_reply and payload is not None:
+            self.lose_reply = False
+            raise RuntimeError("unexpected EOF")
+        return result
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_remote_staging_is_atomic_and_failed_delegate_cannot_corrupt_original(
+    tmp_path, monkeypatch, corrupt
+):
+    """Real remote shell paths preserve the original across a partial upload."""
+    monkeypatch.setattr(_INTEGRATION.time, "sleep", lambda _delay: None)
+    original = tmp_path / "original"
+    source = tmp_path / "source"
+    source.write_bytes(b"verified-original-binary")
+    original.write_bytes(source.read_bytes())
+    runner = _StagingRunner(corrupt=corrupt, lose_reply=not corrupt)
+    operations = (
+        _INTEGRATION._remote_staging_operations(  # pylint: disable=protected-access
+            runner,
+            SimpleNamespace(namespace="test", kubeconfig=tmp_path / "config"),
+            SimpleNamespace(login_container="login"),
+            "slurm",
+            None,
+            source,
+            PurePosixPath(original),
+        )
+    )
+    plan = build_slurm_failure_injection_plan(
+        scenario_id="failure-resume",
+        staging_root=tmp_path / "staging",
+        source_binary=source,
+        source_runtime=None,
+        target_argument=TARGET_ARGUMENT,
+        shared_endpoint="login",
+    )
+    if corrupt:
+        with pytest.raises(RuntimeError, match="checksum"):
+            with staged_failure_injection(plan, operations):
+                pytest.fail("partial delegate must not be published")
+    else:
+        with staged_failure_injection(plan, operations):
+            assert original.read_bytes() == plan.wrapper_script.encode()
+    assert original.read_bytes() == source.read_bytes()
+    assert not Path(plan.layout.root).exists()
+    assert not list(tmp_path.rglob("*.staging.*"))
+    for arguments in runner.commands:
+        assert ("-i" in arguments) == ("cat >" in arguments[-1])
 
 
 def _write_delegate(path, body):

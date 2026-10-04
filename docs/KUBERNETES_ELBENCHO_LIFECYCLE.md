@@ -425,7 +425,11 @@ failure; it does not claim an API outage. Collection retries positively
 identified transient transport failures or tar's isolated changed-source
 warning up to three times with backoff,
 within one transfer deadline (plus the timeout tool's five-second kill
-grace). Authentication, identity, path, local-storage, archive-integrity,
+grace). `KUBECTL_COLLECTION_TIMEOUT_SECONDS` (default 7200) is the total
+deadline. Until a producer times out, each transfer is capped at
+`KUBECTL_COLLECTION_ATTEMPT_TIMEOUT_SECONDS` (default one third of the total);
+the following transfer may use the remaining deadline. Authentication,
+identity, path, local-storage, archive-integrity,
 and unknown failures remain fatal. Each failed transfer preserves bounded
 stderr and producer/consumer status in local attempt diagnostics, including
 when a later transfer succeeds; partial archives are discarded between tries.
@@ -433,6 +437,14 @@ Only the published `state/` subtree is transferred; uploaded control files
 remain available locally. Changed-source warnings are never ignored: a retry
 must finish cleanly and pass the same manifest hashes before publication.
 Persistent changes and other tar errors remain fatal with remote data retained.
+
+Control upload verifies a private staged archive and publishes only a
+complete bundle. Transient transport failures retry up to three times, each
+bounded by `KUBECTL_CONTROL_UPLOAD_TIMEOUT_SECONDS` (default 120); a lost
+acknowledgement is accepted only if the published files are byte-identical.
+Auth, checksum, and other remote errors are fatal. Worker health probes retry
+the same endpoint three times; persistent failure fails the current cell, and
+measured phases are never replayed.
 
 For required-recovery faults, capture bounded Job, Pod, and DaemonSet
 descriptions; relevant container logs and namespace events; durable PVC state;

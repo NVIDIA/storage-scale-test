@@ -19,13 +19,48 @@
 
 import os
 import platform
+import shlex
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+import yaml
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _WRAPPER = _REPO_ROOT / "integration-tests" / "bin" / "ci-integration.sh"
+
+
+def test_integration_workflow_bootstraps_its_lifecycle_interpreter():
+    """Fresh runners cannot borrow runtime packages from the unit-test venv."""
+    workflow = yaml.safe_load(
+        (_REPO_ROOT / ".github/workflows/integration.yml").read_text(encoding="utf-8")
+    )
+    job = workflow["jobs"]["integration"]
+    assert job["env"]["INTEGRATION_PYTHON"] == (
+        "${{ github.workspace }}/.venv/bin/python"
+    )
+    steps = job["steps"]
+    bootstrap_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("name") == "Install integration Python dependencies"
+    )
+    lifecycle_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("name") == "Run the bounded integration lifecycle"
+    )
+    assert bootstrap_index < lifecycle_index
+    commands = [
+        shlex.split(line) for line in steps[bootstrap_index]["run"].splitlines()
+    ]
+    assert commands == [
+        ["python3", "-m", "venv", ".venv"],
+        ["$INTEGRATION_PYTHON", "-m", "pip", "install", "-r", "requirements.txt"],
+        ["$INTEGRATION_PYTHON", "integration-tests/bin/integration-test.py", "--help"],
+    ]
+    assert "INTEGRATION_PYTHON" not in steps[lifecycle_index].get("env", {})
 
 
 def _fixture(tmp_path: Path) -> tuple[dict[str, str], Path]:

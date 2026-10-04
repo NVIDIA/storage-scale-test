@@ -84,10 +84,17 @@ global lock and owner record protect fixed NFS configuration. Cached upstream
 images must match their pinned digest and runner architecture. NFS CSI misses try
 `registry.k8s.io` and `gcr.io/k8s-staging-sig-storage`; its chart tags exist only
 inside kind. Kind node and other image misses use bounded host-Docker retries.
+The SBX binary-extraction path shares those verified image acquisitions. Setup
+acquires all Slinky OCI charts before installing releases, caching validated
+archives with source/version/checksum manifests. Image and chart pulls retry only
+recognized transient failures, with exponential backoff, jitter, and a four-minute
+deadline. Sanitized errors and retry history remain in setup logs; authentication,
+corruption, and unknown failures remain fatal.
 Interrupted private aliases are reconciled; MariaDB and Slinky's Alpine helpers
 use preloaded fixture-private tags. Cleanup recovers partial bootstrap, removes
 only owned resources, restores prior NFS state, verifies unmounts, and does not
-depend on writable diagnostics.
+depend on writable diagnostics. NFS worker headroom and first-timeout kernel
+diagnostics are best-effort; see `integration-tests/README.md`.
 
 The test CLI selects substrates and scenarios independently. Its planner batches
 shared-home SSH cases behind a crash-recoverable transition; separate homes are
@@ -104,7 +111,9 @@ Cartesian sweeps, single-file and weighted-root behavior, shared SSH homes, and
 Slurm scheduling. Fast tests cover parsing, precedence, path and workload safety,
 sizing, scheduler boundaries, failure contracts, and reporting. On-demand CI
 runs the full NFS-backed catalog concurrently on amd64 and arm64 with
-repeatable-teardown headroom; SBX is a supported local backend.
+repeatable-teardown headroom; SBX is a supported local backend. Integration CI
+installs runtime requirements into `.venv` and uses that interpreter for both
+startup smoke checks and the lifecycle; `.venv-ci` is not a runtime bootstrap.
 
 The kubectl filesystem sweep's implemented decisions and tradeoffs are retained
 in the historical
@@ -280,7 +289,8 @@ revalidated by status and collection; the API-independent coordinator probes
 frozen addresses before each cell. Drift or coordinator loss is recovered only
 with fresh identity evidence. Collection copies PVC results to the local result
 tree. A configured namespace, existing PV/PVC, node selector, authorized kubectl
-context, and compatible CNI are prerequisites.
+context, and compatible CNI are prerequisites. Upload, health-probe, and
+collection retry limits are specified in `docs/KUBERNETES_ELBENCHO_LIFECYCLE.md`.
 Docker SBX validates the supported kind profile; dual-architecture NFS CI and
 a separately authorized external-cluster run are release acceptance gates.
 
@@ -292,11 +302,19 @@ their termination and cleanup contracts differ.
 ### Worker directories
 
 `ELBENCHO_FILE_LAYOUT=worker-directories` is the default many-file workload.
-In the usual single-target path, directory creation is separate; write uses
-`--infloop` plus `--timelimit`; direct reads use the same combination; buffered
-reads make at most one logical pass with the time limit as a ceiling to avoid
-measuring repeated page-cache hits. The `-s/--single` or multiple-target branch
-derives a fixed file count for writes while reads remain time-bounded.
+Directory creation is separate. In worker-directory layout, one root with
+weight 1 and direct IO uses timed writes and reads by default. Buffered IO,
+multiple distinct roots, and
+`--run-to-completion` select completion mode for both phases: each requested
+phase processes its finite dataset without a benchmark time limit or repetition.
+A sole `TEST_DIRS` root must have weight 1. Explicit `ELBENCHO_FILES_PER_NODE`
+is a per-node budget rounded to the nearest multiple of threads times summed
+weights (ties upward, minimum one file per thread per weighted target). Without
+an explicit count, the FS budgets and duration derive automatic counts; in
+completion mode duration sizes the dataset rather than limiting runtime. The
+effective mode is saved with execution coordinates; its reason is printed
+during initial staging. Resume preserves the recorded semantics rather than
+reinterpreting the request.
 
 Unless `ELBENCHO_FILE_SIZE` is set, generated file size is the write block size
 times `ELBENCHO_FILE_SIZE_MULTIPLIER`.
@@ -316,10 +334,10 @@ A directory staged with `--read-from` may contain
 `.storage-scale-test-elbencho-treefile.txt`. A cache miss scans into a temporary
 file in the dataset parent and publishes it atomically only after a successful
 read; later reads reuse it without rescanning. The operator must remove the cache
-after changing the dataset. Staged directory reads remain duration-driven
-regardless of `ELBENCHO_FILE_LAYOUT`, and their aggregate file and byte totals
-come from the exact treefile rather than the current reader topology or
-`ELBENCHO_FILES_PER_NODE`.
+after changing the dataset. Direct IO staged directory reads are time-limited
+by default; buffered IO or `--run-to-completion` reads the scanned dataset to
+completion. Totals come from the exact treefile rather than the current reader
+topology or `ELBENCHO_FILES_PER_NODE`.
 
 ### Generated shared directory
 
@@ -366,9 +384,9 @@ sequential IO. Generated write/default runs require
 partitions that file among services; `ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=1`
 adds `--nosvcshare` so each node accesses the complete file.
 
-`--read-from <file>` takes the extent from file metadata and does not use a
-treescan or treefile. Direct reads repeat until the configured time limit.
-Buffered reads make one logical pass with the time limit as a ceiling.
+`--read-from <file>` takes the extent from file metadata, without a treescan.
+By default, direct reads repeat until the time limit. Buffered IO or
+`--run-to-completion` reads the file extent without a time limit or repetition.
 
 ### IO-size and cache semantics
 
@@ -406,6 +424,8 @@ results; Kubernetes uses the asynchronous status/cancel/collect lifecycle and
 requires collection before resume. The shared dispatch protocol accepts both
 workload kinds. Prepared batches save ordered groups locally, freeze common
 resources, and permanently seal their manifest before first external mutation.
+Batch preflight validates each group's saved completion policy, not current
+launcher settings.
 One global ledger owns statuses; group snapshots and artifacts remain isolated
 through dispatch, collection, resume, and unified filesystem reporting.
 The Kubernetes parent owns each active cell's group-specific scratch path and

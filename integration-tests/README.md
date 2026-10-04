@@ -25,8 +25,9 @@ control for the storage-worker label. The two worker nodes run storage clients.
 The current setup target is Ubuntu 24.04 on x86-64 or ARM64 with at least two
 CPUs, 8 GiB total RAM, 6 GiB available RAM, and 20 GiB free on the selected
 backend's filesystem. Python 3.12 and an accessible rootful Docker daemon are
-prerequisites. The driver installs its other host packages and pinned client
-tools when needed. It also builds small derived Slinky login and compute images
+prerequisites. Install the pinned Python runtime requirements before using the
+driver; it installs other host packages and pinned client tools when needed.
+It also builds small derived Slinky login and compute images
 containing the fixed integration workload account; the login image additionally
 provides the standard `file` package required by `validate_env.sh`.
 
@@ -35,6 +36,9 @@ profile invokes passwordless `sudo` itself only for package installation and
 the dedicated export, loop-device, firewall, and systemd operations:
 
 ```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+source .venv/bin/activate
 sudo -v
 integration-tests/bin/integration-test.py setup
 ```
@@ -55,6 +59,29 @@ shared-home behavior, and successful SSH and Slurm filesystem sweeps. NFS and
 CSI provisioning themselves are infrastructure details outside this
 repository's test scope; the backend difference is environmental fidelity, not
 repository feature coverage.
+
+### NFS headroom and kernel isolation
+
+The NFS fixture raises the server to at least 32 workers
+(`INTEGRATION_NFS_THREADS`, 1-256) without lowering a larger pool or
+restarting the server, and restores the recorded original count at teardown.
+Tuning is skipped when that count cannot be recorded, and tuning or restoration
+failures are logged rather than fatal. The `sbx-shared` backend owns no NFS
+server and skips tuning.
+
+Containers share the host kernel, so the loop-backed NFS fixture can stall when
+server writes wait on commits that need the same worker pool. At each command
+timeout the driver logs bounded pressure, NFS counters, blocked-task stacks,
+and kernel warnings before cleanup touches the PVC; blocked server workers
+double the pool, up to 256. This mitigates the stall but is not isolation,
+which needs a separate NFS server VM or host. Local NFS hosts should carry the
+upstream `nfs_release_folio()` reclaim fix
+(`cce0be6eb4971456b703aaeafd571650d314bcca`); the harness never upgrades or
+reboots a shared host.
+
+Failure-injection staging publishes files through digest-verified temporary
+copies with remote deadlines and transient retries. Cleanup restores the
+wrapper from the verified local binary, never from a remote delegate.
 
 Select Docker SBX explicitly with:
 
@@ -252,11 +279,12 @@ than assuming it is preinstalled — see "Checks (run before committing)" in
 ## On-demand CI
 
 The `Filesystem integration` GitHub Actions workflow runs independent amd64
-and arm64 jobs concurrently. Each job runs setup twice, stops and restarts the
-fixture, proves that root lifecycle execution is rejected, runs `test` as the
-ordinary runner account, and tears down twice. A final status job requires both
-architectures to pass. The workflow is deliberately absent from ordinary
-pull-request, push, and default-branch events.
+and arm64 jobs concurrently. Each job installs `requirements.txt` in an isolated
+runtime venv and smoke-tests driver startup before provisioning. It runs setup
+twice, stops and restarts the fixture, proves that root lifecycle execution is
+rejected, runs `test` as the ordinary runner account, and tears down twice. A
+final status job requires both architectures to pass. The workflow runs only
+on demand, not on pull-request, push, or default-branch events.
 
 To run it, open **Actions**, choose **Filesystem integration**, and select
 **Run workflow**. Choose the workflow ref, then optionally enter a different
@@ -281,6 +309,15 @@ logs and rendered manifests are retained in the state directory. Add
 `--verbose` for command-level logging. The failure path captures host, Docker,
 backend, Kubernetes node, pod, and event diagnostics without printing
 Kubernetes Secrets.
+
+Image pulls reuse digest- and architecture-verified host Docker caches. Slinky
+charts are downloaded and validated before any release is installed, then cached
+with source, version, and checksum records. Recognized transient pull failures
+receive up to four attempts per registry reference, with exponential backoff and
+jitter within a shared four-minute deadline per acquisition. Setup logs retain
+sanitized errors and retry history. Authentication, corrupt artifacts, and
+unknown errors fail immediately; retries cannot overcome a persistent registry
+outage.
 
 For CI workers or any host where retained fixture data is not wanted, run:
 

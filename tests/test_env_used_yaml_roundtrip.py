@@ -143,7 +143,7 @@ def _metric_stub():
     return SimpleNamespace(
         is_single_big_file=False,
         all_nodes_all_data=False,
-        sweep_single_option=False,
+        sweep_run_to_completion_option=False,
     )
 
 
@@ -189,7 +189,7 @@ class TestEnvUsedYamlRoundTrip(unittest.TestCase):
 
             self.assertEqual(loaded["dio_or_bio"], "dio")
             self.assertEqual(loaded["rand_option"], 0)
-            self.assertEqual(loaded["single_option"], 0)
+            self.assertEqual(loaded["run_to_completion_option"], 0)
             self.assertEqual(loaded["sweep_write_only"], 0)
             self.assertEqual(loaded["sweep_write_no_read"], 0)
             self.assertEqual(loaded["sweep_read_from"], "")
@@ -232,15 +232,15 @@ class TestEnvUsedYamlRoundTrip(unittest.TestCase):
             apply_env_used_to_metrics(loaded, [metric])
             self.assertTrue(metric.is_single_big_file)
             self.assertTrue(metric.all_nodes_all_data)
-            self.assertFalse(metric.sweep_single_option)
+            self.assertFalse(metric.sweep_run_to_completion_option)
             self.assertEqual(metric.configured_file_layout, "shared-directory")
             self.assertEqual(metric.configured_files_per_node, "8")
             self.assertEqual(metric.configured_file_size, "64G")
 
-    def test_apply_env_used_sets_sweep_single_option(self):
+    def test_apply_env_used_sets_sweep_run_to_completion_option(self):
         metric = _metric_stub()
-        apply_env_used_to_metrics({"single_option": 1}, [metric])
-        self.assertTrue(metric.sweep_single_option)
+        apply_env_used_to_metrics({"run_to_completion_option": 1}, [metric])
+        self.assertTrue(metric.sweep_run_to_completion_option)
         self.assertFalse(metric.is_single_big_file)
         self.assertFalse(metric.all_nodes_all_data)
 
