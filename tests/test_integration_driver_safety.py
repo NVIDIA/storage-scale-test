@@ -3301,6 +3301,41 @@ def test_workload_totals_require_resume_metadata(tmp_path, monkeypatch):
         _assert_execution_contract(scenario, step, tmp_path / "result")
 
 
+@pytest.mark.parametrize("dataset_bytes", ["262144", "0", "16777216"])
+def test_small_file_totals_reject_wrong_byte_counts(
+    tmp_path, monkeypatch, dataset_bytes
+):
+    """A truncated or old-sized failure-resume dataset still fails the contract."""
+    execution_root = tmp_path / "result" / "executions"
+    execution_root.mkdir(parents=True)
+    (execution_root / "0001.sh").write_text("coordinates\n", encoding="utf-8")
+    (execution_root / "0001.status").write_text("SUCCESS\n", encoding="utf-8")
+    (execution_root / "0001.exitcode").write_text("0\n", encoding="utf-8")
+    (execution_root / "0001.workload.tsv").write_text(
+        f"dataset_files_total\t2\ndataset_bytes_total\t{dataset_bytes}\n",
+        encoding="utf-8",
+    )
+    coordinate = SimpleNamespace(nodes=2, io_size="4K", threads=1, io_depth=1)
+    expected = SimpleNamespace(
+        coordinate=coordinate,
+        status=_FILESYSTEM.ExecutionStatus.SUCCESS,
+    )
+    step = SimpleNamespace(
+        name="bounded",
+        kind=_FILESYSTEM.CommandKind.SWEEP,
+        executions=(expected,),
+        required_phases=(),
+    )
+    monkeypatch.setattr(
+        _FILESYSTEM, "_coordinate_from_execution", lambda _path: (2, "4K", 1, 1)
+    )
+
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="invalid dataset"):
+        _assert_execution_contract(
+            SimpleNamespace(name="failure-resume"), step, tmp_path / "result"
+        )
+
+
 def test_mdtest_execution_contract_requires_results_and_completion(tmp_path):
     """The driver checks each successful MD cell's raw data and commit marker."""
     specs = sys.modules["filesystem_scenario_specs"]
@@ -5338,3 +5373,42 @@ def test_markerless_sbx_elbencho_bundle_is_rebuilt(tmp_path, monkeypatch):
     document = json.loads(marker.read_text(encoding="utf-8"))
     assert document["container"] == _FILESYSTEM.ELBENCHO_CONTAINER
     assert document["recipe"] == _FILESYSTEM.SBX_ELBENCHO_BUNDLE_RECIPE
+
+
+@pytest.mark.parametrize(
+    "scenario, nodes, expected",
+    [
+        ("baseline", 2, (2, 32 * 1024 * 1024)),
+        ("ssh-shared-home", 1, (1, 16 * 1024 * 1024)),
+        ("failure-resume", 2, (2, 512 * 1024)),
+        ("slurm-cartesian", 2, (4, 1024 * 1024)),
+        ("retained-lifecycle", 1, (1, 256 * 1024)),
+        ("kubectl-retained-read", 1, (1, 256 * 1024)),
+        ("default-dio", 2, None),
+    ],
+)
+def test_expected_dataset_totals_are_explicit(scenario, nodes, expected):
+    """Exact byte totals are fixed by the fixture, not read from results."""
+    step = SimpleNamespace(kind=_FILESYSTEM.CommandKind.SWEEP)
+    assert _FILESYSTEM._expected_dataset_totals(scenario, step, nodes) == expected
+
+
+@pytest.mark.parametrize(
+    "size, accepted", [("256K", True), ("1M", False), ("16M", False)]
+)
+def test_explicit_completion_requires_the_small_file_size(tmp_path, size, accepted):
+    """The native-flag check follows the fixture's file size, not an old one."""
+    executions = tmp_path / "executions"
+    executions.mkdir()
+    (executions / "0001.log").write_text(
+        "# elbencho --direct --dirs=2 --write --read --files=3 "
+        f"--size={size} /data\n",
+        encoding="utf-8",
+    )
+    step = SimpleNamespace(name="explicit-completion-based")
+    check = _FILESYSTEM._assert_semantic_flags  # pylint: disable=protected-access
+    if accepted:
+        check("default-dio", step, tmp_path)
+    else:
+        with pytest.raises(_FILESYSTEM.IntegrationTestError, match="--size=256K"):
+            check("default-dio", step, tmp_path)

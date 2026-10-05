@@ -59,6 +59,8 @@ from fixture_capacity import (
 )
 from filesystem_scenario_specs import (
     SCENARIO_SPECS_BY_NAME,
+    SMALL_DIO_FILE_BYTES,
+    SMALL_DIO_FILE_SIZE,
     CommandKind,
     DatasetExpectation,
     ExecutionStatus,
@@ -2022,18 +2024,23 @@ def _workload_values(path: Path) -> dict[str, str]:
 def _expected_dataset_totals(
     scenario: str, step: ScenarioStep, nodes: int
 ) -> tuple[int, int] | None:
-    """Return exact bounded totals for workloads with a metadata contract."""
-    if scenario in {"baseline", "ssh-shared-home", "failure-resume"}:
+    """Return exact bounded totals for workloads with a metadata contract.
+
+    File sizes come from the scenario definitions, never from the results.
+    """
+    if scenario in {"baseline", "ssh-shared-home"}:
         return nodes, nodes * 16 * 1024 * 1024
+    if scenario == "failure-resume":
+        return nodes, nodes * SMALL_DIO_FILE_BYTES
     if scenario == "live-capture":
         return nodes * 2, nodes * (MAX_LIVE_CAPTURE_DATASET_BYTES // 2)
     if scenario == "slurm-cartesian":
-        return nodes * 2, nodes * 2 * 1024 * 1024
+        return nodes * 2, nodes * 2 * SMALL_DIO_FILE_BYTES
     if (
         scenario in {"retained-lifecycle", "kubectl-retained-read"}
         and step.kind is not CommandKind.DELETE
     ):
-        return 1, 16 * 1024 * 1024
+        return 1, SMALL_DIO_FILE_BYTES
     return None
 
 
@@ -2287,7 +2294,7 @@ def _assert_semantic_flags(scenario: str, step: ScenarioStep, result: Path) -> N
         required = ("--direct", "--dirs=2", "--write", "--read")
         forbidden = ("--norandalign", "--timelimit", "--infloop")
         if step.name == "explicit-completion-based":
-            required += ("--files=3", "--size=1M")
+            required += ("--files=3", f"--size={SMALL_DIO_FILE_SIZE}")
     elif scenario == "live-capture":
         required = ("--livecsv", "--livecsvex", "--liveint=10")
     elif scenario == "ssh-single-big-file" and step.name == "inferred-extent-read":

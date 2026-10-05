@@ -173,7 +173,12 @@ work, and shared SSH homes. Workloads stay deliberately small; assertions
 check execution coordinates and state transitions, phase and workload
 evidence, dataset totals, required native flags, relevant scheduling evidence,
 and semantic report rows and plot families without treating incidental output
-or performance values as contracts.
+or performance values as contracts. Completion-based direct-I/O scenarios that
+check only structure (default and explicit worker directories, failure/resume,
+retained data, and the Slurm Cartesian sweep) use 256 KiB files, because synced
+direct I/O to the NFS export is slow. Baseline, mixed-batch provenance,
+single-file, live-capture, cancellation, coordinator-loss, and endpoint-drift
+fixtures keep 16 MiB so their sizes and active intervals are unchanged.
 
 The Kubernetes substrate runs each supported sweep as one asynchronous
 cluster Job. `submit` returns after staging the control bundle and creating
