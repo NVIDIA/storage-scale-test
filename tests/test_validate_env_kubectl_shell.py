@@ -87,7 +87,7 @@ def test_root_workload_identity_and_missing_test_dirs_are_actionable(tmp_path):
             KUBECTL_PV=pawan-lustre-pv
             KUBECTL_PVC=lustre-pvc-example
             KUBECTL_NODE_SELECTOR=lustre-host=true
-            KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.1-11
+            KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
             KUBECTL_IMAGE_PULL_POLICY=IfNotPresent
             KUBECTL_RUN_AS_USER=0
             KUBECTL_RUN_AS_GROUP=0

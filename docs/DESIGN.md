@@ -607,7 +607,7 @@ flat directory. Since elbencho accepts one uniform file count per worker, the
 requested total is rounded to the nearest achievable whole-worker total; both
 requested and actual values are recorded in `env_used.yaml`.
 
-**Zero-byte files** (`-s 0 -b 0`) isolate pure metadata operation rates from
+**Zero-byte files** (`-s 0`) isolate pure metadata operation rates from
 any data transfer overhead.
 
 ### 7.3 Object Storage (warp)

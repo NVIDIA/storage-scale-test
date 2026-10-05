@@ -78,7 +78,7 @@ export KUBECTL_NAMESPACE=storage-scale-test
 export KUBECTL_PV=storage-scale-test-pv
 export KUBECTL_PVC=storage-scale-test-pvc
 export KUBECTL_NODE_SELECTOR='storage-scale-test/worker=true'
-export KUBECTL_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.1-11
+export KUBECTL_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.2-1
 export KUBECTL_IMAGE_PULL_POLICY=IfNotPresent
 export KUBECTL_RUN_AS_USER=2000
 export KUBECTL_RUN_AS_GROUP=2000
