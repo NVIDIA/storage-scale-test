@@ -509,7 +509,8 @@ module_exists() {
 # Tail an array of logfile names, robustly, until a slurm JOBID has
 # transitioned into a terminal state.  Return 0 on COMPLETED or 1 otherwise.
 # The final sacct information is printed after the terminal state has been
-# reached, and the tail killed and waited upon.
+# reached, and the tail killed and waited upon. sacct is polled every
+# SLURM_JOB_POLL_INTERVAL_SECONDS (a positive integer; default 15).
 #
 # Call this function like:
 #   tail_until_complete "$JOBID" "${log_files[@]}"
@@ -519,6 +520,11 @@ tail_until_complete() {
     shift
     local log_files=("$@")  # More reliable array handling
     local terminal_rc
+    local poll_seconds="${SLURM_JOB_POLL_INTERVAL_SECONDS:-15}"
+    if [[ ! "$poll_seconds" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: SLURM_JOB_POLL_INTERVAL_SECONDS must be a positive integer: $poll_seconds" >&2
+        return 1
+    fi
 
     # the "-n" is so we don't miss many lines that got into the file
     # before tail noticed the file became available.
@@ -543,7 +549,7 @@ tail_until_complete() {
             *)
                 # No main allocation row yet, or the allocation is still in a
                 # non-terminal state. Child step rows must not decide success.
-                sleep 15
+                sleep "$poll_seconds"
                 continue
                 ;;
         esac

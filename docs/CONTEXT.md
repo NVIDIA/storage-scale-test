@@ -196,6 +196,10 @@ Important configuration relationships:
   not imply all CPUs, setup queries the target node CPU count and adds
   `--cpus-per-task` when it can resolve the count. The default is bare
   `--exclusive`.
+- `SLURM_JOB_POLL_INTERVAL_SECONDS` (default 15) sets how often
+  `tail_until_complete` checks `sacct` for the main allocation's terminal
+  state; integration fixtures use 1. Only the main allocation row decides the
+  result, and the 10-second final log grace is unchanged.
 - `_SBATCH_OPTIONS_BASE` and `_SRUN_OPTIONS_BASE` contain the structured base
   options. `build_sbatch_cmd` and `build_srun_cmd` append the
   `SLURM_EXTRA_ARGS` array without losing embedded spaces. The public

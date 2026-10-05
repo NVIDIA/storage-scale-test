@@ -179,7 +179,7 @@ compatibility. This design means:
 | Metadata | `MDTEST_BRANCH_FACTOR`, `MDTEST_ITEMS_PER_DIR`, `MDTEST_ITERATIONS` | Branched metadata test parameters; the dense layout is selected by a CLI flag |
 | Warp | `WARP_THREAD_LIST`, `WARP_OBJ_SIZES`, PUT/GET durations | Object storage sweep parameters |
 | Netbench | `NETBENCH_THREADS`, `NETBENCH_HOST_NIC_GBPS`, `NETBENCH_TARGET_RUNTIME` | Network test parameters |
-| Slurm extras | `SLURM_JOB_NAME_PREFIX`, `SLURM_EXTRA_ARGS`, `SLURM_EXCLUSIVE_USER`, `SLURM_NODE_IGNORES`, `SLURM_NODE_INCLUDES` | Slurm job customization |
+| Slurm extras | `SLURM_JOB_NAME_PREFIX`, `SLURM_EXTRA_ARGS`, `SLURM_EXCLUSIVE_USER`, `SLURM_NODE_IGNORES`, `SLURM_NODE_INCLUDES`, `SLURM_JOB_POLL_INTERVAL_SECONDS` | Slurm job customization |
 | Kubernetes | `KUBECTL_NAMESPACE`, `KUBECTL_PV`, `KUBECTL_PVC`, `KUBECTL_NODE_SELECTOR`, `KUBECTL_ELBENCHO_IMAGE`, `KUBECTL_RUN_AS_USER`, `KUBECTL_RUN_AS_GROUP` | Existing namespace, RWX storage, eligible nodes, image, and workload identity for kubectl mode |
 
 ### 3.3 Defaults and Compatibility

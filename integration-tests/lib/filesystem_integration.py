@@ -1095,6 +1095,8 @@ def _override_block(
         'export ELBENCHO_IODEPTH_LIST=("1")',
         "export ELBENCHO_SCALE_READ_WRITE_DURATION=1",
         "export ELBENCHO_READ_AFTER_WRITE_PAUSE=0",
+        # Notice finished Slurm jobs within a second instead of 15.
+        "export SLURM_JOB_POLL_INTERVAL_SECONDS=1",
         "export ELBENCHO_LIVE_CSV_EXTENDED=0",
         "export ELBENCHO_SINGLE_BIG_FILE=0",
         'export OBJ_BUCKET=""',
