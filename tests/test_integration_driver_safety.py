@@ -5393,18 +5393,27 @@ def test_expected_dataset_totals_are_explicit(scenario, nodes, expected):
     assert _FILESYSTEM._expected_dataset_totals(scenario, step, nodes) == expected
 
 
+@pytest.mark.parametrize("evidence", ["dispatch-log", "kubectl-command-line"])
 @pytest.mark.parametrize(
     "size, accepted", [("256K", True), ("1M", False), ("16M", False)]
 )
-def test_explicit_completion_requires_the_small_file_size(tmp_path, size, accepted):
-    """The native-flag check follows the fixture's file size, not an old one."""
-    executions = tmp_path / "executions"
-    executions.mkdir()
-    (executions / "0001.log").write_text(
-        "# elbencho --direct --dirs=2 --write --read --files=3 "
-        f"--size={size} /data\n",
-        encoding="utf-8",
-    )
+def test_explicit_completion_requires_the_small_file_size(
+    tmp_path, evidence, size, accepted
+):
+    """The native-flag check follows the fixture's file size, not an old one.
+
+    SSH and Slurm runs log "# elbencho ..." lines; Kubernetes publishes only
+    Elbencho's own result files, whose COMMAND LINE record is the evidence.
+    """
+    flags = f"--direct --dirs=2 --write --read --files=3 --size={size} /data"
+    if evidence == "dispatch-log":
+        executions = tmp_path / "executions"
+        executions.mkdir()
+        (executions / "0001.log").write_text(f"# elbencho {flags}\n", "utf-8")
+    else:
+        (tmp_path / "elbencho-4K-c_001.out").write_text(
+            f"COMMAND LINE: elbencho {flags}\n", "utf-8"
+        )
     step = SimpleNamespace(name="explicit-completion-based")
     check = _FILESYSTEM._assert_semantic_flags  # pylint: disable=protected-access
     if accepted:

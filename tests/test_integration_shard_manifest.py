@@ -193,3 +193,37 @@ def test_workflow_matrix_matches_the_status_check():
     verify = next(step for step in status["steps"] if "verify" in step.get("run", ""))
     assert "--architectures " + ",".join(_ARCHITECTURES) in verify["run"]
     assert "--backend nfs" in verify["run"]
+
+
+def test_workflow_wrapper_and_driver_agree_on_shared_names():
+    """Names written in one place and read in another must not drift apart."""
+    workflow = yaml.safe_load(
+        (_REPO_ROOT / ".github/workflows/integration.yml").read_text(encoding="utf-8")
+    )
+    wrapper = (_REPO_ROOT / "integration-tests/bin/ci-integration.sh").read_text(
+        encoding="utf-8"
+    )
+    steps = {
+        step.get("name"): step for step in workflow["jobs"]["integration"]["steps"]
+    }
+    status = {
+        step.get("name"): step
+        for step in workflow["jobs"]["integration-status"]["steps"]
+    }
+    upload = steps["Upload the shard manifest"]["with"]
+    download = status["Download shard manifests"]["with"]
+    # The wrapper writes manifests where the workflow uploads them from.
+    assert f"$repo_root/{upload['path']}}}" in wrapper
+    # The status job downloads exactly the uploaded manifest artifacts.
+    assert download["pattern"].endswith("*")
+    assert upload["name"].startswith(download["pattern"][:-1])
+    assert not steps["Upload integration diagnostics"]["with"]["name"].startswith(
+        download["pattern"][:-1]
+    )
+    # Shards run, and the status job verifies, the same storage backend.
+    lifecycle = steps["Run the bounded integration lifecycle"]["run"]
+    verify = status["Require the shards to cover the full plan once"]["run"]
+    assert ' nfs "${{ matrix.substrate }}"' in lifecycle
+    assert "--backend nfs" in verify
+    # The wrapper preserves the record the driver writes.
+    assert f'"$run/{_MANIFEST.WORK_ITEMS_FILENAME}"' in wrapper

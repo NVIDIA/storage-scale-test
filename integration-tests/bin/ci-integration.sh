@@ -36,13 +36,6 @@ case "$storage_backend" in
         exit 1
         ;;
 esac
-case "$test_substrate" in
-    all|ssh|slurm|kubectl) ;;
-    *)
-        echo "unsupported integration substrate: $test_substrate" >&2
-        exit 1
-        ;;
-esac
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 readonly repo_root
@@ -58,6 +51,12 @@ if [[ -z "$python_bin" ]]; then
     }
 fi
 readonly python_bin
+# The scenario planner defines the valid selectors; check before provisioning.
+if ! "$python_bin" "$repo_root/integration-tests/lib/shard_manifest.py" plan \
+        "$test_substrate" >/dev/null 2>&1; then
+    echo "unsupported integration substrate: $test_substrate" >&2
+    exit 1
+fi
 readonly privilege_command=${INTEGRATION_PRIVILEGE_COMMAND:-sudo}
 cleanup_started=0
 # Test runs named after this time belong to this lifecycle.
