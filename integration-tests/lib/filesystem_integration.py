@@ -72,6 +72,7 @@ from scenario_planner import (
     WorkItem,
     plan_scenarios,
 )
+from shard_manifest import WORK_ITEMS_FILENAME, WorkItemRecorder
 
 LOG = logging.getLogger("storage-scale-integration")
 
@@ -5574,6 +5575,8 @@ def run_filesystem_tests(
     log_dir = config.state_dir / "test-runs" / run_id
     log_dir.mkdir(parents=True, exist_ok=False)
     LOG.info("Filesystem integration artifacts: %s", log_dir)
+    # CI shard manifests compare the planned and passed work items.
+    work_items = WorkItemRecorder(log_dir / WORK_ITEMS_FILENAME, work)
     scratch_parent = config.state_dir / "test-runs"
     with tempfile.TemporaryDirectory(dir=scratch_parent) as temporary:
         build_root = Path(temporary)
@@ -5621,6 +5624,7 @@ def run_filesystem_tests(
                         )
                     continue
                 scenario = step.scenario.name
+                started = time.monotonic()
                 scenario_root = build_root / f"{scenario}-{step.substrate.value}"
                 scenario_root.mkdir()
                 scenario_logs = log_dir / f"{scenario}-{step.substrate.value}"
@@ -5715,6 +5719,7 @@ def run_filesystem_tests(
                         )
                 except Exception as error:
                     primary_error = error
+                    work_items.record(step, "failed", started)
                     try:
                         _preserve_scenario_failure_diagnostics(
                             runner,
@@ -5743,6 +5748,7 @@ def run_filesystem_tests(
                         if primary_error is None:
                             raise
                         _record_secondary_cleanup_failure(scenario_logs, cleanup_error)
+                work_items.record(step, "passed", started)
         except Exception as error:
             suite_error = error
             raise
