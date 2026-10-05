@@ -579,6 +579,12 @@ check_slurm() {
         return 1
     fi
 
+    # The same check run_sbatch_job applies before submitting.
+    local poll_error
+    if ! poll_error=$(_slurm_job_poll_interval 2>&1 >/dev/null); then
+        register_error "${poll_error#Error: }"
+    fi
+
     # Check partition access and GPU requirements
     target_partition="${partition-}"
     if [[ -z "$target_partition" ]]; then
