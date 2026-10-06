@@ -173,7 +173,12 @@ work, and shared SSH homes. Workloads stay deliberately small; assertions
 check execution coordinates and state transitions, phase and workload
 evidence, dataset totals, required native flags, relevant scheduling evidence,
 and semantic report rows and plot families without treating incidental output
-or performance values as contracts.
+or performance values as contracts. Completion-based direct-I/O scenarios that
+check only structure (default and explicit worker directories, failure/resume,
+retained data, and the Slurm Cartesian sweep) use 256 KiB files, because synced
+direct I/O to the NFS export is slow. Baseline, mixed-batch provenance,
+single-file, live-capture, cancellation, coordinator-loss, and endpoint-drift
+fixtures keep 16 MiB so their sizes and active intervals are unchanged.
 
 The Kubernetes substrate runs each supported sweep as one asynchronous
 cluster Job. `submit` returns after staging the control bundle and creating
@@ -278,13 +283,27 @@ than assuming it is preinstalled — see "Checks (run before committing)" in
 
 ## On-demand CI
 
-The `Filesystem integration` GitHub Actions workflow runs independent amd64
-and arm64 jobs concurrently. Each job installs `requirements.txt` in an isolated
-runtime venv and smoke-tests driver startup before provisioning. It runs setup
-twice, stops and restarts the fixture, proves that root lifecycle execution is
-rejected, runs `test` as the ordinary runner account, and tears down twice. A
-final status job requires both architectures to pass. The workflow runs only
-on demand, not on pull-request, push, or default-branch events.
+The `Filesystem integration` GitHub Actions workflow runs six concurrent jobs,
+one per architecture (amd64, arm64) and substrate (SSH, Slurm, Kubernetes),
+each on its own runner and NFS fixture. Scenarios within a job still run one at
+a time; the substrates never share a fixture. Each job installs
+`requirements.txt` in an isolated runtime venv and smoke-tests driver startup
+before provisioning. It runs setup twice, stops and restarts the fixture,
+proves that root lifecycle execution is rejected, runs
+`test --substrate <substrate>` as the ordinary runner account, and tears down
+twice. The same lifecycle runs locally with
+`integration-tests/bin/ci-integration.sh <amd64|arm64> [nfs|sbx-shared]
+[all|ssh|slurm|kubectl]`; the substrate defaults to `all`.
+
+Every job tests one source commit, resolved once from the requested ref, and
+writes a small manifest: commit, architecture, backend, substrate, boot ID,
+lifecycle step durations, and planned versus passed scenario/substrate work
+items. The final status job requires every job to pass and the six manifests
+to cover the unsharded scenario plan exactly once per architecture
+(`integration-tests/lib/shard_manifest.py verify`). Three fixtures per
+architecture cost more runner time than one, in exchange for wall time. The
+workflow runs only on demand, not on pull-request, push, or default-branch
+events.
 
 To run it, open **Actions**, choose **Filesystem integration**, and select
 **Run workflow**. Choose the workflow ref, then optionally enter a different

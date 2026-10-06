@@ -203,8 +203,8 @@ def test_default_dio_uses_worker_layout_and_derived_file_size():
 
     assert step.arguments == ("--nodes", "1,2")
     assert 'ELBENCHO_FILE_LAYOUT="worker-directories"' in environment
-    assert "ELBENCHO_FILE_SIZE=" in environment
-    assert "ELBENCHO_FILE_SIZE_MULTIPLIER=4096" in environment
+    assert "export ELBENCHO_FILE_SIZE=" in step.env_lines
+    assert "export ELBENCHO_FILE_SIZE_MULTIPLIER=64" in step.env_lines
     assert WorkloadPhase.TREE_SCAN not in step.required_phases
 
 
@@ -311,7 +311,7 @@ def test_worker_directories_exercise_explicit_run_to_completion_on_every_substra
         'declare -A TEST_DIRS=(["{test_root}"]=1 ["{test_root_secondary}"]=1)'
         in step.env_lines
     )
-    assert 'export ELBENCHO_FILE_SIZE="1M"' in step.env_lines
+    assert 'export ELBENCHO_FILE_SIZE="256K"' in step.env_lines
     assert 'export ELBENCHO_FILE_LAYOUT="worker-directories"' in step.env_lines
 
 
@@ -377,3 +377,68 @@ def test_validation_rejects_unbounded_timeout():
 
     with pytest.raises(ScenarioSpecError, match="timeout"):
         validate_scenario_specs((broken,))
+
+
+def _file_size(step):
+    sizes = [
+        line.split("=", 1)[1].strip('"')
+        for line in step.env_lines
+        if line.startswith(("export ELBENCHO_FILE_SIZE=", "ELBENCHO_FILE_SIZE="))
+    ]
+    assert len(sizes) == 1, step.env_lines
+    return sizes[0]
+
+
+def test_structural_direct_io_scenarios_use_small_multi_block_files():
+    """Completion-based DIO checks need several blocks, not 16 MiB per file."""
+    assert _SCENARIOS.SMALL_DIO_FILE_SIZE == "256K"
+    assert _SCENARIOS.SMALL_DIO_FILE_BYTES == 256 * 1024
+    assert _SCENARIOS.SMALL_DIO_FILE_BYTES // 8192 == 32
+    assert _SCENARIOS.SMALL_DIO_SIZE_MULTIPLIER * 4096 == 256 * 1024
+    small = [
+        _scenario("default-dio").steps[1],
+        _scenario("failure-resume").steps[0],
+        *_scenario("retained-lifecycle").steps,
+        *_scenario("kubectl-retained-read").steps,
+        _scenario("slurm-cartesian").steps[0],
+    ]
+    for step in small:
+        assert _file_size(step) == "256K", step.name
+
+
+def test_timing_sensitive_and_provenance_scenarios_keep_their_sizes():
+    """Active-interval and provenance checks must not shrink with DIO fixtures."""
+    unchanged = {
+        "baseline": "16M",
+        "live-capture": "16M",
+        "kubectl-cancel": "16M",
+        "kubectl-coordinator-loss": "16M",
+        "kubectl-endpoint-drift": "16M",
+    }
+    for name, size in unchanged.items():
+        assert _file_size(_scenario(name).steps[0]) == size, name
+    mixed = _scenario("mixed-batch").steps
+    assert (_file_size(mixed[0]), _file_size(mixed[2])) == ("16M", "8M")
+    single = "\n".join(_scenario("ssh-single-big-file").steps[0].env_lines)
+    assert 'ELBENCHO_SINGLE_BIG_FILE_SIZE="16M"' in single
+
+
+def test_small_file_scenarios_keep_their_coordinates_and_failure_plan():
+    """Smaller files must not drop sweep coordinates or the injected failure."""
+    cartesian = _scenario("slurm-cartesian").steps[0]
+    coordinates = {
+        (item.coordinate.nodes, item.coordinate.io_size)
+        + (item.coordinate.threads, item.coordinate.io_depth)
+        for item in cartesian.executions
+    }
+    assert len(cartesian.executions) == len(coordinates) == 16
+    assert "export ELBENCHO_FILES_PER_NODE=2" in cartesian.env_lines
+    initial, resume = _scenario("failure-resume").steps
+    assert [item.status for item in initial.executions] == [
+        ExecutionStatus.SUCCESS,
+        ExecutionStatus.FAILED,
+        ExecutionStatus.PENDING,
+        ExecutionStatus.PENDING,
+    ]
+    assert initial.failure_injection is FailureInjection.FAIL_AFTER_WRITE_ONCE
+    assert len(resume.executions) == 4

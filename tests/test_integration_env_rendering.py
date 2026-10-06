@@ -38,3 +38,25 @@ def test_runtime_environment_selects_each_substrate_explicitly(tmp_path):
             substrate, str(tmp_path), fixture
         )
         assert f"export EXECUTION_SUBSTRATE={substrate}" in rendered
+
+
+def test_rendered_slurm_environment_polls_accounting_every_second(tmp_path):
+    """The fixture's poll interval overrides the template default of 15."""
+    fixture = SimpleNamespace(
+        architecture="x86_64",
+        ssh_home_mode="separate",
+        ssh_addresses=("worker-a", "worker-b"),
+        slurm_nodes=("compute-0", "compute-1"),
+    )
+    rendered, _ = _INTEGRATION._render_env(  # pylint: disable=protected-access
+        _REPOSITORY_ROOT / "env.sh.template", "slurm", str(tmp_path), fixture
+    )
+    assignments = [
+        line.strip()
+        for line in rendered.splitlines()
+        if "SLURM_JOB_POLL_INTERVAL_SECONDS=" in line and not line.startswith("#")
+    ]
+    assert assignments == [
+        "SLURM_JOB_POLL_INTERVAL_SECONDS=15",
+        "export SLURM_JOB_POLL_INTERVAL_SECONDS=1",
+    ]

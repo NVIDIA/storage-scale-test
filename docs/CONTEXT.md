@@ -110,8 +110,9 @@ cover baseline and default I/O, failure/resume, retained data, live capture,
 Cartesian sweeps, single-file and weighted-root behavior, shared SSH homes, and
 Slurm scheduling. Fast tests cover parsing, precedence, path and workload safety,
 sizing, scheduler boundaries, failure contracts, and reporting. On-demand CI
-runs the full NFS-backed catalog concurrently on amd64 and arm64 with
-repeatable-teardown headroom; SBX is a supported local backend. Integration CI
+runs the full NFS-backed catalog on amd64 and arm64, sharded by substrate into
+six isolated fixtures whose manifests must cover the unsharded plan exactly,
+with repeatable-teardown headroom; SBX is a supported local backend. Integration CI
 installs runtime requirements into `.venv` and uses that interpreter for both
 startup smoke checks and the lifecycle; `.venv-ci` is not a runtime bootstrap.
 
@@ -195,6 +196,10 @@ Important configuration relationships:
   not imply all CPUs, setup queries the target node CPU count and adds
   `--cpus-per-task` when it can resolve the count. The default is bare
   `--exclusive`.
+- `SLURM_JOB_POLL_INTERVAL_SECONDS` (default 15) sets how often
+  `tail_until_complete` checks `sacct` for the main allocation's terminal
+  state; integration fixtures use 1. Only the main allocation row decides the
+  result, and the 10-second final log grace is unchanged.
 - `_SBATCH_OPTIONS_BASE` and `_SRUN_OPTIONS_BASE` contain the structured base
   options. `build_sbatch_cmd` and `build_srun_cmd` append the
   `SLURM_EXTRA_ARGS` array without losing embedded spaces. The public

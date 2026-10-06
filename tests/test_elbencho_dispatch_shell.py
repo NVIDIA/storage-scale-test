@@ -1222,6 +1222,79 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         result = _run_bash(textwrap.dedent(script))
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_tail_until_complete_polls_at_the_configured_interval(self) -> None:
+        """Only the main allocation row ends the wait, at the chosen interval."""
+        script = f"""
+        set -e
+        source "{_ENV_FUNCTIONS}"
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        tail() {{ :; }}
+        kill() {{ :; }}
+        wait() {{ :; }}
+        sleep() {{ printf '%s\\n' "$1" >> "$tmp/sleeps"; }}
+        # sacct runs in a command substitution, so count polls in a file.
+        sacct() {{
+            [[ "$*" == *JobIDRaw,State* ]] || return 0
+            printf . >> "$tmp/polls"
+            case "$(wc -c < "$tmp/polls")" in
+                1) return 1 ;;                                    # accounting error
+                2) ;;                                             # no rows yet
+                3) printf '42.extern|COMPLETED\\n' ;;            # child only
+                4) printf '42|RUNNING\\n42.0|COMPLETED\\n' ;;   # main still running
+                *) printf '42|COMPLETED\\n42.extern|COMPLETED\\n' ;;
+            esac
+        }}
+        SLURM_JOB_POLL_INTERVAL_SECONDS=1
+        set +e
+        tail_until_complete 42 /dev/null
+        rc=$?
+        set -e
+        [[ "$rc" -eq 0 ]]
+        [[ "$(wc -c < "$tmp/polls")" -eq 5 ]]
+        # Four 1-second polls, then the unchanged 10-second final log grace.
+        [[ "$(tr '\\n' ' ' < "$tmp/sleeps")" == "1 1 1 1 10 " ]]
+        """
+        result = _run_bash(textwrap.dedent(script))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_tail_until_complete_defaults_and_rejects_invalid_intervals(self) -> None:
+        script = f"""
+        set -e
+        source "{_ENV_FUNCTIONS}"
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        tail() {{ touch "$tmp/tailed"; }}
+        kill() {{ :; }}
+        wait() {{ :; }}
+        sleep() {{ printf '%s\\n' "$1" >> "$tmp/sleeps"; }}
+        sacct() {{
+            [[ "$*" == *JobIDRaw,State* ]] || return 0
+            printf . >> "$tmp/polls"
+            [[ "$(wc -c < "$tmp/polls")" -gt 1 ]] && printf '42|TIMEOUT\\n'
+            return 0
+        }}
+        unset SLURM_JOB_POLL_INTERVAL_SECONDS
+        set +e
+        tail_until_complete 42 /dev/null
+        rc=$?
+        set -e
+        [[ "$rc" -eq 1 && "$(head -1 "$tmp/sleeps")" == 15 ]]
+        rm -f "$tmp/tailed"
+        for interval in 0 -1 1.5 abc 015; do
+            set +e
+            SLURM_JOB_POLL_INTERVAL_SECONDS="$interval" tail_until_complete 42 /dev/null \\
+                2>"$tmp/err"
+            rc=$?
+            set -e
+            [[ "$rc" -eq 1 ]]
+            grep -q "must be a positive integer" "$tmp/err"
+            [[ ! -e "$tmp/tailed" ]]
+        done
+        """
+        result = _run_bash(textwrap.dedent(script))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_ssh_startup_stops_hosts_before_pruning_them(self) -> None:
         script = f"""
         set -e

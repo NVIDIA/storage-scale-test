@@ -162,6 +162,15 @@ class FilesystemScenarioSpec:
     steps: tuple[ScenarioStep, ...]
 
 
+# Completion-based direct-I/O workloads that only check structure (counts,
+# phases, failure/resume, retained reads) use small files: 64 blocks at 4K, 32
+# at 8K. Direct I/O with --sync to the CI NFS export runs below 1 MiB/s, so 16
+# MiB files cost minutes per scenario. Timing-sensitive scenarios (live
+# capture, cancellation, coordinator loss, endpoint drift) keep 16 MiB.
+SMALL_DIO_FILE_SIZE = "256K"
+SMALL_DIO_FILE_BYTES = 256 * 1024
+SMALL_DIO_SIZE_MULTIPLIER = 64  # automatic size = 4K block x 64 = 256K
+
 _SHARED_ENV = (
     "unset TEST_DIRS",
     'declare -A TEST_DIRS=(["{test_root}"]=1)',
@@ -182,7 +191,7 @@ _WORKER_ENV = (
     'export ELBENCHO_FILE_LAYOUT="worker-directories"',
     "export ELBENCHO_FILES_PER_NODE=",
     "export ELBENCHO_FILE_SIZE=",
-    "export ELBENCHO_FILE_SIZE_MULTIPLIER=4096",
+    f"export ELBENCHO_FILE_SIZE_MULTIPLIER={SMALL_DIO_SIZE_MULTIPLIER}",
     'export ELBENCHO_SCALE_THREAD_LIST=("1")',
     'export ELBENCHO_SCALE_IO_SIZES=("4K")',
     'export ELBENCHO_IODEPTH_LIST=("1")',
@@ -190,6 +199,15 @@ _WORKER_ENV = (
     "export ELBENCHO_LIVE_CSV_EXTENDED=0",
     "export ELBENCHO_SINGLE_BIG_FILE=0",
 )
+
+
+def _small_file_env(env_lines: tuple[str, ...]) -> tuple[str, ...]:
+    """Return env_lines with the small direct-I/O file size."""
+    return _override_env(
+        env_lines,
+        {"ELBENCHO_FILE_SIZE": f'export ELBENCHO_FILE_SIZE="{SMALL_DIO_FILE_SIZE}"'},
+    )
+
 
 _NORMAL_PHASES = (
     WorkloadPhase.DIRECTORY_CREATE,
@@ -407,7 +425,9 @@ def _default_dio() -> FilesystemScenarioSpec:
                     _WORKER_ENV,
                     {
                         "ELBENCHO_FILES_PER_NODE": "export ELBENCHO_FILES_PER_NODE=5",
-                        "ELBENCHO_FILE_SIZE": 'export ELBENCHO_FILE_SIZE="1M"',
+                        "ELBENCHO_FILE_SIZE": (
+                            f'export ELBENCHO_FILE_SIZE="{SMALL_DIO_FILE_SIZE}"'
+                        ),
                     },
                 ),
                 _coordinates((1, 2), ("4K",), (1,), (1,)),
@@ -429,7 +449,7 @@ def _failure_resume() -> FilesystemScenarioSpec:
     }
     initial = _coordinates((1, 2), ("4K", "8K"), (1,), (1,), statuses=statuses)
     env_lines = _override_env(
-        _SHARED_ENV,
+        _small_file_env(_SHARED_ENV),
         {"ELBENCHO_SCALE_IO_SIZES": ('export ELBENCHO_SCALE_IO_SIZES=("4K" "8K")')},
     )
     first = _step(
@@ -521,11 +541,12 @@ def _mixed_batch() -> FilesystemScenarioSpec:
 
 
 def _retained_lifecycle() -> FilesystemScenarioSpec:
+    env_lines = _small_file_env(_SHARED_ENV)
     coordinate = _coordinates((1,), ("4K",), (1,), (1,))
     write = _step(
         "write-only",
         ("--write-only", "--nodes", "1"),
-        _SHARED_ENV,
+        env_lines,
         coordinate,
         (WorkloadPhase.DIRECTORY_CREATE, WorkloadPhase.WRITE),
         DatasetExpectation.PRESERVED,
@@ -534,7 +555,7 @@ def _retained_lifecycle() -> FilesystemScenarioSpec:
     read_miss = _step(
         "read-cache-miss",
         ("--read-from", "{retained_data_dir}", "--nodes", "1"),
-        _SHARED_ENV,
+        env_lines,
         coordinate,
         (WorkloadPhase.TREE_SCAN, WorkloadPhase.READ),
         DatasetExpectation.PRESERVED,
@@ -543,7 +564,7 @@ def _retained_lifecycle() -> FilesystemScenarioSpec:
     read_hit = _step(
         "read-cache-hit",
         ("--read-from", "{retained_data_dir}", "--nodes", "1"),
-        _SHARED_ENV,
+        env_lines,
         coordinate,
         (WorkloadPhase.READ,),
         DatasetExpectation.PRESERVED,
@@ -553,7 +574,7 @@ def _retained_lifecycle() -> FilesystemScenarioSpec:
         name="delete-only",
         kind=CommandKind.DELETE,
         arguments=("--delete-only", "{retained_data_dir}"),
-        env_lines=_SHARED_ENV,
+        env_lines=env_lines,
         support_files=(),
         generated_inputs=(),
         timeout_seconds=180,
@@ -600,11 +621,12 @@ def _live_capture() -> FilesystemScenarioSpec:
 
 def _kubectl_retained_read() -> FilesystemScenarioSpec:
     """Exercise retained data across independently collected attempts."""
+    env_lines = _small_file_env(_SHARED_ENV)
     coordinate = _coordinates((1,), ("4K",), (1,), (1,))
     write = _step(
         "write-only",
         ("--write-only", "--nodes", "1"),
-        _SHARED_ENV,
+        env_lines,
         coordinate,
         (WorkloadPhase.DIRECTORY_CREATE, WorkloadPhase.WRITE),
         DatasetExpectation.PRESERVED,
@@ -613,7 +635,7 @@ def _kubectl_retained_read() -> FilesystemScenarioSpec:
     read = _step(
         "read-from",
         ("--read-from", "{retained_data_dir}", "--nodes", "1"),
-        _SHARED_ENV,
+        env_lines,
         coordinate,
         (WorkloadPhase.TREE_SCAN, WorkloadPhase.READ),
         DatasetExpectation.PRESERVED,
@@ -717,7 +739,7 @@ def _slurm_cartesian() -> FilesystemScenarioSpec:
         _SHARED_ENV,
         {
             "ELBENCHO_FILES_PER_NODE": "export ELBENCHO_FILES_PER_NODE=2",
-            "ELBENCHO_FILE_SIZE": 'export ELBENCHO_FILE_SIZE="1M"',
+            "ELBENCHO_FILE_SIZE": f'export ELBENCHO_FILE_SIZE="{SMALL_DIO_FILE_SIZE}"',
             "ELBENCHO_SCALE_THREAD_LIST": (
                 'export ELBENCHO_SCALE_THREAD_LIST=("1" "2")'
             ),

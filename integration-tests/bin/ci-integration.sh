@@ -17,8 +17,11 @@
 
 set -euo pipefail
 
-expected_arch=${1:?usage: ci-integration.sh <amd64|arm64> [nfs|sbx-shared]}
+usage='usage: ci-integration.sh <amd64|arm64> [nfs|sbx-shared] [all|ssh|slurm|kubectl]'
+expected_arch=${1:?$usage}
 storage_backend=${2:-nfs}
+# The CI workflow runs one shard per substrate, each on its own runner.
+test_substrate=${3:-all}
 case "${expected_arch}:$(uname -m)" in
     amd64:x86_64|arm64:aarch64) ;;
     *)
@@ -39,6 +42,7 @@ readonly repo_root
 readonly driver=${INTEGRATION_DRIVER:-$repo_root/integration-tests/bin/integration-test.py}
 readonly state_dir=${INTEGRATION_STATE_DIR:-$repo_root/tmp/integration-state}
 readonly diagnostics=${INTEGRATION_DIAGNOSTICS:-$repo_root/tmp/integration-diagnostics}
+readonly manifest_dir=${INTEGRATION_MANIFEST_DIR:-$repo_root/tmp/integration-manifest}
 python_bin=${INTEGRATION_PYTHON:-}
 if [[ -z "$python_bin" ]]; then
     python_bin=$(command -v python3) || {
@@ -47,8 +51,56 @@ if [[ -z "$python_bin" ]]; then
     }
 fi
 readonly python_bin
+# The scenario planner defines the valid selectors; check before provisioning.
+if ! "$python_bin" "$repo_root/integration-tests/lib/shard_manifest.py" plan \
+        "$test_substrate" >/dev/null 2>&1; then
+    echo "unsupported integration substrate: $test_substrate" >&2
+    exit 1
+fi
 readonly privilege_command=${INTEGRATION_PRIVILEGE_COMMAND:-sudo}
 cleanup_started=0
+# Test runs named after this time belong to this lifecycle.
+lifecycle_started=$(date -u +%Y%m%dT%H%M%SZ)
+readonly lifecycle_started
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/ci-integration.XXXXXX")
+readonly scratch
+readonly timings="$scratch/timings.tsv"
+
+# Run one lifecycle call, recording "step<TAB>seconds<TAB>exit-code".
+timed() {
+    local step=$1 started=$SECONDS rc=0
+    shift
+    "$@" || rc=$?
+    printf '%s\t%s\t%s\n' "$step" "$((SECONDS - started))" "$rc" >> "$timings"
+    return "$rc"
+}
+
+driver_action() {
+    "$python_bin" "$driver" --storage-backend "$storage_backend" "$@"
+}
+
+# Keep this lifecycle's work-item record; teardown removes the state directory.
+preserve_work_items() {
+    local run
+    for run in "$state_dir"/test-runs/*/; do
+        [[ -f "$run/work-items.json" && "$(basename -- "$run")" > "$lifecycle_started" ]] \
+            || continue
+        cp -- "$run/work-items.json" "$scratch/work-items.json" || return 1
+    done
+}
+
+# Every shard writes a manifest, even when setup fails, so the workflow's
+# status job can prove which work items ran. A missing manifest fails CI.
+write_manifest() {
+    local exit_code=$1 source_sha
+    source_sha=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null) || source_sha=unknown
+    "$python_bin" "$repo_root/integration-tests/lib/shard_manifest.py" write \
+        --output "$manifest_dir/$expected_arch-$test_substrate.json" \
+        --source-sha "$source_sha" --architecture "$expected_arch" \
+        --backend "$storage_backend" --substrate "$test_substrate" \
+        --exit-code "$exit_code" --timings "$timings" \
+        --work-items "$scratch/work-items.json"
+}
 
 run_teardown() {
     local log_path=${1:-}
@@ -94,12 +146,19 @@ cleanup() {
         cp -a -- "$state_dir/test-runs" "$diagnostics/test-runs" \
             || echo "Warning: could not preserve test-run diagnostics" >&2
     fi
-    run_teardown "$first_log" || first_rc=$?
-    run_teardown "$second_log" || second_rc=$?
+    preserve_work_items || echo "Warning: could not preserve the work-item record" >&2
+    timed teardown-1 run_teardown "$first_log" || first_rc=$?
+    timed teardown-2 run_teardown "$second_log" || second_rc=$?
+    local final_rc=$original_rc
     if (( original_rc == 0 && (first_rc != 0 || second_rc != 0) )); then
-        return 1
+        final_rc=1
     fi
-    return "$original_rc"
+    if ! write_manifest "$final_rc"; then
+        echo "Error: could not write the integration shard manifest" >&2
+        (( final_rc != 0 )) || final_rc=1
+    fi
+    rm -rf -- "$scratch"
+    return "$final_rc"
 }
 
 finish() {
@@ -116,15 +175,15 @@ trap 'exit 124' TERM
 trap 'exit 130' INT
 
 cd -- "$repo_root"
-"$python_bin" "$driver" --storage-backend "$storage_backend" setup
-"$python_bin" "$driver" --storage-backend "$storage_backend" setup
-"$python_bin" "$driver" --storage-backend "$storage_backend" stop
-"$python_bin" "$driver" --storage-backend "$storage_backend" start
+timed setup-1 driver_action setup
+timed setup-2 driver_action setup
+timed stop driver_action stop
+timed start driver_action start
 for action in setup test; do
-    if "$privilege_command" env INTEGRATION_EXPECT_ROOT_REJECTION=1 \
+    if timed "root-$action" "$privilege_command" env INTEGRATION_EXPECT_ROOT_REJECTION=1 \
             "$python_bin" "$driver" --storage-backend "$storage_backend" "$action"; then
         echo "integration $action action unexpectedly accepted root" >&2
         exit 1
     fi
 done
-"$python_bin" "$driver" --storage-backend "$storage_backend" test
+timed test driver_action test --substrate "$test_substrate"

@@ -506,10 +506,24 @@ module_exists() {
     module avail "$1" 2>&1 | grep -q "^$1"
 }
 
+# Print the sacct poll interval used while waiting for Slurm jobs:
+# SLURM_JOB_POLL_INTERVAL_SECONDS, a positive integer (default 15).
+# run_sbatch_job checks it before submitting, so an invalid value can never
+# leave submitted jobs running after the monitor rejects it.
+_slurm_job_poll_interval() {
+    local seconds="${SLURM_JOB_POLL_INTERVAL_SECONDS:-15}"
+    if [[ ! "$seconds" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: SLURM_JOB_POLL_INTERVAL_SECONDS must be a positive integer: $seconds" >&2
+        return 1
+    fi
+    printf '%s\n' "$seconds"
+}
+
 # Tail an array of logfile names, robustly, until a slurm JOBID has
 # transitioned into a terminal state.  Return 0 on COMPLETED or 1 otherwise.
 # The final sacct information is printed after the terminal state has been
-# reached, and the tail killed and waited upon.
+# reached, and the tail killed and waited upon. sacct is polled every
+# SLURM_JOB_POLL_INTERVAL_SECONDS (a positive integer; default 15).
 #
 # Call this function like:
 #   tail_until_complete "$JOBID" "${log_files[@]}"
@@ -519,6 +533,8 @@ tail_until_complete() {
     shift
     local log_files=("$@")  # More reliable array handling
     local terminal_rc
+    local poll_seconds
+    poll_seconds=$(_slurm_job_poll_interval) || return 1
 
     # the "-n" is so we don't miss many lines that got into the file
     # before tail noticed the file became available.
@@ -543,7 +559,7 @@ tail_until_complete() {
             *)
                 # No main allocation row yet, or the allocation is still in a
                 # non-terminal state. Child step rows must not decide success.
-                sleep 15
+                sleep "$poll_seconds"
                 continue
                 ;;
         esac
@@ -4284,11 +4300,15 @@ print_slurm_node_warnings() {
 #   run_sbatch_job <nodes> <job_name> <output_fmt> <description> \
 #       <batch_script> [script_args...]
 #
-# Returns non-zero on sbatch failure; caller decides how to handle it.
+# Returns non-zero on sbatch failure or an invalid poll interval; caller
+# decides how to handle it.
 # shellcheck disable=SC2154  # Variables set by caller
 run_sbatch_job() {
     local nodes="$1" job_name="$2" output_fmt="$3" description="$4"
     shift 4
+    # Every submitted job is monitored by tail_until_complete; reject its
+    # settings before submitting anything.
+    _slurm_job_poll_interval >/dev/null || return 1
 
     local -a loop_sbatch_opts=()
     if [[ -n "${JOBID:-}" ]]; then

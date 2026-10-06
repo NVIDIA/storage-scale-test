@@ -59,6 +59,8 @@ from fixture_capacity import (
 )
 from filesystem_scenario_specs import (
     SCENARIO_SPECS_BY_NAME,
+    SMALL_DIO_FILE_BYTES,
+    SMALL_DIO_FILE_SIZE,
     CommandKind,
     DatasetExpectation,
     ExecutionStatus,
@@ -72,6 +74,7 @@ from scenario_planner import (
     WorkItem,
     plan_scenarios,
 )
+from shard_manifest import WORK_ITEMS_FILENAME, WorkItemRecorder
 
 LOG = logging.getLogger("storage-scale-integration")
 
@@ -1092,6 +1095,8 @@ def _override_block(
         'export ELBENCHO_IODEPTH_LIST=("1")',
         "export ELBENCHO_SCALE_READ_WRITE_DURATION=1",
         "export ELBENCHO_READ_AFTER_WRITE_PAUSE=0",
+        # Notice finished Slurm jobs within a second instead of 15.
+        "export SLURM_JOB_POLL_INTERVAL_SECONDS=1",
         "export ELBENCHO_LIVE_CSV_EXTENDED=0",
         "export ELBENCHO_SINGLE_BIG_FILE=0",
         'export OBJ_BUCKET=""',
@@ -2021,18 +2026,23 @@ def _workload_values(path: Path) -> dict[str, str]:
 def _expected_dataset_totals(
     scenario: str, step: ScenarioStep, nodes: int
 ) -> tuple[int, int] | None:
-    """Return exact bounded totals for workloads with a metadata contract."""
-    if scenario in {"baseline", "ssh-shared-home", "failure-resume"}:
+    """Return exact bounded totals for workloads with a metadata contract.
+
+    File sizes come from the scenario definitions, never from the results.
+    """
+    if scenario in {"baseline", "ssh-shared-home"}:
         return nodes, nodes * 16 * 1024 * 1024
+    if scenario == "failure-resume":
+        return nodes, nodes * SMALL_DIO_FILE_BYTES
     if scenario == "live-capture":
         return nodes * 2, nodes * (MAX_LIVE_CAPTURE_DATASET_BYTES // 2)
     if scenario == "slurm-cartesian":
-        return nodes * 2, nodes * 2 * 1024 * 1024
+        return nodes * 2, nodes * 2 * SMALL_DIO_FILE_BYTES
     if (
         scenario in {"retained-lifecycle", "kubectl-retained-read"}
         and step.kind is not CommandKind.DELETE
     ):
-        return 1, 16 * 1024 * 1024
+        return 1, SMALL_DIO_FILE_BYTES
     return None
 
 
@@ -2286,7 +2296,7 @@ def _assert_semantic_flags(scenario: str, step: ScenarioStep, result: Path) -> N
         required = ("--direct", "--dirs=2", "--write", "--read")
         forbidden = ("--norandalign", "--timelimit", "--infloop")
         if step.name == "explicit-completion-based":
-            required += ("--files=3", "--size=1M")
+            required += ("--files=3", f"--size={SMALL_DIO_FILE_SIZE}")
     elif scenario == "live-capture":
         required = ("--livecsv", "--livecsvex", "--liveint=10")
     elif scenario == "ssh-single-big-file" and step.name == "inferred-extent-read":
@@ -5574,6 +5584,8 @@ def run_filesystem_tests(
     log_dir = config.state_dir / "test-runs" / run_id
     log_dir.mkdir(parents=True, exist_ok=False)
     LOG.info("Filesystem integration artifacts: %s", log_dir)
+    # CI shard manifests compare the planned and passed work items.
+    work_items = WorkItemRecorder(log_dir / WORK_ITEMS_FILENAME, work)
     scratch_parent = config.state_dir / "test-runs"
     with tempfile.TemporaryDirectory(dir=scratch_parent) as temporary:
         build_root = Path(temporary)
@@ -5621,6 +5633,7 @@ def run_filesystem_tests(
                         )
                     continue
                 scenario = step.scenario.name
+                started = time.monotonic()
                 scenario_root = build_root / f"{scenario}-{step.substrate.value}"
                 scenario_root.mkdir()
                 scenario_logs = log_dir / f"{scenario}-{step.substrate.value}"
@@ -5715,6 +5728,7 @@ def run_filesystem_tests(
                         )
                 except Exception as error:
                     primary_error = error
+                    work_items.record(step, "failed", started)
                     try:
                         _preserve_scenario_failure_diagnostics(
                             runner,
@@ -5743,6 +5757,7 @@ def run_filesystem_tests(
                         if primary_error is None:
                             raise
                         _record_secondary_cleanup_failure(scenario_logs, cleanup_error)
+                work_items.record(step, "passed", started)
         except Exception as error:
             suite_error = error
             raise

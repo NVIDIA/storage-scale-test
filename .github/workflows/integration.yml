@@ -30,17 +30,40 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  source:
+    name: Resolve the source commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_ref || github.sha }}
+      # Every shard checks out this exact commit, even if a branch moves.
+      - name: Record the commit every shard tests
+        id: resolve
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # One isolated fixture per architecture and substrate, each on its own
+  # runner VM; scenarios within a shard still run serially.
   integration:
-    name: Setup and test all (${{ matrix.architecture }})
+    name: Setup and test ${{ matrix.substrate }} (${{ matrix.architecture.name }})
+    needs: source
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - architecture: amd64
+        architecture:
+          - name: amd64
             runner: linux-amd64-cpu4
-          - architecture: arm64
+          - name: arm64
             runner: linux-arm64-cpu4
-    runs-on: ${{ matrix.runner }}
+        substrate: [ssh, slurm, kubectl]
+    runs-on: ${{ matrix.architecture.runner }}
     timeout-minutes: 135
     permissions:
       contents: read
@@ -51,7 +74,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-          ref: ${{ inputs.source_ref || github.sha }}
+          ref: ${{ needs.source.outputs.sha }}
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -75,23 +98,55 @@ jobs:
       - name: Run the bounded integration lifecycle
         run: |
           timeout --kill-after=10m 105m \
-            integration-tests/bin/ci-integration.sh "${{ matrix.architecture }}"
+            integration-tests/bin/ci-integration.sh \
+            "${{ matrix.architecture.name }}" nfs "${{ matrix.substrate }}"
       - name: Upload integration diagnostics
         if: ${{ always() }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: filesystem-integration-${{ matrix.architecture }}
+          name: filesystem-integration-${{ matrix.architecture.name }}-${{ matrix.substrate }}
           path: tmp/integration-diagnostics
           if-no-files-found: warn
+          retention-days: 7
+      - name: Upload the shard manifest
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: integration-manifest-${{ matrix.architecture.name }}-${{ matrix.substrate }}
+          path: tmp/integration-manifest
+          if-no-files-found: error
           retention-days: 7
 
   integration-status:
     name: Filesystem integration status
     if: ${{ always() }}
-    needs: integration
+    needs: [source, integration]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     steps:
-      - name: Require every architecture to pass
+      - name: Require every shard to pass
         env:
           INTEGRATION_RESULT: ${{ needs.integration.result }}
         run: test "$INTEGRATION_RESULT" = success
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ needs.source.outputs.sha }}
+      - name: Download shard manifests
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: integration-manifest-*
+          merge-multiple: true
+          path: integration-manifests
+      # Manifests prove coverage; they never override a failed shard.
+      - name: Require the shards to cover the full plan once
+        env:
+          SOURCE_SHA: ${{ needs.source.outputs.sha }}
+        run: >-
+          python3 integration-tests/lib/shard_manifest.py verify
+          --manifests integration-manifests --source-sha "$SOURCE_SHA"
+          --backend nfs --architectures amd64,arm64
