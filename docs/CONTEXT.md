@@ -113,8 +113,26 @@ sizing, scheduler boundaries, failure contracts, and reporting. On-demand CI
 runs the full NFS-backed catalog on amd64 and arm64, sharded by substrate into
 six isolated fixtures whose manifests must cover the unsharded plan exactly,
 with repeatable-teardown headroom; SBX is a supported local backend. Integration CI
+uses Ubuntu 26.04 for source resolution and final status checks, while benchmark
+shards use NVIDIA-managed `linux-amd64-cpu4` and `linux-arm64-cpu4` runners.
+The status job downloads shard manifests with the Node.js 24-based
+`actions/download-artifact` v7.0.0 action, pinned by commit SHA. Integration CI
 installs runtime requirements into `.venv` and uses that interpreter for both
 startup smoke checks and the lifecycle; `.venv-ci` is not a runtime bootstrap.
+Package-installing fixture image builds (SSH worker, Slinky login) receive the
+runner's APT cache mirrors from workflow env through `lib/apt_mirrors.py` and
+`lib/apt-build.sh`: URI-only source rewrite, CA via BuildKit secret (mode=0444 for
+the `_apt` user; checked early), every public Ubuntu URI must be covered by
+a mirror, each checked on its own even when one deb822 `URIs:` field or line
+lists several (no partial configuration), no public fallback. No per-attempt cap:
+APT's finite timeouts bound stalls, retries only on apt failure, and the
+540-second `APT_BUDGET_SECONDS` ends the build, so slow progress is not killed.
+`apt-get update` exits 0 on source failures, so its output is inspected: only a
+failed index from an Ubuntu source (public hosts or a configured mirror) fails
+or retries; non-Ubuntu base-image sources (Slinky login's Kubernetes repo) are
+tolerated, as bare apt-get did.
+Unset variables keep public repositories. The
+Slinky slurmd image installs nothing and takes no mirror arguments.
 
 The kubectl filesystem sweep's implemented decisions and tradeoffs are retained
 in the historical
@@ -321,6 +339,17 @@ with fresh identity evidence. Collection copies PVC results to the local result
 tree. A configured namespace, existing PV/PVC, node selector, authorized kubectl
 context, and compatible CNI are prerequisites. Upload, health-probe, and
 collection retry limits are specified in `docs/KUBERNETES_ELBENCHO_LIFECYCLE.md`.
+`kubectl_create_owned_object` retries a create lost in transit (up to
+`KUBECTL_CREATE_ATTEMPTS`, default 3) only after an exact GET proves the
+deterministic name absent; this is safe because names are fixed and the same
+manifest and nonce are re-sent, so at most one object can exist and
+`AlreadyExists` resolves by exact identity. The PVC Lease keeps its own create
+path because there `AlreadyExists` can mean another owner. The creation
+ambiguity horizon is max(30 s, `KUBECTL_PROCESS_TIMEOUT_SECONDS`) from the
+intent mtime, which is refreshed before each retry; objects absent past it are
+recorded under `ambiguous-absence/` and never adopted. `validate_env.sh` lists
+objects labeled `app.kubernetes.io/name=storage-scale-test` for humans only;
+that label never establishes ownership.
 Docker SBX validates the supported kind profile; dual-architecture NFS CI and
 a separately authorized external-cluster run are release acceptance gates.
 
@@ -709,7 +738,8 @@ Pull-request and `main` CI explicitly use four workers to match the runner CPU
 count.
 
 After Python changes, run Black 25.9.0 or newer and Pylint. `.pylintrc` is the
-canonical configuration and the required score is 10.00/10. It gates Pylint's
+canonical configuration and the required result is zero messages (the score
+rounds to 10.00 even with one warning). It gates Pylint's
 enabled fatal/error/warning checks plus exactly these C/R checks:
 
 - `C0200` (`consider-using-enumerate`)

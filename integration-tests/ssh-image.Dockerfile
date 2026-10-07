@@ -15,9 +15,13 @@
 
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
+ARG APT_ARCHIVE_MIRROR=
+ARG APT_SECURITY_MIRROR=
+ARG APT_PORTS_MIRROR=
 
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+RUN --mount=type=bind,source=lib/apt-build.sh,target=/tmp/apt-build.sh \
+    --mount=type=secret,id=apt_ca,required=false,mode=0444 \
+    bash /tmp/apt-build.sh \
         ca-certificates \
         coreutils \
         file \

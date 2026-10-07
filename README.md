@@ -180,9 +180,12 @@ checks; a configured `OBJ_BUCKET` enables object checks.
 
 Validation performs access probes, not just syntax checks. It checks writable
 filesystem paths and object access, rejects a nonempty test bucket, and
-creates temporary Kubernetes validation resources when applicable. Read
-detailed errors and diagnostic paths above the final summary. Disabled-test
-notes are not failures.
+creates temporary Kubernetes validation resources when applicable. For
+Kubernetes it also lists existing objects from this toolset, informationally
+(see the
+[troubleshooting notes](docs/FILESYSTEM_TESTING.md#kubernetes-access-and-troubleshooting)).
+Read detailed errors and diagnostic paths above the final summary.
+Disabled-test notes are not failures.
 
 Fix configuration errors in `env.sh`. For mount, admission, registry, or CNI
 failures, use the reported evidence with your cluster/storage administrator.

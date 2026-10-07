@@ -47,6 +47,7 @@ from typing import IO, Any
 INTEGRATION_LIB = Path(__file__).resolve().parents[1] / "lib"
 sys.path.insert(0, str(INTEGRATION_LIB))
 
+from apt_mirrors import apt_build_arguments  # pylint: disable=wrong-import-position
 from chart_acquisition import ensure_chart  # pylint: disable=wrong-import-position
 from filesystem_integration import (  # pylint: disable=wrong-import-position
     IntegrationTestError,
@@ -2523,6 +2524,16 @@ def _publish_image_build(
     _write_image_ownership_state(config, state)
 
 
+def _package_mirror_arguments() -> tuple[str, ...]:
+    """Return docker build arguments for CI-configured package mirrors."""
+    try:
+        return tuple(apt_build_arguments(os.environ))
+    except ValueError as error:
+        raise ProvisionError(
+            f"invalid package mirror configuration: {error}"
+        ) from error
+
+
 def _build_owned_image(
     runner: Runner,
     config: Config,
@@ -2534,6 +2545,8 @@ def _build_owned_image(
     """Build one fixture image without exposing an unjournaled fixed tag."""
     _ensure_pinned_image(runner, base_image)
     temporary_tag = _begin_image_build(runner, config, image)
+    LOG.info("Building fixture image %s (this can take several minutes)", image)
+    started = time.monotonic()
     runner.run(
         [
             "docker",
@@ -2548,6 +2561,12 @@ def _build_owned_image(
         timeout=600,
     )
     _publish_image_build(runner, config, image, temporary_tag)
+    LOG.info(
+        "Built fixture image %s (%s) in %.1fs",
+        image,
+        _image_id(runner, image),
+        time.monotonic() - started,
+    )
 
 
 def _prepare_csi_images(runner: Runner, config: Config) -> None:
@@ -2900,7 +2919,11 @@ def _install_ssh_workers(runner: Runner, config: Config) -> None:
         SSH_IMAGE,
         _resource_path("ssh-image.Dockerfile"),
         SSH_BASE_IMAGE,
-        ("--build-arg", f"BASE_IMAGE={SSH_BASE_IMAGE}"),
+        (
+            "--build-arg",
+            f"BASE_IMAGE={SSH_BASE_IMAGE}",
+            *_package_mirror_arguments(),
+        ),
     )
     nodes = _kind_containers(runner, config, running_only=True)
     _load_image_into_nodes(runner, SSH_IMAGE, nodes)
@@ -3416,6 +3439,7 @@ def _build_slinky_image(
     base_image: str,
     dockerfile: str,
     nodes: list[str],
+    build_arguments: Sequence[str] = (),
 ) -> None:
     """Build, record, and preload one fixture-owned Slinky image."""
     _build_owned_image(
@@ -3424,10 +3448,7 @@ def _build_slinky_image(
         image,
         _resource_path(dockerfile),
         base_image,
-        (
-            "--build-arg",
-            f"BASE_IMAGE={base_image}",
-        ),
+        ("--build-arg", f"BASE_IMAGE={base_image}", *build_arguments),
     )
     _load_image_into_nodes(runner, image, nodes)
 
@@ -4183,6 +4204,7 @@ def _prepare_slurm_images(runner: Runner, config: Config) -> None:
         base_image=SLINKY_LOGIN_BASE_IMAGE,
         dockerfile="slinky-login-image.Dockerfile",
         nodes=[control_plane],
+        build_arguments=_package_mirror_arguments(),
     )
     _build_slinky_image(
         runner,

@@ -549,6 +549,15 @@ workload resources and events; create, inspect, and delete Jobs, Pods,
 DaemonSets, ConfigMaps, NetworkPolicies and Leases; and read Pod logs and exec
 into Pods. The coordinator itself has no Kubernetes API credentials.
 
+`validate_env.sh` also lists, informationally, any Jobs, DaemonSets, Pods,
+NetworkPolicies and Leases labeled `app.kubernetes.io/name=storage-scale-test`
+(all namespaces, falling back to `KUBECTL_NAMESPACE` if cluster-wide listing is
+forbidden). Existing objects never fail validation, and the label does not
+prove ownership: they may belong to an active or uncollected attempt. Find the
+result directory whose `kubernetes/attempts/<run-id>/` matches the listed RUN
+and use `--status`, `--collect`, or `--cancel`. Delete manually only after the
+object's ownership annotation matches the nonce recorded in that attempt.
+
 Elbencho validation, worker, and coordinator Pods request `Unconfined`
 seccomp for Linux AIO. They still run as the configured non-root UID/GID,
 disable privilege escalation, drop all capabilities, and mount no API token.

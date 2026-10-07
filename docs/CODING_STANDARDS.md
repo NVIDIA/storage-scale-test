@@ -42,6 +42,10 @@ Pytest uses `pytest-xdist` to distribute tests across its assigned workers. The
 script uses `uv` when already installed and otherwise uses Python's standard `venv`.
 For a sandbox with preinstalled tools but no package-index access, set
 `CI_BOOTSTRAP=0`; `CI_PYTHON` and `CI_SHELLCHECK` can select the executables.
+A few tests build with real Docker BuildKit on the fixture's digest-pinned
+base images. Without Docker, or when a pinned base is not already present
+locally, they skip. `CI_REQUIRE_DOCKER=1` (set by the CI pytest job) makes
+them pull and verify the pinned bases and fail rather than skip.
 On macOS, unit tests require Bash 4.3 or newer and GNU coreutils; install both
 with `brew install bash coreutils` and put Homebrew's bin directory first on
 `PATH`.
@@ -92,7 +96,9 @@ literal duplicates an existing one.
 1. `black` 25.9.0+ (default line length 88), required after any Python change.
    If `black` or another required check tool is unavailable, install it into
    the repo's local environment and rerun the check.
-2. `pylint` must score 10.00/10. If it does not, either fix the issue or add the
+2. `pylint` must report zero messages. The 10.00/10 score rounds up, so a
+   single warning still prints 10.00/10 while the check fails; trust the exit
+   status and the listed messages, not the score. If it reports any, either fix the issue or add the
    check to the `.pylintrc` disable list only when the repository policy should
    exclude that check.
 3. `.pylintrc` is canonical. It gates enabled fatal/error/warning checks plus

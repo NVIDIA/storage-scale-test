@@ -32,7 +32,7 @@ concurrency:
 jobs:
   source:
     name: Resolve the source commit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -69,6 +69,12 @@ jobs:
       contents: read
     env:
       INTEGRATION_PYTHON: ${{ github.workspace }}/.venv/bin/python
+      # The package-cache action rewrites only the runner's own APT sources.
+      # Forward the same repository caches into the fixture's Docker builds.
+      INTEGRATION_APT_ARCHIVE_MIRROR: https://ubuntu-archive-cache.local.gha-runners.nvidia.com/ubuntu
+      INTEGRATION_APT_SECURITY_MIRROR: https://ubuntu-security-cache.local.gha-runners.nvidia.com/ubuntu
+      INTEGRATION_APT_PORTS_MIRROR: https://ubuntu-ports-cache.local.gha-runners.nvidia.com/ubuntu-ports
+      INTEGRATION_APT_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -121,7 +127,7 @@ jobs:
     name: Filesystem integration status
     if: ${{ always() }}
     needs: [source, integration]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -137,7 +143,7 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.source.outputs.sha }}
       - name: Download shard manifests
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: integration-manifest-*
           merge-multiple: true

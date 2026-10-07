@@ -295,6 +295,37 @@ twice. The same lifecycle runs locally with
 `integration-tests/bin/ci-integration.sh <amd64|arm64> [nfs|sbx-shared]
 [all|ssh|slurm|kubectl]`; the substrate defaults to `all`.
 
+### Package mirrors for fixture image builds
+
+The package-cache action only rewrites the runner's own APT sources, so the
+workflow also exports `INTEGRATION_APT_ARCHIVE_MIRROR`,
+`INTEGRATION_APT_SECURITY_MIRROR`, `INTEGRATION_APT_PORTS_MIRROR` and
+`INTEGRATION_APT_CA_BUNDLE`. The driver forwards them to the SSH and Slinky
+login image builds, the only builds that install packages. Inside the build,
+`lib/apt-build.sh` replaces only the URI of the image's own Ubuntu sources
+(amd64 archive/security, arm64 ports), keeping suites, components and signing
+keys. HTTPS trust comes from the CA bundle, mounted as the `apt_ca` BuildKit
+secret (mode 0444, since APT downloads as the `_apt` user; the script fails
+early if `_apt` cannot read it) and passed to APT on the command line, so it is
+never stored in the image. When any mirror is configured, every public Ubuntu
+repository URI (archive, security, ports) left in the image must be covered by
+a configured mirror, or the build fails; each URI is checked on its own, even
+when a deb822 `URIs:` field lists several. Partial configuration is unsupported.
+There is no per-attempt time cap: APT's own finite timeouts bound each stall,
+retries happen only when APT fails, and a 540-second total budget
+(`APT_BUDGET_SECONDS`) ends the whole build, so slow but progressing downloads
+are never killed and restarted. `apt-get update` exits 0 when a source fails,
+so the script inspects its output and fails (retrying) only when a failed index
+belongs to an Ubuntu source (public archive/security/ports.ubuntu.com or a
+configured mirror host); failures of non-Ubuntu sources the base image carries
+(for example the Slinky login image's Kubernetes repository) are tolerated, as
+bare `apt-get` did. A configured mirror that cannot be applied or reached fails
+the build rather than falling back to the public mirrors. With none of these
+variables set (the local default), builds keep the base image's public
+repositories. Mirror URLs must be plain `http(s)` URLs
+without credentials; an HTTPS mirror requires the CA bundle. The driver logs
+the start and elapsed time of each image build at INFO.
+
 Every job tests one source commit, resolved once from the requested ref, and
 writes a small manifest: commit, architecture, backend, substrate, boot ID,
 lifecycle step durations, and planned versus passed scenario/substrate work

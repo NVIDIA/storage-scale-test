@@ -98,6 +98,7 @@ class TestElbenchoSharedDirectoryBinary(unittest.TestCase):
             records = [
                 json.loads(line)
                 for line in json_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
             ]
             writes = [record for record in records if record["phase_type"] == "WRITE"]
             self.assertEqual(len(writes), 1)
@@ -126,6 +127,7 @@ class TestElbenchoSharedDirectoryBinary(unittest.TestCase):
             delete_records = [
                 json.loads(line)
                 for line in delete_json.read_text(encoding="utf-8").splitlines()
+                if line.strip()
             ]
             self.assertEqual(len(delete_records), 1)
             self.assertEqual(delete_records[0]["phase_type"], "RMFILES")

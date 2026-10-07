@@ -2914,6 +2914,11 @@ def test_prepare_failure_terminalizes_only_after_successful_rollback(
     assert "STORAGE_SCALE_TEST_DIAGNOSTIC_PHASE=network-policy" in result.stderr
     assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=API_UNAVAILABLE" in result.stderr
     assert "STORAGE_SCALE_TEST_DIAGNOSTIC_MAY_STILL_BE_RUNNING=no" in result.stderr
+    # The report reflects the durable state just written, not the stale
+    # PREPARED value loaded before the rollback transition.
+    assert (
+        "STORAGE_SCALE_TEST_DIAGNOSTIC_LOCAL_STATE=SUBMISSION_FAILED" in result.stderr
+    )
 
 
 def test_prepare_rollback_failure_keeps_prepared_attempt_recoverable(
@@ -2950,6 +2955,7 @@ def test_prepare_rollback_failure_keeps_prepared_attempt_recoverable(
         [[ $(cat "$events") == policiesreleasecleanup ]]
         """)
     assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_LOCAL_STATE=PREPARED" in result.stderr
 
 
 def test_submission_failure_terminalizes_only_after_successful_rollback(
@@ -3321,6 +3327,219 @@ def test_creation_absence_retains_possible_late_object_identity(
     """)
     assert result.returncode == 0, result.stderr
     assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=OWNERSHIP_AMBIGUOUS" in result.stderr
+
+
+_CREATE_TIMEOUT = (
+    "error: context deadline exceeded (Client.Timeout or context "
+    "cancellation while reading body)"
+)
+_CREATE_REPLIES = {
+    "ok": "return 0",
+    "timeout": f"printf '%s\\n' {_CREATE_TIMEOUT!r}; return 1",
+    "exists": (
+        "printf '%s\\n' 'Error from server (AlreadyExists): error when "
+        'creating "STDIN": pods "helper" already exists\'; return 1'
+    ),
+    "forbidden": (
+        "printf '%s\\n' 'Error from server (Forbidden): pods \"helper\" is "
+        "forbidden: exceeded quota'; return 1"
+    ),
+}
+
+
+def _fake_create_api(
+    tmp_path: Path, creates: tuple[str, ...], gets: tuple[str, ...]
+) -> str:
+    """Return Bash that scripts create replies and exact-name GET results.
+
+    GET results are ``absent``, ``ours``, ``foreign``, or ``fail``; the last
+    entry repeats. Every API call and intent refresh is appended to ``$log``.
+    """
+    replies = "\n".join(
+        f"    {index}) {_CREATE_REPLIES[reply]} ;;"
+        for index, reply in enumerate(creates, start=1)
+    )
+    return _identity(tmp_path / "state") + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        log={str(tmp_path / 'log')!r}
+        manifests={str(tmp_path / 'manifests')!r}
+        : > "$log"
+        gets=({' '.join(gets)})
+        sleep() {{ :; }}
+        touch() {{ printf 'touch %s\\n' "$*" >> "$log"; command touch "$@"; }}
+        kubectl_delete_owned_object() {{ printf 'delete\\n' >> "$log"; }}
+        _fake_object() {{
+          local nonce=0123456789abcdef0123456789abcdef
+          case "$1" in
+            absent) return 0 ;;
+            fail) printf 'connection refused\\n' >&2; return 1 ;;
+            foreign) nonce=ffffffffffffffffffffffffffffffff ;;
+          esac
+          if [[ "$2" == *'jsonpath={{.metadata.uid}}'* ]]; then
+            printf uid-1
+          else
+            printf 'Pod\\thelper\\tuid-1\\t%s\\t1234abcd' "$nonce"
+          fi
+        }}
+        kubectl_run_bounded() {{
+          local n
+          if [[ " $* " == *' create '* ]]; then
+            printf 'create\\n' >> "$log"
+            {{ cat; printf '\\n'; }} >> "$manifests"
+            n=$(grep -c '^create$' "$log")
+            case "$n" in
+{replies}
+              *) return 1 ;;
+            esac
+          fi
+          printf 'get\\n' >> "$log"
+          n=$(grep -c '^get$' "$log")
+          (( n <= ${{#gets[@]}} )) || n=${{#gets[@]}}
+          _fake_object "${{gets[n - 1]}}" "$*"
+        }}
+        intent="$root/attempts/1234abcd/creation-intents/transfer.sh"
+        create() {{
+          kubectl_create_owned_object uid Pod helper test-ns \\
+            0123456789abcdef0123456789abcdef 1234abcd manifest-body \\
+            "$root" "$fd" transfer
+        }}
+        uid=
+        """
+
+
+def _api_calls(tmp_path: Path) -> list[str]:
+    lines = (tmp_path / "log").read_text(encoding="utf-8").splitlines()
+    return ["touch" if line.startswith("touch ") else line for line in lines]
+
+
+def test_create_retries_absent_object_after_lost_response(tmp_path: Path) -> None:
+    """[S-17] A lost create response with proven absence re-sends one create."""
+    result = _bash(
+        _fake_create_api(tmp_path, ("timeout", "ok"), ("absent", "ours")) + """
+        create || exit 2
+        [[ "$uid" == uid-1 && -f "$intent" ]] || exit 3
+        grep -Fqx "touch -c -- $intent" "$log" || exit 4
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert _api_calls(tmp_path) == ["create", "get", "touch", "create", "get"]
+    manifests = (tmp_path / "manifests").read_text(encoding="utf-8")
+    assert manifests == "manifest-body\nmanifest-body\n"
+    assert "retrying create of Pod/helper (attempt 2/3)" in result.stderr
+
+
+def test_create_adopts_object_accepted_before_lost_response(tmp_path: Path) -> None:
+    """[S-07] [S-17] A visible owned object is adopted without a second create."""
+    result = _bash(_fake_create_api(tmp_path, ("timeout",), ("ours",)) + """
+        create || exit 2
+        [[ "$uid" == uid-1 ]] || exit 3
+        """)
+    assert result.returncode == 0, result.stderr
+    assert _api_calls(tmp_path) == ["create", "get", "get"]
+
+
+def test_create_retry_adopts_own_object_on_already_exists(tmp_path: Path) -> None:
+    """[S-17] A late original and its retry collide; our nonce is adopted."""
+    result = _bash(
+        _fake_create_api(tmp_path, ("timeout", "exists"), ("absent", "ours")) + """
+        create || exit 2
+        [[ "$uid" == uid-1 ]] || exit 3
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert _api_calls(tmp_path) == ["create", "get", "touch", "create", "get"]
+
+
+@pytest.mark.parametrize("first_create", ("exists", "timeout"))
+def test_create_never_adopts_or_deletes_foreign_object(
+    tmp_path: Path, first_create: str
+) -> None:
+    """[S-17] A same-name object with another nonce fails closed untouched."""
+    result = _bash(_fake_create_api(tmp_path, (first_create,), ("foreign",)) + """
+        create && exit 2
+        [[ -z "$uid" && -f "$intent" ]] || exit 3
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "delete" not in _api_calls(tmp_path)
+    assert _api_calls(tmp_path).count("create") == 1
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=IDENTITY_MISMATCH" in result.stderr
+
+
+def test_create_never_retries_permanent_api_rejection(tmp_path: Path) -> None:
+    """[S-17] Forbidden, invalid, or quota errors get one verification only."""
+    result = _bash(_fake_create_api(tmp_path, ("forbidden",), ("absent",)) + """
+        create && exit 2
+        [[ -f "$intent" ]] || exit 3
+        """)
+    assert result.returncode == 0, result.stderr
+    assert _api_calls(tmp_path) == ["create", "get"]
+
+
+def test_create_observation_failure_is_not_absence(tmp_path: Path) -> None:
+    """[S-17] A failed exact GET after a lost response never re-creates."""
+    result = _bash(_fake_create_api(tmp_path, ("timeout", "ok"), ("fail",)) + """
+        KUBECTL_OBSERVATION_ATTEMPTS=2 create && exit 2
+        [[ -f "$intent" ]] || exit 3
+        """)
+    assert result.returncode == 0, result.stderr
+    assert _api_calls(tmp_path) == ["create", "get", "get"]
+
+
+def test_create_retry_exhaustion_retains_creation_intent(tmp_path: Path) -> None:
+    """[S-17] Bounded retries end with the intent kept for S-08/S-09 rollback."""
+    result = _bash(
+        _fake_create_api(tmp_path, ("timeout", "timeout", "timeout"), ("absent",)) + """
+        create && exit 2
+        [[ -z "$uid" && -f "$intent" ]] || exit 3
+        grep -Fqx 'KUBECTL_INTENT_NAME=helper' "$intent" || exit 4
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert _api_calls(tmp_path).count("create") == 3
+    assert "failed transiently 3 times; its creation intent is retained" in (
+        result.stderr
+    )
+
+
+def test_create_attempt_limit_is_validated_before_any_intent(tmp_path: Path) -> None:
+    """An invalid retry bound fails before any durable intent or request."""
+    result = _bash(_fake_create_api(tmp_path, ("ok",), ("ours",)) + """
+        KUBECTL_CREATE_ATTEMPTS=0 create && exit 2
+        [[ ! -e "$intent" && ! -s "$log" ]] || exit 3
+        KUBECTL_CREATE_ATTEMPTS=1 create || exit 4
+        [[ "$uid" == uid-1 ]] || exit 5
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "KUBECTL_CREATE_ATTEMPTS must be a positive integer" in result.stderr
+
+
+def test_creation_ambiguity_horizon_covers_kubectl_process_timeout(
+    tmp_path: Path,
+) -> None:
+    """[S-08] The absence recheck waits out the longest create deadline."""
+    result = _bash(_identity(tmp_path / "state") + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        horizon() {{ kubectl_creation_ambiguity_seconds; }}
+        [[ $(horizon) == 30 ]] || exit 2
+        [[ $(KUBECTL_PROCESS_TIMEOUT_SECONDS=10 horizon) == 30 ]] || exit 3
+        [[ $(KUBECTL_PROCESS_TIMEOUT_SECONDS=90 horizon) == 90 ]] || exit 4
+        KUBECTL_PROCESS_TIMEOUT_SECONDS=abc horizon && exit 5
+        sleeps={str(tmp_path / 'sleeps')!r}
+        kubectl_run_bounded() {{ :; }}
+        sleep() {{ printf '%s\\n' "$1" >> "$sleeps"; }}
+        stat() {{ printf '1000\\n'; }}
+        date() {{ printf '1050\\n'; }}
+        for key in short long; do
+          kubectl_attempt_write_creation_intent "$root" "$fd" 1234abcd "$key" \\
+            Pod "helper-$key" test-ns 0123456789abcdef0123456789abcdef
+        done
+        kubectl_cleanup_creation_intent "$root" "$fd" 1234abcd short || exit 6
+        KUBECTL_PROCESS_TIMEOUT_SECONDS=90 \\
+          kubectl_cleanup_creation_intent "$root" "$fd" 1234abcd long || exit 7
+        [[ $(paste -sd, "$sleeps") == 2,40,2 ]] || exit 8
+        kubectl_local_lock_release "$fd"
+        """)
+    assert result.returncode == 0, result.stderr
 
 
 def test_ephemeral_cleanup_reconciles_intent_only_helpers(tmp_path: Path) -> None:

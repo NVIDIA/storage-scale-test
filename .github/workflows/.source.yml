@@ -96,8 +96,14 @@ jobs:
           -c requirements-ci.txt
           -r requirements.txt
           pytest pytest-xdist
+      # Real-BuildKit regressions must run here, not skip: the tests pull
+      # and verify the fixture's digest-pinned bases instead of trusting
+      # whatever mutable tag the runner happens to cache.
+      - name: Verify the Docker daemon for build regressions
+        run: docker info >/dev/null
       - name: Run unit tests
         env:
           CI_BOOTSTRAP: "0"
           CI_CHECK_JOBS: "4"
+          CI_REQUIRE_DOCKER: "1"
         run: ./utils/run_ci_checks.sh pytest
