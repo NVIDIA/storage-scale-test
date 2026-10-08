@@ -460,6 +460,7 @@ def report_batch(
     except (OSError, ValueError) as error:
         print(f"Combined report: {error}", file=sys.stderr)
         failed = True
+        combined = None
     _write_report_index(manifest, output, outcomes, combined)
     return int(failed or not generated)
 

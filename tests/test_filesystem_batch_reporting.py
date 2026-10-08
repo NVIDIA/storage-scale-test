@@ -18,6 +18,7 @@
 import argparse
 import contextlib
 from dataclasses import FrozenInstanceError
+import errno
 import hashlib
 import importlib.util
 import io
@@ -913,6 +914,46 @@ def test_failed_omnibus_publication_removes_stale_report_and_keeps_group_reports
             manifest.root / "reports/groups" / group.group_id / "report.txt"
         ).exists()
     assert not list(manifest.root.glob(".index-*"))
+
+
+def test_failed_stale_omnibus_deletion_does_not_link_old_tables(tmp_path, capsys):
+    """An undeletable prior aggregate cannot certify freshly generated reports."""
+    manifest = _create_batch(tmp_path / "batch", kinds=("io", "mdtest"))
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+    omnibus = manifest.root / "reports.txt"
+
+    def report(_manifest, group, _successful, destination, options):
+        (destination / "report.txt").write_text(
+            f"Group {group.group_id}: {options}\n", encoding="utf-8"
+        )
+
+    real_unlink = Path.unlink
+
+    def unlink(path, *args, **kwargs):
+        if path == omnibus:
+            raise PermissionError(
+                errno.EACCES, "permission denied for stale aggregate", str(path)
+            )
+        return real_unlink(path, *args, **kwargs)
+
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert report_batch(manifest.root) == 0
+        previous = omnibus.read_bytes()
+        with mock.patch("lib.filesystem_batch.Path.unlink", new=unlink):
+            assert report_batch(manifest.root, engine_options=["fresh"]) == 1
+    assert omnibus.read_bytes() == previous
+    assert "fresh" not in omnibus.read_text(encoding="utf-8")
+    index = (manifest.root / "reports/index.md").read_text(encoding="utf-8")
+    assert "reports.txt" not in index
+    for group in manifest.groups:
+        assert f"groups/{group.group_id}/report.txt" in index
+        assert (
+            manifest.root / "reports/groups" / group.group_id / "report.txt"
+        ).read_text(encoding="utf-8") == f"Group {group.group_id}: ['fresh']\n"
+    diagnostic = capsys.readouterr().err
+    assert "permission denied for stale aggregate" in diagnostic
+    assert str(omnibus) in diagnostic
 
 
 @pytest.mark.parametrize("markdown", [False, True])
