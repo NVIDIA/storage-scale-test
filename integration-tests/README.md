@@ -22,18 +22,16 @@ used to exercise Kubernetes, SSH, and Slurm storage substrates on one Linux
 server. The control-plane node is also the Slinky login node and negative
 control for the storage-worker label. The two worker nodes run storage clients.
 
-The current setup target is Ubuntu 24.04 on x86-64 or ARM64 with at least two
-CPUs, 8 GiB total RAM, 6 GiB available RAM, and 20 GiB free on the selected
-backend's filesystem. Python 3.12 and an accessible rootful Docker daemon are
-prerequisites. Install the pinned Python runtime requirements before using the
-driver; it installs other host packages and pinned client tools when needed.
-It also builds small derived Slinky login and compute images
-containing the fixed integration workload account; the login image additionally
-provides the standard `file` package required by `validate_env.sh`.
+Prerequisites: Ubuntu 24.04 on x86-64 or ARM64, at least two CPUs, 8 GiB total
+and 6 GiB available RAM, 20 GiB free on the selected backend's filesystem,
+Python 3.12 with `requirements.txt` installed, and an accessible rootful Docker
+daemon. The driver installs other host packages and pinned client tools as
+needed, and builds small derived Slinky and SSH images carrying the workload
+account.
 
-Run setup (or its exact synonym, start) as the ordinary test user. The NFS
-profile invokes passwordless `sudo` itself only for package installation and
-the dedicated export, loop-device, firewall, and systemd operations:
+Run setup (or its synonym, `start`) as the ordinary test user. The NFS profile
+uses passwordless `sudo` only for packages and its export, loop-device,
+firewall, and systemd operations:
 
 ```bash
 python3 -m venv .venv
@@ -43,22 +41,48 @@ sudo -v
 integration-tests/bin/integration-test.py setup
 ```
 
-`--storage-backend auto` is the default. It selects `nfs` when the host has the
-required loop, mount, systemd, and kernel NFS facilities. It selects
-`sbx-shared` only when a recognized capability needed by that profile is
-absent. An explicit backend never falls back, and setup records the selection;
-changing it requires teardown first. Arbitrary download, image, Kubernetes,
-manifest, storage-visibility, SSH, and Slurm failures remain fatal.
+## Storage backends
 
-The `nfs` backend uses a loop-backed NFSv4 export and NFS CSI. The
-`sbx-shared` backend is specifically for Docker SBX: it mounts one
-repository-backed directory into every kind node and binds static RWX claims to
-separate test-data and shared-home subdirectories. Both implement the same
-in-scope integration contract: cross-node and host read/write visibility,
-shared-home behavior, and successful SSH and Slurm filesystem sweeps. NFS and
-CSI provisioning themselves are infrastructure details outside this
-repository's test scope; the backend difference is environmental fidelity, not
-repository feature coverage.
+- **`nfs`**: a loop-backed NFSv4 export with NFS CSI, using kind's pinned
+  Kindnet.
+- **`sbx-shared`** (Docker SBX only): one repository-backed directory mounted
+  into every kind node, with static RWX claims bound to separate test-data and
+  shared-home subdirectories.
+
+Both satisfy the same contract (cross-node and host read/write visibility,
+shared homes, successful SSH and Slurm sweeps); they differ in environmental
+fidelity, not feature coverage. NFS and CSI provisioning themselves are out of
+this repository's test scope.
+
+The default, `--storage-backend auto`, selects `nfs` when the host has the
+loop, mount, systemd, and kernel NFS facilities, and `sbx-shared` only when a
+recognized capability that NFS needs is absent. An explicit backend never falls
+back. Setup records the selection; changing it requires teardown. Other
+download, image, Kubernetes, storage-visibility, SSH, and Slurm failures are
+fatal.
+
+Select Docker SBX explicitly with:
+
+```bash
+integration-tests/bin/integration-test.py \
+  --storage-backend sbx-shared setup
+```
+
+The SBX profile:
+
+- requires Docker's private engine to bind-mount the checked-out repository,
+  plus preinstalled host packages; it never invokes `sudo`;
+- uses the tested kind v0.30.0/Kubernetes v1.34.0 profile, mapping `/dev/null`
+  to `/dev/kmsg` only when that device is missing;
+- replaces Kindnet, whose nftables policy path the nested SBX kernel cannot
+  run, with checksum-verified Calico on digest-pinned images preloaded through
+  host Docker;
+- installs Docker SBX's proxy CA, when exposed, in the disposable kind nodes;
+- keeps data under `tmp/integration-sbx-shared` (override with
+  `--sbx-shared-root`, which must stay below the repository's `tmp/`). Its two
+  marker-owned, disposable backing directories are deliberately non-sticky
+  `0777`, because SBX can map the host caller and UID 2000 workloads to
+  different owners and both must create and remove scenario data.
 
 ### NFS headroom and kernel isolation
 
@@ -79,67 +103,38 @@ upstream `nfs_release_folio()` reclaim fix
 (`cce0be6eb4971456b703aaeafd571650d314bcca`); the harness never upgrades or
 reboots a shared host.
 
-Failure-injection staging publishes files through digest-verified temporary
-copies with remote deadlines and transient retries. Cleanup restores the
-wrapper from the verified local binary, never from a remote delegate.
+## Setup, identities, and state
 
-Select Docker SBX explicitly with:
+Setup preloads the pinned upstream Elbencho image under a fixture-private node
+reference and runs a temporary Kubernetes prerequisite probe: one non-root
+service Pod per worker, direct Pod-IPv4 access from a coordinator, denial from
+an unrelated Pod, and bidirectional PVC visibility. Elbencho service Pods
+request the workload's `Unconfined` seccomp profile; other probe Pods keep
+`RuntimeDefault`. The probe uses no Service, host networking, host ports,
+service-account token, or external pull from kind nodes, and removes its
+objects and storage afterward.
 
-```bash
-integration-tests/bin/integration-test.py \
-  --storage-backend sbx-shared setup
-```
+Every lifecycle action refuses root. Kubeconfig, keys, downloaded clients,
+cached deployments, rendered manifests, logs, and test runs are created
+user-owned under `tmp/integration-state` (setup never recursively chowns it),
+and setup confirms the caller can use Docker, kind, kubectl, and that directory.
+The generated host SSH key, strict known-hosts file, and worker addresses live
+there too; re-running setup reconciles and validates the environment without
+replacing them or retained backend data.
 
-The SBX profile requires Docker's private engine to bind-mount the checked-out
-repository path. It uses the tested kind v0.30.0/Kubernetes v1.34.0 profile and
-maps `/dev/null` to `/dev/kmsg` in kind nodes only when the SBX environment
-lacks that device. The nested SBX kernel cannot run Kindnet's nftables policy
-path, so this backend uses checksum-verified Calico with digest-pinned images
-preloaded through host Docker. The NFS profile retains kind's pinned Kindnet.
-When Docker SBX exposes its proxy CA, setup installs that CA in the disposable
-kind nodes. The default shared root is `tmp/integration-sbx-shared`; an
-alternate path may be set with `--sbx-shared-root`, but must remain below the
-repository's `tmp/` directory. This profile never invokes `sudo`; required host
-packages and an accessible Docker engine must already be present. Its two
-disposable backing directories deliberately use non-sticky mode `0777`. Docker
-SBX can map the host caller and UID 2000 workloads to different owners, so
-omitting the sticky bit lets either side create and remove scenario data. This
-is safe only for these marker-owned, disposable leaves below the repository's
-`tmp/` directory.
+The in-cluster workload account is independent of the host account: LoginSet
+coordination, Slurm jobs, SSH workers, and shared-storage staging run as
+`tester` (UID/GID 2000), verified on the coordinator and both real `srun`
+tasks. This matches the NFS export's anonymous mapping, so clients create data
+directly with a restrictive umask and never chown through the all-squashed
+mount.
 
-Setup also preloads the pinned upstream Elbencho image under a fixture-private
-node reference and runs a temporary Kubernetes prerequisite probe. It requires
-one non-root service Pod on each worker, direct Pod-IPv4 access from a
-coordinator, denial from an unrelated Pod, and bidirectional PVC visibility.
-The Elbencho service Pods request the workload's `Unconfined` seccomp profile;
-non-benchmark probe Pods retain `RuntimeDefault`.
-The probe uses no Service, host networking, host ports, service-account token,
-or external pull from kind nodes, and removes its objects and storage afterward.
+SSH workers normally have separate `emptyDir` homes. A scenario needing the
+RWX shared-home claim owns a bounded StatefulSet transition and restores
+separate homes afterward; setup and SSH test preflight recover an interrupted
+transition first. The kind and Slurm fixtures keep running throughout.
 
-Every lifecycle action runs as the ordinary test account and refuses root.
-Kubeconfig, keys, downloaded clients, cached deployments, rendered manifests,
-logs, and test runs remain user-owned from creation under the default
-`tmp/integration-state` directory. Setup never recursively changes that
-tree's ownership. It verifies that the caller can use Docker, kind, kubectl,
-and the state directory after provisioning.
-
-The host account and in-cluster workload account are deliberately independent.
-LoginSet coordination, Slurm jobs, SSH workers, and shared-storage staging run
-as `tester` with UID/GID 2000; setup verifies that identity on the coordinator
-and on both real `srun` tasks. This matches the NFS export's anonymous mapping,
-so clients create scenario data directly with a restrictive umask and never
-attempt to change ownership through an all-squashed mount.
-
-SSH workers normally use separate `emptyDir` homes. A scenario that requires
-the RWX shared-home claim owns a bounded StatefulSet transition and restores
-separate homes afterward. Setup and SSH test preflight recover an interrupted
-transition before allowing more SSH work; the kind and Slurm fixtures remain
-running throughout.
-
-The generated host SSH key, strict known-hosts file, and two worker addresses
-are kept under `tmp/integration-state/`. Re-running setup
-reconciles and validates the environment without replacing those credentials
-or retained backend data.
+## Running tests
 
 After setup succeeds, run the bounded filesystem regression cases with:
 
@@ -151,104 +146,109 @@ integration-tests/bin/integration-test.py test --scenario mdtest-sweep
 integration-tests/bin/integration-test.py test --list-scenarios
 ```
 
-With no options, `test` runs every available scenario on each applicable
-substrate. `--substrate` accepts `all`, `ssh`, `slurm`, or `kubectl`; repeatable
-`--scenario` options select named cases independently. Scenario listing needs
-no setup state or privileges. Actual tests refuse root execution, require the
-saved non-root identity, validate the live topology, generate environments
-from the packaged `env.sh.template`, and run `validate_env.sh` before a sweep.
+With no options, `test` runs every scenario on each applicable substrate.
+`--substrate` accepts `all`, `ssh`, `slurm`, or `kubectl`; `--scenario` is
+repeatable. `--list-scenarios` prints each scenario's name, substrates, and
+purpose, and needs no setup state or privileges. Real tests refuse root,
+require the saved non-root identity, validate the live topology, generate
+environments from the packaged `env.sh.template`, and run `validate_env.sh`
+before each sweep.
 
-The real scenario catalog covers buffered and direct I/O, one- and two-node
-selection, failure and resume, retained write/read/delete data, extended live
-CSV capture, and mdtest-Elbencho sweeps over one and two nodes and one and two
-tasks per node on SSH, Slurm, and Kubernetes. The MD scenario checks both raw
-result files, injects one failed cell, and resumes while checking that the
-earlier successful cell is preserved. `mixed-batch` prepares IO → metadata → IO
-with different roots and repeated coordinates, starts through the other launcher,
-injects a failure, resumes without rerunning successful cells, and verifies
-separate group reports on all three substrates. Focused cases
-add a multidimensional Slurm sweep, Slurm include/exclude and exclusive-user
-allocation behavior, SSH weighted roots, generated and staged single-file
-work, and shared SSH homes. Workloads stay deliberately small; assertions
-check execution coordinates and state transitions, phase and workload
-evidence, dataset totals, required native flags, relevant scheduling evidence,
-and semantic report rows and plot families without treating incidental output
-or performance values as contracts. Completion-based direct-I/O scenarios that
-check only structure (default and explicit worker directories, failure/resume,
-retained data, and the Slurm Cartesian sweep) use 256 KiB files, because synced
-direct I/O to the NFS export is slow. Baseline, mixed-batch provenance,
-single-file, live-capture, cancellation, coordinator-loss, and endpoint-drift
-fixtures keep 16 MiB so their sizes and active intervals are unchanged.
+Scenarios fall into common cases that run on all three substrates (baseline,
+direct I/O, failure/resume, mdtest sweep, mixed prepared batch, live capture)
+and focused cases for a subset (for example, retained data on SSH and Slurm,
+Slurm scheduling, SSH shared homes, and Kubernetes cancellation, coordinator
+loss, and endpoint drift). Workloads are deliberately small. Assertions check
+execution coordinates, state transitions, workload evidence, dataset totals,
+required native flags, scheduling evidence, and semantic report rows and plot
+families, never incidental output or performance values. Structure-only
+direct-I/O scenarios use 256 KiB files because synced direct I/O to the NFS
+export is slow; scenarios whose sizes or active intervals matter keep 16 MiB.
+Failure-injection staging publishes files through digest-verified temporary
+copies with remote deadlines and transient retries, and cleanup restores the
+wrapper from the verified local binary, never from a remote delegate.
 
-The Kubernetes substrate runs each supported sweep as one asynchronous
-cluster Job. `submit` returns after staging the control bundle and creating
-the attempt; `status` reads its durable state, `collect` copies completed
-cell results into the local result directory, and `cancel` stops the exact
-attempt while preserving collected data. `--resume` is collection-gated:
-collect first, then resume the local partial result tree. The whole sweep,
-not an individual node count, is the asynchronous unit. The remote Job does
-not depend on later kubectl credentials; its control ledger and completed
-cells live below `.storage-scale-test` in the canonical scenario test root,
-while a namespaced Lease excludes competing attempts on the PVC. Active
-benchmark output is scratch data, published only between cells.
+The kubectl cases exercise the asynchronous submit/status/collect/cancel/resume
+lifecycle specified in
+[KUBERNETES_ELBENCHO_LIFECYCLE.md](../docs/KUBERNETES_ELBENCHO_LIFECYCLE.md)
+and described for users in
+[FILESYSTEM_TESTING.md](../docs/FILESYSTEM_TESTING.md#kubernetes-run-inspect-and-collect).
+The local fixture proves that lifecycle and its networking contract (ordinary
+Pod networking with an attempt-scoped NetworkPolicy; no host networking, host
+ports, or Service) on its supported kind profile. An external cluster still
+needs its own acceptance run for CNI, Pod-to-Pod policy, storage behavior, and
+credential lifetime.
 
-Kubernetes requires an authorized context plus an existing namespace, PV,
-PVC, and selector-matching worker nodes. It discovers selected nodes and
-freezes their Pod addresses, starts one Elbencho service Pod per node, and
-uses ordinary Pod networking with an attempt-scoped NetworkPolicy. It does
-not use host networking, host ports, or a Service. The coordinator and
-short-lived validation helpers use the configured Elbencho image and PVC
-mount; all remote resources carry the attempt ownership identity and are
-removed only after identity validation. A real external cluster acceptance
-run must still verify its CNI, Pod-to-Pod policy, storage behavior, and
-credential lifetime; the local SBX fixture proves the repository lifecycle
-and networking contract on its supported kind profile.
+Tests run a real deployment archive: the harness snapshots the tracked source
+once, builds it with the zero-argument `utils/build_tarball.sh`, and caches the
+validated archive by snapshot manifest, architecture, integration recipe, and
+seeded Elbencho/runtime identity. Each scenario extracts it into an isolated
+workspace, adds only its own environment and inputs, and cleans its remote data
+afterward. SSH cases launch `validate_env.sh` and `nv-elbencho-sweep.sh` on the
+host and reach the two worker pods over SSH; Slurm cases stream the archive to
+the LoginSet, extract it in shared storage, and launch both there. The NFS
+profile gets Elbencho from a size-limited, checksum-verified upstream archive;
+on Docker SBX, where GitHub release assets may be unreachable, the binary and
+runtime libraries are extracted from the digest-pinned
+`docker.io/breuner/elbencho:v3.2-1` image into the generated test deployment
+only.
 
-The K-specific regression cases cover retained read-after-collection,
-cancellation, coordinator loss before and during execution, and worker
-endpoint replacement. The common baseline, direct-I/O, failure/resume, and
-live-capture cases also run through kubectl; the planner keeps substrate-only
-cases separate from the SSH and Slurm catalog.
+Beyond each scenario's own checks, every test requires successful execution
+records, exact workload totals, ordered worker selection, nonempty benchmark
+output, environment snapshots, and cleanup of generated data directories, and
+runs `utils/extract-elbencho.sh` on host-side result copies. Host-side results
+and diagnostics stay under the state directory, with timestamped build and step
+logs below its `test-runs/`.
 
-With `EXECUTION_SUBSTRATE=kubectl` in `env.sh`, the lifecycle commands are:
+## Stopping and tearing down
+
+Delete the disposable kind cluster and, for the NFS backend when owned
+exclusively by the harness, stop NFS with:
 
 ```bash
-storage-tests/fs/nv-elbencho-sweep.sh --nodes 1,2
-storage-tests/fs/nv-elbencho-sweep.sh --status "$RESULTS_DIR/elbencho-<run>"
-storage-tests/fs/nv-elbencho-sweep.sh --cancel "$RESULTS_DIR/elbencho-<run>"
-storage-tests/fs/nv-elbencho-sweep.sh --collect "$RESULTS_DIR/elbencho-<run>"
-storage-tests/fs/nv-elbencho-sweep.sh --resume "$RESULTS_DIR/elbencho-<run>"
+integration-tests/bin/integration-test.py stop
 ```
 
-The MD sweep uses the same lifecycle options through
-`storage-tests/fs/nv-mdtest-elbencho.sh` and accepts `--nodes 1,2 --tasks 1,2`.
+Stop deletes kind containers, Kubernetes objects, and MariaDB's node-local
+volume, and preserves packages, downloaded charts, Docker images, generated
+keys and passwords, rendered state, logs, and backend data. A later `start`
+therefore creates and validates a fresh cluster, which takes longer than an
+idempotent setup against a running one.
 
-Use `--cancel` instead of `--status` when stopping an active attempt. The
-submit command is intentionally asynchronous; `--collect` is the operation
-that transfers terminal results from the PVC to the host.
+Where retained fixture data is not wanted (for example, CI workers), run:
 
-The harness materializes one immutable tracked-source snapshot and builds a
-real deployment archive from it with the zero-argument
-`utils/build_tarball.sh`. It caches the validated archive by snapshot manifest,
-architecture, fixed integration recipe, and seeded Elbencho/runtime identity.
-Every scenario extracts that artifact into an isolated workspace, adds only
-its own environment and inputs, and cleans its remote data afterward; host-side
-results and diagnostics remain under the state directory. The SSH cases launch
-`validate_env.sh` and
-`nv-elbencho-sweep.sh` on the host and reach the two worker pods over SSH. The
-Slurm cases stream the same archive to the LoginSet, extract it in shared
-storage, and launch both commands there.
+```bash
+integration-tests/bin/integration-test.py teardown
+```
 
-The NFS profile uses a size-limited, checksum-verified upstream benchmark
-archive. Docker SBX, where GitHub release assets may be unavailable, extracts
-the binary and runtime libraries from the digest-pinned upstream
-`docker.io/breuner/elbencho:v3.2-1` image and includes them only in the
-generated test deployment. Timestamped build and step logs are retained below
-the state directory's `test-runs/` directory. The test also requires successful
-execution records, exact one- and two-node workload totals, ordered worker
-selection, nonempty benchmark output, environment snapshots, and cleanup of
-generated data directories. It runs `utils/extract-elbencho.sh` on host-side result
-copies and checks the semantic report content applicable to each scenario.
+Teardown is idempotent. It performs the stop, then deletes the fixture's
+generated data, keys, logs, and locally built image tags, restoring the exact
+prior image ID where a tag existed before setup. Harness-downloaded client
+copies go with the state tree; OS packages, pre-existing client tools, and
+reusable upstream image layers stay. It refuses destructive cleanup when
+ownership and path checks do not match the fixture.
+
+- **NFS**: removes the dedicated export and configuration and any
+  harness-owned UFW rule, unmounts the verified loop-backed filesystem, and
+  disables and stops `nfs-server` only if setup started it and no unrelated
+  exports remain.
+- **Docker SBX**: removes only the marker-owned shared root; it never invokes
+  NFS, systemd, firewall, loop, or mount operations.
+
+## Logs, caches, and retries
+
+Add `--verbose` for command-level logging. On failure, the driver captures
+host, Docker, backend, Kubernetes node, Pod, and event diagnostics without
+printing Kubernetes Secrets.
+
+Image pulls reuse digest- and architecture-verified host Docker caches. Slinky
+charts are downloaded and validated before any release is installed, then
+cached with source, version, and checksum records. Recognized transient pull
+failures get up to four attempts per registry reference, with exponential
+backoff and jitter within a shared four-minute deadline per acquisition;
+setup logs keep sanitized errors and retry history. Authentication errors,
+corrupt artifacts, and unknown errors fail immediately, and retries cannot
+overcome a persistent registry outage.
 
 ## Bootstrapping prerequisites in a constrained sandbox
 
@@ -266,128 +266,84 @@ are reliably reachable even when arbitrary internet hosts are not:
 - Run ShellCheck from the `shellcheck-py` PyPI package inside the repository's
   `.venv-ci`, rather than fetching a standalone ShellCheck release archive.
 - Let the harness pull container images (including the pinned Elbencho image)
-  through the host Docker daemon and import them into kind, rather than
-  relying on kind's own node containers to reach registries directly — the
-  host daemon's registry path and proxy/CA configuration is usually the most
-  reliable one available. Images pulled this way stay cached in the sandbox
-  for subsequent runs.
-- Ensure the sandbox's Docker data root (commonly `/var/lib/docker`) has at
-  least the ~50 GiB this suite's images, kind nodes, and build artifacts need;
-  request a larger backing volume for it up front rather than after hitting
-  `no space left on device`.
+  through the host Docker daemon, whose registry path and proxy/CA
+  configuration is usually the most reliable, and import them into kind; don't
+  rely on kind nodes reaching registries directly. Pulled images stay cached
+  for later runs.
+- Give the Docker data root (commonly `/var/lib/docker`) the ~50 GiB this
+  suite's images, kind nodes, and build artifacts need; request a larger
+  volume up front rather than after `no space left on device`.
 
-If a required tool is genuinely unavailable through these channels, install
-it into the repository's own state (a local venv, `tmp/`, or similar) rather
-than assuming it is preinstalled — see "Checks (run before committing)" in
-`AGENTS.md` for the equivalent guidance for CI tooling.
+If a required tool is unavailable through these channels, install it into the
+repository's own state (a local venv, `tmp/`, or similar) rather than assuming
+it is preinstalled; see "Checks (run before committing)" in
+[AGENTS.md](../AGENTS.md) for the CI-tooling equivalent.
 
 ## On-demand CI
 
-The `Filesystem integration` GitHub Actions workflow runs six concurrent jobs,
-one per architecture (amd64, arm64) and substrate (SSH, Slurm, Kubernetes),
-each on its own runner and NFS fixture. Scenarios within a job still run one at
-a time; the substrates never share a fixture. Each job installs
-`requirements.txt` in an isolated runtime venv and smoke-tests driver startup
-before provisioning. It runs setup twice, stops and restarts the fixture,
-proves that root lifecycle execution is rejected, runs
-`test --substrate <substrate>` as the ordinary runner account, and tears down
-twice. The same lifecycle runs locally with
-`integration-tests/bin/ci-integration.sh <amd64|arm64> [nfs|sbx-shared]
-[all|ssh|slurm|kubectl]`; the substrate defaults to `all`.
+The `Filesystem integration` GitHub Actions workflow runs only on demand, never
+on pull-request, push, or default-branch events. To run it, open **Actions**,
+choose **Filesystem integration**, select **Run workflow**, pick the workflow
+ref, and optionally enter a different source branch, tag, or commit SHA to test
+(empty tests the workflow ref). **Re-run jobs** repeats an existing run.
+
+It runs six concurrent jobs, one per architecture (amd64, arm64) and substrate
+(SSH, Slurm, Kubernetes), each on its own runner and NFS fixture; scenarios
+within a job run one at a time. Three fixtures per architecture cost more
+runner time than one but cut wall time. Each job installs
+`requirements.txt` in an isolated venv, smoke-tests driver startup, runs setup
+twice, stops and restarts the fixture, proves root lifecycle execution is
+rejected, runs `test --substrate <substrate>` as the ordinary runner account,
+and tears down twice. Run the same lifecycle locally with:
+
+```bash
+integration-tests/bin/ci-integration.sh <amd64|arm64> [nfs|sbx-shared] [all|ssh|slurm|kubectl]
+```
+
+The substrate defaults to `all`. Every job tests one source commit, resolved
+once from the requested ref, and writes a manifest (commit, architecture,
+backend, substrate, boot ID, lifecycle step durations, and planned versus
+passed work items). The final status job requires every job to pass and the six
+manifests to cover the unsharded scenario plan exactly once per architecture
+(`integration-tests/lib/shard_manifest.py verify`).
+
+Separately, the regular (pull-request, default-branch, weekly) CI pytest job
+sets `CI_REQUIRE_DOCKER=1`, making the Docker BuildKit fixture-build tests
+mandatory rather than skippable; see
+[Running repository checks](../docs/CODING_STANDARDS.md#running-repository-checks).
 
 ### Package mirrors for fixture image builds
 
-The package-cache action only rewrites the runner's own APT sources, so the
-workflow also exports `INTEGRATION_APT_ARCHIVE_MIRROR`,
-`INTEGRATION_APT_SECURITY_MIRROR`, `INTEGRATION_APT_PORTS_MIRROR` and
-`INTEGRATION_APT_CA_BUNDLE`. The driver forwards them to the SSH and Slinky
-login image builds, the only builds that install packages. Inside the build,
-`lib/apt-build.sh` replaces only the URI of the image's own Ubuntu sources
-(amd64 archive/security, arm64 ports), keeping suites, components and signing
-keys. HTTPS trust comes from the CA bundle, mounted as the `apt_ca` BuildKit
-secret (mode 0444, since APT downloads as the `_apt` user; the script fails
-early if `_apt` cannot read it) and passed to APT on the command line, so it is
-never stored in the image. When any mirror is configured, every public Ubuntu
-repository URI (archive, security, ports) left in the image must be covered by
-a configured mirror, or the build fails; each URI is checked on its own, even
-when a deb822 `URIs:` field lists several. A mirror is needed only for hosts
-the image actually uses (an amd64 image needs no ports mirror).
-There is no per-attempt time cap: APT's own finite timeouts bound each stall,
-retries happen only when APT fails or update output shows a failed Ubuntu
-index, and a 540-second total budget
-(`APT_BUDGET_SECONDS`) ends the whole build, so slow but progressing downloads
-are never killed and restarted. `apt-get update` exits 0 when a source fails,
-so the script inspects its output and fails (retrying) only when a failed index
-belongs to an Ubuntu source (public archive/security/ports.ubuntu.com or a
-configured mirror host); failures of non-Ubuntu sources the base image carries
-(for example the Slinky login image's Kubernetes repository) are tolerated, as
-bare `apt-get` did. A configured mirror that cannot be applied or reached fails
-the build rather than falling back to the public mirrors. With none of these
-variables set (the local default), builds keep the base image's public
-repositories. Mirror URLs must be plain `http(s)` URLs
-without credentials; an HTTPS mirror requires the CA bundle. The driver logs
-the start and elapsed time of each image build at INFO.
+The package-cache action rewrites only the runner's own APT sources, so the
+SSH and Slinky login image builds (the only ones that install packages) get
+mirrors through `lib/apt-build.sh`:
 
-Every job tests one source commit, resolved once from the requested ref, and
-writes a small manifest: commit, architecture, backend, substrate, boot ID,
-lifecycle step durations, and planned versus passed scenario/substrate work
-items. The final status job requires every job to pass and the six manifests
-to cover the unsharded scenario plan exactly once per architecture
-(`integration-tests/lib/shard_manifest.py verify`). Three fixtures per
-architecture cost more runner time than one, in exchange for wall time. The
-workflow runs only on demand, not on pull-request, push, or default-branch
-events.
-
-To run it, open **Actions**, choose **Filesystem integration**, and select
-**Run workflow**. Choose the workflow ref, then optionally enter a different
-source branch, tag, or commit SHA to check out and test. Leaving the source ref
-empty tests the selected workflow ref. This supports explicit runs against a
-pull-request branch, another development revision, or `main`; an existing run
-can instead be repeated with **Re-run jobs**.
-
-Delete the disposable kind cluster and, for the NFS backend when owned
-exclusively by the harness, stop NFS with:
-
-```bash
-integration-tests/bin/integration-test.py stop
-```
-
-Stop preserves packages, downloaded charts, Docker images, generated keys and
-passwords, rendered state, and backend data. Kind containers, Kubernetes
-objects, and MariaDB's node-local volume are disposable and are deleted. A
-subsequent start therefore creates and validates a fresh cluster and takes
-longer than an idempotent setup against an already-running cluster. Timestamped
-logs and rendered manifests are retained in the state directory. Add
-`--verbose` for command-level logging. The failure path captures host, Docker,
-backend, Kubernetes node, pod, and event diagnostics without printing
-Kubernetes Secrets.
-
-Image pulls reuse digest- and architecture-verified host Docker caches. Slinky
-charts are downloaded and validated before any release is installed, then cached
-with source, version, and checksum records. Recognized transient pull failures
-receive up to four attempts per registry reference, with exponential backoff and
-jitter within a shared four-minute deadline per acquisition. Setup logs retain
-sanitized errors and retry history. Authentication, corrupt artifacts, and
-unknown errors fail immediately; retries cannot overcome a persistent registry
-outage.
-
-For CI workers or any host where retained fixture data is not wanted, run:
-
-```bash
-integration-tests/bin/integration-test.py teardown
-```
-
-Teardown is idempotent. It performs the disposable stop and deletes the
-fixture's generated data, keys, logs, and locally built image tags. For NFS it
-also removes the dedicated export and configuration, removes any harness-owned
-UFW rule, and unmounts the verified loop-backed filesystem. It disables and
-stops `nfs-server` only when setup started it and no unrelated exports remain;
-a pre-existing service is left running. For Docker SBX it removes only the
-marker-owned shared root and never invokes NFS, systemd, firewall, loop, or
-mount operations. It refuses destructive cleanup when the applicable ownership
-and path checks do not match the fixture. Operating-system packages,
-pre-existing client tools, and reusable upstream Docker image layers are not
-uninstalled. Checksum-verified client copies that the harness downloaded into
-its own state tree are removed with that tree. If a locally built tag existed
-before setup, teardown restores that exact prior image ID instead of deleting
-it.
+- **Interface**: the workflow exports `INTEGRATION_APT_ARCHIVE_MIRROR`,
+  `INTEGRATION_APT_SECURITY_MIRROR`, `INTEGRATION_APT_PORTS_MIRROR`, and
+  `INTEGRATION_APT_CA_BUNDLE`, which the driver forwards to those builds.
+  Mirror URLs must be plain `http(s)` without credentials; HTTPS needs the CA
+  bundle. With none set (the local default), builds keep the base image's
+  public repositories.
+- **Rewrite**: only the URI of the image's own Ubuntu sources changes (amd64
+  archive/security, arm64 ports); suites, components, and signing keys are
+  kept.
+- **Coverage and failure**: once any mirror is set, every public Ubuntu URI the
+  image uses must be covered, checked per URI even when a deb822 `URIs:` field
+  lists several; a mirror is needed only for hosts the image uses (an amd64
+  image needs no ports mirror). Because `apt-get update` exits 0 when a source
+  fails, the script inspects its output: a failed index from an Ubuntu source
+  (public archive/security/ports.ubuntu.com or a configured mirror) fails and
+  is retried, while failures of non-Ubuntu sources in the base image (such as
+  the Slinky login image's Kubernetes repository) are tolerated, as with bare
+  `apt-get`. A mirror that cannot be applied or reached fails the build; it
+  never falls back to the public repositories.
+- **CA trust**: the bundle is mounted as the `apt_ca` BuildKit secret with mode
+  0444 (APT downloads as `_apt`; the script fails early if `_apt` cannot read
+  it) and passed to APT on the command line, so it is never stored in the
+  image.
+- **Time budget**: there is no per-attempt cap. APT's own finite timeouts (30 s,
+  with two internal retries) bound each stall, the script retries only
+  when APT fails or a failed Ubuntu index appears, and `APT_BUDGET_SECONDS`
+  (default 540) ends the whole build, so slow but progressing downloads are
+  never killed and restarted. The driver logs each image build's start and
+  elapsed time at INFO.

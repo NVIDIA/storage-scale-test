@@ -50,20 +50,14 @@ Kubernetes runs asynchronously: collect terminal results before reporting.
 
 ## Prerequisites and deployment
 
-- Benchmark processes require Linux. Slurm orchestration also requires Linux.
-  macOS may initiate SSH and kubectl filesystem sweeps with Bash 4.3+ and GNU
-  coreutils; kubectl also requires GNU tar and `flock`:
-
-  ```bash
-  brew install bash coreutils gnu-tar flock
-  ```
-
-  Put Homebrew's Bash first on `PATH`. Validation checks prefixed Homebrew
-  tools; benchmarks still run on remote Linux hosts or in Linux Pods.
+- Benchmarks and Slurm orchestration require Linux. macOS can launch SSH and
+  kubectl filesystem sweeps with Homebrew's Bash (4.3+) first on `PATH`
+  (`brew install bash coreutils`; kubectl also needs `gnu-tar flock`).
 - Reporting requires Python 3.12+. The extraction wrappers set up their Python
   dependencies.
-- SSH/Slurm workers need benchmark binaries for each client architecture.
-  Kubernetes uses the configured workload image instead.
+- SSH/Slurm workers need benchmark binaries under `utils/` for each client
+  architecture; see the archive builder below. Kubernetes uses the configured
+  workload image instead.
 
 Use a prepared checkout or create a deployment archive:
 
@@ -71,20 +65,15 @@ Use a prepared checkout or create a deployment archive:
 ./utils/build_tarball.sh
 ```
 
-This creates `storage-scale-test.tar.gz`. Unpack it on your launcher and
-configure its `env.sh`. Read linked guides from the source checkout or
-repository browser; deployment archives omit `docs/`. The builder reuses or
-downloads pinned elbencho binaries, includes existing Warp binaries, and
-builds `s3test`. See
-[object-tool preparation](docs/OBJECT_STORAGE_TESTING.md#prepare-the-tools)
-if you need Warp. Existing Elbencho binaries, including custom builds, are
-preserved unless `--force-download` is given.
-
-Download failure does not prevent archive creation: check warnings and verify
-tools for every target architecture. The repository does not ship benchmark
-binaries, and NVIDIA does not distribute your generated archive. Review
-third-party provenance and licenses in [NOTICE](NOTICE), including elbencho's
-GPL-3.0 and Warp's AGPL-3.0.
+It downloads pinned elbencho binaries into `utils/` (keeping existing or
+custom builds unless `--force-download` is given), includes Warp binaries if
+present ([Warp preparation](docs/OBJECT_STORAGE_TESTING.md#prepare-the-tools)),
+builds `s3test`, and writes `storage-scale-test.tar.gz` (without `docs/`;
+read guides in the checkout or repository browser). Unpack it on your launcher
+and configure its `env.sh`. A failed download only warns, so confirm the tools
+for every client architecture. Neither the repository nor NVIDIA distributes
+these binaries; see [NOTICE](NOTICE) for provenance and licenses (elbencho
+GPL-3.0, Warp AGPL-3.0).
 
 ## Configure the execution substrate
 
@@ -108,8 +97,7 @@ export SSH_HOST_LIST=/absolute/path/to/host_list
 
 The host list accepts comma- or whitespace-separated hosts across multiple
 lines and ignores comment lines. Authentication must be non-interactive.
-Slurm settings are ignored in SSH mode. Filesystem paths must exist on every
-selected worker:
+Filesystem paths must exist on every selected worker:
 
 ```bash
 declare -A TEST_DIRS=(["/mnt/fs/scaletest"]=1)
@@ -131,8 +119,7 @@ See [advanced node selection and Slurm options](docs/FILESYSTEM_TESTING.md#advan
 
 ### Kubernetes
 
-Authorize `kubectl` for the intended context first. The tool does not
-provision a cluster, namespace, PV, or PVC:
+Authorize `kubectl` for the intended context first:
 
 ```bash
 export EXECUTION_SUBSTRATE=kubectl
@@ -147,52 +134,26 @@ export KUBECTL_RUN_AS_GROUP=2000
 declare -A TEST_DIRS=(["scale-test"]=1)
 ```
 
-Before validating, confirm:
-
-- The namespace exists and the RWX PVC is bound to the named PV.
-- The selector matches enough Ready, schedulable nodes of the intended
-  architecture for your largest node count. Inspect labels with
-  `kubectl get nodes --show-labels`; comma-separated equality labels are ANDed,
-  for example `storage-scale-test/worker=true,storage-tier=lustre`.
-- Every selected node can mount the PVC. Each logical `TEST_DIRS` path already
-  exists and is writable by the configured positive UID/GID; `2000:2000` is an
-  example, not a required identity. Do not prepend `/mnt/storage-scale-test/`:
-  the tool adds that Pod-side prefix. The PVC mount root need not be writable.
-- The CNI provides cross-node Pod IPv4 connectivity on TCP 1611 and enforces
-  NetworkPolicies.
-- Admission policy allows the Elbencho Pods' `Unconfined` seccomp profile,
-  needed for Linux AIO.
-- Your identity has the [required resource permissions](docs/FILESYSTEM_TESTING.md#kubernetes-access-and-troubleshooting),
-  including `get`, `create`, and `delete` on namespaced Leases.
-- The image supports your nodes and is usable under the pull policy with any
-  required registry credentials. `Never` requires preloading; `Always`
-  requires a digest-qualified reference.
-
-Validation creates a temporary Job to check the image, workload identity,
-PVC access, and seccomp mode. For lifecycle commands, durable storage layout,
-and troubleshooting, see the [filesystem guide](docs/FILESYSTEM_TESTING.md#kubernetes-run-inspect-and-collect).
+The tool provisions no cluster, namespace, PV, or PVC; complete the
+[Kubernetes prerequisites](docs/FILESYSTEM_TESTING.md#kubernetes-prerequisites)
+before validating. For lifecycle commands, durable storage layout, and
+troubleshooting, see the
+[filesystem guide](docs/FILESYSTEM_TESTING.md#kubernetes-run-inspect-and-collect).
 
 ## Validate and correct the configuration
 
-Run `./validate_env.sh` after configuration changes. It checks the selected
-substrate and enabled workloads: nonempty `TEST_DIRS` enables filesystem
-checks; a configured `OBJ_BUCKET` enables object checks.
+Run `./validate_env.sh` after configuration changes. It probes the selected
+substrate and enabled workloads (nonempty `TEST_DIRS` for filesystem, a set
+`OBJ_BUCKET` for object): writable paths, object access (a nonempty bucket
+fails), and temporary Kubernetes validation resources. Read detailed errors and
+diagnostic paths above the final summary. Disabled-test notes and the
+[Kubernetes object inventory](docs/FILESYSTEM_TESTING.md#kubernetes-access-and-troubleshooting)
+are informational, not failures.
 
-Validation performs access probes, not just syntax checks. It checks writable
-filesystem paths and object access, rejects a nonempty test bucket, and
-creates temporary Kubernetes validation resources when applicable. For
-Kubernetes it also lists existing objects from this toolset, informationally
-(see the
-[troubleshooting notes](docs/FILESYSTEM_TESTING.md#kubernetes-access-and-troubleshooting)).
-Read detailed errors and diagnostic paths above the final summary.
-Disabled-test notes are not failures.
-
-Fix configuration errors in `env.sh`. For mount, admission, registry, or CNI
-failures, use the reported evidence with your cluster/storage administrator.
-Repeat until it prints “All validation checks passed successfully.”
-
-Validation cannot prove every workload or performance limit. Start with a
-small run before scaling.
+Fix configuration errors in `env.sh`; take mount, admission, registry, or CNI
+evidence to your cluster/storage administrator. Repeat until it prints
+`All validation checks passed successfully`. Validation cannot prove every
+workload or performance limit; start with a small run before scaling.
 
 ## Further reading
 
