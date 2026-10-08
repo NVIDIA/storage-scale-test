@@ -190,8 +190,14 @@ def test_mixed_batch_prepares_changed_groups_with_repeated_coordinates():
     assert metadata.arguments[0] == repeated.arguments[0] == "--append"
     assert [step.executions[0].coordinate.nodes for step in scenario.steps] == [1, 2, 1]
     assert first.executions[0].coordinate == repeated.executions[0].coordinate
-    assert first.env_lines != repeated.env_lines
-    assert "{test_root_secondary}" in "\n".join(metadata.env_lines)
+    # env.sh never changes; appended groups differ only through override files.
+    assert first.env_lines == metadata.env_lines == repeated.env_lines
+    for step in (metadata, repeated):
+        override = step.arguments[step.arguments.index("--env-override") + 1]
+        assert not override.startswith("/")
+        assert [item.relative_path for item in step.support_files] == [override]
+    assert "{test_root_secondary}" in metadata.support_files[0].content
+    assert 'ELBENCHO_FILE_SIZE="8M"' in repeated.support_files[0].content
     assert metadata.failure_injection is FailureInjection.FAIL_AFTER_WRITE_ONCE
     assert metadata.executions[0].status is ExecutionStatus.FAILED
 
@@ -379,14 +385,26 @@ def test_validation_rejects_unbounded_timeout():
         validate_scenario_specs((broken,))
 
 
-def _file_size(step):
-    sizes = [
+def _file_size_assignments(lines):
+    return [
         line.split("=", 1)[1].strip('"')
-        for line in step.env_lines
+        for line in lines
         if line.startswith(("export ELBENCHO_FILE_SIZE=", "ELBENCHO_FILE_SIZE="))
     ]
+
+
+def _file_size(step):
+    """The effective file size: env.sh, then the step's --env-override file."""
+    sizes = _file_size_assignments(step.env_lines)
     assert len(sizes) == 1, step.env_lines
-    return sizes[0]
+    arguments = list(step.arguments)
+    if "--env-override" in arguments:
+        path = arguments[arguments.index("--env-override") + 1]
+        (override,) = [
+            item for item in step.support_files if item.relative_path == path
+        ]
+        sizes += _file_size_assignments(override.content.splitlines())
+    return sizes[-1]
 
 
 def test_structural_direct_io_scenarios_use_small_multi_block_files():

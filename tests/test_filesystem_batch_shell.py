@@ -19,10 +19,11 @@ from pathlib import Path
 import hashlib
 import os
 import shlex
-import shutil
 import subprocess
 
 import pytest
+
+from tests.filesystem_checkout_test_support import make_filesystem_checkout
 
 ROOT = Path(__file__).resolve().parents[1]
 IO = "nv-elbencho-sweep.sh"
@@ -32,31 +33,7 @@ MD = "nv-mdtest-elbencho.sh"
 @pytest.fixture(name="checkout")
 def checkout_fixture(tmp_path):
     """Real launchers/libraries with a bounded, completely local environment."""
-    base = tmp_path / "checkout's space"
-    base.mkdir()
-    shutil.copytree(ROOT / "lib", base / "lib")
-    shutil.copytree(ROOT / "storage-tests/fs", base / "storage-tests/fs")
-    (base / "utils").mkdir()
-    (base / "utils/elbencho").write_text("#!/usr/bin/env bash\nexit 0\n")
-    (base / "utils/elbencho").chmod(0o755)
-    (base / "hosts").write_text("first,second\n")
-    text = (ROOT / "env.sh.template").read_text()
-    overrides = f"""
-export EXECUTION_SUBSTRATE=ssh
-export SSH_HOST_LIST={shlex.quote(str(base / 'hosts'))}
-export SSH_USER=tester
-export RESULTS_DIR={shlex.quote(str(base / 'results'))}
-export LOGS_DIR={shlex.quote(str(base / 'logs'))}
-TEST_DIRS=(["/data/one"]=1)
-export ELBENCHO_SCALE_THREAD_LIST=(1)
-export ELBENCHO_SCALE_IO_SIZES=(4K)
-export ELBENCHO_IODEPTH_LIST=(1)
-export MDTEST_BRANCH_FACTOR=1 MDTEST_ITEMS_PER_DIR=2 MDTEST_ITERATIONS=1
-"""
-    (base / "env.sh").write_text(
-        text.replace("# STORAGE_SCALE_TEST_INTEGRATION_OVERRIDES", overrides)
-    )
-    return base
+    return make_filesystem_checkout(tmp_path, ROOT)
 
 
 def launch(checkout, entry, *args):

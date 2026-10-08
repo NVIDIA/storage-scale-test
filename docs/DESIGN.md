@@ -17,7 +17,7 @@ limitations under the License.
 
 # NVIDIA Storage Scale Test — Design Document
 
-**Last Updated**: 2026-09-23\
+**Last Updated**: 2026-10-08\
 **Status**: Documents the design and architecture of the existing implementation.
 
 ---
@@ -160,7 +160,8 @@ template has a clearly-marked editable section bounded by:
 followed by `source lib/env_base.sh` which applies defaults and backward
 compatibility. This design means:
 
-- The user only ever edits one file.
+- The user edits one file; filesystem launchers can layer a workload-only
+  `--env-override` file (§3.5).
 - Defaults are set once in `env_base.sh`, not scattered across scripts.
 - Every orchestrator script sources `env.sh` as its first action, giving it the
   full configuration.
@@ -214,17 +215,44 @@ edit-validate loop:
    | Binary architecture match | `file` on binary vs. `uname -m` on remote |
    | Filesystem paths use storage distinct from `/` | Compare `stat -c %d` device IDs on compute nodes (via Slurm/SSH) |
    | Filesystem paths are writable | Touch test on compute nodes |
+   | Kubernetes prerequisites | API access and Lease permission, namespace/PV/PVC identity, Ready nodes matching `KUBECTL_NODE_SELECTOR`, and a short-lived Job that checks the image, UID/GID, required tools, and PVC read/write |
+   | Existing toolset Kubernetes objects | Read-only listing of objects labeled `app.kubernetes.io/name=storage-scale-test`; informational (may warn), never fails validation |
    | S3 credentials and bucket access | `s3test` binary |
    | S3 bucket emptiness | Object count check (warning if non-empty) |
    | Elbencho parameters | Thread list integers, IO sizes valid, duration valid |
 
-3. **Execution-mode-aware.** Validation uses Slurm or SSH to check remote
-   nodes, matching the mode that benchmarks will actually use.
+3. **Execution-mode-aware.** Validation uses Slurm, SSH, or kubectl to check
+   remote nodes, matching the mode that benchmarks will actually use.
 
 **Rationale:** Storage benchmark failures are expensive — a bad configuration
 discovered after a 2-hour run wastes the user's time and Slurm allocation.
 Front-loading all validation into a fast, comprehensive check is the single
 most effective ergonomic investment.
+
+### 3.5 Workload Override Files
+
+Filesystem launchers accept one `--env-override <file>` per new submission,
+`--batch`, or `--append`; see
+[Workload override files](FILESYSTEM_TESTING.md#workload-override-files) for
+usage. After `env.sh`, `filesystem_env_override_declarations`
+(`lib/env_functions.sh`) sources the file in an isolated child shell seeded
+with the current allowed values and the exported environment, so relative edits
+such as `LIST+=(x)` work. Only names listed by `filesystem_env_override_names`
+may change; new lowercase scratch variables are discarded, and any other change
+is an error. Values are type-checked (associative array, indexed array, or
+scalar) and returned as declarations that the launcher `eval`s, followed by
+`apply_filesystem_workload_defaults`.
+
+- **Allowlist equals the snapshot.** The names are exactly the workload
+  settings that `env_used.sh` records. Slurm coordinators re-source `env.sh`
+  and then only `env_used.sh`, so overriding anything else would silently
+  revert.
+- **`env_base.sh` is not re-sourced.** It is not idempotent (modules, `PATH`,
+  Slurm queries); only the workload defaults are re-applied.
+- **Evaluated once per group.** Batch preparation reuses the launcher's
+  validated declarations instead of re-sourcing the file.
+- **Provenance.** `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}`
+  record the file path, its SHA-256, and the changed names (§8.1).
 
 ---
 
@@ -257,11 +285,11 @@ top-level orchestrator (storage-tests/*/nv-*.sh)
     │               │
     │               └── source shared lib functions and run benchmark phases
     │
-    └── SSH: select hosts and run an SSH dispatcher on the launch host
-                    │
-                    └── transmit a checked-in or generated scriptlet to a head host
-                            └── source copied libraries and run benchmark phases
-
+    ├── SSH: select hosts and run an SSH dispatcher on the launch host
+    │               │
+    │               └── transmit a checked-in or generated scriptlet to a head host
+    │                       └── source copied libraries and run benchmark phases
+    │
     └── kubectl: reserve an attempt on the configured PVC and create owned
                     │
                     └── worker DaemonSet + coordinator Job; query or collect
@@ -355,7 +383,7 @@ the same execution directory.
 makes the smallest resumable unit one parameter cell, while a single maximum-sized
 Slurm allocation avoids scheduler churn and repeated service startup.
 
-### Prepared filesystem batches
+### 4.5 Prepared Filesystem Batches
 
 Both filesystem launchers share local `--batch`, `--append`, and `--start`
 operations through `lib/_batch_functions.sh`. Preparation saves immutable IO or
@@ -367,9 +395,10 @@ is not executable. The existing dispatch-lock ownership checks protect append
 and seal operations.
 
 The common execution environment and host/scheduler-list contents are frozen at
-creation. Group workload settings may differ. Start performs non-mutating
-preflight, checks that the manifest revision is unchanged, and permanently seals
-it before external mutation. Submission failure never reopens preparation.
+creation. Group workload settings may differ, through `env.sh` edits or a
+per-group `--env-override` file (§3.5). Start performs non-mutating preflight,
+checks that the manifest revision is unchanged, and permanently seals it before
+external mutation. Submission failure never reopens preparation.
 Every cell restores its own saved configuration in an isolated context. Ordinary
 non-batch layouts and dispatch remain unchanged.
 
@@ -390,7 +419,7 @@ routes common options to both kinds and type-specific options only to matching
 selected groups, rejecting unused options. Filtered runs atomically rebuild the
 whole-batch index from current cell states and retained group reports.
 
-### 4.5 Remote Scriptlet and Result-Transfer Patterns
+### 4.6 Remote Scriptlet and Result-Transfer Patterns
 
 SSH-mode nodes may not share the repository or output filesystem with the launch
 host. The launch host therefore copies the required benchmark binary, helper
@@ -433,7 +462,7 @@ SSH workers are started with `spawn_N_ssh`, and the coordinator is invoked with
 
 | Benchmark | Lifecycle |
 |-----------|-----------|
-| Filesystem IO | Slurm starts elbencho services once on the maximum-sized allocation; SSH starts them once on the usable host pool. Health checks can restart unhealthy services between phases. All services stop when the sweep dispatcher exits. |
+| Filesystem IO | Slurm starts elbencho services once on the maximum-sized allocation; SSH starts them once on the usable host pool. Health checks can restart unhealthy services between phases. All services stop when the sweep dispatcher exits. Kubernetes uses an attempt-scoped worker DaemonSet (§4.3). |
 | Filesystem metadata | Slurm and SSH reuse sweep-wide elbencho services across numbered `(nodes, tasks)` executions; Kubernetes uses an attempt-scoped worker fleet. |
 | Object storage | Each node-count dispatch starts Warp clients, runs the object-size/thread work, then terminates the clients. |
 | Network | Each node-count dispatch starts elbencho services and reuses them for the iteration/thread sweep, checking health between Slurm runs. |
@@ -709,8 +738,12 @@ invocations. `env_used.yaml` is the human/tool-readable configuration snapshot;
 directory is the execution ledger and may also contain exit codes, Slurm job IDs,
 exact-completion JSON, workload TSV records, core files, and treefile-cache usage
 records. Metadata sweeps write `env_used.yaml` and a sourceable `env_used.sh`
-snapshot and use the same typed execution ledger. Separately,
-staged directory reads can persist their reusable treefile cache in the dataset,
+snapshot and use the same typed execution ledger. Filesystem `env_used.sh`
+always records `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}`
+(empty without an override, so sourcing one group's snapshot after another's
+cannot inherit provenance); `env_used.yaml` carries an `env_override` mapping
+(`file`, `sha256`, `variables`) or `null` (§3.5). Separately, staged
+directory reads can persist their reusable treefile cache in the dataset,
 outside the result directory.
 
 ### 8.2 File Naming Convention
@@ -884,8 +917,9 @@ does not make compliance determinations for deployments.
 
 ### 11.2 Trusted Inputs and Persistent State
 
-`env.sh` and the object-auth file are sourced as Bash. They are trusted operator
-inputs and can execute arbitrary commands with the invoking user's privileges.
+`env.sh`, the object-auth file, and `--env-override` files are sourced as
+Bash. They are trusted operator inputs and can execute arbitrary commands with
+the invoking user's privileges.
 Filesystem IO resume also sources the generated `env_used.sh` snapshot and each
 reified `executions/NNNN.sh` definition. Result directories used with `--resume`
 must therefore remain writable only by trusted users. Paths passed to

@@ -105,13 +105,7 @@ fi
 
 # Key env vars toggle the various storage types:
 #   "" if not enabled, "1" if they are
-export FS_ENABLED=""
-for dir in "${!TEST_DIRS[@]}"; do
-    if [ -n "$dir" ]; then
-        export FS_ENABLED="1"
-        break
-    fi
-done
+filesystem_enabled_from_test_dirs
 export OBJ_ENABLED=${OBJ_BUCKET:+1}
 export BLOCK_ENABLED=
 
@@ -318,50 +312,9 @@ if [ -n "$SLURM_ENABLED" ]; then
     export SLURM_JOB_NAME_PREFIX="${SLURM_JOB_NAME_PREFIX:-}"
 fi
 
-# Default values for FS_MAX_* estimates
-# If IOR_FS_MAX_AGG_THROUGHPUT is defined, use it as the default for FS_MAX_AGG_THROUGHPUT
-if [ -n "${IOR_FS_MAX_AGG_THROUGHPUT+x}" ]; then
-    export FS_MAX_AGG_THROUGHPUT=${FS_MAX_AGG_THROUGHPUT:-$IOR_FS_MAX_AGG_THROUGHPUT}   # Units are GB/s
-else
-    export FS_MAX_AGG_THROUGHPUT=${FS_MAX_AGG_THROUGHPUT:-10}   # Units are GB/s
-fi
-export FS_MAX_NODE_THROUGHPUT_GBPS=${FS_MAX_NODE_THROUGHPUT_GBPS:-40}  # Units are Gbps
-export FS_MAX_NODE_IOPS=${FS_MAX_NODE_IOPS:-10000}
-
-# Set some defaults in case old env.sh files don't get updated in-place when
-# new code comes in that defines new vars (merely a convenience)
-export MDTEST_BRANCH_FACTOR=${MDTEST_BRANCH_FACTOR:-7}
-export MDTEST_ITEMS_PER_DIR=${MDTEST_ITEMS_PER_DIR:-100}
-export MDTEST_ITERATIONS=${MDTEST_ITERATIONS:-3}
-#
-# Set defaults for ELBENCHO settings
-declare -p ELBENCHO_SCALE_THREAD_LIST &>/dev/null || \
-    export ELBENCHO_SCALE_THREAD_LIST=("1" "2" "4" "8" "16" "32" "64" "128" "256")
-declare -p ELBENCHO_SCALE_IO_SIZES &>/dev/null || \
-    export ELBENCHO_SCALE_IO_SIZES=("4K" "16K" "64K" "1M" "1M,4K")
-if ! declare -p ELBENCHO_IODEPTH_LIST &>/dev/null || \
-   [[ "${#ELBENCHO_IODEPTH_LIST[@]}" -eq 0 ]] || \
-   [[ -z "${ELBENCHO_IODEPTH_LIST[0]}" ]]; then
-    export ELBENCHO_IODEPTH_LIST=("1")  # default is to only always use 1
-fi
-export ELBENCHO_SCALE_READ_WRITE_DURATION=${ELBENCHO_SCALE_READ_WRITE_DURATION:-30}
-export ELBENCHO_READ_AFTER_WRITE_PAUSE=${ELBENCHO_READ_AFTER_WRITE_PAUSE:-0}
-export ELBENCHO_FILE_SIZE_MULTIPLIER=${ELBENCHO_FILE_SIZE_MULTIPLIER:-1024}
-# Generated many-file layout and bounded-workload controls. Empty count/size
-# values preserve the historical worker-directory workload.
-# Snapshot restore helpers assign these names in isolated subshells; the
-# parent-shell defaults here remain intentional.
-# shellcheck disable=SC2031
-export ELBENCHO_FILE_LAYOUT=${ELBENCHO_FILE_LAYOUT:-worker-directories} \
-    ELBENCHO_FILES_PER_NODE=${ELBENCHO_FILES_PER_NODE:-} \
-    ELBENCHO_FILE_SIZE=${ELBENCHO_FILE_SIZE:-}
-# Single shared large file (elbencho file path mode); sequential I/O only (mutually exclusive with random)
-export ELBENCHO_SINGLE_BIG_FILE=${ELBENCHO_SINGLE_BIG_FILE:-0}
-export ELBENCHO_SINGLE_BIG_FILE_BASENAME=${ELBENCHO_SINGLE_BIG_FILE_BASENAME:-elbencho-bigfile}
-# When ELBENCHO_SINGLE_BIG_FILE=1: required for write/read-after-write; optional for nv-elbencho-sweep --read-from (read omits -s)
-export ELBENCHO_SINGLE_BIG_FILE_SIZE=${ELBENCHO_SINGLE_BIG_FILE_SIZE:-}
-# When 1, maps to elbencho --nosvcshare (each service touches full file)
-export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=${ELBENCHO_ALL_NODES_ACCESS_ALL_DATA:-0}
+# Default filesystem workload settings (FS_MAX_*, MDTEST_*, ELBENCHO_*). The
+# function is idempotent so --env-override can re-apply it after an override.
+apply_filesystem_workload_defaults
 #
 export WARP_RPS_BUDGET_PUT=${WARP_RPS_BUDGET_PUT:-}
 export WARP_RPS_BUDGET_GET=${WARP_RPS_BUDGET_GET:-}

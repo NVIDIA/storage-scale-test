@@ -37,6 +37,8 @@ readonly KUBECTL_COLLECTION_HEADROOM_BYTES=$((64 * 1024 * 1024))
 readonly KUBECTL_JOB_QUIESCENCE_TIMEOUT_SECONDS_DEFAULT=120
 readonly KUBECTL_CREATION_AMBIGUITY_SECONDS_DEFAULT=30
 readonly KUBECTL_CREATION_ABSENCE_RECHECK_SECONDS_DEFAULT=2
+readonly KUBECTL_PROCESS_TIMEOUT_SECONDS_DEFAULT=30
+readonly KUBECTL_CREATE_ATTEMPTS_DEFAULT=3
 readonly KUBECTL_OBSERVATION_ATTEMPTS_DEFAULT=3
 readonly KUBECTL_OBSERVATION_BACKOFF_SECONDS_DEFAULT=1
 readonly KUBECTL_DIAGNOSTIC_SCHEMA_VERSION=1
@@ -615,7 +617,10 @@ kubectl_attempt_write_state() {
     fi
     local tmp="$metadata_dir/state.sh.tmp.${BASHPID:-$$}.$RANDOM"
     printf 'KUBECTL_LIFECYCLE_STATE=%q\n' "$state" > "$tmp" \
-        && mv -f "$tmp" "$metadata_dir/state.sh"
+        && mv -f "$tmp" "$metadata_dir/state.sh" || return 1
+    # Keep the in-memory view equal to the durable state just published, so
+    # diagnostics after a transition never report the superseded state.
+    KUBECTL_LIFECYCLE_STATE="$state"
 }
 
 kubectl_attempt_load_identity() {
@@ -796,7 +801,7 @@ kubectl_render_template() {
 
 kubectl_run_bounded() {
     local request_timeout="${KUBECTL_REQUEST_TIMEOUT_SECONDS:-20}"
-    local process_timeout="${KUBECTL_PROCESS_TIMEOUT_SECONDS:-30}"
+    local process_timeout="${KUBECTL_PROCESS_TIMEOUT_SECONDS:-$KUBECTL_PROCESS_TIMEOUT_SECONDS_DEFAULT}"
     # Keep kubectl in timeout's child process group. In particular, a wedged
     # exec stream can otherwise survive TERM while timeout waits in foreground.
     _kubectl_local_timeout --kill-after=5s "${process_timeout}s" \
@@ -1481,23 +1486,94 @@ kubectl_create_owned_object() {
     local nonce="$5" run_id="$6" manifest="$7"
     local kubernetes_dir="${8:-}" lock_fd="${9:-}" resource_key="${10:-}"
     [[ "$output_variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    local attempts attempt create_output create_rc _kubectl_present_object_uid=""
+    attempts=$(_kubectl_create_attempt_limit) || return 1
+    # The intent is written once, before the first request. Every retry below
+    # re-sends the same deterministic name, manifest, and ownership nonce.
     if [[ -n "$kubernetes_dir" || -n "$lock_fd" || -n "$resource_key" ]]; then
         [[ -n "$kubernetes_dir" && -n "$lock_fd" && -n "$resource_key" ]] || return 1
         kubectl_attempt_write_creation_intent "$kubernetes_dir" "$lock_fd" \
             "$run_id" "$resource_key" "$kind" "$name" "$namespace" "$nonce" \
             || return 1
     fi
-    local create_output=""
-    if ! create_output=$(printf '%s' "$manifest" \
-            | kubectl_run_bounded -n "$namespace" create -f - 2>&1); then
+    local intent_file=""
+    [[ -z "$kubernetes_dir" ]] \
+        || intent_file="$kubernetes_dir/attempts/$run_id/creation-intents/$resource_key.sh"
+    for ((attempt = 1; ; attempt++)); do
+        create_rc=0
+        create_output=$(printf '%s' "$manifest" \
+            | kubectl_run_bounded -n "$namespace" create -f - 2>&1) || create_rc=$?
+        [[ "$create_rc" -ne 0 ]] || break
         printf 'Warning: create response was not authoritative: %s\n' \
             "$create_output" >&2
-    fi
+        # AlreadyExists and permanent failures get the single exact identity
+        # verification below; neither is retried.
+        _kubectl_create_failure_is_retryable "$create_rc" "$create_output" || break
+        # Observation failure is not absence: never re-create on that basis.
+        _kubectl_observe_object_uid _kubectl_present_object_uid "$kind" "$name" \
+            "$namespace" || return 1
+        [[ -z "$_kubectl_present_object_uid" ]] || break
+        _kubectl_prepare_create_retry "$attempt" "$attempts" "$kind" "$name" \
+            "$namespace" "$intent_file" || return 1
+    done
     local _kubectl_created_object_uid
     _kubectl_created_object_uid=$(kubectl_verify_object_identity \
-        "$kind" "$name" "$namespace" "$nonce" "$run_id") || return 1
+        "$kind" "$name" "$namespace" "$nonce" "$run_id" \
+        "$_kubectl_present_object_uid") || return 1
     printf -v "$output_variable" '%s' "$_kubectl_created_object_uid"
     return 0
+}
+
+_kubectl_create_attempt_limit() {
+    local attempts="${KUBECTL_CREATE_ATTEMPTS:-$KUBECTL_CREATE_ATTEMPTS_DEFAULT}"
+    [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || {
+        echo "Error: KUBECTL_CREATE_ATTEMPTS must be a positive integer" >&2
+        return 1
+    }
+    printf '%s\n' "$attempts"
+}
+
+# Only a transport-level failure with no API verdict may be retried. Every
+# owned name is deterministic and the same manifest is re-sent, so the API
+# server admits at most one object; AlreadyExists is resolved by identity.
+_kubectl_create_failure_is_retryable() {
+    local rc="$1" output="$2"
+    ! grep -Eqi 'AlreadyExists|already exists' <<< "$output" \
+        && _kubectl_observation_failure_is_transient "$rc" "$output"
+}
+
+_kubectl_observe_object_uid() {
+    local output_variable="$1" kind="$2" name="$3" namespace="$4"
+    [[ "$output_variable" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    local _kubectl_observed_object_uid
+    _kubectl_observed_object_uid=$(kubectl_run_observational -n "$namespace" \
+        get "$kind" "$name" --ignore-not-found \
+        -o 'jsonpath={.metadata.uid}') || return 1
+    printf -v "$output_variable" '%s' "$_kubectl_observed_object_uid"
+}
+
+_kubectl_prepare_create_retry() {
+    local attempt="$1" attempts="$2" kind="$3" name="$4" namespace="$5"
+    local intent_file="$6"
+    if [[ "$attempt" -ge "$attempts" ]]; then
+        printf 'Error: create of %s %s/%s failed transiently %d times; its creation intent is retained\n' \
+            "$kind" "$namespace" "$name" "$attempts" >&2
+        return 1
+    fi
+    local backoff="${KUBECTL_OBSERVATION_BACKOFF_SECONDS:-$KUBECTL_OBSERVATION_BACKOFF_SECONDS_DEFAULT}"
+    [[ "$backoff" =~ ^[0-9]+$ ]] || return 1
+    printf 'Warning: %s %s/%s is absent after a transient create failure; retrying create of %s/%s (attempt %d/%d)\n' \
+        "$kind" "$namespace" "$name" "$kind" "$name" "$((attempt + 1))" "$attempts" >&2
+    local delay=$((backoff * attempt))
+    (( backoff == 0 )) || delay=$((delay + RANDOM % (backoff + 1)))
+    sleep "$delay"
+    # The ambiguity horizon is measured from the intent mtime. Refresh it
+    # before every re-send so the horizon covers the latest in-flight create.
+    # Content is unchanged, so intent and tombstone comparisons still hold.
+    if [[ -n "$intent_file" ]]; then
+        [[ -f "$intent_file" && ! -L "$intent_file" ]] \
+            && touch -c -- "$intent_file" || return 1
+    fi
 }
 
 kubectl_render_pvc_lease() {
@@ -2007,6 +2083,21 @@ kubectl_attempt_clear_creation_intent() {
     [[ ! -e "$intent_file" && ! -L "$intent_file" ]] || rm -f -- "$intent_file"
 }
 
+# The creation ambiguity horizon bounds how long after the latest create
+# request (the creation intent mtime) a lost response may still yield a
+# visible object: the longer of the 30-second floor and the effective kubectl
+# process deadline that bounded that create.
+kubectl_creation_ambiguity_seconds() {
+    local process_timeout="${KUBECTL_PROCESS_TIMEOUT_SECONDS:-$KUBECTL_PROCESS_TIMEOUT_SECONDS_DEFAULT}"
+    [[ "$process_timeout" =~ ^[1-9][0-9]*$ ]] || {
+        echo "Error: KUBECTL_PROCESS_TIMEOUT_SECONDS must be a positive integer" >&2
+        return 1
+    }
+    local horizon="$KUBECTL_CREATION_AMBIGUITY_SECONDS_DEFAULT"
+    (( process_timeout <= horizon )) || horizon="$process_timeout"
+    printf '%s\n' "$horizon"
+}
+
 kubectl_cleanup_creation_intent() {
     local kubernetes_dir="$1" lock_fd="$2" attempt_id="$3" resource_key="$4"
     _kubectl_require_local_lock "$kubernetes_dir" "$lock_fd" || return 1
@@ -2027,7 +2118,9 @@ kubectl_cleanup_creation_intent() {
         now=$(date +%s) || return 1
         [[ "$intent_epoch" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ \
             && "$now" -ge "$intent_epoch" ]] || return 1
-        remaining=$((KUBECTL_CREATION_AMBIGUITY_SECONDS_DEFAULT - now + intent_epoch))
+        local horizon
+        horizon=$(kubectl_creation_ambiguity_seconds) || return 1
+        remaining=$((horizon - now + intent_epoch))
         (( remaining <= 0 )) || sleep "$remaining"
         sleep "$KUBECTL_CREATION_ABSENCE_RECHECK_SECONDS_DEFAULT"
         observed_uid=$(kubectl_run_observational -n "$KUBECTL_INTENT_NAMESPACE" \

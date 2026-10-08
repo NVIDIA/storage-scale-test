@@ -170,6 +170,80 @@ class TestRunCiChecksShell(unittest.TestCase):
         for check in _LINT_CHECKS:
             self.assertIn(f"{check} diagnostic", result.stdout)
 
+    def test_bootstrap_falls_back_to_system_shellcheck(self) -> None:
+        """A blocked shellcheck-py binary download must not block linting."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, _, _ = self._make_repo(root)
+            (repo / "requirements.txt").write_text("PyYAML\n", encoding="utf-8")
+            (repo / "requirements-ci.txt").write_text(
+                "black==1\nshellcheck-py==0.11.0.1\n", encoding="utf-8"
+            )
+            venv = root / "venv"
+            (venv / "bin").mkdir(parents=True)
+            self._write_executable(venv / "bin/python", "#!/bin/sh\nexit 0\n")
+            shims = root / "shims"
+            shims.mkdir()
+            # Like shellcheck-py behind a firewall: any install including it fails.
+            self._write_executable(
+                shims / "uv",
+                """
+                #!/usr/bin/env bash
+                while [[ $# -gt 0 ]]; do
+                    if [[ "$1" == -r ]] && grep -q '^shellcheck-py' "$2"; then
+                        echo "HTTP Error 403: Forbidden" >&2
+                        exit 1
+                    fi
+                    shift
+                done
+                """,
+            )
+            self._write_executable(
+                shims / "shellcheck",
+                """
+                #!/usr/bin/env bash
+                if [[ "${1:-}" == --version ]]; then
+                    printf 'ShellCheck\\nversion: 0.10.0\\n'
+                else
+                    echo "system shellcheck diagnostic"
+                fi
+                """,
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CI_BOOTSTRAP": "1",
+                    "CI_VENV_DIR": str(venv),
+                    "GITHUB_ACTIONS": "false",
+                    "PATH": f"{shims}{os.pathsep}{env['PATH']}",
+                }
+            )
+            env.pop("GITHUB_STEP_SUMMARY", None)
+
+            def run() -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    ["bash", "utils/run_ci_checks.sh", "shellcheck"],
+                    cwd=repo,
+                    env=env,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+            first = run()
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertIn("retrying without shellcheck-py", first.stderr)
+            self.assertIn("0.10.0 differs from pinned 0.11.0", first.stderr)
+            self.assertIn("system shellcheck diagnostic", first.stdout)
+            self.assertIn("dependencies updated without shellcheck-py", first.stdout)
+
+            # The fallback is recorded; later runs neither retry nor reinstall.
+            second = run()
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertNotIn("retrying", second.stderr)
+            self.assertIn("dependencies current", second.stdout)
+            self.assertIn("system shellcheck diagnostic", second.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

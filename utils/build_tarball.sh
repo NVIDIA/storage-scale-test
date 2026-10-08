@@ -428,6 +428,7 @@ $TAR_CMD czf "$OUTPUT_TARBALL" \
     --exclude=__pycache__ \
     --exclude=*.png \
     --exclude=env.sh \
+    --exclude=overrides \
     --exclude=bin-amd64 \
     --exclude=bin-arm64 \
     --exclude=.ci-cache \

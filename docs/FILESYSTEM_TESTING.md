@@ -23,8 +23,10 @@ from the repository root or unpacked deployment directory. Use dedicated test
 paths: these tests create, overwrite, and delete data.
 
 Start with [IO](#first-io-sweep) or [metadata](#metadata-sweeps), or assemble a
-[mixed batch](#prepared-filesystem-batches). Kubernetes users should also read
-the [asynchronous workflow](#kubernetes-run-inspect-and-collect). Finish with
+[mixed batch](#prepared-filesystem-batches); vary workloads without editing
+`env.sh` using [override files](#workload-override-files). Kubernetes users
+should also read the
+[asynchronous workflow](#kubernetes-run-inspect-and-collect). Finish with
 [reporting](#filesystem-reporting); tuned settings live in the
 [benchmark recipes](../BENCHMARK_RECIPES_FILESYSTEM.md).
 
@@ -47,7 +49,13 @@ targets because they determine generated file counts and bounded write time.
 
 ## First IO sweep
 
-For a short smoke test, set a small product in `env.sh` and revalidate:
+Set `TEST_DIRS` and the elbencho variables in `env.sh`, then run
+`validate_env.sh`; to vary a workload without editing `env.sh`, use an
+[override file](#workload-override-files). `ELBENCHO_SCALE_IO_SIZES`,
+`ELBENCHO_SCALE_THREAD_LIST`, and `ELBENCHO_IODEPTH_LIST` form a Cartesian
+product for every requested node count. An IO-size entry may be `4K`, `r4K`,
+or a write/read pair such as `1M,r4K`; see `env.sh.template`. For a short
+smoke test, use a small product:
 
 ```bash
 export ELBENCHO_SCALE_IO_SIZES=("r4K" "1M")
@@ -56,13 +64,9 @@ export ELBENCHO_IODEPTH_LIST=("1")
 export ELBENCHO_SCALE_READ_WRITE_DURATION=10
 ```
 
-Ten seconds checks operation, not sustained performance.
-
-Set `TEST_DIRS`, tune the elbencho variables in `env.sh`, and run
-`validate_env.sh`. `ELBENCHO_SCALE_IO_SIZES`, `ELBENCHO_SCALE_THREAD_LIST`,
-and `ELBENCHO_IODEPTH_LIST` form a Cartesian product for every requested node
-count. An IO-size entry may be `4K`, `r4K`, or a write/read pair such as
-`1M,r4K`; see `env.sh.template`.
+Ten seconds checks operation, not sustained performance. For timed direct IO,
+60 seconds suits exploration; 300 seconds or more is a typical starting point
+for publishable runs.
 
 Start with one node, analyze it, then retain only useful thread, size, and I/O
 depth values for the scale sweep:
@@ -75,12 +79,26 @@ depth values for the scale sweep:
 ./storage-tests/fs/nv-elbencho-sweep.sh --nodes 1,2,4,8
 ```
 
+All sweep scripts accept comma-separated positive integers and ascending
+inclusive ranges: `X`, `X-Y`, or `X-Y+Z`; order is preserved. The endpoint is
+always included: `3-10+2` expands to `3,5,7,9,10`. Run a script with `--help`
+for its full mode and argument contract.
+
+The default lifecycle is mkdir, write, read, and cleanup.
+`--write-no-read` skips the read and still cleans up; the
+[retained-dataset modes](#retained-datasets) keep, reread, or delete a dataset.
+Slurm uses one coordinator allocation sized to the largest node count; Slurm
+and SSH run cells sequentially. Size Slurm `run_time` for the complete product
+and all phases, startup, pauses, and cleanup.
+
 Ordinary sweeps default to direct IO; `-b/--bio` selects buffered IO.
 `-r/--rand` makes write and read access random; `r`-prefixed IO-size entries
 can instead select random access per phase. Random IO is incompatible with
 single-shared-file mode. A sole `TEST_DIRS` root with weight other than 1 is
-rejected. The following policy applies to worker-directory IO; generated
-shared-directory and generated single-file datasets always run to completion.
+rejected.
+
+Worker-directory phases are timed or run to completion as shown below;
+generated shared-directory and single-file datasets always run to completion.
 
 | Configuration | Phase behavior |
 |---|---|
@@ -89,14 +107,11 @@ shared-directory and generated single-file datasets always run to completion.
 | Multiple distinct roots, direct IO | Complete writes and reads |
 | `--run-to-completion` | Complete writes and reads |
 
-Completion mode processes each requested phase's finite dataset without a
-benchmark time limit or repetition. For staged `--read-from`, buffered IO or
-`--run-to-completion` reads the existing dataset to completion; direct IO
-without the flag remains time-limited. Buffered IO completes without repetition
-to avoid repeatedly measuring the same warm page-cache data; this does not
-guarantee cold caches. Write-only modes still skip reads.
-`ELBENCHO_FILE_SIZE` fixes each generated file's size in ordinary sweeps too;
-otherwise, size is the write block size times `ELBENCHO_FILE_SIZE_MULTIPLIER`.
+Completion mode processes each requested phase's finite dataset once, without
+a benchmark time limit. Buffered IO completes to avoid repeatedly measuring
+the same warm page-cache data; this does not guarantee cold caches. Staged
+`--read-from` reads follow the same rule: direct IO without
+`--run-to-completion` remains time-limited. Write-only modes still skip reads.
 
 ### Finite dataset sizing
 
@@ -112,67 +127,38 @@ export ELBENCHO_SCALE_THREAD_LIST=("1" "4")
 ./storage-tests/fs/nv-elbencho-sweep.sh --run-to-completion --nodes 1,2
 ```
 
-In worker-directory mode, each thread visits every weighted target.
-Let `G = threads * sum(TEST_DIRS weights)`: the actual count per node is the
-nearest multiple of G to the requested budget, ties upward, with a minimum
-of G files. Elbencho receives `actual / G` files per thread per directory.
-For example, budget 1,000, 16 threads, and weights 2:1 produce 1,008 files per
-node, split 672:336. Small budgets may round up substantially; each cell prints
-requested and effective counts. File counts can vary with the thread count.
+In worker-directory mode, each thread visits every weighted target. With
+`G = threads * sum(TEST_DIRS weights)`, the per-node count is the requested
+budget rounded to the nearest multiple of G (ties up, minimum G); for example,
+budget 1,000, 16 threads, and weights 2:1 produce 1,008 files per node, split
+672:336. Each cell prints requested and effective counts, which can vary with
+the thread count.
 
 Explicit counts in worker-directory mode require completion mode. Generated
 shared-directory mode is always completion-based and keeps exact counts: one
 root with weight 1, with the count at least and divisible by every thread
-count. Neither setting redefines a staged read dataset.
+count. Neither setting redefines a staged read dataset. `ELBENCHO_FILE_SIZE`
+fixes each generated file's size; otherwise, size is the write block size
+times `ELBENCHO_FILE_SIZE_MULTIPLIER`.
 
-With the count unset, completion mode computes a per-thread file count from
-`FS_MAX_AGG_THROUGHPUT`, `FS_MAX_NODE_THROUGHPUT_GBPS`,
-`FS_MAX_NODE_IOPS`, file/block sizes, topology, and
-`ELBENCHO_SCALE_READ_WRITE_DURATION`. That duration sizes the dataset, not a
-deadline. Counts divide across nodes, threads, and weighted targets and round
-up, with at least one file per thread per target. In timed direct IO mode,
-reads retain the configured time limit.
-No benchmark deadline means a large dataset can take a long time: size it
-deliberately and allow sufficient Slurm allocation time.
-
-All sweep scripts accept comma-separated positive integers and ascending
-inclusive ranges: `X`, `X-Y`, or `X-Y+Z`. The endpoint is included even when
-the step does not land on it; for example, `3-10+2` expands to
-`3,5,7,9,10`. The order is preserved. Run a script with `--help` for its full
-mode and argument contract.
-
-Set `ELBENCHO_SCALE_READ_WRITE_DURATION` long enough to measure sustained I/O
-for timed direct IO; 60 seconds is useful for exploration, while 300 seconds or
-more is a typical starting point for publishable runs. In completion mode,
-duration sizes the automatic dataset; it does not limit runtime.
-
-The default lifecycle is mkdir, write, read, and cleanup.
-`--write-no-read` skips the read and still cleans up; the staged-data modes
-below retain, reread, or delete an operator-selected dataset.
-
-Slurm uses one coordinator allocation sized to the largest node count and runs
-all cells sequentially; SSH also runs cells sequentially. Size Slurm
-`run_time` for the complete product and all phases, startup, pauses, and
-cleanup.
+With the count unset, the file count is sized from `FS_MAX_AGG_THROUGHPUT`,
+`FS_MAX_NODE_THROUGHPUT_GBPS`, `FS_MAX_NODE_IOPS`, file/block sizes, topology,
+and `ELBENCHO_SCALE_READ_WRITE_DURATION`, with at least one file per thread per
+target. In completion mode that duration sizes the dataset but sets no
+deadline, so a large dataset can take a long time; in timed direct IO mode,
+reads retain the time limit.
 
 ## Kubernetes: run, inspect, and collect
 
-`TEST_DIRS` remains a logical filesystem configuration in Kubernetes mode.
-The sweep prepends `/mnt/storage-scale-test/` when it constructs Pod-side
-paths, so users must not add that prefix themselves. The PVC is mounted at
-that path. Every configured root must already be a directory writable by
-`KUBECTL_RUN_AS_USER:KUBECTL_RUN_AS_GROUP`; the mount root itself need not be
-writable. The tool chooses the lexically first normalized `TEST_DIRS` root and
-creates `.storage-scale-test` beneath it for durable state and completed-cell
-data. Kubernetes path components accept letters, digits, `.`, `_`, and `-`;
-do not use `.storage-scale-test` as a component. A Kubernetes Lease
-keyed by the namespace, PV, and PVC UIDs prevents concurrent sweeps on the same
-claim even when they use different test roots.
+`TEST_DIRS` paths are relative to the PVC (see
+[Kubernetes prerequisites](#kubernetes-prerequisites)); path components
+accept letters, digits, `.`, `_`, and `-`. Durable state and completed-cell
+data live in `.storage-scale-test` under the lexically first root, so do not
+use that name as a component. A per-PVC Lease blocks concurrent sweeps on the
+same claim, even with different test roots.
 
-A Kubernetes invocation submits one asynchronous Job for the whole sweep.
-Submission stages the verified control bundle and execution definitions on
-the PVC, starts the Job, and prints commands for querying, cancelling, and
-collecting the attempt:
+A Kubernetes invocation submits one asynchronous Job for the whole sweep and
+prints commands to query, cancel, and collect it:
 
 ```bash
 ./storage-tests/fs/nv-elbencho-sweep.sh --nodes 1,2,4
@@ -182,28 +168,22 @@ collecting the attempt:
 ./storage-tests/fs/nv-elbencho-sweep.sh --collect "$RUN"
 ```
 
-To stop an active attempt, use `--cancel "$RUN"`, then collect its terminal
-results. The metadata launcher offers the same lifecycle commands.
+The metadata launcher offers the same lifecycle commands. The Job runs without
+your credentials, but lifecycle commands need current `kubectl` access.
 
-The Job does not depend on the submitting process's later `kubectl`
-credentials, although lifecycle commands require current credentials until
-cleanup completes. `--status` inspects durable state and performs only bounded,
-exact-identity reconciliation. A successful status query exits zero regardless
-of the benchmark outcome. `--cancel` stops the exact saved attempt and preserves
-its durable state. `--collect` is required after a terminal attempt: it copies
-completed results, snapshots, and diagnostics into the local result directory
-and performs owned-resource cleanup. Collection of a failed or cancelled
-attempt returns nonzero after publishing the partial results, so callers must
-inspect the collected state before deciding whether to continue.
+- `--status` exits 0 whenever the query succeeds, whatever the benchmark
+  outcome.
+- `--cancel "$RUN"` stops an active attempt; collect it afterward.
+- `--collect` is required after every terminal attempt: it copies results and
+  diagnostics locally and cleans up. For a failed or cancelled attempt it
+  publishes partial results, then exits nonzero.
+- `--resume "$RUN"` requires collection first and, with the same Kubernetes
+  configuration, reruns only unfinished cells.
+- A failure mid-cell can lose that cell's partial output, but never records it
+  as successful.
 
-Kubernetes `--resume` is collection-gated. After collecting a failed attempt,
-run `--resume <results-dir>` with the same Kubernetes configuration to submit
-only the uncompleted cells; successful cells and their results are retained.
-Concurrent mutating operations on one result directory and concurrent sweeps
-on one PVC are rejected. Active measured output is Pod-local scratch, while
-completed-cell publication and the control ledger are copied to the PVC
-between cells. A failure before publication can lose that cell's partial
-output, but cannot silently claim it succeeded.
+The [Kubernetes lifecycle contract](KUBERNETES_ELBENCHO_LIFECYCLE.md) covers
+the details.
 
 ## Resume after failure
 
@@ -211,17 +191,16 @@ The sweep records each cell separately and stops at the first failure. After
 correcting the cause, continue it with:
 
 ```bash
-./storage-tests/fs/nv-elbencho-sweep.sh --resume \
-    "$RUN"
+./storage-tests/fs/nv-elbencho-sweep.sh --resume "$RUN"
 ```
 
 `--resume` must be the only argument. It restores the original environment and
 CLI modes from the result directory, skips successful cells, resets stale
-running cells, and dispatches the remainder in their original order in either
-Slurm or SSH mode. Do not run concurrent resumes. A Slurm resume also refuses
-to reset work while its prior coordinator may still be active. Resume sources
-shell files in the result directory, so use only a trusted, unmodified result
-directory created by a resume-capable revision.
+running cells, and dispatches the remainder in their original order; on
+Kubernetes, [collect first](#kubernetes-run-inspect-and-collect). Do not run
+concurrent resumes. A Slurm resume also refuses to reset work while its prior
+coordinator may still be active. Resume sources shell files in the result
+directory, so use only a trusted, unmodified result directory.
 
 ## Retained datasets
 
@@ -296,11 +275,9 @@ file, transferring `nodes * file_size` bytes. The default is direct I/O; pass
 
 With `--read-from`, pass a file, not a directory. Its metadata supplies the
 extent, so `ELBENCHO_SINGLE_BIG_FILE_SIZE` is optional. Direct reads repeat
-until the time limit. Buffered IO or `--run-to-completion` reads the file to
-completion without repetition or a benchmark time limit. Buffered IO uses this
-rule to avoid repeatedly measuring the same warm page-cache data; it does not
-guarantee cold caches. Host assignment rotates between read cells to reduce
-cross-run client-cache reuse.
+until the time limit; buffered IO or `--run-to-completion` reads the file once,
+to completion (see the [IO policy](#first-io-sweep)). Host assignment rotates
+between read cells to reduce cross-run client-cache reuse.
 
 `utils/extract-elbencho.sh` handles these results normally. See Recipe 4 in
 [BENCHMARK_RECIPES_FILESYSTEM.md](../BENCHMARK_RECIPES_FILESYSTEM.md).
@@ -313,9 +290,8 @@ reuse. Configure `MDTEST_BRANCH_FACTOR`, `MDTEST_ITEMS_PER_DIR`, and
 `MDTEST_ITERATIONS`, then run:
 
 ```bash
-./storage-tests/fs/nv-mdtest-elbencho.sh \
-    --nodes 1,2,4,8 --tasks 64,128
-# Set RUN to this sweep’s complete printed result-directory path.
+./storage-tests/fs/nv-mdtest-elbencho.sh --nodes 1,2,4,8 --tasks 64,128
+# Set RUN to this sweep's complete printed result-directory path.
 # Kubernetes: collect terminal results before reporting.
 ./utils/extract-filesystem.sh "$RUN"
 ```
@@ -331,7 +307,7 @@ With `EXECUTION_SUBSTRATE=kubectl`, submission returns while a coordinator Job
 runs the sweep. Use `--status`, `--cancel`, and `--collect` with the same result
 directory. Collect a terminal attempt before using `--resume`.
 
-**Dense single-directory runs (`--single-dir-file-target`):**
+### Dense single-directory runs
 
 The default layout creates a branched tree. To measure contention in one flat
 directory, pass `--single-dir-file-target <count>`:
@@ -342,12 +318,9 @@ directory, pass `--single-dir-file-target <count>`:
 
 Dense mode requires one node count, one task count, and one generated target.
 Every worker creates, stats, and deletes uniquely named zero-byte files in that
-directory. Because elbencho assigns an integer count to each worker, the actual
-total is `workers * max(1, round(target / workers))`, where
-`workers = nodes * tasks` and rounding is to the nearest integer, ties up.
-This rounds the target to a whole-worker multiple with at least one file per
-worker: target 1 with two nodes and 64 tasks creates 128 files. Requested and
-actual counts are recorded.
+directory. The actual total is `workers * max(1, round(target / workers))`,
+where `workers = nodes * tasks` and ties round up: target 1 with two nodes and
+64 tasks creates 128 files. Requested and actual counts are recorded.
 
 ## Prepared filesystem batches
 
@@ -357,8 +330,9 @@ Assemble IO and metadata sweeps before running them. Each invocation saves one
 ```bash
 ./storage-tests/fs/nv-elbencho-sweep.sh --batch --nodes 1,2
 # Set BATCH to the printed STORAGE_SCALE_TEST_BATCH_RESULTS path.
-# Edit env.sh for the next group's workload, then append it.
-./storage-tests/fs/nv-mdtest-elbencho.sh --append "$BATCH" --nodes 2,4 --tasks 4,8
+# Vary each group's workload with an override file (see the next section).
+./storage-tests/fs/nv-mdtest-elbencho.sh --append "$BATCH" \
+    --env-override overrides/md-deep-tree.env --nodes 2,4 --tasks 4,8
 ./storage-tests/fs/nv-elbencho-sweep.sh --status "$BATCH"
 ./storage-tests/fs/nv-mdtest-elbencho.sh --start "$BATCH"
 # Kubernetes: wait for terminal status, then collect before reporting.
@@ -377,18 +351,19 @@ remaining work. Initial start acquires capacity for the entire batch's maximum
 node requirement. `--batch` creates a new directory and takes no directory
 argument; only `--append` adds work to an existing draft.
 
-`--status` prints one `KEY=value` view: `BATCH=DRAFT|SEALED`, execution `STATE`,
-`EXECUTIONS_{TOTAL,PENDING,RUNNING,SUCCEEDED,FAILED}`, and `NEXT_ACTION`.
-`EXECUTION_SCOPE=BATCH` counts the full local SSH/Slurm or draft ledger;
-`CURRENT_ATTEMPT` counts only the current Kubernetes attempt, excluding cells
-completed before resume. `PROGRESS_SOURCE=LOCAL|PVC` identifies the ledger.
-`BETWEEN_EXECUTIONS` means the coordinator has pending work but no running cell;
-`AWAITING_COMPLETION` means no cells remain pending or running, but the attempt
-has not yet committed its terminal outcome.
-Neither permits collection: wait for `NEXT_ACTION=COLLECT`.
-`RESULT_COLLECTION=PENDING|CLEANUP_PENDING|COMPLETE` distinguishes remote results,
-published results needing cleanup, and completed collection. SSH/Slurm report
-`NOT_REQUIRED`. Unknown executor ownership reports `STATE=UNKNOWN`, not success.
+`--status` prints `KEY=value` lines. Wait for `NEXT_ACTION=COLLECT` before
+collecting; `STATE=UNKNOWN` is not success.
+
+| Key | Meaning |
+| --- | --- |
+| `BATCH` | `DRAFT` until first start, then `SEALED` |
+| `ATTEMPT` | Kubernetes only: current attempt ID |
+| `STATE` | `BETWEEN_EXECUTIONS`: work pending, no cell running; `AWAITING_COMPLETION`: no cells left, outcome not yet committed; `UNKNOWN`: executor ownership unknown |
+| `EXECUTION_SCOPE` | `BATCH`: full SSH/Slurm or draft ledger; `CURRENT_ATTEMPT`: current Kubernetes attempt, excluding cells completed before resume |
+| `PROGRESS_SOURCE` | Ledger read: `LOCAL` or `PVC` |
+| `EXECUTIONS_{TOTAL,PENDING,RUNNING,SUCCEEDED,FAILED}` | Cell counts within that scope |
+| `RESULT_COLLECTION` | `PENDING` (results remote), `CLEANUP_PENDING` (published, cleanup needed), `COMPLETE`; SSH/Slurm: `NOT_REQUIRED` |
+| `NEXT_ACTION` | `START`, `WAIT`, `COLLECT`, `RESUME`, `INSPECT`, or `NONE` |
 
 Groups may use different test roots, weights, IO modes, sizes, durations, and
 metadata layouts. The substrate, executable identity, architecture, ordering,
@@ -396,6 +371,69 @@ host pool, and selected substrate's connection/allocation settings are frozen;
 append names mismatched fields. Start and resume use saved settings, not the
 current `env.sh`. Kubernetes credentials remain those of the current client.
 Its durable control directory is chosen from the union of all group test roots.
+
+## Workload override files
+
+`--env-override <file>` varies a workload without editing `env.sh`. Either
+launcher, IO or metadata, accepts one file on a new run, `--batch`, or
+`--append`, on any substrate. Each appended group keeps its own override, so a
+directory of small numbered files and a short script can build a mixed batch:
+
+```bash
+# overrides/10-small-random.env
+ELBENCHO_SCALE_IO_SIZES=("r4K" "r16K")
+ELBENCHO_IODEPTH_LIST=(1 16)
+ELBENCHO_SCALE_THREAD_LIST+=(512)   # extends the list from env.sh
+```
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+IO=./storage-tests/fs/nv-elbencho-sweep.sh
+MD=./storage-tests/fs/nv-mdtest-elbencho.sh
+BATCH=$("$IO" --batch --env-override overrides/10-small-random.env \
+    --nodes 1,2,4,8 | sed -n 's/^STORAGE_SCALE_TEST_BATCH_RESULTS=//p')
+test -n "$BATCH"
+"$IO" --append "$BATCH" --env-override overrides/20-large-seq.env --nodes 1,8
+"$MD" --append "$BATCH" --env-override overrides/30-deep-tree.env \
+    --nodes 2,4 --tasks 64,128
+"$IO" --start "$BATCH"
+```
+
+The file is trusted Bash, sourced after `env.sh` in an isolated shell. It sees
+the exported environment and the current values of the allowed settings, so
+`+=` and `$((MDTEST_ITERATIONS + 1))` build on `env.sh`; unexported `env.sh`
+helper variables are not visible. `unset NAME` gives a setting its usual
+default. A relative file path resolves from the current directory. The file
+must finish with status 0 and must not call `exit`.
+
+Both launchers accept every allowed setting, so IO and metadata groups can
+share a file:
+
+- `TEST_DIRS`: associative array.
+- Indexed arrays, one value per element (no whitespace):
+  `ELBENCHO_SCALE_THREAD_LIST`, `ELBENCHO_SCALE_IO_SIZES`,
+  `ELBENCHO_IODEPTH_LIST`.
+- Scalars: `FS_MAX_{AGG_THROUGHPUT,NODE_THROUGHPUT_GBPS,NODE_IOPS}`,
+  `MDTEST_{BRANCH_FACTOR,ITEMS_PER_DIR,ITERATIONS}`,
+  `ELBENCHO_{FILE_SIZE_MULTIPLIER,FILE_LAYOUT,FILES_PER_NODE,FILE_SIZE}`,
+  `ELBENCHO_{SCALE_READ_WRITE_DURATION,READ_AFTER_WRITE_PAUSE}`,
+  `ELBENCHO_{LIVE_CSV_EXTENDED,LIVEINT,ALL_NODES_ACCESS_ALL_DATA}`,
+  `ELBENCHO_SINGLE_BIG_FILE{,_BASENAME,_SIZE}`.
+
+Changing any other variable (a typo, a new uppercase name, or a lowercase name
+that `env.sh` or the launcher already defines) is an error, and the message
+lists every allowed name. A value of the wrong type is also an error. Either
+fails before a results directory is created or a group is appended. New
+lowercase variables, such as loop counters, are discarded.
+
+Each submission prints
+`Env override: <path> (sha256 <hash>): <changed variables | no settings changed>`
+and records the same in `env_used.sh`
+(`STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}`) and `env_used.yaml`
+(`env_override`). `--start`, `--resume`, `--status`, `--cancel`, `--collect`,
+and `--delete-only` reject the flag; lifecycle commands use the saved values,
+so later edits to the file have no effect.
 
 ## Filesystem reporting
 
@@ -441,13 +479,12 @@ Use `--help` for all options. Cached CSV input and single-file parsing require
 | IO | `--client-max-heatmap-rows N` | Limit clients per heatmap (default 50) |
 | Metadata | `--normalize-to N` | Scale rates/stddev to N nodes, not latency |
 
-Both analysis wrappers accept one or more result directories, filters, CSV
-export/import, and `--markdown`. These are `extract-elbencho.sh` and
-`extract-mdtest-elbencho.sh`; the unified front door accepts one result
-directory. Elbencho reports IOPS or throughput and latency
-by operation, size, thread count, node count, and I/O depth. Metadata reports
-create/stat/delete rates, elapsed times, latency distributions, variance, and
-scaling efficiency.
+For several result directories at once, use `extract-elbencho.sh` or
+`extract-mdtest-elbencho.sh`, which accept the same filters, CSV
+export/import, and `--markdown`. IO reports show IOPS or throughput and
+latency by operation, size, thread count, node count, and I/O depth. Metadata
+reports show create/stat/delete rates, elapsed times, latency distributions,
+variance, and scaling efficiency.
 
 For per-client filesystem I/O diagnostics, set
 `ELBENCHO_LIVE_CSV_EXTENDED=1` before the run and analyze with
@@ -484,7 +521,7 @@ python3 utils/slurm/group_into_bins.py --bin-size 25 nodes.csv \
 Use `ordered_nodes` as `SSH_HOST_LIST` or `SLURM_NODE_INCLUDES`, set
 `ORDER_NODES=1`, and pass the emitted node counts to a sweep. SSH then takes the
 first `N` hosts; Slurm with an include list requests exactly its first `N`
-expanded nodes. Netbench still shuffles its selected nodes into traffic groups.
+expanded nodes.
 
 Smaller bins add sweep points; larger bins provide more balancing freedom.
 
@@ -500,18 +537,48 @@ SLURM_EXTRA_ARGS=("--constraint=ib" "--comment=storage validation run")
 `--cpus-per-task` when the target CPU count is available; the default uses
 `--exclusive`.
 
+## Kubernetes prerequisites
+
+The tool provisions no cluster, namespace, PV, or PVC. After setting the
+[README Kubernetes configuration](../README.md#kubernetes), confirm:
+
+- The namespace exists and the RWX PVC is bound to the named PV.
+- The selector matches enough Ready, schedulable nodes of the intended
+  architecture for your largest node count. Inspect labels with
+  `kubectl get nodes --show-labels`; comma-separated equality labels are ANDed,
+  for example `storage-scale-test/worker=true,storage-tier=lustre`.
+- Every selected node can mount the PVC. Each logical `TEST_DIRS` path already
+  exists and is writable by the configured positive UID/GID; `2000:2000` is an
+  example, not a required identity. Do not prepend `/mnt/storage-scale-test/`:
+  the tool adds that Pod-side prefix. The PVC mount root need not be writable.
+- The CNI provides cross-node Pod IPv4 connectivity on TCP 1611 and enforces
+  NetworkPolicies.
+- Admission policy allows `Unconfined` seccomp for elbencho validation, worker,
+  and coordinator Pods; Linux AIO needs it. These Pods still run as the
+  configured non-root UID/GID, disable privilege escalation, drop all
+  capabilities, and mount no API token. Helper Pods keep more restrictive
+  settings.
+- The submitting identity can inspect nodes, the namespace, PV/PVC, workload
+  resources and events; create, get, and delete Jobs, Pods, DaemonSets,
+  ConfigMaps, NetworkPolicies, and namespaced Leases; and read Pod logs and
+  exec into Pods. The coordinator itself has no Kubernetes API credentials.
+- The image supports your nodes and is usable under the pull policy with any
+  required registry credentials. `Never` requires preloading; `Always`
+  requires a digest-qualified reference.
+
+`validate_env.sh` then runs a temporary Job to check the image, workload
+identity, PVC access, and seccomp mode.
+
 ## Kubernetes access and troubleshooting
 
-Use the [README configuration checklist](../README.md#kubernetes) first.
-The submitting identity needs access to inspect nodes, namespace, PV/PVC,
-workload resources and events; create, inspect, and delete Jobs, Pods,
-DaemonSets, ConfigMaps, NetworkPolicies and Leases; and read Pod logs and exec
-into Pods. The coordinator itself has no Kubernetes API credentials.
-
-Elbencho validation, worker, and coordinator Pods request `Unconfined`
-seccomp for Linux AIO. They still run as the configured non-root UID/GID,
-disable privilege escalation, drop all capabilities, and mount no API token.
-Helper Pods retain their more restrictive security settings.
+`validate_env.sh` also lists, informationally, any Jobs, DaemonSets, Pods,
+NetworkPolicies and Leases labeled `app.kubernetes.io/name=storage-scale-test`
+(all namespaces, falling back to `KUBECTL_NAMESPACE` if cluster-wide listing is
+forbidden). Existing objects never fail validation, and the label does not
+prove ownership: they may belong to an active or uncollected attempt. Find the
+result directory whose `kubernetes/attempts/<run-id>/` matches the listed RUN
+and use `--status`, `--collect`, or `--cancel`. Delete manually only after the
+object's ownership annotation matches the nonce recorded in that attempt.
 
 On failure, read the diagnostic bundle path and safe next action printed by
 validation or the sweep. Common causes are:

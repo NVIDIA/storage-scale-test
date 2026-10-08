@@ -19,6 +19,7 @@
 /utils/mdtest*
 /*.png
 /env.sh
+/overrides/
 /.venv
 /.venv-ci
 /.obj_auth

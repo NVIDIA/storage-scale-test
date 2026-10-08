@@ -117,3 +117,105 @@ def test_root_workload_identity_and_missing_test_dirs_are_actionable(tmp_path):
     assert "FS not enabled" not in result.stdout
     assert "OBJ not enabled" not in result.stdout
     assert "invalid Kubernetes filesystem sweep configuration" not in result.stdout
+
+
+_ROW = "ns1|sst-elb-ab12cd34-sweep|ab12cd34|coordinator|2026-01-02T03:04:05Z"
+
+
+def _run_inventory(tmp_path, fake_body):
+    """Run check_kubectl_owned_resources against a fake kubectl on PATH."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "kubectl"
+    fake.write_text("#!/usr/bin/env bash\n" + fake_body, encoding="utf-8")
+    fake.chmod(0o755)
+    source = (_ROOT / "validate_env.sh").read_text(encoding="utf-8")
+    inventory = source.split("# Informational, read-only inventory", 1)[1].split(
+        "check_kubectl_filesystem_prerequisites() {", 1
+    )[0]
+    functions = _ROOT / "storage-tests/fs/kubectl/_nv-elbencho-kubectl-functions.sh"
+    script = textwrap.dedent(f"""\
+        source {str(functions)!r}
+        register_error() {{ printf 'ERROR:%s\\n' "$1"; }}
+        register_warning() {{ printf 'WARNING:%s\\n' "$1"; }}
+        KUBECTL_NAMESPACE=myns
+        KUBECTL_OBSERVATION_ATTEMPTS=1
+        {inventory}
+        check_kubectl_owned_resources
+        """)
+    return subprocess.run(
+        [_BASH, "-c", script],
+        check=False,
+        env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"},
+        text=True,
+        capture_output=True,
+    )
+
+
+def test_owned_resources_none_found(tmp_path):
+    """An empty cluster is reported informationally."""
+    result = _run_inventory(tmp_path, "exit 0\n")
+    assert result.returncode == 0
+    assert "none found (all namespaces)" in result.stdout
+    assert "ERROR:" not in result.stdout
+
+
+def test_owned_resources_listed_without_error(tmp_path):
+    """Existing objects are tabulated with run id and never register errors."""
+    body = f'[[ " $* " == *" get jobs "* ]] && echo "{_ROW}"\nexit 0\n'
+    result = _run_inventory(tmp_path, body)
+    assert result.returncode == 0
+    assert "1 found (all namespaces)" in result.stdout
+    assert ["Job", "ns1"] in [line.split()[:2] for line in result.stdout.splitlines()]
+    assert "ab12cd34" in result.stdout
+    assert "sst-elb-ab12cd34-sweep" in result.stdout
+    assert "coordinator" in result.stdout
+    assert "kubernetes/attempts/<RUN>/" in result.stdout
+    assert "ERROR:" not in result.stdout
+    assert "WARNING:" not in result.stdout
+
+
+def test_owned_resources_forbidden_all_namespaces_falls_back(tmp_path):
+    """RBAC denial of -A falls back to the configured namespace."""
+    body = textwrap.dedent(f"""\
+        if [[ " $* " == *" -A "* ]]; then
+            echo 'Error from server (Forbidden): cannot list resource' >&2
+            exit 1
+        fi
+        [[ " $* " == *" -n myns "* && " $* " == *" get jobs "* ]] \\
+            && echo "{_ROW}"
+        exit 0
+        """)
+    result = _run_inventory(tmp_path, body)
+    assert result.returncode == 0
+    assert (
+        "namespace myns where cluster-wide listing is forbidden: Job, DaemonSet"
+        in result.stdout
+    )
+    assert "ab12cd34" in result.stdout
+    assert "ERROR:" not in result.stdout
+    assert "WARNING:" not in result.stdout
+
+
+def test_owned_resources_probe_failure_warns(tmp_path):
+    """API failures downgrade to a warning, not an error."""
+    body = "echo 'connection refused' >&2\nexit 1\n"
+    result = _run_inventory(tmp_path, body)
+    assert result.returncode == 0
+    assert "WARNING:Could not list Kubernetes objects" in result.stdout
+    assert "ERROR:" not in result.stdout
+
+
+def test_owned_resources_ignore_kubectl_stderr_warnings(tmp_path):
+    """Version-skew warnings on stderr never become inventory rows."""
+    body = textwrap.dedent(f"""\
+        echo 'Warning: version difference between client (1.36) and server (1.34)' >&2
+        [[ " $* " == *" get pods "* ]] && echo "{_ROW}"
+        exit 0
+        """)
+    result = _run_inventory(tmp_path, body)
+    assert result.returncode == 0
+    assert "1 found (all namespaces)" in result.stdout
+    assert ["Pod", "ns1"] in [line.split()[:2] for line in result.stdout.splitlines()]
+    assert "version difference" not in result.stdout
+    assert "WARNING:" not in result.stdout

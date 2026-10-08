@@ -37,12 +37,13 @@ fi
 usage() {
     cat <<USAGE
 Usage: $0 --nodes <node_spec> --tasks <task_spec> [--single-dir-file-target <count>]
+          [--env-override <file>]
        $0 --resume <results_dir>
        $0 --status <results_dir>
        $0 --cancel <results_dir>
        $0 --collect <results_dir>
-       $0 --batch --nodes <node_spec> --tasks <task_spec>
-       $0 --append <batch_dir> --nodes <node_spec> --tasks <task_spec>
+       $0 --batch [--env-override <file>] --nodes <node_spec> --tasks <task_spec>
+       $0 --append <batch_dir> [--env-override <file>] --nodes <node_spec> --tasks <task_spec>
        $0 --start <batch_dir>
 
 --batch prepares the first group without executing. --append adds a group only
@@ -59,6 +60,11 @@ ranges X-Y, and stepped ranges X-Y+Z. Results are saved beneath
 zero-byte files. It requires one node count, one task count, and one generated
 target directory. The achievable file count is rounded to whole workers.
 
+--env-override sources <file> after env.sh so its filesystem workload settings
+(TEST_DIRS, FS_MAX_*, MDTEST_*, ELBENCHO_*) take precedence. It is accepted
+once, only for a new submission or --batch/--append. Values are saved in
+env_used.sh; later lifecycle operations never reread the file or env.sh.
+
 --resume restores the saved execution definitions and retries non-SUCCESS cells.
 For Kubernetes, first collect the terminal attempt. --status, --cancel, and
 --collect manage the asynchronous Kubernetes attempt.
@@ -68,12 +74,13 @@ USAGE
 nodes_spec=""
 tasks_spec=""
 single_dir_target_files=""
+env_override_file=""
 operation="submit"
 operation_dir=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
-        --nodes|--tasks|--single-dir-file-target|--resume|--status|--cancel|--collect)
+        --nodes|--tasks|--single-dir-file-target|--env-override|--resume|--status|--cancel|--collect)
             [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || {
                 echo "Error: $1 requires an argument" >&2; exit 1;
             }
@@ -93,6 +100,11 @@ while [[ $# -gt 0 ]]; do
                         echo "Error: --single-dir-file-target may be specified only once" >&2; exit 1;
                     }
                     single_dir_target_files="$2" ;;
+                --env-override)
+                    [[ -z "$env_override_file" ]] || {
+                        echo "Error: --env-override may be specified only once" >&2; exit 1;
+                    }
+                    env_override_file="$2" ;;
                 *)
                     [[ "$operation" == submit ]] || {
                         echo "Error: lifecycle operations are mutually exclusive" >&2; exit 1;
@@ -105,6 +117,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "$operation" != submit && -n "$env_override_file" ]]; then
+    echo "Error: --env-override applies only to a new submission or --batch/--append;" \
+        "existing results always use their saved env_used.sh" >&2
+    exit 1
+fi
 if [[ "$operation" != submit && ( -n "$nodes_spec" || -n "$tasks_spec" \
         || -n "$single_dir_target_files" ) ]]; then
     echo "Error: $operation is mutually exclusive with workload flags" >&2
@@ -169,6 +186,23 @@ if [[ "$operation" == resume ]]; then
     unset EXECUTION_SUBSTRATE
     # shellcheck disable=SC1090,SC1091
     source "$OUTPUT_DIR/env_used.sh" || exit 1
+fi
+# A new submission layers its --env-override over env.sh at top level, before
+# any validation or output, so every check and snapshot sees effective values.
+if [[ "$operation" == submit ]]; then
+    reset_env_override_provenance
+    if [[ -n "$env_override_file" ]]; then
+        env_override_file=$(resolve_env_override_file "$env_override_file") || exit 1
+        # Batch preparation passes a staged copy; record the operator's file.
+        env_override_label="$env_override_file"
+        if [[ -n "${ELBENCHO_BATCH_PREPARE_DIR:-}" ]]; then
+            env_override_label="${ELBENCHO_BATCH_ENV_OVERRIDE_ORIGIN:-$env_override_file}"
+        fi
+        env_override_declarations=$(filesystem_env_override_declarations \
+            "$env_override_file" "$env_override_label" \
+            "${ELBENCHO_BATCH_PREPARE_DIR:+$ELBENCHO_BATCH_PREPARE_DIR/.env-override-declarations.sh}") || exit 1
+        eval "$env_override_declarations"
+    fi
 fi
 if [[ -n "${SLURM_JOB_ID:-}" && -z "${SSH_ENABLED:-}" ]]; then
     echo "Error: run this launcher outside a Slurm allocation" >&2
@@ -254,6 +288,7 @@ write_mdtest_elbencho_env_used "$OUTPUT_DIR/env_used.yaml" \
 runner_log="$OUTPUT_DIR/mdtest-elbencho-sweep-$DS-runner.log"
 exec 1> >(tee -a "$runner_log")
 exec 2> >(tee -a "$runner_log" >&2)
+print_env_override_summary
 echo "Metadata sweep: nodes=${node_counts[*]} tasks=${task_counts[*]} output=$OUTPUT_DIR"
 if [[ -n "$single_dir_target_files" ]]; then
     print_mdtest_single_dir_target_summary "$single_dir_target_files" \

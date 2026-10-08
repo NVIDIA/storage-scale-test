@@ -4470,6 +4470,34 @@ def test_fixture_build_does_not_force_registry_refresh(tmp_path, monkeypatch):
     assert "--pull" not in build
 
 
+def test_package_mirror_arguments_reach_ssh_build_and_errors_are_provision_errors(
+    tmp_path, monkeypatch
+):
+    """Configured mirrors are forwarded to the real build; bad ones stop setup."""
+    runner = _RecordingRunner()
+    config = _config(tmp_path / "state", tmp_path / "export")
+    monkeypatch.setattr(_DRIVER, "_ensure_pinned_image", lambda *_args: None)
+    monkeypatch.setattr(_DRIVER, "_begin_image_build", lambda *_args: "fixture:pending")
+    monkeypatch.setattr(_DRIVER, "_publish_image_build", lambda *_args: None)
+    mirror = "http://mirror.example/ubuntu"
+    monkeypatch.setenv("INTEGRATION_APT_ARCHIVE_MIRROR", mirror)
+
+    _build_owned_image(
+        runner,
+        config,
+        "fixture:latest",
+        tmp_path / "Dockerfile",
+        "base@sha256:index",
+        _DRIVER._package_mirror_arguments(),
+    )
+
+    build = next(c for c in runner.commands if c[:2] == ["docker", "build"])
+    assert f"APT_ARCHIVE_MIRROR={mirror}" in build
+    monkeypatch.setenv("INTEGRATION_APT_ARCHIVE_MIRROR", "ftp://bad")
+    with pytest.raises(_DRIVER.ProvisionError, match="package mirror"):
+        _DRIVER._package_mirror_arguments()
+
+
 def test_slurm_login_restart_preserves_operator_managed_template(tmp_path, monkeypatch):
     """Replace the login Pod, then wait for its ready successor without a rollout."""
     config = _config(tmp_path / "state", tmp_path / "export")

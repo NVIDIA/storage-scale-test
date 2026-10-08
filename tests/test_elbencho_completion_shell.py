@@ -428,6 +428,7 @@ def _assert_native_totals(root, total_files):
         records = [
             json.loads(line)
             for line in (root / f"{phase}.json").read_text().splitlines()
+            if line.strip()
         ]
         record = next(item for item in records if item["phase_type"] == phase.upper())
         assert int(record["last_done"]["entries"]) == total_files

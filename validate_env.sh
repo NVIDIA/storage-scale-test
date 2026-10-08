@@ -183,6 +183,99 @@ check_macos_launcher_prerequisites() {
     printf '  macOS launcher prerequisites: passed for %s\n' "$EXECUTION_SUBSTRATE"
 }
 
+# Informational, read-only inventory of objects this toolset created that still
+# exist in the cluster. Existence never fails validation, and labels are never
+# treated as proof of ownership (only a result directory's UID journal is).
+# Only stdout is parsed: kubectl warnings (for example version skew) go to
+# stderr and must not become table rows.
+_kubectl_inventory_list() {
+    local stderr_path="$1"
+    shift
+    kubectl_run_observational "$@" \
+        -l app.kubernetes.io/name=storage-scale-test \
+        -o 'jsonpath={range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.metadata.labels.storage-scale-test\.nvidia\.com/run}{"|"}{.metadata.labels.app\.kubernetes\.io/component}{"|"}{.metadata.creationTimestamp}{"\n"}{end}' \
+        2> "$stderr_path"
+}
+
+# The last kubectl error line, without retry notices or diagnostic records.
+_kubectl_inventory_error() {
+    local error
+    error=$(grep -Ev '^(STORAGE_SCALE_TEST_DIAGNOSTIC_|Warning: transient Kubernetes observation failed)' \
+        -- "$1" | grep . | tail -n 1)
+    printf '%s' "${error:0:200}"
+}
+
+_print_kubectl_inventory_table() {
+    awk -F'|' '
+        { for (i = 1; i <= 6; i++) { cell[NR, i] = ($i == "" ? "-" : $i) } }
+        END {
+            split("KIND|NAMESPACE|NAME|RUN|COMPONENT|CREATED", header, "|")
+            for (i = 1; i <= 6; i++) { cell[0, i] = header[i] }
+            for (j = 0; j <= NR; j++) {
+                for (i = 1; i <= 6; i++) {
+                    if (length(cell[j, i]) > width[i]) { width[i] = length(cell[j, i]) }
+                }
+            }
+            for (j = 0; j <= NR; j++) {
+                line = ""
+                for (i = 1; i <= 6; i++) { line = line sprintf("  %-" width[i] "s", cell[j, i]) }
+                sub(/ +$/, "", line)
+                print line
+            }
+        }'
+}
+
+check_kubectl_owned_resources() {
+    local stderr_path resource kind output rows="" fallback="" unlisted=""
+    local probe_failures="" scope="all namespaces"
+    stderr_path=$(mktemp "${TMPDIR:-/tmp}/storage-scale-test-validate-inventory.XXXXXX") || {
+        register_warning "Could not create temporary storage for the Kubernetes object inventory"
+        return 0
+    }
+    for resource in Job:jobs DaemonSet:daemonsets Pod:pods \
+            NetworkPolicy:networkpolicies Lease:leases.coordination.k8s.io; do
+        kind="${resource%%:*}"
+        resource="${resource#*:}"
+        if ! output=$(_kubectl_inventory_list "$stderr_path" get "$resource" -A); then
+            if grep -qi forbidden -- "$stderr_path"; then
+                fallback+="${fallback:+, }$kind"
+                output=$(_kubectl_inventory_list "$stderr_path" \
+                    -n "$KUBECTL_NAMESPACE" get "$resource") || {
+                    unlisted+="${unlisted:+, }$kind"
+                    probe_failures+="${probe_failures:+; }$kind: $(_kubectl_inventory_error "$stderr_path")"
+                    continue
+                }
+            else
+                unlisted+="${unlisted:+, }$kind"
+                probe_failures+="${probe_failures:+; }$kind: $(_kubectl_inventory_error "$stderr_path")"
+                continue
+            fi
+        fi
+        local row
+        while IFS= read -r row; do
+            [[ -z "$row" ]] || rows+="$kind|$row"$'\n'
+        done <<< "$output"
+    done
+    rm -f -- "$stderr_path"
+    [[ -z "$fallback" ]] \
+        || scope="namespace $KUBECTL_NAMESPACE where cluster-wide listing is forbidden: $fallback"
+    if [[ -n "$unlisted" ]]; then
+        register_warning "Could not list Kubernetes objects from this toolset ($unlisted): $probe_failures"
+        scope+="; could not list: $unlisted"
+    fi
+    if [[ -z "$rows" ]]; then
+        printf '  Kubernetes objects from this toolset: none found (%s)\n' "$scope"
+        return 0
+    fi
+    printf '  Kubernetes objects from this toolset: %s found (%s)\n' \
+        "$(grep -c . <<< "$rows")" "$scope"
+    printf '%s' "$rows" | _print_kubectl_inventory_table
+    printf '  These may belong to an active or uncollected attempt. Find the result directory\n'
+    printf '  whose kubernetes/attempts/<RUN>/ matches and use --status, --collect, or --cancel.\n'
+    printf '  Delete manually only after confirming the object ownership annotation matches\n'
+    printf '  the nonce recorded in that attempt (resources/ or ambiguous-absence/ files).\n'
+}
+
 check_kubectl_filesystem_prerequisites() {
     local kubectl_functions="${SCALE_TEST_BASE}/storage-tests/fs/kubectl/_nv-elbencho-kubectl-functions.sh"
     if [[ ! -f "$kubectl_functions" ]]; then
@@ -217,6 +310,7 @@ check_kubectl_filesystem_prerequisites() {
         return 1
     fi
     printf '  Kubernetes namespace/PV/PVC identity: %s\n' "$identity"
+    check_kubectl_owned_resources
     local nodes_dir nodes_path node_output node_count node_arch node_names
     nodes_dir=$(mktemp -d "${TMPDIR:-/tmp}/storage-scale-test-validate-nodes.XXXXXX") || {
         register_error "Could not create temporary storage for Kubernetes node validation"

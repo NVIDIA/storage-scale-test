@@ -271,8 +271,9 @@ contract change rather than silently expanding the release boundary.
 | S-05 | Competing result trees reserve one PVC | Required recovery | One owner; loser rolls back without touching it. | Covered |
 | S-06 | Exit around PVC Lease creation or journaling | Required recovery | Reconcile exact owner/intent; never steal the Lease. | Covered |
 | S-07 | API accepts create but response is lost | Required recovery | Resolve deterministic identity, then journal or delete the exact object. | Covered |
-| S-08 | API visibility is delayed within the documented ambiguity horizon | Required recovery | Wait and perform a later linearizable GET. | Covered |
-| S-09 | Object appears after the ambiguity horizon | Required diagnosis | Retain possible identity and print exact inspection/cleanup guidance. | Covered diagnostically; automatic recovery unsupported |
+| S-17 | Create request fails in transit and the object is absent | Required recovery X Covered |
+| S-08 | API visibility is delayed within the creation ambiguity horizon (defined below the table) | Required recovery | Wait and perform a later linearizable GET. | Covered |
+| S-09 | Object appears after the creation ambiguity horizon (defined below the table) | Required diagnosis | Retain possible identity and print exact inspection/cleanup guidance. | Covered diagnostically; automatic recovery unsupported |
 | S-10 | API 429, 5xx, timeout, or disconnect during observation | Required recovery | Bounded retry with jitter, then safe retry guidance. | Covered |
 | S-11 | Credentials expire or network fails during submission | Required recovery | Preserve recoverable state; roll back only from exact evidence. | Covered locally; external acceptance pending |
 | S-12 | Transfer Pod, policy, or worker cannot become Ready | Required recovery | Bounded rollback plus descriptions, logs, and events. | Covered |
@@ -280,6 +281,29 @@ contract change rather than silently expanding the release boundary.
 | S-14 | Exit after Job acceptance but before `SUBMITTED` | Required recovery | Quiesce exact Job and workers before releasing remote state. | Covered |
 | S-15 | Submitter exits after `SUBMITTED` but before printing commands | Required diagnosis | Retain discoverable state under the supplied result directory. | Covered; lost stdout is accepted |
 | S-16 | Original Teleport credential expires after handoff | Required recovery | Job continues; later client reports authentication and safely retries after login. | Acceptance pending |
+
+**Creation ambiguity horizon:** the longer of 30 seconds and
+`KUBECTL_PROCESS_TIMEOUT_SECONDS` (default 30), measured from the creation
+intent's modification time (refreshed before each create retry). Rolling back
+an absent object waits out the horizon plus 2 seconds, then repeats the
+exact-name GET before recording ambiguous absence (S-08, S-09).
+
+**Create retry (S-17).** If `kubectl create` fails without an API verdict
+(the S-10 transient classifier: process timeout, disconnect, 429, or HTTP
+500/502/503/504), do an exact-name GET:
+
+- Owned object present: adopt it after exact identity verification.
+- Absent: re-send the same manifest and ownership nonce under the same intent,
+  with jittered backoff, up to `KUBECTL_CREATE_ATTEMPTS` total requests
+  (default 3).
+- `AlreadyExists`: adopt only if the ownership nonce and run label match;
+  otherwise `IDENTITY_MISMATCH`, with no delete and no retry.
+- GET failure (not absence) or a permanent rejection (`Forbidden`, `Invalid`,
+  quota, admission denial): stop without retry; a rejection still gets one
+  exact identity verification.
+- Retries exhausted: keep the intent, so S-08/S-09 rollback applies.
+- The PVC Lease create is never retried: a foreign `AlreadyExists` there means
+  PVC contention (S-05).
 
 ### Coordinator and benchmark
 
@@ -354,7 +378,8 @@ assertion at the appropriate layer; merely reaching the branch is not evidence.
 | S-04 | `test_s04_local_lifecycle_lock_rejects_a_concurrent_mutator` |
 | S-05 | `test_intended_reservation_does_not_touch_competing_pvc_owner`, `test_pvc_lease_is_create_only_and_has_no_time_expiry` |
 | S-06 | `test_interrupted_pvc_lease_creation_is_reconciled_by_exact_identity`, `test_pvc_lease_release_uses_uid_precondition_and_is_journaled`, `test_pvc_lease_release_clears_redundant_matching_creation_intent` |
-| S-07, S-08, S-09 | `test_creation_intent_cleans_object_left_before_resource_journal`, `test_creation_intent_rechecks_absence_after_create_deadline`, `test_creation_absence_retains_possible_late_object_identity`, `test_create_only_verifies_exact_identity_before_returning_uid`, `test_delayed_pvc_lease_creation_uses_common_ambiguity_wait` |
+| S-07, S-08, S-09 | `test_creation_intent_cleans_object_left_before_resource_journal`, `test_creation_intent_rechecks_absence_after_create_deadline`, `test_creation_absence_retains_possible_late_object_identity`, `test_create_only_verifies_exact_identity_before_returning_uid`, `test_delayed_pvc_lease_creation_uses_common_ambiguity_wait`, `test_creation_ambiguity_horizon_covers_kubectl_process_timeout`, `test_create_adopts_object_accepted_before_lost_response` |
+| S-17 | `test_create_retries_absent_object_after_lost_response`, `test_create_adopts_object_accepted_before_lost_response`, `test_create_retry_adopts_own_object_on_already_exists`, `test_create_never_adopts_or_deletes_foreign_object`, `test_create_never_retries_permanent_api_rejection`, `test_create_observation_failure_is_not_absence`, `test_create_retry_exhaustion_retains_creation_intent` |
 | S-10, T-01 | `test_observational_calls_retry_only_transient_api_failures` |
 | S-11, T-02 | `test_exhausted_observation_emits_actionable_diagnostic_envelope` |
 | S-12 | `test_worker_readiness_timeout_captures_daemonset_diagnostics` |

@@ -17,7 +17,7 @@ limitations under the License.
 
 # NVIDIA Storage Scale Test — Requirements
 
-**Last Updated**: 2026-09-23\
+**Last Updated**: 2026-10-08\
 **Status**: Accurate as of last update.
 
 ---
@@ -209,13 +209,14 @@ These requirements address the infrastructure and runtime constraints the tool m
 
 | ID | Requirement | Satisfied? |
 |----|-------------|:----------:|
-| CV-1.1 | All test parameters shall be centrally configured in a single configuration file (`env.sh`). | Yes |
+| CV-1.1 | All test parameters shall be configured in `env.sh`; filesystem launchers may layer one per-submission workload override file (CV-1.8). | Yes |
 | CV-1.2 | A template configuration file (`env.sh.template`) shall be provided with documented defaults and comments explaining every parameter. | Yes |
 | CV-1.3 | The configuration file shall support Slurm-specific settings (account, reservation, partition, timeout). | Yes |
 | CV-1.4 | The configuration file shall support SSH-specific settings (host list file, SSH user, shared homedir flag). | Yes |
 | CV-1.5 | Benchmark parameters shall support configurable sweep lists (IO sizes, thread counts, IO depths, and object sizes), while node and task counts shall be supplied through the entry-point CLI. | Yes |
 | CV-1.6 | The tool shall support backward compatibility when new configuration variables are introduced (fall back to old variable names or hardcoded defaults). | Yes |
 | CV-1.7 | The configuration shall support Kubernetes namespace, PV, PVC, node-selector, benchmark-image, image-pull-policy, and workload UID/GID settings when `EXECUTION_SUBSTRATE=kubectl`. | Yes |
+| CV-1.8 | Filesystem launchers shall accept `--env-override <file>` for a new submission, `--batch`, or `--append`. The file shall change only the filesystem workload settings recorded in `env_used.sh`; other names and wrongly typed values shall be rejected before results are created. The file's path, SHA-256, and changed variable names shall be recorded in `env_used.sh` and `env_used.yaml`. See [Workload override files](FILESYSTEM_TESTING.md#workload-override-files). | Yes |
 
 ### CV-2: Configuration Validation
 
@@ -231,7 +232,7 @@ These requirements address the infrastructure and runtime constraints the tool m
 | CV-2.8 | Validation shall warn if the target S3 bucket contains existing objects (warp deletes all objects). | Yes |
 | CV-2.9 | Validation shall validate elbencho configuration parameters (thread list contains integers, IO sizes are valid, duration is valid). | Yes |
 | CV-2.10 | Validation shall accumulate all errors and report them together at the end, rather than stopping at the first error. | Yes |
-| CV-2.11 | Kubernetes validation shall verify API access, namespace and PV/PVC identity, PVC binding and mount usability, selected Ready-node compatibility, admission and use of the required Elbencho seccomp profile, and benchmark runtime prerequisites. Submission shall verify requested capacity, service readiness, and coordinator connectivity before executing a cell. | Yes |
+| CV-2.11 | Kubernetes validation shall verify API access, namespace and PV/PVC identity, PVC binding and mount usability, selected Ready-node compatibility, admission and use of the required Elbencho seccomp profile, and benchmark runtime prerequisites. Submission shall verify requested capacity, service readiness, and coordinator connectivity before executing a cell. Validation shall also list, without failing, existing Kubernetes objects labeled as belonging to this toolset. | Yes |
 
 ### CV-3: Slurm Advanced Configuration
 
@@ -388,8 +389,8 @@ This repository does not include or distribute third-party benchmark binaries. U
 
 | Component | Requirements Addressed |
 |-----------|----------------------|
-| `storage-tests/fs/nv-elbencho-sweep.sh` | UC-2, UC-5, UC-9, BM-1, BM-5 |
-| `storage-tests/fs/nv-mdtest-elbencho.sh` | UC-3, UC-6, UC-9, BM-2, BM-5 |
+| `storage-tests/fs/nv-elbencho-sweep.sh` | UC-2, UC-5, UC-9, CV-1.8, BM-1, BM-5 |
+| `storage-tests/fs/nv-mdtest-elbencho.sh` | UC-3, UC-6, UC-9, CV-1.8, BM-2, BM-5 |
 | `storage-tests/object/nv-warp-sweep.sh` | UC-4, UC-7, UC-9, BM-3, BM-5 |
 | `storage-tests/network/nv-netbench.sh` | UC-1, UC-9, BM-4, BM-5 |
 | `utils/extract-elbencho.py` | UC-8, RA-1, RA-2, RA-3 |
@@ -399,7 +400,7 @@ This repository does not include or distribute third-party benchmark binaries. U
 | `validate_env.sh` | EE-2, CV-2 |
 | `env.sh` / `env.sh.template` | EE-2, CV-1 |
 | `lib/env_base.sh` | EE-2, CV-1 |
-| `lib/env_functions.sh` | UC-9, EE-3, EE-4, CV-3 |
+| `lib/env_functions.sh` | UC-9, EE-3, EE-4, CV-1.8, CV-3 |
 | `storage-tests/fs/kubectl/` | UC-5, UC-9, EE-3, CV-1, CV-2, BM-1, BM-5 |
 | `lib/_elbencho_functions.sh` | BM-1, BM-2, EE-3 |
 | `lib/_warp_functions.sh` | BM-3, EE-3 |

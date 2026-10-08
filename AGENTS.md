@@ -17,13 +17,16 @@ limitations under the License.
 
 # AGENTS.md
 
-Canonical, always-on instructions for AI coding agents (Codex, Cursor, Claude
-Code, etc.). `CLAUDE.md` imports this file so Claude Code reads the same source.
-Humans should start with [README.md](README.md).
-
-Kept deliberately lean. Depth lives in referenced docs that you read on demand:
+Canonical instructions for AI coding agents; `CLAUDE.md` imports this file.
+Humans: start with [README.md](README.md). Depth lives in docs to read on demand:
 - Coding standards (Python/shell detail, linting): [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md)
 - Architecture, design decisions, error patterns, recent work: [docs/CONTEXT.md](docs/CONTEXT.md) — read before non-trivial work; update it afterward.
+
+## Delegation (mandatory)
+
+You MUST run every independent task (searches, reviews, checks, per-file work)
+as concurrent sub-agents, maximizing parallelism. Give each the most
+cost-efficient model that can do it well.
 
 ## What this is
 
@@ -58,54 +61,54 @@ See the README "Getting Started" section for the full quickstart and
 
 ## Checks (run before committing)
 
+CI lint and pytest must find nothing these checks missed. Commit or push only
+after the full script exits 0; judge it by exit status and full output, never a
+grep of the score. Report any failure you cannot fix.
+
 ```bash
 ./utils/run_ci_checks.sh
 ```
 
-After changing `.github/`, parse every `.yml` and `.yaml` file beneath it with
-a YAML parser before committing.
+After changing `.github/`, parse every `.yml`/`.yaml` beneath it with a YAML
+parser.
 
-If any required check tool is missing from the sandbox, install it into the
-repo's local environment and rerun the check. Do not skip required tooling just
-because it is not preinstalled.
+Install any missing check tool into the repo's local environment and rerun;
+never skip required tooling.
 
-The script creates and reuses `.venv-ci` with the pinned tools. Pass
-`lint` to run all static checks, or pass `compliance`, `shellcheck`, `black`,
-`pylint`, or `pytest` to run one check. Set `CI_CHECK_JOBS=1` in a constrained
-sandbox. In a pre-provisioned, network-restricted sandbox, set `CI_BOOTSTRAP=0`
-and use `CI_PYTHON` or `CI_SHELLCHECK` to select installed tools.
-Run tests and lint through this script or an environment populated from both
-requirements files; never treat ambient Python tooling as authoritative.
-When changing runtime imports or CI entry points, reproduce the workflow's
-dependency bootstrap and smoke-test its command in a clean environment.
-Preloaded sandbox or `.venv-ci` packages do not prove CI readiness.
+The script reuses `.venv-ci` with the pinned tools. Pass `lint`, `compliance`,
+`shellcheck`, `black`, `pylint`, or `pytest` to run one check. Set
+`CI_CHECK_JOBS=1` in a constrained sandbox; in a network-restricted one, set
+`CI_BOOTSTRAP=0` and use `CI_PYTHON`/`CI_SHELLCHECK`. Run tests and lint only
+through this script or an environment populated from both requirements files;
+ambient tooling, preloaded sandbox packages, and `.venv-ci` do not prove CI
+readiness. When changing runtime imports or CI entry points, also reproduce the
+workflow's dependency bootstrap and smoke-test its command in a clean
+environment.
 
-`black` must be 25.9.0+; `pylint` must score 10.00/10. Details and rationale:
-[docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md).
+`black` must be 25.9.0+; `pylint` must report zero messages (its score rounds
+to 10.00 despite a warning). Details: [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md).
 
-## Key conventions (non-obvious; not enforced by the linters)
+## Key conventions (non-obvious; don't restate linter-enforced rules)
 
 - **Do not vendor third-party binaries or code** (elbencho is GPL-3.0, Warp is
   AGPL-3.0). They are invoked as separate processes; keep it that way.
-- **License header**: every text file carries the NVIDIA Apache-2.0 header — the
-  block at the top of this file, rendered in the file type's comment syntax.
-  Copy it verbatim into new files. `LICENSE` contains the license text itself
-  and is exempt; `README.md` carries the same notice in its Copyright section
-  at the bottom so the project introduction remains first.
+- **License header**: every text file carries the NVIDIA Apache-2.0 header (the
+  block at the top of this file) in its comment syntax; copy it verbatim.
+  `LICENSE` is exempt; `README.md` carries the notice in its Copyright section
+  at the bottom.
 - **elbencho behavior**: do not rely on elbencho source older than **3.0.37**;
   prefer a local checkout at `tmp/elbencho-src` when present over web snippets.
 - **Python**: keep each function's cognitive complexity <= 15 (not linter-enforced);
-  avoid duplicating a literal string 3+ times (use a constant). `pylint` 10.00/10.
+  avoid duplicating a literal string 3+ times (use a constant).
 - **Kubernetes probe diagnosis**: `kubectl exec` returning `-9` does not prove
   OOM or broken Pod networking. Check OOM evidence, then run the socket operation
   from a Pod-resident script. If only exec-carried socket code is killed, keep
   network I/O in the Pod and use exec for bounded request/result transfer.
-- Don't restate rules the linters already enforce; rely on `black`/`pylint`/`shellcheck`.
 
 ## Pull requests
 
 Wrap commit-message lines at about 72 characters.
 
-This project is currently not accepting external contributions. For maintainer
-changes: keep PRs focused, ensure the checks above pass, and update
-`README.md`/`docs/` when behavior or configuration changes.
+No external contributions currently. Maintainer PRs: stay focused, pass the
+checks above, and update `README.md`/`docs/` when behavior or configuration
+changes.
