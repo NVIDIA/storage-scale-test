@@ -88,7 +88,7 @@ Obtain corresponding source from the URL above.
 Description: Python plotting library used by benchmark extraction and summary
              utilities.
 Used by:     Installed from requirements.txt into the repository .venv/ by
-             setup_python_venv().
+             lib/python_bootstrap.py.
 License:     LicenseRef-PSF-2.0 (Python Software Foundation License)
 Source:      https://github.com/matplotlib/matplotlib
 License text: https://github.com/matplotlib/matplotlib/blob/main/LICENSE/LICENSE
@@ -154,7 +154,7 @@ notices.
 Description: Python numerical computing library used by benchmark extraction and
              summary utilities.
 Used by:     Installed from requirements.txt into the repository .venv/ by
-             setup_python_venv().
+             lib/python_bootstrap.py.
 License:     BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0
 Source:      https://github.com/numpy/numpy
 License text: https://github.com/numpy/numpy/blob/main/LICENSE.txt
@@ -310,7 +310,7 @@ file for the complete license text.
 Description: YAML parser and emitter for Python; used by benchmark extraction
              utilities.
 Used by:     Installed from requirements.txt (listed as PyYAML) into the
-             repository .venv/ by setup_python_venv().
+             repository .venv/ by lib/python_bootstrap.py.
 License:     MIT
 Source:      https://github.com/yaml/pyyaml
 License text: https://github.com/yaml/pyyaml/blob/master/LICENSE
@@ -414,7 +414,7 @@ License text: https://github.com/madler/zlib/blob/master/LICENSE
 Description: Python bindings to the Zstandard compression library; used by
              benchmark extraction utilities.
 Used by:     Installed from requirements.txt into the repository .venv/ by
-             setup_python_venv().
+             lib/python_bootstrap.py.
 License:     BSD-3-Clause
 Source:      https://github.com/indygreg/python-zstandard
              (bundles https://github.com/facebook/zstd)

@@ -22,7 +22,6 @@ Parses result files from nv-netbench tests, aggregates metrics across
 iterations and directions, and generates performance reports and visualizations.
 """
 
-import argparse
 import csv
 import os
 import re
@@ -32,18 +31,25 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set, Any
 
-import matplotlib.pyplot as plt
-
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+# Bootstrap must precede runtime dependencies, including imports for plotting.
+# pylint: disable=wrong-import-position,wrong-import-order
+from lib.report_cli import extract_netbench_parser, prepare_report_runtime
+
+if __name__ == "__main__":
+    prepare_report_runtime(__file__, extract_netbench_parser)
+
+import matplotlib.pyplot as plt  # pylint: disable=wrong-import-position
+
 
 from lib.join_datestamps import (  # pylint: disable=wrong-import-position
     join_datestamps as join_datestamps_lib,
     join_datestamps_for_filename,
 )
 from lib.reporting_common import (  # pylint: disable=wrong-import-position
-    add_common_report_arguments,
     discover_result_pairs,
     filter_metrics_by_scale,
     format_decimal_aligned_latency_ms,
@@ -1389,33 +1395,7 @@ def filter_metrics(
 
 def main() -> None:
     """Script entry point."""
-    parser = argparse.ArgumentParser(
-        description="Analyze elbencho netbench benchmark results.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "input_dirs",
-        nargs="*",
-        help="Directories containing netbench result files",
-    )
-    parser.add_argument(
-        "--to-csv",
-        metavar="FILE",
-        help="Write aggregated metrics to CSV file",
-    )
-    add_common_report_arguments(parser)
-    parser.add_argument(
-        "--only-mode",
-        metavar="MODE",
-        choices=["bidir", "half"],
-        help="Only include this mode (bidir or half)",
-    )
-    parser.add_argument(
-        "--test-parse",
-        metavar="FILE",
-        help="Test parsing a single file pair (provide path without extension)",
-    )
-
+    parser = extract_netbench_parser()
     args = parser.parse_args()
 
     # Handle test-parse mode

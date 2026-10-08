@@ -163,9 +163,11 @@ alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 | `lib/_elbencho_functions.sh` | Filesystem IO, metadata, execution reification, and workload-completion logic |
 | `lib/_warp_functions.sh` | Warp client lifecycle and object benchmark logic |
 | `lib/_netbench_functions.sh` | Netbench service, grouping, and traffic logic |
-| `lib/*.py` | Shared analysis, report, live-data, and metadata helpers |
-| `utils/extract-*.sh` | Analysis entry points that prepare the repository virtual environment |
-| `utils/extract-*.py` | Parsers, aggregators, tables, and plots |
+| `lib/python_bootstrap.py` | Locked, standard-library setup and verification of the shared `.venv` |
+| `lib/*.py` | Shared analysis, report, live-data, metadata, and Python CLI helpers |
+| `utils/extract-*.py` | Self-bootstrapping analysis entry points |
+| `utils/summarize-elbencho.py` | Self-bootstrapping Elbencho run summary command |
+| `utils/slurm/sinfo_to_node_gbps_csv.py` | Standard-library Slurm node inventory utility with optional `env.sh` partition lookup |
 | `utils/build_tarball.sh` | User-local deployment-tarball builder |
 | `utils/build/` | Helpers for building Warp and the in-tree s3test program |
 | `tests/` | Python and shell-behavior regression tests collected by `pytest` |
@@ -175,10 +177,10 @@ The checked-in benchmark entry points are:
 
 | Benchmark | Entry point | Analyzer | Slurm dispatch unit | SSH dispatch unit |
 |---|---|---|---|---|
-| Filesystem IO | `storage-tests/fs/nv-elbencho-sweep.sh` | `utils/extract-elbencho.sh` | One maximum-sized coordinator allocation for the sweep | One local sequential dispatcher for the sweep |
-| Filesystem metadata | `storage-tests/fs/nv-mdtest-elbencho.sh` | `utils/extract-mdtest-elbencho.sh` | One maximum-sized coordinator allocation for the sweep | One sequential dispatcher for the sweep |
-| Object storage | `storage-tests/object/nv-warp-sweep.sh` | `utils/extract-warp.sh` | One job per node count | One remote invocation per node count |
-| Network | `storage-tests/network/nv-netbench.sh` | `utils/extract-netbench.sh` | One job per node count | One remote invocation per node count |
+| Filesystem IO | `storage-tests/fs/nv-elbencho-sweep.sh` | `utils/extract-elbencho.py` | One maximum-sized coordinator allocation for the sweep | One local sequential dispatcher for the sweep |
+| Filesystem metadata | `storage-tests/fs/nv-mdtest-elbencho.sh` | `utils/extract-mdtest-elbencho.py` | One maximum-sized coordinator allocation for the sweep | One sequential dispatcher for the sweep |
+| Object storage | `storage-tests/object/nv-warp-sweep.sh` | `utils/extract-warp.py` | One job per node count | One remote invocation per node count |
+| Network | `storage-tests/network/nv-netbench.sh` | `utils/extract-netbench.py` | One job per node count | One remote invocation per node count |
 
 ## Configuration and substrate selection
 
@@ -566,11 +568,10 @@ Runs write UTC-datestamped directories below `RESULTS_DIR`, including
 `elbencho-<datestamp>`, `mdtest-elbencho-<datestamp>`,
 `warp-<datestamp>`, and `netbench-<mode>-<datestamp>`.
 
-The analysis wrappers call `setup_python_venv()` and install the pinned root
-`requirements.txt` only when its hash differs from
-`.venv/.requirements.sha256`. Python 3.12 or newer is required; pinned NumPy
-sets that floor. Run analyzers through their shell wrappers so dependency setup
-and argument forwarding remain consistent.
+The executable analysis tools bootstrap `.venv` from the pinned root
+`requirements.txt` when its hash or installed package versions differ from the
+recorded environment. Python 3.12 or newer is required; pinned NumPy sets that
+floor. Their help and version options run before dependency setup.
 
 Batch reporting uses shared options and routes groups by workload kind.
 `reports/index.md` retains filtered-out reports only when canonical batch,

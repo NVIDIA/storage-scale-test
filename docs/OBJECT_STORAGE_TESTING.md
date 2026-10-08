@@ -58,7 +58,7 @@ then establish a single-node baseline before scaling:
 ```bash
 ./storage-tests/object/nv-warp-sweep.sh --nodes 1
 # Set RUN to the complete result-directory path printed by the sweep.
-./utils/extract-warp.sh "$RUN"
+./utils/extract-warp.py "$RUN"
 ./storage-tests/object/nv-warp-sweep.sh --nodes 1,2,4,8
 ```
 
@@ -79,7 +79,7 @@ prefixes and requires [NVIDIA/warp-minio](https://github.com/NVIDIA/warp-minio).
 
 ## Reporting
 
-`extract-warp.sh` generates terminal tables and PNG plots for throughput, TTFB
+`extract-warp.py` generates terminal tables and PNG plots for throughput, TTFB
 latency, and scaling efficiency. Markdown output is not implemented.
 
 | Option | Purpose |

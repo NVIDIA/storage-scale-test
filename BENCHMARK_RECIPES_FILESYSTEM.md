@@ -145,7 +145,7 @@ export ELBENCHO_READ_AFTER_WRITE_PAUSE=0
 ./storage-tests/fs/nv-elbencho-sweep.sh --nodes 1
 ```
 
-Review the single-node report (`utils/extract-elbencho.sh`) and identify:
+Review the single-node report (`utils/extract-elbencho.py`) and identify:
 
 1. The **first thread count** that saturates (or nearly saturates) the
    node's storage-facing NIC line rate for sequential IO.
@@ -291,7 +291,7 @@ export ELBENCHO_READ_AFTER_WRITE_PAUSE=0
 ./storage-tests/fs/nv-elbencho-sweep.sh --nodes 8,16
 ```
 
-**What to compare:** Generate a report with `utils/extract-elbencho.sh` and
+**What to compare:** Generate a report with `utils/extract-elbencho.py` and
 compare key metrics (sequential read/write GB/s, random 4K IOPS) against
 the baseline. A regression of more than ~10% warrants investigation.
 
@@ -625,7 +625,7 @@ export ELBENCHO_SCALE_IO_SIZES=("r4K" "1M" "4M" "8M" "16M")
 
 Use the single-node results to identify which size maximizes throughput,
 then narrow down for multi-node runs. Filter the report afterward with
-`utils/extract-elbencho.sh --only-sizes ...`.
+`utils/extract-elbencho.py --only-sizes ...`.
 
 3. **Compare nearby sizes.** When documentation suggests a size (e.g., 1M
    or 16M), testing both that value and one step larger or smaller can

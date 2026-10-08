@@ -19,7 +19,7 @@ set -euo pipefail
 
 # Create or refresh the repository .venv with the pinned dependencies used by
 # Python analysis tools. This is a convenience for local development and IDEs;
-# runtime wrappers call the same setup_python_venv helper automatically.
+# executable Python entry points prepare the same environment when run.
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd) || {
     echo "Error: Failed to determine script directory" >&2

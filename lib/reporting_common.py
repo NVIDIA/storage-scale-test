@@ -17,6 +17,8 @@
 
 """Shared parsing and presentation helpers for benchmark result reports."""
 
+from __future__ import annotations
+
 import argparse
 import os
 import re

@@ -21,9 +21,16 @@ import argparse
 import csv
 import math
 import os
+from pathlib import Path
 import subprocess
 import sys
 from typing import List, Optional, Sequence, Tuple
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from lib.report_cli import add_version_argument  # pylint: disable=wrong-import-position
 
 PARTITION_ENV_VAR = "PARTITION"
 SINFO_BIN = "sinfo"
@@ -127,15 +134,42 @@ def _partition_from_env() -> str:
     return os.environ.get(PARTITION_ENV_VAR, "").strip()
 
 
+def _partition_from_config() -> str:
+    """Preserve executable site config only when no explicit partition is supplied."""
+    config_path = _REPO_ROOT / "env.sh"
+    if not config_path.is_file():
+        return ""
+    command = [
+        "bash",
+        "-c",
+        'source "$1" >/dev/null || exit; printf "%s" "${partition:-}"',
+        "sinfo-config",
+        str(config_path),
+    ]
+    try:
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+    except OSError as error:
+        _eprint(f"failed to load {config_path}: {error}")
+        sys.exit(1)
+    if result.returncode:
+        _eprint(f"failed to load {config_path}: {result.stderr.strip()}")
+        sys.exit(1)
+    return result.stdout.strip()
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     desc = (
         "List idle nodes in the Slurm partition from "
-        f"${PARTITION_ENV_VAR} (set by env.sh), excluding drain/draining/drained "
+        f"--partition, ${PARTITION_ENV_VAR}, or env.sh, excluding drain/draining/drained "
         "nodes, match each node name to the "
         "longest PREFIX that is a prefix of the name, and print CSV "
         f"({CSV_COL_INSTANCE},{CSV_COL_GBPS}) to stdout."
     )
     parser = argparse.ArgumentParser(description=desc)
+    add_version_argument(parser)
+    parser.add_argument(
+        "--partition", help="Slurm partition; overrides PARTITION and env.sh."
+    )
     parser.add_argument(
         "prefix_gbps",
         nargs="+",
@@ -149,11 +183,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = _build_arg_parser()
     args = parser.parse_args()
-    partition = _partition_from_env()
+    partition = (
+        args.partition or _partition_from_env() or _partition_from_config()
+    ).strip()
     if not partition:
         _eprint(
-            f"error: {PARTITION_ENV_VAR} is not set or empty "
-            "(source env.sh via utils/sinfo_to_node_gbps_csv.sh)"
+            f"error: no partition selected; use --partition, set {PARTITION_ENV_VAR}, "
+            "or configure partition in env.sh"
         )
         sys.exit(1)
     nodes = sorted({*_load_idle_nodes(partition)})

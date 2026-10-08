@@ -46,7 +46,7 @@ Analyze `$RESULTS_DIR/netbench-{half|bidir}-<datestamp>/` with:
 
 ```bash
 # Set RUN to the complete result-directory path printed by netbench.
-./utils/extract-netbench.sh "$RUN"
+./utils/extract-netbench.py "$RUN"
 ```
 
 The analyzer reports throughput, latency distributions, variance, and scaling

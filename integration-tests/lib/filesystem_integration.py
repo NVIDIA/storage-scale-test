@@ -2332,9 +2332,9 @@ def _assert_scenario_report(
     report_dir = log_dir / f"report-{step.name}"
     report_dir.mkdir()
     extractor = (
-        "extract-mdtest-elbencho.sh"
+        "extract-mdtest-elbencho.py"
         if step.workload_kind == "mdtest"
-        else "extract-elbencho.sh"
+        else "extract-elbencho.py"
     )
     command: list[str | Path] = [
         report_workspace / "utils" / extractor,
@@ -5342,7 +5342,7 @@ def _mixed_batch_report(
     reports = log_dir / "reports-mixed-batch"
     completed = runner.run(
         [
-            report_workspace / "utils/extract-filesystem.sh",
+            report_workspace / "utils/extract-filesystem.py",
             result,
             "--output-dir",
             reports,

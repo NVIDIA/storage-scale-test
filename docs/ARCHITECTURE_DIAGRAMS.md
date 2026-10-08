@@ -33,7 +33,7 @@ NVIDIA Storage Scale Test is a benchmark orchestration tool packaged by the user
    - S3-compatible object storage endpoints accessed over HTTPS.
    - Network paths between benchmark clients (TCP throughput/latency).
 
-4. **Analysis tools.** Python scripts (invoked through shell wrappers that auto-manage a virtualenv) parse result files and produce terminal tables, PNG plots, and optional Markdown reports.
+4. **Analysis tools.** Executable Python tools bootstrap a shared virtual environment, then parse result files and produce terminal tables, PNG plots, and optional Markdown reports.
 
 The tool has no always-running daemon or server-side control plane. A
 Kubernetes filesystem sweep does create a finite-lived coordinator Job, but the
@@ -83,7 +83,7 @@ flowchart TB
     RESX["Results directory on executing host<br/>($RESULTS_DIR/...)"]
     STATE["Persistent run artifacts<br/>(results, env snapshots,<br/>execution status)"]
     PARSE["read/parse results<br/>(local file I/O)"]
-    ANA["Analysis tools (optional)<br/>(utils/extract-*.sh -> Python venv -> extract-*.py)"]
+    ANA["Analysis tools (optional)<br/>(self-bootstrapping utils/extract-*.py)"]
   end
 
   subgraph CL["Benchmark Clients"]
@@ -132,7 +132,7 @@ flowchart TB
   subgraph LN["Slurm Login Node"]
     ORCH["Orchestrator scripts<br/>(storage-tests/\*/nv-\*.sh)"]
     SBATCH["submit jobs<br/>(sbatch)"]
-    ANA["Analysis tools (optional)<br/>(utils/extract-\*.sh -> Python venv -> extract-\*.py)"]
+    ANA["Analysis tools (optional)<br/>(self-bootstrapping utils/extract-\*.py)"]
   end
 
   subgraph HOME["Shared Home Directory"]

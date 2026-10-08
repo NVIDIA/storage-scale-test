@@ -50,6 +50,12 @@ def install_extract_heavy_dependency_stubs() -> None:
         sys.modules["matplotlib"] = stub_matplotlib
         sys.modules["matplotlib.pyplot"] = stub_pyplot
         sys.modules["matplotlib.ticker"] = stub_ticker
+        stub_axes = types.ModuleType("matplotlib.axes")
+        stub_lines = types.ModuleType("matplotlib.lines")
+        stub_axes.Axes = type("Axes", (), {})
+        stub_lines.Line2D = type("Line2D", (), {})
+        sys.modules["matplotlib.axes"] = stub_axes
+        sys.modules["matplotlib.lines"] = stub_lines
     if "numpy" not in sys.modules:
         stub_numpy = types.ModuleType("numpy")
 
