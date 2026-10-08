@@ -271,9 +271,9 @@ contract change rather than silently expanding the release boundary.
 | S-05 | Competing result trees reserve one PVC | Required recovery | One owner; loser rolls back without touching it. | Covered |
 | S-06 | Exit around PVC Lease creation or journaling | Required recovery | Reconcile exact owner/intent; never steal the Lease. | Covered |
 | S-07 | API accepts create but response is lost | Required recovery | Resolve deterministic identity, then journal or delete the exact object. | Covered |
-| S-17 | Create request fails in transit and the object is absent | Required recovery | Bounded retry of the same create under the same durable intent; resolve `AlreadyExists` by exact identity. | Covered |
-| S-08 | API visibility is delayed within the creation ambiguity horizon | Required recovery | Wait and perform a later linearizable GET. | Covered |
-| S-09 | Object appears after the ambiguity horizon | Required diagnosis | Retain possible identity and print exact inspection/cleanup guidance. | Covered diagnostically; automatic recovery unsupported |
+| S-17 | Create request fails in transit and the object is absent | Required recovery X Covered |
+| S-08 | API visibility is delayed within the creation ambiguity horizon (defined below the table) | Required recovery | Wait and perform a later linearizable GET. | Covered |
+| S-09 | Object appears after the creation ambiguity horizon (defined below the table) | Required diagnosis | Retain possible identity and print exact inspection/cleanup guidance. | Covered diagnostically; automatic recovery unsupported |
 | S-10 | API 429, 5xx, timeout, or disconnect during observation | Required recovery | Bounded retry with jitter, then safe retry guidance. | Covered |
 | S-11 | Credentials expire or network fails during submission | Required recovery | Preserve recoverable state; roll back only from exact evidence. | Covered locally; external acceptance pending |
 | S-12 | Transfer Pod, policy, or worker cannot become Ready | Required recovery | Bounded rollback plus descriptions, logs, and events. | Covered |
@@ -282,29 +282,28 @@ contract change rather than silently expanding the release boundary.
 | S-15 | Submitter exits after `SUBMITTED` but before printing commands | Required diagnosis | Retain discoverable state under the supplied result directory. | Covered; lost stdout is accepted |
 | S-16 | Original Teleport credential expires after handoff | Required recovery | Job continues; later client reports authentication and safely retries after login. | Acceptance pending |
 
-The **creation ambiguity horizon** is the longer of 30 seconds and the
-effective `KUBECTL_PROCESS_TIMEOUT_SECONDS` (default 30) that bounds each
-`kubectl create`. It is measured from the creation intent's modification time,
-which marks the latest create request. Rollback of an intent whose object is
-absent waits until the horizon has elapsed, waits a further two seconds, and
-repeats the exact-name GET before recording ambiguous absence (S-08, S-09).
+**Creation ambiguity horizon:** the longer of 30 seconds and
+`KUBECTL_PROCESS_TIMEOUT_SECONDS` (default 30), measured from the creation
+intent's modification time (refreshed before each create retry). Rolling back
+an absent object waits out the horizon plus 2 seconds, then repeats the
+exact-name GET before recording ambiguous absence (S-08, S-09).
 
-A create that fails in transit without an API verdict (a process timeout or a
-transient error such as a timeout, disconnect, 429, or 5xx) is followed by an
-exact-name GET. An owned object is adopted after exact identity verification;
-a proven absence re-sends the same manifest under the same intent, with
-jittered backoff, up to `KUBECTL_CREATE_ATTEMPTS` total requests (default 3).
-The intent's modification time is refreshed before each re-send so the horizon
-covers the latest in-flight request. Every owned name is deterministic and
-every retry carries the same ownership nonce, so the API server admits at most
-one object: `AlreadyExists` with this attempt's nonce and run label is
-adopted, while any other identity fails closed with `IDENTITY_MISMATCH`
-without deletion or retry. A failed GET is not absence and stops retrying.
-Permanent rejections such as `Forbidden`, `Invalid`, quota, or admission
-denial receive one exact identity verification and are never retried.
-Exhausted retries keep the intent, so ordinary S-08/S-09 rollback applies. The
-PVC Lease create is not retried: there, `AlreadyExists` with a foreign nonce
-means PVC contention (S-05).
+**Create retry (S-17).** If `kubectl create` fails without an API verdict
+(the S-10 transient classifier: process timeout, disconnect, 429, or HTTP
+500/502/503/504), do an exact-name GET:
+
+- Owned object present: adopt it after exact identity verification.
+- Absent: re-send the same manifest and ownership nonce under the same intent,
+  with jittered backoff, up to `KUBECTL_CREATE_ATTEMPTS` total requests
+  (default 3).
+- `AlreadyExists`: adopt only if the ownership nonce and run label match;
+  otherwise `IDENTITY_MISMATCH`, with no delete and no retry.
+- GET failure (not absence) or a permanent rejection (`Forbidden`, `Invalid`,
+  quota, admission denial): stop without retry; a rejection still gets one
+  exact identity verification.
+- Retries exhausted: keep the intent, so S-08/S-09 rollback applies.
+- The PVC Lease create is never retried: a foreign `AlreadyExists` there means
+  PVC contention (S-05).
 
 ### Coordinator and benchmark
 

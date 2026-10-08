@@ -310,9 +310,11 @@ early if `_apt` cannot read it) and passed to APT on the command line, so it is
 never stored in the image. When any mirror is configured, every public Ubuntu
 repository URI (archive, security, ports) left in the image must be covered by
 a configured mirror, or the build fails; each URI is checked on its own, even
-when a deb822 `URIs:` field lists several. Partial configuration is unsupported.
+when a deb822 `URIs:` field lists several. A mirror is needed only for hosts
+the image actually uses (an amd64 image needs no ports mirror).
 There is no per-attempt time cap: APT's own finite timeouts bound each stall,
-retries happen only when APT fails, and a 540-second total budget
+retries happen only when APT fails or update output shows a failed Ubuntu
+index, and a 540-second total budget
 (`APT_BUDGET_SECONDS`) ends the whole build, so slow but progressing downloads
 are never killed and restarted. `apt-get update` exits 0 when a source fails,
 so the script inspects its output and fails (retrying) only when a failed index

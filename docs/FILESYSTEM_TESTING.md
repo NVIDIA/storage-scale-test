@@ -23,8 +23,10 @@ from the repository root or unpacked deployment directory. Use dedicated test
 paths: these tests create, overwrite, and delete data.
 
 Start with [IO](#first-io-sweep) or [metadata](#metadata-sweeps), or assemble a
-[mixed batch](#prepared-filesystem-batches). Kubernetes users should also read
-the [asynchronous workflow](#kubernetes-run-inspect-and-collect). Finish with
+[mixed batch](#prepared-filesystem-batches); vary workloads without editing
+`env.sh` using [override files](#workload-override-files). Kubernetes users
+should also read the
+[asynchronous workflow](#kubernetes-run-inspect-and-collect). Finish with
 [reporting](#filesystem-reporting); tuned settings live in the
 [benchmark recipes](../BENCHMARK_RECIPES_FILESYSTEM.md).
 
@@ -357,7 +359,7 @@ Assemble IO and metadata sweeps before running them. Each invocation saves one
 ```bash
 ./storage-tests/fs/nv-elbencho-sweep.sh --batch --nodes 1,2
 # Set BATCH to the printed STORAGE_SCALE_TEST_BATCH_RESULTS path.
-# Change the next group's workload with an override file (or by editing env.sh).
+# Vary each group's workload with an override file (see the next section).
 ./storage-tests/fs/nv-mdtest-elbencho.sh --append "$BATCH" \
     --env-override overrides/md-deep-tree.env --nodes 2,4 --tasks 4,8
 ./storage-tests/fs/nv-elbencho-sweep.sh --status "$BATCH"
@@ -398,45 +400,68 @@ append names mismatched fields. Start and resume use saved settings, not the
 current `env.sh`. Kubernetes credentials remain those of the current client.
 Its durable control directory is chosen from the union of all group test roots.
 
-### Workload override files
+## Workload override files
 
-`--env-override <file>` lets each submission, `--batch`, or `--append` vary
-its workload without editing `env.sh`, so a script can build a large batch from
-a set of named files:
+`--env-override <file>` varies a workload without editing `env.sh`. Either
+launcher, IO or metadata, accepts one file on a new run, `--batch`, or
+`--append`, on any substrate. Each appended group keeps its own override, so a
+directory of small numbered files and a short script can build a mixed batch:
 
 ```bash
-# overrides/small-io-qd16.env
+# overrides/10-small-random.env
 ELBENCHO_SCALE_IO_SIZES=("r4K" "r16K")
-ELBENCHO_IODEPTH_LIST=(16)
-ELBENCHO_SCALE_THREAD_LIST+=(512)   # relative to env.sh
+ELBENCHO_IODEPTH_LIST=(1 16)
+ELBENCHO_SCALE_THREAD_LIST+=(512)   # extends the list from env.sh
 ```
 
 ```bash
-BATCH=$(./storage-tests/fs/nv-elbencho-sweep.sh --batch --nodes 1-8 \
-    --env-override overrides/small-io-qd16.env |
-    sed -n 's/^STORAGE_SCALE_TEST_BATCH_RESULTS=//p')
-for override in overrides/large-seq-*.env; do
-    ./storage-tests/fs/nv-elbencho-sweep.sh --append "$BATCH" \
-        --env-override "$override" --nodes 1,8 || exit 1
-done
-./storage-tests/fs/nv-elbencho-sweep.sh --start "$BATCH"
+#!/usr/bin/env bash
+set -euo pipefail
+IO=./storage-tests/fs/nv-elbencho-sweep.sh
+MD=./storage-tests/fs/nv-mdtest-elbencho.sh
+BATCH=$("$IO" --batch --env-override overrides/10-small-random.env \
+    --nodes 1,2,4,8 | sed -n 's/^STORAGE_SCALE_TEST_BATCH_RESULTS=//p')
+test -n "$BATCH"
+"$IO" --append "$BATCH" --env-override overrides/20-large-seq.env --nodes 1,8
+"$MD" --append "$BATCH" --env-override overrides/30-deep-tree.env \
+    --nodes 2,4 --tasks 64,128
+"$IO" --start "$BATCH"
 ```
 
-The file is Bash, sourced after `env.sh`; its values win, and an `unset`
-setting gets its normal default. Only filesystem workload settings may change:
-`TEST_DIRS`, `FS_MAX_*`, `MDTEST_{BRANCH_FACTOR,ITEMS_PER_DIR,ITERATIONS}`, and
-the `ELBENCHO_*` sweep lists, file-layout, duration, live-CSV, and single-file
-settings from `env.sh.template`. Changing any other variable (substrate,
-connection, Slurm, or misspelled names) is an error. Lowercase helper variables
-that `env.sh` does not define, such as loop counters, are discarded. Settings
-that do not apply to a launcher are ignored, so IO and metadata groups can
-share a file.
+The file is trusted Bash, sourced after `env.sh` in an isolated shell. It sees
+the exported environment and the current values of the allowed settings, so
+`+=` and `$((MDTEST_ITERATIONS + 1))` build on `env.sh`; unexported `env.sh`
+helper variables are not visible. `unset NAME` gives a setting its usual
+default. A relative file path resolves from the current directory. The file
+must finish with status 0 and must not call `exit`.
 
-Use one file per invocation. Values are saved with the run or group, along with
-the file's path and SHA-256 (`env_override` in `env_used.yaml`).
-`--start`, `--resume`, `--status`, `--cancel`, `--collect`, and reporting use
-the saved values; later edits to the file or `env.sh` have no effect, and these
-commands reject `--env-override`. `--delete-only` also rejects it.
+Both launchers accept every allowed setting, so IO and metadata groups can
+share a file:
+
+- `TEST_DIRS`: associative array.
+- Indexed arrays, one value per element (no whitespace):
+  `ELBENCHO_SCALE_THREAD_LIST`, `ELBENCHO_SCALE_IO_SIZES`,
+  `ELBENCHO_IODEPTH_LIST`.
+- Scalars: `FS_MAX_{AGG_THROUGHPUT,NODE_THROUGHPUT_GBPS,NODE_IOPS}`,
+  `MDTEST_{BRANCH_FACTOR,ITEMS_PER_DIR,ITERATIONS}`,
+  `ELBENCHO_{FILE_SIZE_MULTIPLIER,FILE_LAYOUT,FILES_PER_NODE,FILE_SIZE}`,
+  `ELBENCHO_{SCALE_READ_WRITE_DURATION,READ_AFTER_WRITE_PAUSE}`,
+  `ELBENCHO_{LIVE_CSV_EXTENDED,LIVEINT,ALL_NODES_ACCESS_ALL_DATA}`,
+  `ELBENCHO_SINGLE_BIG_FILE{,_BASENAME,_SIZE}`.
+
+Changing any other variable (a typo, a new uppercase name, or a lowercase name
+that `env.sh` or the launcher already defines) is an error, and the message
+lists every allowed name. A value of the wrong type is also an error. Either
+fails before a results directory is created or a group is appended. New
+lowercase variables, such as loop counters, are discarded.
+
+Each submission prints
+`Env override: <path> (sha256 <hash>): <changed variables | no settings changed>`
+and records the same in `env_used.sh`
+(`STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}`) and `env_used.yaml`
+(`env_override`). `--start`, `--resume`, `--status`, `--cancel`, `--collect`,
+and `--delete-only` reject the flag; lifecycle commands use the saved values,
+so later edits to the file have no effect.
 
 ## Filesystem reporting
 

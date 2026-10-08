@@ -21,7 +21,7 @@ limitations under the License.
 
 NVIDIA Storage Scale Test is a benchmark orchestration tool packaged by the user as a single tarball for transfer into a test environment. This repository does not distribute pre-built benchmark binaries; users are responsible for obtaining, building, validating, and complying with license/security requirements for the binaries they include. The architecture has four components:
 
-1. **Orchestration layer.** Shell scripts on an executing host (login node or workstation) drive benchmark execution. A single configuration file (`env.sh`) parameterizes all behavior. The orchestration layer supports three explicitly selected dispatch mechanisms:
+1. **Orchestration layer.** Shell scripts on an executing host (login node or workstation) drive benchmark execution. `env.sh` parameterizes all behavior; filesystem launchers may layer a workload override file. The orchestration layer supports three explicitly selected dispatch mechanisms:
    - **Slurm:** Jobs are submitted via `sbatch` to a Slurm controller, which allocates compute nodes and executes benchmark workloads within job allocations.
    - **SSH:** Benchmark code is transmitted as self-contained scriptlets to remote nodes over passwordless SSH. Results are streamed back through SSH, normally as tar archives.
    - **kubectl:** Filesystem sweeps create an attempt-scoped worker DaemonSet and coordinator Job in an existing Kubernetes namespace. The submitter returns after dispatch; later lifecycle commands query status, cancel, or collect the durable attempt.

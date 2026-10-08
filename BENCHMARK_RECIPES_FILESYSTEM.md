@@ -26,6 +26,18 @@ random IO, comma-separated write/read sizes), and the test workflow, see
 [filesystem guide](docs/FILESYSTEM_TESTING.md) and the comments in
 [env.sh.template](env.sh.template).
 
+Each settings block below also works unchanged as an override file, so you
+can run recipes without editing `env.sh`:
+
+```bash
+./storage-tests/fs/nv-elbencho-sweep.sh \
+    --env-override overrides/r2-requirements.env --nodes 8,16
+```
+
+Queue several with `--batch`/`--append`. Override values apply on top of
+`env.sh`, not on top of a previous recipe, so make each file self-contained.
+See [Workload override files](docs/FILESYSTEM_TESTING.md#workload-override-files).
+
 ---
 
 ## Table of Contents
@@ -136,7 +148,7 @@ Run a broad single-node sweep to identify which thread counts saturate a
 single node's NIC for each IO pattern.
 
 ```bash
-# env.sh settings for single-node peak-finding
+# env.sh or --env-override file: single-node peak-finding
 export ELBENCHO_SCALE_THREAD_LIST=("1" "32" "64" "128" "256")
 export ELBENCHO_SCALE_IO_SIZES=("r4K" "1M")           # random: r4K or r64K (see §1); seq: adjust 1M based on filesystem type (see §7)
 export ELBENCHO_IODEPTH_LIST=("1" "8" "32")
@@ -168,7 +180,7 @@ Pare down the thread list to the 1–2 values chosen from single-node
 results. Extend duration for trustworthy numbers.
 
 ```bash
-# env.sh settings for multi-node peak-finding
+# env.sh or --env-override file: multi-node peak-finding
 export ELBENCHO_SCALE_THREAD_LIST=("64" "128")         # chosen from Phase 1
 export ELBENCHO_SCALE_IO_SIZES=("r4K" "1M")           # chosen from Phase 1
 export ELBENCHO_IODEPTH_LIST=("1" "8" "32")
@@ -199,7 +211,7 @@ produced the best results in Phase 2 — and two IO sizes covering both
 ends of the spectrum (small random and large sequential).
 
 ```bash
-# env.sh settings for max-node sustained test
+# env.sh or --env-override file: max-node sustained test
 export ELBENCHO_SCALE_THREAD_LIST=("128")              # best value from Phase 2
 export ELBENCHO_SCALE_IO_SIZES=("r4K" "1M")           # chosen from phase 1
 export ELBENCHO_IODEPTH_LIST=("32")                    # best value from Phase 2
@@ -250,7 +262,7 @@ Use the same IO sizes and thread counts you would for peak-finding, but run
 fewer node counts — just enough to confirm the target is met.
 
 ```bash
-# env.sh settings for requirements confirmation
+# env.sh or --env-override file: requirements confirmation
 export ELBENCHO_SCALE_THREAD_LIST=("64" "128")         # known-good from prior peak-finding
 export ELBENCHO_SCALE_IO_SIZES=("r4K" "1M")           # chosen from Recipe 1 peak-finding
 export ELBENCHO_IODEPTH_LIST=("1" "8" "32")
@@ -285,7 +297,7 @@ This recipe prioritizes speed over thoroughness. Run a compact test, compare
 against a known-good baseline from a prior Recipe 1 or Recipe 2 run.
 
 ```bash
-# env.sh settings for quick validation
+# env.sh or --env-override file: quick validation
 export ELBENCHO_SCALE_THREAD_LIST=("64" "128")    # same as your baseline run
 export ELBENCHO_SCALE_IO_SIZES=("r4K" "1M")       # from baseline run
 export ELBENCHO_IODEPTH_LIST=("1" "8")            # 8 sometimes needed to get full IOPS
@@ -318,8 +330,8 @@ on a single shared file — the access pattern of checkpoint writes, container
 image pulls, and packed-dataset reads.
 
 This recipe uses `ELBENCHO_SINGLE_BIG_FILE=1` mode.  For background on the
-env vars and access modes, see the "Single Shared File" section in
-[README.md](README.md).
+env vars and access modes, see
+[Single shared file](docs/FILESYSTEM_TESTING.md#single-shared-file).
 
 ### Choosing File Size
 
@@ -369,7 +381,7 @@ Run a single-file write then read at the node count that matches your
 workload (or a representative count from your many-files Recipe 1 results).
 
 ```bash
-# env.sh settings for single-file testing
+# env.sh or --env-override file: single-file testing
 export ELBENCHO_SINGLE_BIG_FILE=1
 export ELBENCHO_SINGLE_BIG_FILE_SIZE=50G          # set to your workload's file size
 export ELBENCHO_SCALE_THREAD_LIST=("64" "128")    # from prior single-node characterization
@@ -403,16 +415,22 @@ Compare the two access modes at a representative node count:
   "N nodes all pulling the same container image or model weights" pattern.
   Stresses inode and file-level locking more heavily.
 
-To test full-file mode, add to env.sh:
+To run both modes in one batch, put the Recipe 4 settings in
+`overrides/single-file.env`, and in `overrides/full-file-read.env` repeat
+them plus `ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=1`:
 
 ```bash
-export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=1
+set -euo pipefail
+IO=./storage-tests/fs/nv-elbencho-sweep.sh
+BATCH=$("$IO" --batch --env-override overrides/single-file.env --nodes 8 |
+    sed -n 's/^STORAGE_SCALE_TEST_BATCH_RESULTS=//p'); test -n "$BATCH"
+"$IO" --append "$BATCH" --env-override overrides/full-file-read.env --nodes 8
+"$IO" --start "$BATCH"
 ```
 
-Then re-run the read sweep (or full pipeline).  Compare per-host throughput
-between the two modes — full-file mode should show roughly the same
-per-host throughput if the storage can serve the parallel reads, but
-aggregate traffic is N× higher.
+Compare per-host throughput between the two modes — full-file mode should
+show roughly the same per-host throughput if the storage can serve the
+parallel reads, but aggregate traffic is N× higher.
 
 ### Phase 3: Node-Count Scaling
 
@@ -535,11 +553,16 @@ with four GPUs per node, 3,000 nodes, one approximately 2.5 GiB file per rank,
 buffered I/O, and no readback:
 
 ```bash
+export ELBENCHO_FILE_LAYOUT=shared-directory
+export ELBENCHO_SINGLE_BIG_FILE=0
 export ELBENCHO_FILES_PER_NODE=4
 export ELBENCHO_FILE_SIZE=2560M
 export ELBENCHO_SCALE_THREAD_LIST=("4")
 export ELBENCHO_SCALE_IO_SIZES=("512M") # replace with the observed write size
 export ELBENCHO_IODEPTH_LIST=("1")
+```
+
+```bash
 ./storage-tests/fs/nv-elbencho-sweep.sh -b --write-no-read --nodes 3000
 ```
 
@@ -673,7 +696,7 @@ then narrow down for multi-node runs. Filter the report afterward with
   deployments may reach throughput limits or become unresponsive at high
   client counts. If you encounter issues, reduce max node count and
   compensate with higher per-node concurrency (threads, IO depth).
-- **Use longer durations.** 300s+ durations help ensure measurements
+- **Use longer durations.** 120–300s durations help ensure measurements
   reflect steady-state behavior, especially on tiered or buffered storage.
 - **Read-after-write pause.** Storage with asynchronous data placement may
   need time between write and read phases for reads to reflect full
@@ -687,7 +710,8 @@ then narrow down for multi-node runs. Filter the report afterward with
   throughput. Document mount options (`mount` output) when reporting
   results.
 - **Metadata-heavy workloads.** For create/stat/delete characterization,
-  consider also running mdtest-elbencho (see `README.md`).
+  consider also running mdtest-elbencho (see
+  [Metadata sweeps](docs/FILESYSTEM_TESTING.md#metadata-sweeps)).
 
 ---
 
@@ -770,7 +794,7 @@ every node count.
 | **Goal** | Find max throughput/IOPS | Verify sustained at peak | Confirm target met | Check for regression | Single-file multi-host throughput | Exact flat checkpoint files |
 | **Thread list** | Wide (5+ values) then narrow | 1 best value | 1–2 known-good values | Same as baseline | 1–2 known-good values | Saving ranks (one writer each) |
 | **IO sizes** | `r4K` / `r64K` + FS-specific seq size | `r4K` / `r64K` + FS-specific seq size | Same as Recipe 1 | Same as baseline | FS-specific seq size only | Workload block size |
-| **IO depth** | `1 8 32` | 1 best value | `1 8 32` | `1` (fast) | `1` | `1` for checkpoint I/O |
+| **IO depth** | `1 8 32` | 1 best value | `1 8 32` | `1 8` (fast) | `1` | `1` for checkpoint I/O |
 | **Duration** | 60s explore → 300s publish | 1800s (30 min) | 300s | 60s | Workload file size driven | Inactive; exact completion |
 | **Node counts** | 1 to past server count | Max available | Target count + 1 smaller | Same as baseline | Workload target count | Workload saving nodes |
 | **Wall time** | Hours | 1–2 hours | 1–2 hours | 15–30 minutes | Minutes–hours | Requested bytes/throughput |

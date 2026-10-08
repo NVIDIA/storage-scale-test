@@ -20,7 +20,7 @@ limitations under the License.
 Implemented design record, not an outstanding implementation plan. There were
 no scope deviations. Current interfaces are documented in the
 [filesystem guide](../FILESYSTEM_TESTING.md#prepared-filesystem-batches) and
-launcher help. The [design](../DESIGN.md#prepared-filesystem-batches) describes
+launcher help. The [design](../DESIGN.md#45-prepared-filesystem-batches) describes
 the durable layout; the [Kubernetes lifecycle contract](../KUBERNETES_ELBENCHO_LIFECYCLE.md)
 remains authoritative for attempt recovery.
 
