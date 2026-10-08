@@ -58,21 +58,20 @@ def _git(root, *arguments) -> str:
 
 
 def release_commit(root, tag) -> str:
-    """Return the commit of an annotated vMAJOR.MINOR.PATCH[-PRERELEASE] tag."""
-    semver = subprocess.run(
+    """Return the commit of an annotated vMAJOR.MINOR.PATCH tag."""
+    release_tag = subprocess.run(
         [
             "bash",
             "-c",
-            'source "$1" && _project_semver "$2"',
+            'source "$1" && _project_release_tag "$2"',
             "release-tag",
             str(Path(root) / "lib/project_version.sh"),
             tag,
         ],
         check=False,
     )
-    # GitHub rewrites "+" in asset names, so build metadata cannot be released.
-    if semver.returncode or "+" in tag:
-        raise ValueError(f"not a release tag (vMAJOR.MINOR.PATCH[-PRERELEASE]): {tag}")
+    if release_tag.returncode:
+        raise ValueError(f"not a release tag (vMAJOR.MINOR.PATCH): {tag}")
     if _git(root, "cat-file", "-t", f"refs/tags/{tag}") != "tag":
         raise ValueError(f"release tags must be annotated: {tag}")
     return _git(root, "rev-parse", f"refs/tags/{tag}^{{commit}}")
@@ -178,7 +177,6 @@ def publish_release(repository, tag, commit, assets, notes, run=subprocess.run):
 
     _require_merged_tag(gh, repository, tag, commit)
     archive, checksum = assets
-    prerelease = "-" in tag
     release = _existing_release(gh, repository, tag)
     if release is None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -197,11 +195,8 @@ def publish_release(repository, tag, commit, assets, notes, run=subprocess.run):
                 tag,
                 "--notes-file",
                 str(notes_file),
-                *(["--prerelease"] if prerelease else []),
             )
         return
-    if release["isPrerelease"] != prerelease:
-        raise ValueError(f"existing release {tag} has the wrong prerelease flag")
     published = _published_assets(gh, repository, release["assets"], assets)
     _adopt_published_assets(gh, repository, tag, published, archive, checksum)
     for asset in (archive, checksum):
@@ -233,7 +228,7 @@ _ARCHIVE_NOTE = (
 
 def _existing_release(gh, repository, tag):
     """Return the release (including a draft) for tag, or None if there is none."""
-    fields = "isDraft,isPrerelease,assets"
+    fields = "isDraft,assets"
     found = gh(
         "release", "view", tag, "--repo", repository, "--json", fields, check=False
     )

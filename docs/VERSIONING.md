@@ -17,9 +17,8 @@ limitations under the License.
 
 # Versions
 
-Releases are annotated Git tags named `vMAJOR.MINOR.PATCH`, optionally with a
-[SemVer](https://semver.org/) prerelease such as `v1.2.3-rc.1`. Changes between
-releases are in [CHANGELOG.md](../CHANGELOG.md).
+Releases are annotated Git tags named `vMAJOR.MINOR.PATCH`, such as `v1.2.3`.
+Changes between releases are in [CHANGELOG.md](../CHANGELOG.md).
 
 ## Reading a version
 
@@ -75,7 +74,6 @@ The release workflow runs the source checks, builds and verifies
 `storage-scale-test-v1.2.3-source.tar.gz` and its `.sha256`, and publishes a
 GitHub release with the changelog section as its notes. It refuses tags that
 are not on `main` or have no changelog section, and can be rerun safely.
-Prerelease tags make prereleases.
 
 To build and check an archive locally:
 

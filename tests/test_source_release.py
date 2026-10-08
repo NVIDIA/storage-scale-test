@@ -397,7 +397,7 @@ def test_smoke_test_rejects_a_command_with_the_wrong_version(tmp_path, command, 
     "tag, message",
     [
         ("v1.2.4", "annotated"),
-        ("v1.2.3+build.1", "not a release tag"),
+        ("v1.2.3-rc.1", "not a release tag"),
         ("v1.2.5", "no section"),
     ],
 )
@@ -512,17 +512,18 @@ def assets_fixture(tmp_path):
     return archive, checksum
 
 
+DRAFT = {"isDraft": True}
+
+
 def _publish(github, assets, tag="v1.2.3"):
     publish_release("example/project", tag, "abc", assets, "notes", run=github)
 
 
-@pytest.mark.parametrize("tag", ["v1.2.3", "v1.2.3-rc.1"])
-def test_new_release_is_created_with_assets_and_notes(assets, tag):
+def test_new_release_is_created_with_assets_and_notes(assets):
     github = GitHub()
-    _publish(github, assets, tag)
+    _publish(github, assets)
     create = next(call for call in github.calls if call[:2] == ["release", "create"])
     assert [str(path) for path in assets] == create[3:5]
-    assert ("--prerelease" in create) == ("-" in tag)
     assert github.operations() == ["view", "create"]
 
 
@@ -553,8 +554,7 @@ def test_rerun_keeps_published_archive_and_finishes_a_draft(assets):
     # Same tar content, different gzip bytes (another zlib): keep the published one.
     published = gzip.compress(b"tar contents", compresslevel=1, mtime=0)
     assert published != archive.read_bytes()
-    draft = {"isDraft": True, "isPrerelease": False}
-    github = GitHub(release=draft, assets={archive.name: published})
+    github = GitHub(release=DRAFT, assets={archive.name: published})
     _publish(github, assets)
     assert archive.read_bytes() == published
     digest = hashlib.sha256(published).hexdigest()
@@ -564,11 +564,11 @@ def test_rerun_keeps_published_archive_and_finishes_a_draft(assets):
     assert github.operations()[-1] == "edit"
 
 
-@pytest.mark.parametrize("different", ["archive", "checksum", "prerelease"])
+@pytest.mark.parametrize("different", ["archive", "checksum"])
 def test_rerun_refuses_different_published_content(assets, different):
     archive, checksum = assets
     published = {archive.name: archive.read_bytes()}
-    release = {"isDraft": False, "isPrerelease": different == "prerelease"}
+    release = {"isDraft": False}
     if different == "archive":
         published[archive.name] = gzip.compress(b"other source", mtime=0)
     elif different == "checksum":
@@ -580,7 +580,6 @@ def test_rerun_refuses_different_published_content(assets, different):
     assert not github.deletions()
 
 
-DRAFT = {"isDraft": True, "isPrerelease": False}
 ASSET_ENDPOINT = "repos/example/project/releases/assets/{}"
 
 

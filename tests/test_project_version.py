@@ -85,7 +85,7 @@ def commit(root):
     git(root, "commit", "-qam", "Next")
 
 
-@pytest.mark.parametrize("tag", ["v1.2.3", "v1.2.3-rc.1", "v0.0.0", "v2.0.0+build.7"])
+@pytest.mark.parametrize("tag", ["v1.2.3", "v0.0.0", "v10.20.30"])
 def test_release_tag_and_later_commits(repository, tag):
     git(repository, "tag", "-a", tag, "-m", tag)
     assert resolve_version(repository) == tag
@@ -96,7 +96,7 @@ def test_release_tag_and_later_commits(repository, tag):
 
 @pytest.mark.parametrize(
     "tag",
-    ["1.2.3", "v01.2.3", "v1.2", "v1.2.3-01", "v1.2.3-", "v1.2.3.4", "v1.2.3-modified"],
+    ["1.2.3", "v01.2.3", "v1.2", "v1.2.3.4", "v1.2.3-rc.1", "v1.2.3+build.7"],
 )
 def test_non_release_tags_are_ignored(repository, tag):
     git(repository, "tag", "-a", tag, "-m", tag)
@@ -161,8 +161,8 @@ def test_shallow_clone_trusts_only_an_exact_tag(repository, tmp_path):
         ["git", "clone", "-q", "--depth=1", repository.as_uri(), str(clone)], check=True
     )
     assert resolve_version(clone).startswith("shallow-g")
-    git(clone, "tag", "-a", "v2.0.0-rc.1", "-m", "exact")
-    assert resolve_version(clone) == "v2.0.0-rc.1"
+    git(clone, "tag", "-a", "v2.0.0", "-m", "exact")
+    assert resolve_version(clone) == "v2.0.0"
 
 
 def test_unreadable_git_metadata_is_reported(tmp_path):

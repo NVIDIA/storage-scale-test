@@ -19,21 +19,10 @@
 # docs/VERSIONING.md. VERSION and SOURCE_SHA256 are read as data, never sourced.
 # Also runs as a command: project_version.sh resolve ROOT | stamp ROOT VERSION
 
-# True for a release tag: v-prefixed SemVer 2.0. The "-modified" suffix is
-# reserved for locally modified source.
-_project_semver() {
-    local value="$1" identifier numeric='(0|[1-9][0-9]*)'
-    local pattern="^v${numeric}\\.${numeric}\\.${numeric}(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$"
-    [[ "$value" =~ $pattern && "$value" != *-modified ]] || return 1
-    value=${value%%+*}
-    [[ "$value" == *-* ]] || return 0
-    # SemVer forbids leading zeros in numeric prerelease identifiers.
-    local identifiers=()
-    IFS=. read -r -a identifiers <<< "${value#*-}"
-    for identifier in "${identifiers[@]}"; do
-        [[ ! "$identifier" =~ ^0[0-9]+$ ]] || return 1
-    done
-    return 0
+# True for a release tag: vMAJOR.MINOR.PATCH without leading zeros.
+_project_release_tag() {
+    local numeric='(0|[1-9][0-9]*)'
+    [[ "$1" =~ ^v${numeric}\.${numeric}\.${numeric}$ ]]
 }
 
 # True for any version this file can produce.
@@ -44,7 +33,7 @@ _project_valid_version() {
     if [[ "$value" =~ ^(v.+)-[0-9]+-g[0-9a-f]{12,40}$ ]]; then
         value=${BASH_REMATCH[1]}
     fi
-    _project_semver "$value"
+    _project_release_tag "$value"
 }
 
 _project_sha256sum() {
@@ -55,7 +44,7 @@ _project_sha256sum() {
     fi
 }
 
-# Version of a Git checkout, from the nearest reachable annotated SemVer tag.
+# Version of a Git checkout, from the nearest reachable annotated release tag.
 _project_git_version() {
     local root="$1" top sha shallow version='' tag status
     local matches=()
@@ -67,7 +56,7 @@ _project_git_version() {
     sha=$(git -C "$root" rev-parse --short=12 HEAD) || return 1
     # Without --tags, describe already ignores lightweight tags.
     while IFS= read -r tag; do
-        ! _project_semver "$tag" || matches+=(--match "$tag")
+        ! _project_release_tag "$tag" || matches+=(--match "$tag")
     done < <(git -C "$root" tag --list 'v*')
     shallow=$(git -C "$root" rev-parse --is-shallow-repository)
     if [[ ${#matches[@]} -gt 0 ]]; then

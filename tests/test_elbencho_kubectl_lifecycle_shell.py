@@ -2318,7 +2318,7 @@ def test_control_bundle_stages_phase_six_contract_once(tmp_path: Path) -> None:
             [[ " $* " != *' -- '* ]] || return 64
             command chmod "$@"
         }}
-        STORAGE_SCALE_TEST_VERSION=v1.2.3-rc.1
+        STORAGE_SCALE_TEST_VERSION=v1.2.3-4-g0123456789ab
         kubectl_prepare_control_bundle bundle "$root" "$fd" 1234abcd \\
           elbencho-20260922Z123456 {str(coordinator)!r}
         test -x "$bundle/coordinator.sh"
@@ -2328,7 +2328,7 @@ def test_control_bundle_stages_phase_six_contract_once(tmp_path: Path) -> None:
         ! grep -Fq '\\t' "$bundle/bundle-manifest.tsv"
         grep -Fx 'attempt_id\t1234abcd' "$bundle/run-metadata.tsv"
         grep -Fx 'output_basename\telbencho-20260922Z123456' "$bundle/run-metadata.tsv"
-        grep -Fx 'project_version\tv1.2.3-rc.1' "$bundle/run-metadata.tsv"
+        grep -Fx 'project_version\tv1.2.3-4-g0123456789ab' "$bundle/run-metadata.tsv"
         ! kubectl_prepare_control_bundle other "$root" "$fd" 1234abcd \\
           elbencho-20260922Z123456 {str(coordinator)!r}
         kubectl_local_lock_release "$fd"
