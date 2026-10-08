@@ -202,7 +202,7 @@ def publish_release(repository, tag, commit, assets, notes, run=subprocess.run):
         return
     if release["isPrerelease"] != prerelease:
         raise ValueError(f"existing release {tag} has the wrong prerelease flag")
-    published = {asset["name"] for asset in release["assets"]}
+    published = _published_assets(gh, repository, release["assets"], assets)
     _adopt_published_assets(gh, repository, tag, published, archive, checksum)
     for asset in (archive, checksum):
         if asset.name not in published:
@@ -244,6 +244,37 @@ def _existing_release(gh, repository, tag):
     if "HTTP 404" not in lookup.stderr:
         raise ValueError(f"cannot determine whether release {tag} exists")
     return None
+
+
+def _published_assets(gh, repository, remote_assets, assets):
+    """Names of our fully uploaded assets, after deleting failed-upload placeholders.
+
+    A failed upload (for example HTTP 502) can leave an empty asset in state
+    "starter" that blocks re-uploading its name; GitHub documents that it can be
+    deleted. Delete it by its exact asset id. Never delete an uploaded asset, and
+    refuse any other state rather than guess.
+    """
+    ours = {asset.name for asset in assets}
+    published = set()
+    for remote in remote_assets:
+        name, state = remote["name"], remote.get("state")
+        if name not in ours:
+            continue
+        if state == "uploaded":
+            published.add(name)
+        elif state == "starter":
+            gh("api", _asset_endpoint(repository, remote), "--method", "DELETE")
+        else:
+            raise ValueError(f"published {name} is in unexpected state {state!r}")
+    return published
+
+
+def _asset_endpoint(repository, remote):
+    """REST endpoint of one asset, from the numeric id at the end of its apiUrl."""
+    found = re.search(r"/releases/assets/(\d+)$", remote.get("apiUrl", ""))
+    if found is None:
+        raise ValueError(f"cannot identify the asset id of {remote['name']}")
+    return f"repos/{repository}/releases/assets/{found.group(1)}"
 
 
 def _adopt_published_assets(gh, repository, tag, published, archive, checksum):

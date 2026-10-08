@@ -95,7 +95,8 @@ The release workflow then runs the source checks, builds
 `v1.2.3`, and publishes a GitHub release whose notes are the changelog section.
 Prerelease tags make prereleases. The workflow refuses tags that are not on
 `main` or have no changelog section. A rerun keeps any assets already published
-and refuses to replace them with different content.
+and refuses to replace them with different content. It deletes and re-uploads
+only an asset GitHub left in the `starter` state after a failed upload.
 
 To build and check an archive locally, without publishing:
 

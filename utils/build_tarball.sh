@@ -438,7 +438,9 @@ if ! $TAR_CMD cf - \
     --exclude=__pycache__ \
     --exclude=*.png \
     --exclude=env.sh \
+    --exclude=.obj_auth \
     --exclude=overrides \
+    --exclude=results \
     --exclude=bin-amd64 \
     --exclude=bin-arm64 \
     --exclude=.ci-cache \
@@ -447,6 +449,8 @@ if ! $TAR_CMD cf - \
     --exclude=requirements-ci.txt \
     --exclude=.security-triage.yaml \
     --exclude=.agents \
+    --exclude=.claude \
+    --exclude=.cursor \
     --exclude=integration-tests \
     --exclude=docs \
     --exclude=tests \
@@ -457,6 +461,7 @@ if ! $TAR_CMD cf - \
     --exclude=pytest.ini \
     --exclude=pyrightconfig.json \
     --exclude=utils/build/*.c \
+    --exclude=utils/build/*.log \
     --exclude=utils/build_tarball.sh \
     --exclude=utils/fix_up_developer_venv.sh \
     --exclude=static-binaries \

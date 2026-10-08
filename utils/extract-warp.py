@@ -4163,10 +4163,12 @@ def main():
 
     print(f"\nPlots and reports saved to: {os.path.abspath(output_dir)}")
 
-    # Print summary table last so it stays visible in terminal
+    # Print summary table last so it stays visible in terminal. The report's
+    # detailed tables show every metric (only its summary is filtered), so its
+    # provenance covers every metric too.
     mirror_stdout_to_file(
         os.path.join(output_dir, REPORT_TXT_FILENAME),
-        with_versions(print_table, versions.of(filtered_plot_metrics)),
+        with_versions(print_table, versions.of(metrics)),
         metrics,
         is_multi_node,
         only_sizes,

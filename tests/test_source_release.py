@@ -109,6 +109,29 @@ def test_deployment_tarball_is_stamped_and_keeps_custom_binaries(tmp_path):
     assert resolve_version(repackaged) == "v1.2.3-modified"
 
 
+LOCAL_ONLY = (
+    ".obj_auth",
+    "env.sh",
+    "overrides/workload.env",
+    "results/run/output.txt",
+    ".claude/settings.json",
+    ".cursor/rules",
+    "utils/build/s3test.log",
+)
+
+
+def test_deployment_tarball_leaves_out_credentials_and_local_state(tmp_path):
+    root = _deployment_source(tmp_path)
+    for name in LOCAL_ONLY:
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text("export WARP_SECRET_KEY=do-not-ship\n")
+    deployment = _package(root)
+    shipped = {str(path.relative_to(deployment)) for path in deployment.rglob("*")}
+    assert not shipped & set(LOCAL_ONLY)
+    assert not {"overrides", "results", ".claude", ".cursor"} & shipped
+    assert "source.txt" in shipped and "utils/elbencho" in shipped
+
+
 def _release_repository(tmp_path, name="release"):
     """A minimal checkout whose commands report the project version."""
     root = tmp_path / name
@@ -206,19 +229,47 @@ class GitHub:
     def __init__(self, *, release=None, assets=None, tag_commit="abc", status="behind"):
         self.release = release
         self.assets = assets or {}
+        # Asset name -> state; names not listed were uploaded successfully.
+        self.states = {}
         self.tag_commit = tag_commit
         self.status = status
         self.lookup_error = "HTTP 404: Not Found"
+        self.delete_fails = False
         self.calls = []
 
-    def __call__(self, arguments, **_kwargs):
+    def __call__(self, arguments, check=False, **_kwargs):
         self.calls.append(arguments[1:])
         output, error, status = self._answer(arguments[1:])
+        if check and status:
+            raise subprocess.CalledProcessError(status, arguments, output, error)
         return SimpleNamespace(returncode=status, stdout=output, stderr=error)
+
+    def _asset_list(self):
+        return [
+            {
+                "name": name,
+                "state": self.states.get(name, "uploaded"),
+                "id": f"RA_node{index}",
+                "apiUrl": f"https://api.github.com/repos/Example/Project/"
+                f"releases/assets/{100 + index}",
+            }
+            for index, name in enumerate(self.assets)
+        ]
+
+    def _delete(self, endpoint):
+        if self.delete_fails:
+            return "", "HTTP 500: Server Error", 1
+        index = int(endpoint.rsplit("/", 1)[1]) - 100
+        name = list(self.assets)[index]
+        del self.assets[name]
+        self.states.pop(name, None)
+        return "", "", 0
 
     def _answer(self, arguments):
         if arguments[0] == "api":
             endpoint = arguments[1]
+            if "--method" in arguments:
+                return self._delete(endpoint)
             if "/commits/" in endpoint:
                 return self.tag_commit, "", 0
             if "/compare/" in endpoint:
@@ -229,7 +280,7 @@ class GitHub:
         if arguments[:2] == ["release", "view"]:
             if self.release is None:
                 return "", "release not found", 1
-            assets = [{"name": name} for name in self.assets]
+            assets = self._asset_list()
             return json.dumps({**self.release, "assets": assets}), "", 0
         if arguments[:2] == ["release", "download"]:
             name = arguments[arguments.index("--pattern") + 1]
@@ -240,6 +291,16 @@ class GitHub:
     def operations(self):
         """Release subcommands in call order."""
         return [call[1] for call in self.calls if call[0] == "release"]
+
+    def deletions(self):
+        """Endpoints deleted through the REST API, in call order."""
+        return [
+            call[1] for call in self.calls if call[:1] == ["api"] and "DELETE" in call
+        ]
+
+    def uploads(self):
+        """Local files uploaded to an existing release, in call order."""
+        return [call[3] for call in self.calls if call[:2] == ["release", "upload"]]
 
 
 @pytest.fixture(name="assets")
@@ -298,8 +359,8 @@ def test_rerun_keeps_published_archive_and_finishes_a_draft(assets):
     assert archive.read_bytes() == published
     digest = hashlib.sha256(published).hexdigest()
     assert checksum.read_text() == f"{digest}  {archive.name}\n"
-    uploads = [call[3] for call in github.calls if call[:2] == ["release", "upload"]]
-    assert uploads == [str(checksum)]
+    assert github.uploads() == [str(checksum)]
+    assert not github.deletions()
     assert github.operations()[-1] == "edit"
 
 
@@ -314,5 +375,49 @@ def test_rerun_refuses_different_published_content(assets, different):
         published[checksum.name] = b"0000  other\n"
     github = GitHub(release=release, assets=published)
     with pytest.raises(ValueError):
+        _publish(github, assets)
+    assert not {"upload", "edit", "create"} & set(github.operations())
+    assert not github.deletions()
+
+
+DRAFT = {"isDraft": True, "isPrerelease": False}
+ASSET_ENDPOINT = "repos/example/project/releases/assets/{}"
+
+
+@pytest.mark.parametrize("failed", ["archive", "checksum"])
+def test_rerun_replaces_a_failed_upload_placeholder(assets, failed):
+    """An HTTP 502 upload leaves an empty "starter" asset; replace only that one."""
+    archive, checksum = assets
+    original = archive.read_bytes()
+    published = {archive.name: original}
+    if failed == "archive":
+        published[archive.name] = b""
+    else:
+        published[checksum.name] = b""
+    github = GitHub(release=DRAFT, assets=published)
+    github.states[archive.name if failed == "archive" else checksum.name] = "starter"
+    _publish(github, assets)
+    index = 0 if failed == "archive" else 1
+    assert github.deletions() == [ASSET_ENDPOINT.format(100 + index)]
+    expected = [archive, checksum] if failed == "archive" else [checksum]
+    assert github.uploads() == [str(path) for path in expected]
+    # The successfully uploaded archive is still downloaded and validated.
+    assert ("download" in github.operations()) == (failed == "checksum")
+    assert archive.read_bytes() == original
+    assert github.operations()[-1] == "edit"
+
+
+@pytest.mark.parametrize("problem", ["delete fails", "unknown state"])
+def test_rerun_stops_when_a_placeholder_cannot_be_replaced(assets, problem):
+    archive, _ = assets
+    github = GitHub(release=DRAFT, assets={archive.name: b""})
+    if problem == "delete fails":
+        github.states[archive.name] = "starter"
+        github.delete_fails = True
+        error = subprocess.CalledProcessError
+    else:
+        github.states[archive.name] = "open"
+        error = ValueError
+    with pytest.raises(error):
         _publish(github, assets)
     assert not {"upload", "edit", "create"} & set(github.operations())

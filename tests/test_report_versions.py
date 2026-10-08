@@ -136,3 +136,34 @@ def test_netbench_report_lists_versions_of_selected_groups(
     assert _header(capsys.readouterr().out)[0] == (
         "Produced by storage-scale-test: v2.0.0"
     )
+
+
+def test_warp_report_lists_versions_of_unfiltered_detail_tables(
+    monkeypatch, tmp_path, capsys
+):
+    """--only-sizes filters only the summary; detail tables show every size."""
+    warp = _load("extract-warp")
+    for size, version in (("1MiB", "v1.0.0"), ("2MiB", "v2.0.0")):
+        out = tmp_path / f"warp-GET-{size}-c_001-s_004_{_DATESTAMP}.out"
+        out.write_text("", encoding="utf-8")
+        out.with_name(out.name + ".project-version").write_text(version)
+
+    def parse(path):
+        return SimpleNamespace(
+            nodes=1, threads=4, obj_size=Path(path).name.split("-")[2]
+        )
+
+    reported = []
+    monkeypatch.setattr(warp, "parse_warp_file", parse)
+    monkeypatch.setattr(warp, "plot_metrics", lambda *_args: None)
+    monkeypatch.setattr(
+        warp, "print_table", lambda metrics, *_args: reported.extend(metrics)
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["extract-warp.py", str(tmp_path), "--only-sizes", "1MiB"]
+    )
+    warp.main()
+    assert sorted(m.obj_size for m in reported) == ["1MiB", "2MiB"]
+    assert _header(capsys.readouterr().out)[0] == (
+        "Produced by storage-scale-test: v1.0.0, v2.0.0"
+    )
