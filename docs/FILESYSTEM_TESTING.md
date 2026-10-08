@@ -442,18 +442,40 @@ ordinary IO or metadata runs and mixed batches. It dispatches each kind to
 its analyzer without combining unlike metrics.
 
 Each group has separate artifacts and reports, so repeated coordinates never
-overwrite or average across groups. `reports/index.md` links the group reports
-and lists cell states. Report only selected groups with `--groups 0001,0003`,
-choose `--kind io|mdtest|all`, or redirect reports with `--output-dir PATH`.
+overwrite or average across groups. All tables for one group are saved in
+`reports/groups/<group-id>/report.txt`; individual tables do not have separate
+text files. `reports/index.md` links the group reports and lists cell states.
+Report only selected groups with `--groups 0001,0003`, choose
+`--kind io|mdtest|all`, or redirect reports with `--output-dir PATH`.
 Reports include successful cells only; Kubernetes results must first be
 collected. Both existing specialized reporters accept batches and select their
 own workload kind.
+
+When at least two groups have valid reports, the reporter also writes
+`reports.txt` at the batch root and links it from `reports/index.md`. This file
+collects the groups' tables in manifest order without combining their metrics.
+Each IO group begins with one compact summary of its effective saved settings,
+targeting about six lines. It covers the runner, targets, configured sweep,
+file layout and sizing, lifecycle, and override filename; inactive optional
+settings are omitted. Long values remain complete and may wrap. The
+`Saved settings` path identifies the full
+`env_used.yaml` snapshot, also linked from `reports/index.md`.
+Table titles remain adjacent to their tables. Metadata reports include the raw
+saved YAML once before the entire workload group report, keeping configuration,
+rates, elapsed times, latency tables, and commands together. Individual group
+`report.txt` files remain unchanged. Both plain-text and `--markdown` reports
+are supported. With `--output-dir PATH`,
+the combined file is `PATH/reports.txt`, alongside `PATH/index.md` and
+`PATH/groups/`.
 
 The unified reporter also accepts the established analysis options. Common
 options such as `--only-nodes` and `--markdown` apply to both kinds;
 `--normalize-to` applies only to metadata and `--per-client-plots` only to IO.
 An option with no matching selected group is an error. Filtered runs update
-selected reports without dropping other groups from the index:
+selected reports and rebuild the index and combined file, retaining valid
+reports from other groups in the same batch. Failed, stale, or unowned reports
+are excluded; when fewer than two valid group reports remain, `reports.txt`
+is removed:
 
 ```bash
 ./utils/extract-filesystem.sh --normalize-to 1 --only-nodes 2,4 "$BATCH"

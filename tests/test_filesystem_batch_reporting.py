@@ -16,9 +16,13 @@
 """Prepared batch provenance validation and successful-only group reporting."""
 
 import argparse
+import contextlib
 from dataclasses import FrozenInstanceError
+import errno
 import hashlib
 import importlib.util
+import io
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -535,11 +539,15 @@ def test_shared_report_destination_does_not_retain_another_batch(tmp_path):
         assert "groups/0001/report.txt" in index
         assert "groups/0002/report.txt" not in index
         assert "groups/0003/report.txt" not in index
+        assert not (output / "reports.txt").exists()
         assert report_batch(second.root, groups="0002", output_dir=output) == 0
     index = (output / "index.md").read_text(encoding="utf-8")
     assert "groups/0001/report.txt" in index
     assert "groups/0002/report.txt" in index
     assert "groups/0003/report.txt" not in index
+    combined = (output / "reports.txt").read_text(encoding="utf-8")
+    assert str(first.root) not in combined
+    assert str(second.root) in combined
 
 
 @pytest.mark.parametrize("fault", ["missing", "corrupt", "overwritten", "failed"])
@@ -623,6 +631,400 @@ def test_interrupted_index_publication_preserves_previous_index(tmp_path):
             report_batch(manifest.root)
     assert index.read_text(encoding="utf-8") == "previous complete index"
     assert not list(output.glob(".index-*"))
+
+
+@pytest.mark.parametrize("markdown", [False, True])
+@pytest.mark.parametrize("custom_output", [False, True])
+def test_omnibus_report_preserves_tables_with_each_saved_environment(
+    tmp_path, markdown, custom_output
+):
+    """IO summaries and raw metadata settings precede each intact group report."""
+    manifest = _create_batch(tmp_path / "batch", kinds=("io", "mdtest"))
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+    output = tmp_path / "custom reports" if custom_output else None
+    report_root = output or manifest.root / "reports"
+    omnibus = (output or manifest.root) / "reports.txt"
+    contents = {}
+    for group in manifest.groups:
+        identifier = group.group_id
+        if markdown:
+            first_header = f"| Nodes | {identifier} first metric |"
+            second_header = f"| Nodes | {identifier} second metric |"
+            contents[identifier] = (
+                f"# Group {identifier} results\n\n"
+                "```text\n# Example command\n"
+                "| Example | Value |\n| --- | --- |\n| fake | row |\n```\n\n"
+                f"## First table\n\n{first_header}\n| --- | --- |\n| 1 | 10 |\n\n"
+                f"## Second table\n\n{second_header}\n| --- | --- |\n| 1 | 20 |\n"
+            )
+        elif group.kind == "io":
+            first_header = f"Nodes | Thrds | {identifier} first metric"
+            second_header = f"Nodes | Thrds | {identifier} second metric"
+            contents[identifier] = (
+                "=== IO Size: 1M - WRITE ===\n"
+                f"{first_header}\n----------------------------------------\n1 | 1 | 10\n\n"
+                "=== IO Size: 1M - READ ===\n"
+                f"{second_header}\n----------------------------------------\n1 | 1 | 20\n"
+            )
+        else:
+            first_header = f"Nodes  Threads  Iters  {identifier} first metric"
+            second_header = f"Nodes  Threads  Iters  {identifier} second metric"
+            contents[identifier] = (
+                "=== MDTest Configuration (env_used.yaml) ===\n"
+                "MDTEST_ITERATIONS  1\n\n"
+                "=== Performance Rates (ops/sec) ===\n\n"
+                f"{first_header}\n----------------------------------------\n1  1  1  10\n\n"
+                "=== Average Phase Elapsed Times ===\n\n"
+                "Mean measured-operation wall time.\n\n"
+                f"{second_header}\n----------------------------------------\n1  1  1  20\n\n"
+                "=== Representative Commands ===\n# Create: elbencho --mkdir\n"
+            )
+
+    def report(_manifest, group, _successful, destination, _options):
+        (destination / "report.txt").write_text(
+            contents[group.group_id], encoding="utf-8"
+        )
+
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert report_batch(manifest.root, output_dir=output) == 0
+    combined = omnibus.read_text(encoding="utf-8")
+    previous_end = 0
+    for group in manifest.groups:
+        saved_environment = (manifest.group_path(group) / ENV_YAML).read_text(
+            encoding="utf-8"
+        )
+        if group.kind == "mdtest":
+            assert combined.count(saved_environment) == 1
+            group_start = combined.index(contents[group.group_id])
+            assert saved_environment in combined[previous_end:group_start]
+            previous_end = group_start + len(contents[group.group_id])
+        else:
+            assert saved_environment not in combined
+            group_start = combined.index(contents[group.group_id])
+            prefix = combined[previous_end:group_start]
+            assert prefix.count("Runner:") == 1
+            assert prefix.count("Override:") == 1
+            previous_end = group_start + len(contents[group.group_id])
+        assert (report_root / "groups" / group.group_id / "report.txt").read_text(
+            encoding="utf-8"
+        ) == contents[group.group_id]
+    assert "\n\n" in combined
+    if markdown:
+        assert combined.count("| Example | Value |\n| --- | --- |\n| fake | row |") == 2
+    else:
+        assert "MDTEST_ITERATIONS  1" in combined
+        assert "# Create: elbencho --mkdir" in combined
+    index = (report_root / "index.md").read_text(encoding="utf-8")
+    assert "reports.txt" in index
+    if not custom_output:
+        assert not (report_root / "reports.txt").exists()
+
+
+def test_filtered_omnibus_retains_owned_reports_and_removes_stale_output(tmp_path):
+    """Filtered failures remove obsolete tables while retaining valid other groups."""
+    manifest = _create_batch(tmp_path / "batch")
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+    omnibus = manifest.root / "reports.txt"
+
+    def report(_manifest, group, _successful, destination, options):
+        (destination / "report.txt").write_text(
+            f"Group {group.group_id}: {options}\n", encoding="utf-8"
+        )
+
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert report_batch(manifest.root) == 0
+        assert report_batch(manifest.root, groups="0001", engine_options=["new"]) == 0
+    combined = omnibus.read_text(encoding="utf-8")
+    assert "Group 0001: ['new']" in combined
+    assert "Group 0001: []" not in combined
+    assert combined.index("Group 0001:") < combined.index("Group 0002:")
+    assert combined.index("Group 0002:") < combined.index("Group 0003:")
+    with mock.patch(
+        "lib.filesystem_batch._report_group", side_effect=ValueError("bad report")
+    ):
+        assert report_batch(manifest.root, groups="0002") == 1
+    combined = omnibus.read_text(encoding="utf-8")
+    assert "Group 0002:" not in combined
+    assert "Group 0001:" in combined and "Group 0003:" in combined
+    (manifest.root / "reports/groups/0003/report.txt").write_text(
+        "foreign content", encoding="utf-8"
+    )
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert report_batch(manifest.root, groups="0001") == 0
+    assert not omnibus.exists()
+    assert "reports.txt" not in (manifest.root / "reports/index.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_single_group_batch_does_not_write_omnibus(tmp_path):
+    manifest = _create_batch(tmp_path / "batch", kinds=("io",))
+    _publish_result(manifest, manifest.groups[0])
+
+    def report(_manifest, _group, _successful, destination, _options):
+        (destination / "report.txt").write_text("single report\n", encoding="utf-8")
+
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert report_batch(manifest.root) == 0
+    assert not (manifest.root / "reports.txt").exists()
+
+
+@pytest.mark.parametrize("markdown", [False, True])
+def test_omnibus_keeps_actual_metadata_reports_together_by_saved_environment(
+    tmp_path, markdown
+):
+    """Actual metadata reports stay contiguous beneath their own override settings."""
+    manifest = _create_batch(tmp_path / "batch", kinds=("io", "mdtest", "mdtest"))
+    for group in manifest.groups[1:]:
+        snapshot = manifest.group_path(group) / ENV_YAML
+        previous_digest = _digest(snapshot)
+        snapshot.write_text(
+            snapshot.read_text(encoding="utf-8")
+            + f"env_override:\n  file: /saved/overrides/{group.group_id}.env\n",
+            encoding="utf-8",
+        )
+        _replace_manifest(manifest.root, previous_digest, _digest(snapshot))
+    manifest = read_batch_manifest(manifest.root)
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+    io_reporter = load_extract_elbencho_module("omnibus_io_tables")
+    metadata_path = (
+        Path(__file__).resolve().parents[1] / "utils/extract-mdtest-elbencho.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "omnibus_metadata_tables", metadata_path
+    )
+    metadata_reporter = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = metadata_reporter
+    spec.loader.exec_module(metadata_reporter)
+    io_metric = io_reporter.ElbenchoMetrics(
+        nodes=1,
+        io_size="1M",
+        threads=1,
+        io_depth=1,
+        operation="WRITE",
+        datestamp=DATESTAMP,
+        is_multi_node=False,
+        command="elbencho --write",
+        file_size_bytes=1024**3,
+        direct_io=1,
+        random_io=0,
+        iops=100,
+        throughput_mib_s=100,
+        throughput_mb_s=104.8576,
+        throughput_gbps=0.8,
+        min_lat_sec=0.001,
+        avg_lat_sec=0.002,
+        max_lat_sec=0.003,
+        lat_pct_1=0.001,
+        lat_pct_50=0.002,
+        lat_pct_75=0.002,
+        lat_pct_99=0.003,
+    )
+    metadata_metric = metadata_reporter.AggregatedMetrics(
+        node_count=2,
+        thread_count=4,
+        datestamps={DATESTAMP},
+        iteration_count=1,
+        create_rate_avg=100,
+        stat_rate_avg=200,
+        delete_rate_avg=300,
+        create_command="elbencho --mkdir",
+        stat_command="elbencho --stat",
+        delete_command="elbencho --delete",
+    )
+    contents = {}
+
+    def report(_manifest, group, _successful, destination, _options):
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            if group.kind == "io":
+                io_reporter.print_terminal_table([io_metric])
+            else:
+                printer = (
+                    metadata_reporter.print_markdown_report
+                    if markdown
+                    else metadata_reporter.print_terminal_table
+                )
+                printer(
+                    [metadata_metric],
+                    test_configuration={"MDTEST_ITERATIONS": group.group_id},
+                )
+        contents[group.group_id] = captured.getvalue()
+        (destination / "report.txt").write_text(
+            contents[group.group_id], encoding="utf-8"
+        )
+
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert report_batch(manifest.root) == 0
+    combined = (manifest.root / "reports.txt").read_text(encoding="utf-8")
+    assert "TEST_ROOT: /saved/0001\n" not in combined
+    previous_end = combined.index(contents["0001"]) + len(contents["0001"])
+    for group in manifest.groups[1:]:
+        environment = (manifest.group_path(group) / ENV_YAML).read_text(
+            encoding="utf-8"
+        )
+        assert combined.count(environment) == 1
+        report_start = combined.index(contents[group.group_id])
+        assert environment in combined[previous_end:report_start]
+        previous_end = report_start + len(contents[group.group_id])
+        for operation in ("Create", "Stat", "Delete"):
+            assert f"{operation} Latency Percentiles" in contents[group.group_id]
+        assert "Performance Rates" in contents[group.group_id]
+        assert "Average Phase Elapsed Times" in contents[group.group_id]
+        for command in ("elbencho --mkdir", "elbencho --stat", "elbencho --delete"):
+            assert command in contents[group.group_id]
+        assert (
+            manifest.root / "reports/groups" / group.group_id / "report.txt"
+        ).read_text(encoding="utf-8") == contents[group.group_id]
+
+
+def test_failed_omnibus_publication_removes_stale_report_and_keeps_group_reports(
+    tmp_path,
+):
+    """An aggregate publication error cannot leave prior tables looking current."""
+    manifest = _create_batch(tmp_path / "batch", kinds=("io", "mdtest"))
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+    omnibus = manifest.root / "reports.txt"
+
+    def report(_manifest, group, _successful, destination, _options):
+        (destination / "report.txt").write_text(group.group_id, encoding="utf-8")
+
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert report_batch(manifest.root) == 0
+        assert omnibus.exists()
+        real_replace = os.replace
+
+        def replace(source, destination):
+            if Path(destination) == omnibus:
+                raise OSError("full disk")
+            return real_replace(source, destination)
+
+        with mock.patch("lib.filesystem_batch.os.replace", side_effect=replace):
+            assert report_batch(manifest.root) == 1
+    assert not omnibus.exists()
+    index = (manifest.root / "reports/index.md").read_text(encoding="utf-8")
+    assert "reports.txt" not in index
+    for group in manifest.groups:
+        assert f"groups/{group.group_id}/report.txt" in index
+        assert (
+            manifest.root / "reports/groups" / group.group_id / "report.txt"
+        ).exists()
+    assert not list(manifest.root.glob(".index-*"))
+
+
+def test_failed_stale_omnibus_deletion_does_not_link_old_tables(tmp_path, capsys):
+    """An undeletable prior aggregate cannot certify freshly generated reports."""
+    manifest = _create_batch(tmp_path / "batch", kinds=("io", "mdtest"))
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+    omnibus = manifest.root / "reports.txt"
+
+    def report(_manifest, group, _successful, destination, options):
+        (destination / "report.txt").write_text(
+            f"Group {group.group_id}: {options}\n", encoding="utf-8"
+        )
+
+    real_unlink = Path.unlink
+
+    def unlink(path, *args, **kwargs):
+        if path == omnibus:
+            raise PermissionError(
+                errno.EACCES, "permission denied for stale aggregate", str(path)
+            )
+        return real_unlink(path, *args, **kwargs)
+
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert report_batch(manifest.root) == 0
+        previous = omnibus.read_bytes()
+        with mock.patch("lib.filesystem_batch.Path.unlink", new=unlink):
+            assert report_batch(manifest.root, engine_options=["fresh"]) == 1
+    assert omnibus.read_bytes() == previous
+    assert "fresh" not in omnibus.read_text(encoding="utf-8")
+    index = (manifest.root / "reports/index.md").read_text(encoding="utf-8")
+    assert "reports.txt" not in index
+    for group in manifest.groups:
+        assert f"groups/{group.group_id}/report.txt" in index
+        assert (
+            manifest.root / "reports/groups" / group.group_id / "report.txt"
+        ).read_text(encoding="utf-8") == f"Group {group.group_id}: ['fresh']\n"
+    diagnostic = capsys.readouterr().err
+    assert "permission denied for stale aggregate" in diagnostic
+    assert str(omnibus) in diagnostic
+
+
+@pytest.mark.parametrize("markdown", [False, True])
+def test_omnibus_keeps_real_io_report_titles_and_tables_adjacent(tmp_path, markdown):
+    """One summary precedes unchanged real WRITE/READ reports in either format."""
+    manifest = _create_batch(tmp_path / "batch", kinds=("io", "io"))
+    repository = Path(__file__).resolve().parents[1]
+    renderer = """
+from dataclasses import replace
+import importlib.util
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location(
+    "actual_io_reporter", Path(sys.argv[1]) / "utils/extract-elbencho.py"
+)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+metric = module.ElbenchoMetrics(
+    nodes=int(sys.argv[3]), io_size="1M", threads=1, io_depth=1,
+    operation="WRITE", datestamp="20260930Z120000", is_multi_node=True,
+    command="elbencho --write --read", file_size_bytes=1024**3,
+    direct_io=1, random_io=0, iops=100, throughput_mib_s=100,
+    throughput_mb_s=104.8576, throughput_gbps=0.8,
+    min_lat_sec=0.001, avg_lat_sec=0.002, max_lat_sec=0.003,
+    lat_pct_1=0.001, lat_pct_50=0.002, lat_pct_75=0.002, lat_pct_99=0.003,
+)
+printer = module.print_markdown_table if sys.argv[2] == "True" else module.print_terminal_table
+printer([metric, replace(metric, operation="READ")])
+"""
+    contents = {}
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                renderer,
+                str(repository),
+                str(markdown),
+                group.group_id,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        contents[group.group_id] = completed.stdout
+
+    def report(_manifest, group, _successful, destination, _options):
+        (destination / "report.txt").write_text(
+            contents[group.group_id], encoding="utf-8"
+        )
+
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
+        assert report_batch(manifest.root) == 0
+    combined = (manifest.root / "reports.txt").read_text(encoding="utf-8")
+    previous_end = 0
+    for group in manifest.groups:
+        content = contents[group.group_id]
+        assert "WRITE" in content and "READ" in content
+        start = combined.index(content)
+        summary = combined[previous_end:start]
+        assert summary.count("Runner:") == 1
+        assert summary.count("Files/sizing:") == 1
+        assert summary.count("Override:") == 1
+        assert "```yaml" not in summary
+        assert (
+            manifest.root / "reports/groups" / group.group_id / "report.txt"
+        ).read_text(encoding="utf-8") == content
+        previous_end = start + len(content)
 
 
 @pytest.mark.parametrize("kind", ["io", "mdtest"])

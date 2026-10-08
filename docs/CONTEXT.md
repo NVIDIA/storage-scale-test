@@ -17,11 +17,8 @@ limitations under the License.
 
 # NVIDIA Storage Scale Test — Repository Context
 
-This document records the non-obvious state and invariants of the repository.
-It describes what exists and how it behaves; it is not a changelog or an
-implementation journal.
-
-Use the following documents for their narrower authoritative scopes:
+Non-obvious repository behavior and invariants; not a changelog. Authoritative
+guides for narrower scopes:
 
 - [README.md](../README.md): launcher setup, substrate configuration, and validation.
 - [Filesystem](FILESYSTEM_TESTING.md), [object](OBJECT_STORAGE_TESTING.md), and
@@ -50,11 +47,9 @@ The lowercase repository, package, tarball, and directory identifier is
 `storage-scale-test`. Shell configuration uses `SCALE_TEST_BASE` as the
 repository or extracted deployment root.
 
-Elbencho and Warp run as separate third-party processes. Their source and
-binaries are not vendored in the repository. The repository publishes source
-only: NVIDIA and the project do not publish or deliver benchmark binaries or
-prepared deployment tarballs. Users may create a deployment tarball locally
-and are responsible for every binary they place in it.
+Elbencho and Warp run as separate processes and are never vendored. The project
+publishes source only; users build deployment tarballs locally and own the
+binaries they include.
 
 `EXECUTION_SUBSTRATE` explicitly selects Slurm, passwordless SSH, or kubectl;
 there is no default, and `SSH_HOST_LIST` no longer selects a mode. The
@@ -70,12 +65,11 @@ nftables policy path. Setup proves non-root Elbencho Pod placement, direct
 Pod-IPv4 coordination, enforced NetworkPolicy, and PVC access before testing
 the SSH, Slurm, and kubectl substrates.
 
-One budget drives PVC capacity and the growable 4 GiB NFS image. Setup publishes
-image tags transactionally, grows retained filesystems, checks fixture and Docker
-backing capacity, and reconciles eight NFS workers. Teardown restores recorded
-NFS active, enabled, and worker-count states. SBX pins kind 0.30 and
-Kubernetes/kubectl 1.34; setup replaces clusters whose kubelets do not match the
-node-image profile.
+One budget drives PVC capacity and the growable 4 GiB NFS image. Setup checks
+fixture/Docker capacity, grows retained filesystems, publishes image tags
+transactionally, and reconciles eight NFS workers. Teardown restores NFS active,
+enabled, and worker-count states. SBX pins kind 0.30 and Kubernetes/kubectl 1.34;
+setup replaces mismatched kubelet profiles.
 
 Lifecycle actions run as an ordinary user, store state under
 `tmp/integration-state`, and use `sudo` only for NFS host operations. Ownership
@@ -103,36 +97,31 @@ export and Slurm account.
 Restart the Slinky login Pod, not its operator-managed Deployment template;
 the operator can revert rollout annotations and kill an in-flight probe.
 
-The harness builds the ordinary deployment archive from an immutable tracked
-snapshot, caches it by snapshot, architecture, fixed recipe, and seeded
-Elbencho/runtime identity, and extracts isolated scenario workspaces. Real cases
-cover baseline and default I/O, failure/resume, retained data, live capture,
-Cartesian sweeps, single-file and weighted-root behavior, shared SSH homes, and
-Slurm scheduling. Fast tests cover parsing, precedence, path and workload safety,
-sizing, scheduler boundaries, failure contracts, and reporting. On-demand CI
-runs the full NFS-backed catalog on amd64 and arm64, sharded by substrate into
-six isolated fixtures whose manifests must cover the unsharded plan exactly,
-with repeatable-teardown headroom; SBX is a supported local backend. Integration CI
-uses Ubuntu 26.04 for source resolution and final status checks, while benchmark
-shards use NVIDIA-managed `linux-amd64-cpu4` and `linux-arm64-cpu4` runners.
-The status job downloads shard manifests with the Node.js 24-based
-`actions/download-artifact` v7.0.0 action, pinned by commit SHA. Integration CI
-installs runtime requirements into `.venv` and uses that interpreter for both
-startup smoke checks and the lifecycle; `.venv-ci` is not a runtime bootstrap.
-Package-installing fixture image builds (SSH worker, Slinky login) receive the
-runner's APT cache mirrors from workflow env through `lib/apt_mirrors.py` and
-`lib/apt-build.sh`: URI-only source rewrite, CA via BuildKit secret (mode=0444 for
-the `_apt` user; checked early), every public Ubuntu URI must be covered by
-a mirror, each checked on its own even when one deb822 `URIs:` field or line
-lists several (no partial configuration), no public fallback. No per-attempt cap:
-APT's finite timeouts bound stalls, retries only on apt failure, and the
-540-second `APT_BUDGET_SECONDS` ends the build, so slow progress is not killed.
-`apt-get update` exits 0 on source failures, so its output is inspected: only a
-failed index from an Ubuntu source (public hosts or a configured mirror) fails
-or retries; non-Ubuntu base-image sources (Slinky login's Kubernetes repo) are
-tolerated, as bare apt-get did.
-Unset variables keep public repositories. The
-Slinky slurmd image installs nothing and takes no mirror arguments.
+The harness caches deployment archives by immutable tracked snapshot, architecture,
+recipe, and seeded Elbencho/runtime identity, then extracts isolated scenario
+workspaces. Real cases cover defaults, failure/resume, retained data, live capture,
+Cartesian sweeps, single-file/weighted-root behavior, shared SSH homes, and Slurm
+scheduling. Fast tests cover parsing, precedence, workload/path safety, sizing,
+scheduler boundaries, failure contracts, and reporting.
+On-demand CI runs the full NFS catalog on amd64/arm64, sharded by substrate into
+six isolated fixtures; shard manifests must exactly cover the unsharded plan,
+with repeatable-teardown headroom. SBX remains a local backend.
+Source-resolution/status jobs use Ubuntu 26.04; benchmark shards use NVIDIA
+`linux-amd64-cpu4`/`linux-arm64-cpu4` runners. The status job uses SHA-pinned
+Node.js 24 `actions/download-artifact` v7.0.0. Runtime requirements are installed
+in `.venv` for smoke checks and fixture lifecycle; `.venv-ci` is not a runtime
+bootstrap.
+
+Package-installing images (SSH worker, Slinky login) receive runner APT mirrors
+through `lib/apt_mirrors.py` and `lib/apt-build.sh`. Rewrite URIs only, require
+coverage of every public Ubuntu URI (including multi-URI sources), and pass the
+CA as a mode-0444 BuildKit secret for `_apt`, verified before installation.
+Configured mirrors have no public fallback; unset variables retain public repositories. Slurmd installs nothing
+and takes no mirror arguments. APT's finite timeouts bound stalls; retries follow
+apt failures until the 540-second `APT_BUDGET_SECONDS`, without per-attempt caps
+that kill slow progress. Because `apt-get update` can exit zero on failed indexes,
+inspect output: Ubuntu-source failures fail/retry; non-Ubuntu sources such as
+Slinky's Kubernetes repo remain tolerated.
 
 The kubectl filesystem sweep's implemented decisions and tradeoffs are retained
 in the historical
@@ -316,10 +305,9 @@ on the same execution directory. Slurm resume refuses to reset work while the
 saved coordinator may still be active; if `squeue` no longer knows the job,
 terminal state must be confirmed through Slurm accounting.
 
-`env_used.sh` is the executable resume snapshot. `env_used.yaml` is the
-human- and tool-readable run snapshot. Protect the result directory from
-untrusted modification because resume sources both `env_used.sh` and each
-`executions/NNNN.sh`.
+`env_used.sh` is the executable resume snapshot; `env_used.yaml` is for humans
+and tools. Resume also sources `executions/NNNN.sh`, so protect the entire result
+directory from untrusted modification.
 
 In kubectl mode, one submission represents the whole sweep. The launcher
 acquires a PVC-wide Kubernetes Lease, stages a verified control bundle below
@@ -339,13 +327,11 @@ with fresh identity evidence. Collection copies PVC results to the local result
 tree. A configured namespace, existing PV/PVC, node selector, authorized kubectl
 context, and compatible CNI are prerequisites. Upload, health-probe, and
 collection retry limits are specified in `docs/KUBERNETES_ELBENCHO_LIFECYCLE.md`.
-`kubectl_create_owned_object` retries a create lost in transit (up to
-`KUBECTL_CREATE_ATTEMPTS`, default 3) only after an exact GET proves the
-deterministic name absent; this is safe because names are fixed and the same
-manifest and nonce are re-sent, so at most one object can exist and
-`AlreadyExists` resolves by exact identity. The PVC Lease keeps its own create
-path because there `AlreadyExists` can mean another owner. The creation
-ambiguity horizon is max(30 s, `KUBECTL_PROCESS_TIMEOUT_SECONDS`) from the
+`kubectl_create_owned_object` retries lost creates (up to
+`KUBECTL_CREATE_ATTEMPTS`, default 3) only after exact GET proves the deterministic
+name absent. Retries reuse the manifest/nonce; `AlreadyExists` requires exact
+identity. The PVC Lease has a separate create path because that response can
+mean another owner. The creation ambiguity horizon is max(30 s, `KUBECTL_PROCESS_TIMEOUT_SECONDS`) from the
 intent mtime, which is refreshed before each retry; objects absent past it are
 recorded under `ambiguous-absence/` and never adopted. `validate_env.sh` lists
 objects labeled `app.kubernetes.io/name=storage-scale-test` for humans only;
@@ -494,9 +480,6 @@ One global ledger owns statuses; group snapshots and artifacts remain isolated
 through dispatch, collection, resume, and unified filesystem reporting.
 The Kubernetes parent owns each active cell's group-specific scratch path and
 finalizes abnormal child exits before publishing a terminal attempt.
-Reporters share option definitions; the unified entry point routes by workload
-kind and retains other groups' index links across filtered runs only when
-their canonical batch, immutable group, and report-content identity match.
 Kubernetes helper loading is idempotent: repeated preflight/dispatch loads must
 preserve readonly constants and active ownership maps.
 Status emits one scoped progress view with collection state and next action.
@@ -589,6 +572,22 @@ The analysis wrappers call `setup_python_venv()` and install the pinned root
 sets that floor. Run analyzers through their shell wrappers so dependency setup
 and argument forwarding remain consistent.
 
+Batch reporting uses shared options and routes groups by workload kind.
+`reports/index.md` retains filtered-out reports only when canonical batch,
+immutable group, and report-content identities match. Each group's tables remain
+in `reports/groups/<group-id>/report.txt`.
+With at least two eligible owned reports, it also writes batch-root `reports.txt`
+(or `--output-dir/reports.txt`) in manifest order and links it from the index.
+IO groups get one compact, roughly six-line snapshot summary: runner, targets,
+sweep, files/sizing hints, lifecycle, and override basename. It uses recorded
+settings, marks missing core values unknown, and supplies no current defaults. Full saved YAML
+remains referenced by path and linked from the index; long values stay complete.
+Metadata groups get one raw YAML block before their complete report, keeping
+rates, elapsed times, latency, configuration, and commands together.
+Both formats preserve original group report contents and title/table adjacency.
+Filtered runs rebuild the aggregate from fresh and retained owned reports;
+failed/unowned reports are excluded. Fewer than two eligible reports removes it.
+
 Shared Python behavior lives in `lib/`:
 
 - `reporting_common.py`: result-pair discovery, histogram parsing, latency
@@ -597,7 +596,9 @@ Shared Python behavior lives in `lib/`:
 - `join_datestamps.py`: display and filename-safe datestamp joining;
 - `parse_only_sizes.py`: `--only-sizes` parsing without splitting compound
   entries such as `1M,r64K`;
-- `stdout_report_file.py`: mirrored terminal report output; and
+- `stdout_report_file.py`: mirrored terminal report output;
+- `filesystem_batch.py`: batch provenance, isolated reports, and omnibus publication;
+- `filesystem_snapshot_summary.py`: compact IO settings from verified snapshots; and
 - `elbencho_live_report.py`: live CSV aggregation and per-client analysis.
 
 Reports preserve operation, size, random/sequential order, direct/buffered IO,
@@ -615,8 +616,7 @@ Highly populated plots can reuse colors or marker shapes. The project generates
 comparisons and reports but does not automatically decide whether a performance
 change is a regression.
 
-For large JSON or JSON.zst inspection without printing complete datasets, use
-`utils/compress_json_for_context.py`:
+Inspect large JSON/JSON.zst without printing complete datasets:
 
 ```bash
 zstd -dc result.json.zst | python3 utils/compress_json_for_context.py
@@ -721,39 +721,12 @@ Public accepted-risk records live in `.security-triage.yaml` and cover:
 
 ## Required validation
 
-`pytest.ini` limits default collection to `tests/`, excluding ignored checkouts
-under `tmp/`.
-
-Run the repository checks from the root:
-
-```bash
-./utils/run_ci_checks.sh
-```
-
-The `lint` target runs the four static checks concurrently by default, buffers
-their output, and reports all failures. `CI_CHECK_JOBS` controls the shared
-concurrency budget. Local `all` runs divide the host's logical CPUs between the
-lint checks and pytest, with pytest distributing tests through `pytest-xdist`.
-Pull-request and `main` CI explicitly use four workers to match the runner CPU
-count.
-
-After Python changes, run Black 25.9.0 or newer and Pylint. `.pylintrc` is the
-canonical configuration and the required result is zero messages (the score
-rounds to 10.00 even with one warning). It gates Pylint's
-enabled fatal/error/warning checks plus exactly these C/R checks:
-
-- `C0200` (`consider-using-enumerate`)
-- `C0411` (`wrong-import-order`)
-- `R0801` (`duplicate-code`)
-- `R1704` (`redefined-argument-from-local`)
-
-All other C/R categories are disabled. `E0401` is disabled because dependency
-availability is handled by wrapper setup and runtime validation; `W0511` allows
-maintainer TODO/FIXME comments. `E0106` and `W1502` remain at Pylint's disabled
-optional-extension defaults.
-
-Shell changes must pass ShellCheck across the repository. Bash-specific
-conditionals use `[[ ... ]]`; sourced libraries use `# shellcheck shell=bash`;
-remote scriptlets use a Bash shebang; variables and arrays remain quoted; and
-functions use explicit return status where the surrounding library follows that
-convention.
+`pytest.ini` collects only `tests/`, excluding ignored `tmp/` checkouts.
+Run `./utils/run_ci_checks.sh` from the repository root. It bootstraps pinned
+runtime/check dependencies locally; use its exit status and full output.
+Pylint must produce zero messages: its score can round to 10.00 despite a warning.
+`CI_CHECK_JOBS` controls the budget shared by concurrent lint and pytest workers;
+PR/main CI uses four workers. Runtime imports and CI-entry changes also need a
+clean workflow dependency bootstrap and startup smoke check.
+See [CODING_STANDARDS.md](CODING_STANDARDS.md) for tool versions, configuration,
+platform prerequisites, individual checks, and shell/Python conventions.
