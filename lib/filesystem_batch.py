@@ -30,7 +30,10 @@ import sys
 import tempfile
 from urllib.parse import quote
 
+import yaml
+
 from lib.filesystem_report_options import options_by_kind
+from lib.filesystem_snapshot_summary import format_io_snapshot_summary
 
 MANIFEST_FILENAME = "batch-manifest.tsv"
 SEAL_FILENAME = "batch-sealed.sha256"
@@ -44,6 +47,7 @@ ENV_SHELL = "env_used.sh"
 ENV_YAML = "env_used.yaml"
 SUCCESS = "SUCCESS"
 REPORT_IDENTITY_FILENAME = ".report-identity"
+COMBINED_REPORT_FILENAME = "reports.txt"
 KINDS = ("all", "io", "mdtest")
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
@@ -446,7 +450,17 @@ def report_batch(
         generated += group_generated
         failed = failed or group_failed
         outcomes[group.group_id] = result
-    _write_report_index(manifest, output, outcomes)
+    combined = (
+        output / COMBINED_REPORT_FILENAME
+        if output_dir
+        else manifest.root / COMBINED_REPORT_FILENAME
+    )
+    try:
+        _write_combined_report(manifest, output, outcomes, combined)
+    except (OSError, ValueError) as error:
+        print(f"Combined report: {error}", file=sys.stderr)
+        failed = True
+    _write_report_index(manifest, output, outcomes, combined)
     return int(failed or not generated)
 
 
@@ -506,7 +520,10 @@ def _has_owned_report(manifest: BatchManifest, group: BatchGroup, report: Path) 
 
 
 def _write_report_index(
-    manifest: BatchManifest, output: Path, outcomes: dict[str, str]
+    manifest: BatchManifest,
+    output: Path,
+    outcomes: dict[str, str],
+    combined: Path | None = None,
 ) -> None:
     """Rebuild all committed rows, retaining reports untouched by filtered runs."""
     lines = [
@@ -517,6 +534,8 @@ def _write_report_index(
         "| Group | Kind | Saved settings | Cell states | Reports |",
         "| --- | --- | --- | --- | --- |",
     ]
+    if combined is not None and combined.is_file():
+        lines[4:4] = [_markdown_link("Combined report", combined, output), ""]
     for group in manifest.groups:
         counts = Counter(
             _execution_status(manifest, execution)
@@ -542,6 +561,68 @@ def _write_report_index(
             f"| {group.group_id} | {group.kind} | {settings} | {states} | {result} |"
         )
     _publish_report_text(output / "index.md", "\n".join(lines) + "\n")
+
+
+def _write_combined_report(
+    manifest: BatchManifest,
+    output: Path,
+    outcomes: dict[str, str],
+    destination: Path,
+) -> None:
+    """Rebuild the omnibus from owned reports, including untouched selected kinds."""
+    # Never leave a previous aggregate presenting failed or foreign evidence.
+    destination.unlink(missing_ok=True)
+    eligible = []
+    for group in manifest.groups:
+        report = output / "groups" / group.group_id / "report.txt"
+        result = outcomes.get(group.group_id)
+        if result is not None and result != _markdown_link("report", report, output):
+            continue
+        if _has_owned_report(manifest, group, report):
+            eligible.append((group, report))
+    if len(eligible) < 2:
+        return
+    sections = []
+    for group, report in eligible:
+        source = manifest.group_path(group) / ENV_YAML
+        environment = _verify_digest(source, group.yaml_digest).decode("utf-8")
+        content = _read_regular(report).decode("utf-8")
+        settings_label = (
+            f"Group {group.group_id} ({group.kind}) — Saved settings: {source}"
+        )
+        if group.kind == "mdtest":
+            annotated = _report_settings_block(environment, settings_label) + content
+        else:
+            snapshot = _parse_report_snapshot(environment, source)
+            annotated = format_io_snapshot_summary(snapshot) + "\n" + content
+        sections.append(
+            f"\n\n{'=' * 80}\nGroup {group.group_id} ({group.kind})\n"
+            f"Report: {report}\nSaved settings: {source}\n\n" + annotated
+        )
+    _publish_report_text(destination, "".join(sections) + "\n")
+
+
+def _parse_report_snapshot(environment: str, source: Path) -> dict:
+    """Parse the digest-verified saved YAML without substituting current defaults."""
+    try:
+        snapshot = yaml.safe_load(environment)
+    except yaml.YAMLError as error:
+        raise ValueError(f"Invalid saved YAML: {source}") from error
+    if not isinstance(snapshot, dict):
+        raise ValueError(f"Expected saved YAML mapping: {source}")
+    return snapshot
+
+
+def _report_settings_block(environment: str, settings_label: str = "") -> str:
+    """Render the exact saved YAML with a fence safe for its contents."""
+    longest_run = max((len(run) for run in re.findall(r"`+", environment)), default=0)
+    yaml_fence = "`" * max(3, longest_run + 1)
+    trailing_newline = "" if environment.endswith("\n") else "\n"
+    settings_label = settings_label or f"Saved settings ({ENV_YAML}):"
+    return (
+        f"\n\n{'-' * 80}\n{settings_label}\n"
+        f"{yaml_fence}yaml\n{environment}{trailing_newline}{yaml_fence}\n\n"
+    )
 
 
 def _publish_report_text(destination: Path, content: str) -> None:
