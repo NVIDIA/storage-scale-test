@@ -118,17 +118,22 @@ def sinfo_checkout_fixture(cli_checkout, tmp_path):
     binary_directory.mkdir()
     binary = binary_directory / "sinfo"
     binary.write_text(
-        "#!/usr/bin/env python3\n"
-        "import sys\n"
-        "partition = sys.argv[sys.argv.index('-p') + 1]\n"
-        "if sys.argv[sys.argv.index('-t') + 1] == 'idle':\n"
-        "    print(partition + '-node')\n",
+        "#!/bin/sh\n"
+        '[ "${SINFO_SITE_MARKER:-}" = loaded ] || exit 42\n'
+        'if [ "$5" = idle ]; then printf \'%s-node\\n\' "$3"; fi\n',
         encoding="utf-8",
     )
     binary.chmod(0o755)
+    environment_config = cli_checkout / "env.sh"
+    environment_config.write_text(
+        f"PATH='{binary_directory}'\n"
+        "export SINFO_SITE_MARKER=loaded\n"
+        "echo noisy site config\n"
+        "partition='config'\n",
+        encoding="utf-8",
+    )
     environment = {
         **os.environ,
-        "PATH": str(binary_directory) + os.pathsep + os.environ["PATH"],
     }
     environment.pop("PARTITION", None)
     script = cli_checkout / "utils/slurm/sinfo_to_node_gbps_csv.py"
@@ -137,10 +142,7 @@ def sinfo_checkout_fixture(cli_checkout, tmp_path):
 
 @pytest.mark.parametrize("source", ("argument", "environment", "config"))
 def test_sinfo_partition_precedence_and_csv_output(sinfo_checkout, source):
-    checkout, script, environment = sinfo_checkout
-    (checkout / "env.sh").write_text(
-        "echo noisy site config\npartition='config'\n", encoding="utf-8"
-    )
+    _, script, environment = sinfo_checkout
     arguments = [str(script)]
     if source in ("argument", "environment"):
         environment["PARTITION"] = "environment"
@@ -155,7 +157,8 @@ def test_sinfo_partition_precedence_and_csv_output(sinfo_checkout, source):
 
 
 def test_sinfo_invalid_site_config_is_reported(sinfo_checkout):
-    _, script, environment = sinfo_checkout
+    checkout, script, environment = sinfo_checkout
+    (checkout / "env.sh").write_text("exit 73\n", encoding="utf-8")
     completed = subprocess.run(
         [str(script), "node,40"],
         env=environment,

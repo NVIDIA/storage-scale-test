@@ -168,7 +168,7 @@ alongside Python 3.12 unit tests for pull requests and pushes to `main`. Python
 | `lib/*.py` | Shared analysis, report, live-data, metadata, and Python CLI helpers |
 | `utils/extract-*.py` | Self-bootstrapping analysis entry points |
 | `utils/summarize-elbencho.py` | Self-bootstrapping Elbencho run summary command |
-| `utils/slurm/sinfo_to_node_gbps_csv.py` | Standard-library Slurm node inventory utility with optional `env.sh` partition lookup |
+| `utils/slurm/sinfo_to_node_gbps_csv.py` | Standard-library Slurm node inventory utility with optional `env.sh` setup |
 | `utils/build_tarball.sh` | User-local deployment-tarball builder |
 | `utils/build/` | Helpers for building Warp and the in-tree s3test program |
 | `tests/` | Python and shell-behavior regression tests collected by `pytest` |
@@ -573,6 +573,9 @@ The executable analysis tools bootstrap `.venv` from the pinned root
 `requirements.txt` when its hash or installed package versions differ from the
 recorded environment. Python 3.12 or newer is required; pinned NumPy sets that
 floor. Their help and version options run before dependency setup.
+The Slurm inventory utility sources an existing `env.sh` once and passes its
+exported environment, including module-provided `PATH`, to both `sinfo` queries.
+Partition precedence is `--partition`, incoming `PARTITION`, then site `partition`.
 
 Batch reporting uses shared options and routes groups by workload kind.
 `reports/index.md` retains filtered-out reports only when canonical batch,
