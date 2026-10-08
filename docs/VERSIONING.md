@@ -32,51 +32,33 @@ releases are in [CHANGELOG.md](../CHANGELOG.md).
 | `unknown` | Neither Git metadata nor a `VERSION` file was found. |
 
 A `-modified` suffix means the source differs from that commit or release.
-In a Git checkout, that is any change `git status` reports; ignored files such
-as `env.sh`, `results/`, and downloaded binaries don't count. Git 2.15 or newer
-is required.
+Ignored files such as `env.sh`, `results/`, and downloaded binaries don't
+count. Requires Git 2.15 or newer.
 
-A deployment tarball (`utils/build_tarball.sh`) or release source archive has
-no Git metadata. It carries a `VERSION` file and a `SOURCE_SHA256` list of its
-files, and becomes `-modified` when a listed file changes. You can check one
-yourself with `sha256sum -c SOURCE_SHA256`. Files a deployment is expected to
-add or replace are not listed: `env.sh`, credentials, and benchmark binaries.
+Deployment tarballs and release source archives have no Git metadata; they
+carry a `VERSION` file and a `SOURCE_SHA256` file list, which
+`sha256sum -c SOURCE_SHA256` checks. `env.sh`, credentials, and benchmark
+binaries are not listed, so adding or replacing them doesn't count.
 
-`lib/project_version.sh` implements all of this; Python commands call it.
-
-## `--version`
-
-These commands print the version and exit when given `--version`:
-`validate_env.sh`, the `storage-tests/*/nv-*.sh` launchers,
-`utils/build_tarball.sh`, the `utils/extract-*` and `utils/summarize-elbencho`
-reporters, `utils/reconstruct_elbencho_env_used.py`, and the `utils/build/` and
-`utils/slurm/` helpers. A built `s3test` binary reports the version it was built
-from.
-
-Launcher and reporter `--help` paths work before configuration or credentials
-are loaded. Reporter help and version queries also work without installing the
-reporting dependencies or creating a virtual environment.
+User-facing commands accept `--version`; launcher and reporter `--version` and
+`--help` work before `env.sh` or reporting dependencies are set up. A built
+`s3test` binary also reports its version.
 
 ## Results and reports
 
-Every benchmark result file gets a `<name>.out.project-version` file holding
-the version of the code that ran it. The launcher resolves its version once and
-passes it to SSH workers and the Kubernetes coordinator; a Slurm job resolves
-its own when it starts, because the checkout can change while the job waits.
-Each run log also starts with the version. A resumed run keeps the versions of
-results that already succeeded; results it runs now get the current version.
+Each result file gets a `<name>.out.project-version` file recording the version
+that ran it, and each run log starts with the version. A resumed run keeps the
+versions of results that already succeeded.
 
-Reports start with the versions that produced the results they include and the
-version of the reporter:
+Reports list the versions that produced their results and the reporter's own:
 
 ```text
 Produced by storage-scale-test: v1.2.3, v1.3.0
 Reported by storage-scale-test: v1.4.0
 ```
 
-Several produced-by versions mean the results came from different code.
-`unknown` covers results recorded before versioning, and metrics loaded from
-reporter CSV files or Warp analyzed JSON, which carry no versions.
+`unknown` covers results recorded before versioning and metrics loaded from
+reporter CSV files or Warp analyzed JSON.
 
 ## Releasing
 
@@ -89,21 +71,18 @@ reporter CSV files or Warp analyzed JSON, which carry no versions.
    git push origin v1.2.3
    ```
 
-The release workflow then runs the source checks, builds
-`storage-scale-test-v1.2.3-source.tar.gz` and its `.sha256` from the tag with
-`git archive`, checks that the archive verifies and that its commands report
-`v1.2.3`, and publishes a GitHub release whose notes are the changelog section.
-Prerelease tags make prereleases. The workflow refuses tags that are not on
-`main` or have no changelog section. A rerun keeps any assets already published
-and refuses to replace them with different content. It deletes and re-uploads
-only an asset GitHub left in the `starter` state after a failed upload.
+The release workflow runs the source checks, builds and verifies
+`storage-scale-test-v1.2.3-source.tar.gz` and its `.sha256`, and publishes a
+GitHub release with the changelog section as its notes. It refuses tags that
+are not on `main` or have no changelog section, and can be rerun safely.
+Prerelease tags make prereleases.
 
-To build and check an archive locally, without publishing:
+To build and check an archive locally:
 
 ```bash
 python3 utils/build_source_release.py --tag v1.2.3 --smoke
 ```
 
-GitHub's automatic "Source code" downloads have no `VERSION` file and report
-`unknown`; use the attached archive. Anyone who can push a `v*` tag can start a
-release, so restrict tag creation with a repository ruleset.
+GitHub's automatic "Source code" downloads report `unknown`; use the attached
+archive. Anyone who can push a `v*` tag can start a release, so restrict tag
+creation with a repository ruleset.

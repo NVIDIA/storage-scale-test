@@ -75,9 +75,9 @@ def _deployment_source(tmp_path):
     return root
 
 
-def _package(root):
+def _package(root, *arguments):
     result = subprocess.run(
-        ["bash", str(root / "utils/build_tarball.sh")],
+        ["bash", str(root / "utils/build_tarball.sh"), *arguments],
         check=False,
         capture_output=True,
         text=True,
@@ -129,7 +129,207 @@ def test_deployment_tarball_leaves_out_credentials_and_local_state(tmp_path):
     shipped = {str(path.relative_to(deployment)) for path in deployment.rglob("*")}
     assert not shipped & set(LOCAL_ONLY)
     assert not {"overrides", "results", ".claude", ".cursor"} & shipped
-    assert "source.txt" in shipped and "utils/elbencho" in shipped
+    assert "source.txt" in shipped
+    _assert_custom_binaries(root, deployment)
+
+
+BINARY_NAMES = (
+    "elbencho",
+    "elbencho.aarch64",
+    "warp",
+    "warp.aarch64",
+    "s3test",
+    "s3test.aarch64",
+)
+CREDENTIAL_MARKER = b"unique-packaging-credential-do-not-ship"
+
+
+def _assert_custom_binaries(source, deployment):
+    for name in BINARY_NAMES:
+        assert (deployment / "utils" / name).read_bytes() == (
+            source / "utils" / name
+        ).read_bytes()
+
+
+def _assert_no_credential_payloads(root):
+    """Inspect file and hardlink payloads, not just member names."""
+    with tarfile.open(root.parent / "storage-scale-test.tar.gz") as archive:
+        for member in archive.getmembers():
+            if member.isreg() or member.islnk():
+                assert CREDENTIAL_MARKER not in archive.extractfile(member).read()
+
+
+@pytest.mark.parametrize("declaration", ["flag", "environment"])
+@pytest.mark.parametrize("location", ["inside", "outside", "symlink-parent"])
+def test_deployment_excludes_declared_credentials_and_aliases(
+    tmp_path, monkeypatch, declaration, location
+):
+    root = _deployment_source(tmp_path)
+    monkeypatch.delenv("OBJ_AUTH_FILE", raising=False)
+    parent = tmp_path if location == "outside" else root
+    credential = parent / "private [keys]*?" / "auth file.env"
+    credential.parent.mkdir()
+    credential.write_bytes(CREDENTIAL_MARKER)
+    if location == "symlink-parent":
+        (root / "linked keys").symlink_to(
+            credential.parent.relative_to(root), target_is_directory=True
+        )
+        declared = "linked keys/auth file.env"
+    else:
+        declared = (
+            str(credential.relative_to(root))
+            if location == "inside"
+            else str(credential)
+        )
+    (root / "credential hardlink.env").hardlink_to(credential)
+    (root / "credential symlink.env").symlink_to(credential)
+    # A wildcard interpretation of the declared path would match this neighbor.
+    neighbor = root / "private keys" / "auth file.env"
+    neighbor.parent.mkdir()
+    neighbor.write_bytes(b"ordinary source")
+    (root / "env.sh").write_text('export OBJ_AUTH_FILE="never-execute-this-config"\n')
+    if declaration == "environment":
+        monkeypatch.setenv("OBJ_AUTH_FILE", declared)
+        arguments = ()
+    else:
+        arguments = ("--obj-auth-file", declared)
+    deployment = _package(root, *arguments)
+    assert not (deployment / "credential hardlink.env").exists()
+    assert not (deployment / "credential symlink.env").is_symlink()
+    if location == "inside":
+        assert not (deployment / credential.relative_to(root)).exists()
+    assert (
+        deployment / neighbor.relative_to(root)
+    ).read_bytes() == neighbor.read_bytes()
+    assert credential.read_bytes() == CREDENTIAL_MARKER
+    _assert_no_credential_payloads(root)
+    _assert_custom_binaries(root, deployment)
+
+
+@pytest.mark.parametrize("git_metadata", [True, False])
+def test_deployment_excludes_default_aliases_and_multiple_declared_files(
+    tmp_path, git_metadata
+):
+    root = _deployment_source(tmp_path)
+    if not git_metadata:
+        shutil.rmtree(root / ".git")
+    credentials = [root / ".obj_auth", root / "one auth.env", root / "two auth.env"]
+    for index, credential in enumerate(credentials):
+        credential.write_bytes(CREDENTIAL_MARKER)
+        (root / f"alias-{index}.env").hardlink_to(credential)
+    (root / "default link.env").symlink_to(credentials[0])
+    deployment = _package(
+        root, "--obj-auth-file", "one auth.env", "--obj-auth-file", "two auth.env"
+    )
+    for credential in credentials:
+        assert not (deployment / credential.name).exists()
+    assert not list(deployment.glob("alias-*.env"))
+    assert not (deployment / "default link.env").is_symlink()
+    _assert_no_credential_payloads(root)
+    _assert_custom_binaries(root, deployment)
+
+
+# An inherited OBJ_AUTH_FILE that does not exist here has nothing to exclude.
+@pytest.mark.parametrize("configuration", ["absent", "present"])
+@pytest.mark.parametrize("inherited", [None, "", "missing.env", "/no/such/auth"])
+def test_no_argument_deployment_protects_default_without_executing_configuration(
+    tmp_path, monkeypatch, configuration, inherited
+):
+    root = _deployment_source(tmp_path)
+    monkeypatch.delenv("OBJ_AUTH_FILE", raising=False)
+    if inherited is not None:
+        monkeypatch.setenv("OBJ_AUTH_FILE", inherited)
+    sentinel = tmp_path / "configuration-executed"
+    if configuration == "present":
+        (root / "env.sh").write_text(
+            f"export OBJ_AUTH_FILE=\"$(touch '{sentinel}')\"\n"
+        )
+    (root / ".obj_auth").write_bytes(CREDENTIAL_MARKER)
+    (root / "default alias.env").hardlink_to(root / ".obj_auth")
+    (root / "default link.env").symlink_to(root / ".obj_auth")
+    deployment = _package(root)
+    assert not sentinel.exists()
+    assert not (deployment / "default alias.env").exists()
+    assert not (deployment / "default link.env").is_symlink()
+    _assert_no_credential_payloads(root)
+    _assert_custom_binaries(root, deployment)
+
+
+@pytest.mark.parametrize(
+    "arguments, inherited",
+    [
+        (("--obj-auth-file", "missing.env"), None),
+        (("--obj-auth-file", "utils"), None),
+        (("--obj-auth-file", ""), None),
+        (("--obj-auth-file",), None),
+        ((), "utils"),
+    ],
+)
+def test_credential_preflight_fails_before_building_or_replacing_archive(
+    tmp_path, monkeypatch, arguments, inherited
+):
+    root = _deployment_source(tmp_path)
+    monkeypatch.delenv("OBJ_AUTH_FILE", raising=False)
+    if inherited is not None:
+        monkeypatch.setenv("OBJ_AUTH_FILE", inherited)
+    sentinel = tmp_path / "configuration-executed"
+    (root / "env.sh").write_text(f"export OBJ_AUTH_FILE=\"$(touch '{sentinel}')\"\n")
+    (root / ".obj_auth").write_bytes(CREDENTIAL_MARKER)
+    archive = root.parent / "storage-scale-test.tar.gz"
+    archive.write_bytes(b"previous deployment archive")
+    side_effect = tmp_path / "download-or-build-executed"
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    for name in ("curl", "cc", "gcc", "aarch64-linux-gnu-gcc", "docker"):
+        command = commands / name
+        command.write_text(
+            '#!/bin/sh\nprintf touched > "$PACKAGING_SIDE_EFFECT"\nexit 99\n'
+        )
+        command.chmod(0o755)
+    monkeypatch.setenv("PACKAGING_SIDE_EFFECT", str(side_effect))
+    monkeypatch.setenv("PATH", str(commands), prepend=":")
+    for name in BINARY_NAMES:
+        (root / "utils" / name).unlink()
+    result = subprocess.run(
+        ["bash", str(root / "utils/build_tarball.sh"), *arguments],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert archive.read_bytes() == b"previous deployment archive"
+    assert not sentinel.exists()
+    assert not side_effect.exists()
+    assert not any((root / "utils" / name).exists() for name in BINARY_NAMES)
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+def test_deployment_rejects_an_output_directory_without_changing_it(
+    tmp_path, monkeypatch, symlink
+):
+    root = _deployment_source(tmp_path)
+    monkeypatch.delenv("OBJ_AUTH_FILE", raising=False)
+    output = root.parent / "storage-scale-test.tar.gz"
+    target = tmp_path / "existing output directory" if symlink else output
+    target.mkdir()
+    sentinel = target / "keep.txt"
+    sentinel.write_bytes(b"existing directory contents")
+    if symlink:
+        output.symlink_to(target, target_is_directory=True)
+    result = subprocess.run(
+        ["bash", str(root / "utils/build_tarball.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "directory" in result.stderr.lower()
+    assert output.is_dir()
+    assert output.is_symlink() == symlink
+    assert list(target.iterdir()) == [sentinel]
+    assert sentinel.read_bytes() == b"existing directory contents"
 
 
 def _release_repository(tmp_path, name="release"):

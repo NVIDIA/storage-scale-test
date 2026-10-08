@@ -653,6 +653,9 @@ into a benchmark environment. It:
 - includes existing Warp binaries but does not download or automatically build
   them, warning when an architecture is missing.
 
+Archives exclude default and supplied credential files and their symlink/hardlink
+aliases without reading `env.sh`; see [OBJECT_STORAGE_TESTING.md](OBJECT_STORAGE_TESTING.md).
+
 Metadata phases use `-s 0` without `-b 0`: Elbencho 3.2 rejects zero block
 sizes even for zero-byte files. Existing custom binaries remain untouched by
 the deployment builder unless `--force-download` is supplied.

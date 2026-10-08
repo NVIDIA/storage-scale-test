@@ -53,6 +53,8 @@ project_version_option "${SCRIPT_DIR}/.." "$@"
 
 # Change dir to just inside our tree
 cd "${SCRIPT_DIR}/.." || exit
+SOURCE_TREE_ROOT=$(pwd -P) || exit 1
+readonly SOURCE_TREE_ROOT
 
 # Capture our tree's dir name (no assumptions)
 TREE_DIR_NAME="$(basename "$(pwd)")"
@@ -292,21 +294,82 @@ check_s3test_binaries() {
 # Command-line argument processing
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--force-download] [--help | -h]
+Usage: $(basename "$0") [--force-download] [--obj-auth-file PATH ...] [--help | -h]
 
 Options:
   --force-download   Force (re-)download of the elbencho binaries, even if present.
+  --obj-auth-file PATH
+                     Exclude this credential file and all its in-tree aliases.
+                     Repeat for multiple files; relative paths use the source root.
+                     An inherited OBJ_AUTH_FILE also declares a credential file;
+                     it is ignored if no such file exists.
   -h, --help         Display this help message and exit.
   --version          Print the project version and exit.
+
+No credential arguments are required, and env.sh is never executed.
+The default .obj_auth and its aliases are always excluded when present,
+including without configuration or Git metadata.
 EOF
 }
 
+validate_credential_files() {
+    local index path
+    for index in "${!credential_files[@]}"; do
+        path=${credential_files[$index]}
+        [[ "$path" == /* ]] || path="$SOURCE_TREE_ROOT/$path"
+        if [[ ! -f "$path" ]]; then
+            _error "Object credential path must resolve to a regular file: $path"
+            return 1
+        fi
+        credential_files[index]=$path
+    done
+}
+
+capture_credential_names() {
+    local listing candidate credential
+    [[ ${#credential_files[@]} -gt 0 ]] || return 0
+    listing=$(mktemp) || return 1
+    if ! find "$SOURCE_TREE_ROOT" \( -type f -o -type l \) -print0 > "$listing"; then
+        rm -f -- "$listing"
+        _error "Failed to inspect source files for credential aliases"
+        return 1
+    fi
+    while IFS= read -r -d '' candidate; do
+        for credential in "${credential_files[@]}"; do
+            # -ef follows symlinks and compares device/inode, including hardlinks
+            # and credential paths outside the source tree that alias files within.
+            if [[ "$candidate" -ef "$credential" ]]; then
+                credential_names+=("${candidate#"$SOURCE_TREE_ROOT"/}")
+                break
+            fi
+        done
+    done < "$listing"
+    rm -f -- "$listing"
+}
+
 force_download=false
+declare -a credential_files=() credential_names=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --force-download)
             force_download=true
+            shift
+            ;;
+        --obj-auth-file)
+            if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+                _error "--obj-auth-file requires a file path"
+                exit 1
+            fi
+            credential_files+=("$2")
+            shift 2
+            ;;
+        --obj-auth-file=*)
+            if [[ -z "${1#*=}" ]]; then
+                _error "--obj-auth-file requires a file path"
+                exit 1
+            fi
+            credential_files+=("${1#*=}")
             shift
             ;;
         -h|--help)
@@ -320,6 +383,24 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# An inherited OBJ_AUTH_FILE often names a path on the launcher. A file that
+# does not exist here cannot be shipped, so there is nothing to exclude.
+if [[ -n "${OBJ_AUTH_FILE:-}" ]]; then
+    inherited_credential=$OBJ_AUTH_FILE
+    [[ "$inherited_credential" == /* ]] \
+        || inherited_credential="$SOURCE_TREE_ROOT/$inherited_credential"
+    if [[ -e "$inherited_credential" ]]; then
+        credential_files+=("$OBJ_AUTH_FILE")
+    else
+        echo "Ignoring OBJ_AUTH_FILE; no such file: $inherited_credential"
+    fi
+fi
+if [[ -f "$SOURCE_TREE_ROOT/.obj_auth" ]]; then
+    credential_files+=("$SOURCE_TREE_ROOT/.obj_auth")
+fi
+validate_credential_files || exit 1
+capture_credential_names || exit 1
 
 PROJECT_VERSION=$(project_version "${SCRIPT_DIR}/..")
 echo "Creating deployment tarball for storage-scale-test ${PROJECT_VERSION}..."
@@ -402,6 +483,10 @@ fi
 
 OUTPUT_TARBALL="storage-scale-test.tar.gz"
 DEPLOY_DIR_NAME="storage-scale-test"
+if [[ -d "$OUTPUT_TARBALL" ]]; then
+    _error "Output archive path is a directory: $OUTPUT_TARBALL"
+    exit 1
+fi
 
 # Detect tar command early (for use in final tarball creation)
 # Mac users may install gtar using Brew; detect and use that if it's available
@@ -424,7 +509,9 @@ echo "  including NOTICE (third-party attribution)"
 
 # Copy the tree into staging, stamp the copy with its version and checksums,
 # and archive the stamped copy.
-staging=$(mktemp -d) || exit 1
+# Keep the final temporary archive on the output filesystem so mv replaces an
+# existing archive atomically only after copying, sanitizing, and checking it.
+staging=$(mktemp -d "$(pwd -P)/.storage-scale-test-build.XXXXXX") || exit 1
 trap 'rm -rf "$staging"' EXIT
 if ! $TAR_CMD cf - \
     "${TAR_OPTS[@]}" \
@@ -465,17 +552,38 @@ if ! $TAR_CMD cf - \
     --exclude=utils/build_tarball.sh \
     --exclude=utils/fix_up_developer_venv.sh \
     --exclude=static-binaries \
-    "${TREE_DIR_NAME}" | $TAR_CMD xf - -C "$staging" \
-    || ! project_stamp "$staging/$DEPLOY_DIR_NAME" "$PROJECT_VERSION" \
-    || ! $TAR_CMD czf "$OUTPUT_TARBALL" -C "$staging" "$DEPLOY_DIR_NAME"; then
+    "${TREE_DIR_NAME}" | $TAR_CMD xf - -C "$staging"; then
+    _error "Failed to copy deployment source into staging"
+    exit 1
+fi
+
+for credential_name in "${credential_names[@]}"; do
+    credential_path="$staging/$DEPLOY_DIR_NAME/$credential_name"
+    if ! rm -f -- "$credential_path" \
+            || [[ -e "$credential_path" || -L "$credential_path" ]]; then
+        _error "Failed to remove a credential alias from staging"
+        exit 1
+    fi
+done
+if ! project_stamp "$staging/$DEPLOY_DIR_NAME" "$PROJECT_VERSION"; then
+    _error "Failed to stamp deployment source"
+    exit 1
+fi
+staged_archive="$staging/$OUTPUT_TARBALL"
+if ! $TAR_CMD czf "$staged_archive" -C "$staging" "$DEPLOY_DIR_NAME"; then
     _error "Failed to create ${OUTPUT_TARBALL}"
     exit 1
 fi
 
 # Read the whole listing rather than piping into "grep -q": an early-exiting
 # grep would SIGPIPE tar, which "set -o pipefail" reports as a build failure.
-if ! grep -qxF "${DEPLOY_DIR_NAME}/NOTICE" <<< "$($TAR_CMD tzf "$OUTPUT_TARBALL")"; then
+if ! archive_listing=$($TAR_CMD tzf "$staged_archive") \
+        || ! grep -qxF "${DEPLOY_DIR_NAME}/NOTICE" <<< "$archive_listing"; then
     _error "${OUTPUT_TARBALL} does not contain ${DEPLOY_DIR_NAME}/NOTICE"
+    exit 1
+fi
+if ! mv -f -- "$staged_archive" "$OUTPUT_TARBALL"; then
+    _error "Failed to publish ${OUTPUT_TARBALL}"
     exit 1
 fi
 

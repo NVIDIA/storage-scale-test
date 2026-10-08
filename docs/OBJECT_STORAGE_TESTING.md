@@ -37,6 +37,16 @@ and accepts another GitHub/GitLab URL with a tag, branch, or commit. Review its
 help and third-party licenses before use. The tarball builder also builds
 `s3test` for validation; check warnings for missing tools or architectures.
 
+The tarball never includes `.obj_auth` or links to it. To exclude other
+credential files, pass `--obj-auth-file PATH` (repeatable) or export
+`OBJ_AUTH_FILE`; relative paths are from the checkout. An exported path that
+does not exist is ignored. The builder never reads `env.sh`; create the
+credentials file on the launcher.
+
+```bash
+./utils/build_tarball.sh --obj-auth-file credentials/object.auth
+```
+
 ## Configure the target and run a sweep
 
 Set `OBJ_BUCKET`, `OBJ_REGION`, `OBJ_HOST`, `OBJ_HOST_PORT`, and an absolute

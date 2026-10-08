@@ -25,8 +25,30 @@ section below.
 
 ### Added
 
-- Project versions. User-facing commands accept `--version`.
-- Each benchmark result records the version that produced it. Reports list
-  those versions and the reporter's own version.
-- Deployment tarballs and release source archives carry their version and
-  detect later edits.
+- Kubernetes (`EXECUTION_SUBSTRATE=kubectl`) runs filesystem IO and
+  metadata sweeps alongside SSH and Slurm. Sweeps run in the cluster; use
+  `--status`, `--collect`, `--cancel`, and `--resume` to follow them. See
+  [Kubernetes](README.md#kubernetes).
+- Prepared filesystem batches: build a set of IO and metadata sweeps with
+  `--batch` and `--append`, run them together with `--start`, and report
+  them with `utils/extract-filesystem.sh`. See
+  [Prepared filesystem batches](docs/FILESYSTEM_TESTING.md#prepared-filesystem-batches).
+- Workload override files: `--env-override FILE` changes selected workload
+  settings for one run or batch group without editing `env.sh`. See
+  [Workload override files](docs/FILESYSTEM_TESTING.md#workload-override-files).
+- Metadata sweeps can be resumed with `--resume`, like IO sweeps. See
+  [Metadata sweeps](docs/FILESYSTEM_TESTING.md#metadata-sweeps).
+- Completion-based IO sweeps: buffered IO, multiple `TEST_DIRS` roots, or
+  `--run-to-completion` process a finite dataset once instead of running
+  for a fixed time. See [First IO sweep](docs/FILESYSTEM_TESTING.md#first-io-sweep).
+- Project versions: commands accept `--version`, results record the
+  version that produced them, and reports list it. See
+  [docs/VERSIONING.md](docs/VERSIONING.md).
+- Deployment tarballs and release source archives carry their version
+  and detect later edits.
+
+### Changed
+
+- elbencho v3.2-1 is the pinned download and default Kubernetes image.
+- Deployment tarballs leave out object storage credentials. See
+  [Prepare the tools](docs/OBJECT_STORAGE_TESTING.md#prepare-the-tools).
