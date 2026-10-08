@@ -63,7 +63,8 @@ over a repository-shared path. NFS retains pinned Kindnet; Docker SBX uses
 pinned, preloaded Calico because its nested kernel cannot run Kindnet's
 nftables policy path. Setup proves non-root Elbencho Pod placement, direct
 Pod-IPv4 coordination, enforced NetworkPolicy, and PVC access before testing
-the SSH, Slurm, and kubectl substrates.
+the SSH, Slurm, and kubectl substrates. Control uploads preserve precreated
+staging-directory metadata; GNU tar can reject restoring `.` on SBX virtiofs.
 
 One budget drives PVC capacity and the growable 4 GiB NFS image. Setup checks
 fixture/Docker capacity, grows retained filesystems, publishes image tags
