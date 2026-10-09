@@ -310,3 +310,46 @@ def test_unsafe_tracked_symlink_is_rejected(tmp_path):
         _CACHE.get_or_build_deployment(
             _Runner(), _request(tmp_path, repository, binary)
         )
+
+
+def test_tag_only_change_invalidates_deployment_cache(tmp_path):
+    """The stamped snapshot puts the checkout version in the cache key."""
+    repository, binary = _repository(tmp_path)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "Initial",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    runner = _Runner()
+    request = _request(tmp_path, repository, binary)
+    first = _CACHE.get_or_build_deployment(runner, request)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "tag",
+            "-a",
+            "v1.2.3",
+            "-m",
+            "release",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    second = _CACHE.get_or_build_deployment(runner, request)
+    assert first.key != second.key
+    with tarfile.open(second.archive) as archive:
+        assert archive.extractfile("./VERSION").read() == b"v1.2.3\n"
+    assert runner.builder_calls == 2

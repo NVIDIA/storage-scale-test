@@ -61,6 +61,8 @@ def test_root_workload_identity_and_missing_test_dirs_are_actionable(tmp_path):
     functions_dir = deployment / "storage-tests" / "fs" / "kubectl"
     functions_dir.mkdir(parents=True)
     shutil.copy2(_ROOT / "validate_env.sh", deployment / "validate_env.sh")
+    (deployment / "lib").mkdir()
+    shutil.copy2(_ROOT / "lib/project_version.sh", deployment / "lib")
     shutil.copy2(
         _ROOT
         / "storage-tests"

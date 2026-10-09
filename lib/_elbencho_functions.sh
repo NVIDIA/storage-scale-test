@@ -1915,30 +1915,6 @@ _elbencho_emit_write_only_data_dir() {
 readonly _ELBE_ISO_DATE_START_PREFIX='ISO DATE start: '
 readonly _ELBE_ISO_DATE_END_PREFIX='ISO DATE end  : '
 
-# Parse --resfile from elbencho argv. Prints path to stdout (may be empty).
-# Usage: resfile=$(_elbencho_resfile_from_args "$@")
-_elbencho_resfile_from_args() {
-    local resfile=""
-    local skip_next=false
-    local arg
-    for arg in "$@"; do
-        if [[ "$skip_next" == true ]]; then
-            resfile="$arg"
-            skip_next=false
-            continue
-        fi
-        if [[ "$arg" == --resfile ]]; then
-            skip_next=true
-            continue
-        fi
-        if [[ "$arg" == --resfile=* ]]; then
-            resfile="${arg#--resfile=}"
-        fi
-    done
-    printf '%s' "$resfile"
-    return 0
-}
-
 # Rewrite legacy bare "ISO DATE:" lines in a resfile to aligned start/end labels.
 # Lines before COMMAND LINE become start; all other bare ISO DATE lines become end.
 # Usage: _elbencho_normalize_resfile_iso_date_labels <resfile>
@@ -2061,6 +2037,7 @@ _elbencho_run_master_with_coredump() {
 }
 
 run_an_elbencho() {
+    _write_result_version "$(_elbencho_resfile_from_args "$@")"
     # Single pass: detect --hosts and build display args (omitting --hosts for readability)
     local display_args=()
     local has_hosts=false

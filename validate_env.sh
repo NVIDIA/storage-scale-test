@@ -30,6 +30,10 @@ declare source_output=""
 
 # Get absolute path to script directory
 SCALE_TEST_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/project_version.sh
+# shellcheck disable=SC1091
+source "$SCALE_TEST_BASE/lib/project_version.sh" || exit 1
+project_version_option "$SCALE_TEST_BASE" "$@"
 
 # Initialize error accumulation system
 ERROR_FILE=""

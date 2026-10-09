@@ -66,6 +66,15 @@
 # remote_output_dir # basename for ssh, full path for slurm
 
 run_a_warp() {
+    # Record the project version beside the run's BENCHDATA.out log, as
+    # lib/_platform_functions.sh does for elbencho; never fail the benchmark.
+    local argument
+    for argument in "$@"; do
+        [[ "$argument" == --benchdata=* ]] || continue
+        printf '%s\n' "${STORAGE_SCALE_TEST_VERSION:-unknown}" \
+            > "${argument#--benchdata=}.out.project-version" \
+            || echo "Warning: could not record the project version for ${argument#--benchdata=}" >&2
+    done
     printf "# warp %s\n" "$*"
     # Force flush stdout by redirecting file descriptor 1 to itself
     # This works because redirecting causes the shell to flush the buffer

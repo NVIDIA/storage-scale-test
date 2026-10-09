@@ -4157,8 +4157,9 @@ kubectl_prepare_control_bundle() {
             "$destination/_nv-elbencho-kubectl-functions.sh" \
             || ! cp -- "$coordinator_source" "$destination/coordinator.sh" \
             || ! chmod 0700 "$destination/coordinator.sh" \
-            || ! printf '%s\t%s\n%s\t%s\n' attempt_id "$attempt_id" output_basename \
-                "$output_basename" > "$destination/run-metadata.tsv" \
+            || ! printf '%s\t%s\n%s\t%s\n%s\t%s\n' attempt_id "$attempt_id" output_basename \
+                "$output_basename" project_version "${STORAGE_SCALE_TEST_VERSION:-unknown}" \
+                > "$destination/run-metadata.tsv" \
             || ! _kubectl_write_bundle_manifest "$destination"; then
             rm -rf -- "$destination"
             return 1

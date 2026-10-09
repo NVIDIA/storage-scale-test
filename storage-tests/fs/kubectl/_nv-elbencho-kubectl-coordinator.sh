@@ -177,7 +177,7 @@ _coordinator_verify_bundle() {
 _coordinator_load_run_metadata() {
     local metadata="$CONTROL_DIR/run-metadata.tsv" key value extra rows=0
     [[ -f "$metadata" && ! -L "$metadata" ]] || return 1
-    unset COORDINATOR_OUTPUT_BASENAME
+    unset COORDINATOR_OUTPUT_BASENAME STORAGE_SCALE_TEST_VERSION
     while IFS=$'\t' read -r key value extra || [[ -n "${key:-}" ]]; do
         [[ -z "${extra:-}" ]] || return 1
         case "$key" in
@@ -187,11 +187,17 @@ _coordinator_load_run_metadata() {
                 COORDINATOR_OUTPUT_BASENAME="$value"
                 ;;
             attempt_id) [[ "$value" == "$ATTEMPT_ID" ]] || return 1 ;;
+            project_version)
+                # The launcher's version, recorded beside each result.
+                [[ -z "${STORAGE_SCALE_TEST_VERSION:-}" && "$value" =~ ^[0-9A-Za-z.+-]+$ ]] || return 1
+                export STORAGE_SCALE_TEST_VERSION="$value"
+                ;;
             *) return 1 ;;
         esac
         rows=$((rows + 1))
     done < "$metadata"
-    [[ "$rows" -eq 2 && -n "${COORDINATOR_OUTPUT_BASENAME:-}" ]]
+    [[ "$rows" -eq 3 && -n "${COORDINATOR_OUTPUT_BASENAME:-}" \
+        && -n "${STORAGE_SCALE_TEST_VERSION:-}" ]]
 }
 
 _coordinator_validate_arguments() {

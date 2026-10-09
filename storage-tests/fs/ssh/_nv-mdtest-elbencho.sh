@@ -115,7 +115,8 @@ run_ssh_single "${SSH_NODELIST%%,*}" "$status_dir/mdtest-elbencho.rc" "/dev/stdo
     "@${SCRIPT_DIR}/_nv-mdtest-elbencho-remote-scriptlet.sh" \
     "$OUTPUT_DIR" "$tasks_per_node" "$SSH_NODELIST" "$test_dirs_csv" \
     "$MDTEST_BRANCH_FACTOR" "$MDTEST_ITEMS_PER_DIR" "$MDTEST_ITERATIONS" \
-    "$single_dir_target_files" "$single_dir_files_per_worker"
+    "$single_dir_target_files" "$single_dir_files_per_worker" \
+    "${STORAGE_SCALE_TEST_VERSION:-unknown}"
 
 # Process exit status and retrieve files
 mdtest_rc_file="$status_dir/mdtest-elbencho.rc"

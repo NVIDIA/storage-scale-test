@@ -129,6 +129,8 @@ def test_other_benchmarks_reject_kubectl_before_creating_results(
     destination = fake_root / relative_script
     destination.parent.mkdir(parents=True)
     shutil.copy2(_REPOSITORY_ROOT / relative_script, destination)
+    (fake_root / "lib").mkdir()
+    shutil.copy2(_REPOSITORY_ROOT / "lib/project_version.sh", fake_root / "lib")
     (fake_root / "env.sh").write_text(
         textwrap.dedent(f"""
             SCALE_TEST_BASE={str(_REPOSITORY_ROOT)!r}
@@ -162,6 +164,8 @@ def test_filesystem_sweep_selects_kubectl_before_dispatch(tmp_path):
         _REPOSITORY_ROOT / "storage-tests" / "fs" / "nv-elbencho-sweep.sh",
         destination,
     )
+    (fake_root / "lib").mkdir()
+    shutil.copy2(_REPOSITORY_ROOT / "lib/project_version.sh", fake_root / "lib")
     kubectl_dir = destination.parent / "kubectl"
     kubectl_dir.mkdir()
     shutil.copy2(
@@ -207,6 +211,7 @@ def _run_resume_selection_case(tmp_path, current, saved_line):
         destination,
     )
     (lib_dir / "_elbencho_functions.sh").write_text("", encoding="utf-8")
+    shutil.copy2(_REPOSITORY_ROOT / "lib/project_version.sh", lib_dir)
     (fake_root / "env.sh").write_text(
         textwrap.dedent(f"""
             SCALE_TEST_BASE={str(fake_root)!r}

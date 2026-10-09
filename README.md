@@ -7,6 +7,10 @@ their results into tables and plots.
 - [Object storage testing](docs/OBJECT_STORAGE_TESTING.md): S3-compatible storage with Warp.
 - [Network testing](docs/NETWORK_TESTING.md): peer throughput and latency with elbencho (beta).
 
+Each release has a version, such as `v1.2.3`, and commands print theirs with
+`--version`. Results record the version that produced them, and reports show
+it. See [versions](docs/VERSIONING.md) and the [changelog](CHANGELOG.md).
+
 ## Warning: these tests destroy data
 
 Tests **create, overwrite, and delete files and objects**. Use dedicated test

@@ -19,15 +19,14 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
-from pathlib import Path
-import sys
 
-from lib.python_bootstrap import ensure_runtime, project_version
+from lib.python_bootstrap import ensure_runtime
 
 from lib.filesystem_report_options import (
     add_analysis_arguments,
     add_report_destination_arguments,
 )
+from lib.project_version import add_version_argument, exit_for_information
 from lib.reporting_common import add_common_report_arguments
 
 
@@ -35,28 +34,8 @@ def prepare_report_runtime(
     script_path: str, parser_factory: Callable[[], argparse.ArgumentParser]
 ) -> None:
     """Serve informational options before provisioning any runtime dependencies."""
-    if any(argument in ("-h", "--help", "--version") for argument in sys.argv[1:]):
-        parser_factory().parse_args()
+    exit_for_information(parser_factory)
     ensure_runtime(script_path)
-
-
-class _ProjectVersionAction(argparse.Action):
-    """Resolve the checkout revision only when explicitly requested."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        revision = project_version(Path(__file__).resolve().parent.parent)
-        print(f"{parser.prog}: storage-scale-test {revision}")
-        parser.exit()
-
-
-def add_version_argument(parser: argparse.ArgumentParser) -> None:
-    """Expose source-tree version information without installing dependencies."""
-    parser.add_argument(
-        "--version",
-        action=_ProjectVersionAction,
-        nargs=0,
-        help="Show the source revision and exit.",
-    )
 
 
 def extract_filesystem_parser() -> argparse.ArgumentParser:

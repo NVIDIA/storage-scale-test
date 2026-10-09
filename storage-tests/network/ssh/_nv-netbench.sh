@@ -160,7 +160,7 @@ run_ssh_single "${SSH_NODELIST%%,*}" "$status_dir/netbench.rc" "/dev/stdout" "" 
     "$OUTPUT_DIR" "$bidirectional" "$SSH_NODELIST" \
     "$NETBENCH_PORT" "$NETBENCH_BLOCKSIZE" "$NETBENCH_RESPSIZE" \
     "$NETBENCH_HOST_NIC_GBPS" "$NETBENCH_TARGET_RUNTIME" \
-    "$NETBENCH_ITERATIONS" "$threads_str"
+    "$NETBENCH_ITERATIONS" "$threads_str" "${STORAGE_SCALE_TEST_VERSION:-unknown}"
 
 # Process exit status and retrieve files
 netbench_rc_file="$status_dir/netbench.rc"

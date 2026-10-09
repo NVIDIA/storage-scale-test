@@ -350,6 +350,8 @@ def _make_sweep_fixture(tmp_path: Path) -> Path:
     script_dir.mkdir(parents=True)
     sweep = script_dir / _SWEEP.name
     shutil.copy2(_SWEEP, sweep)
+    (tmp_path / "lib").mkdir()
+    shutil.copy2(_REPO_ROOT / "lib/project_version.sh", tmp_path / "lib")
     kubectl_dir = script_dir / "kubectl"
     kubectl_dir.mkdir()
     shutil.copy2(

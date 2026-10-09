@@ -54,24 +54,6 @@ print(json.dumps([list(sys.version_info[:2]), versions,
 """
 
 
-def project_version(repo_root: Path) -> str:
-    """Report the checkout revision without requiring a configured environment."""
-    if (repo_root / ".git").exists():
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(repo_root), "describe", "--always", "--dirty"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=5,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    return "unversioned source"
-
-
 def _pins(requirements: bytes) -> dict[str, str]:
     """Check exact top-level pins while leaving other pip syntax to pip itself."""
     pins = {}

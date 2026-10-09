@@ -1107,6 +1107,7 @@ def test_unified_real_metadata_report_exports_and_reimports_normalized_metrics(
     source = _publish_result(manifest, group)
     (source / f"{MD_STEM}.csv").write_text(_DENSE_CSV, encoding="utf-8")
     (source / f"{MD_STEM}.out").write_text(_DENSE_OUT, encoding="utf-8")
+    (source / f"{MD_STEM}.out.project-version").write_text("v1.2.3\n")
     wrapper = reporting_checkout / "utils/extract-filesystem.py"
     completed = subprocess.run(
         [
@@ -1129,6 +1130,7 @@ def test_unified_real_metadata_report_exports_and_reimports_normalized_metrics(
     assert completed.returncode == 0, completed.stdout + completed.stderr
     report = manifest.root / "reports/groups/0001/report.txt"
     assert "normalized to 1 node" in report.read_text(encoding="utf-8")
+    assert "- Produced by storage-scale-test: v1.2.3\n" in report.read_text()
     exported = list(report.parent.glob("mdtest-elbencho-metrics-*.csv"))
     assert len(exported) == 1
     completed = subprocess.run(
@@ -1151,6 +1153,8 @@ def test_unified_real_metadata_report_exports_and_reimports_normalized_metrics(
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "normalized to 1 node" in completed.stdout
+    # Reporter CSV caches carry no versions.
+    assert "- Produced by storage-scale-test: unknown\n" in completed.stdout
 
 
 def test_legacy_reporter_batch_routing_forwards_options(tmp_path):
@@ -1221,8 +1225,7 @@ def reporting_checkout_fixture(tmp_path):
         shutil.copyfile(entry, repository / "utils" / entry.name)
     (repository / "env.sh").write_text("exit 73\n", encoding="utf-8")
     (repository / "lib/python_bootstrap.py").write_text(
-        "def ensure_runtime(_script): pass\n"
-        "def project_version(_root): return 'test fixture'\n",
+        "def ensure_runtime(_script): pass\n",
         encoding="utf-8",
     )
     return repository

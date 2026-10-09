@@ -31,7 +31,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from lib.report_cli import add_version_argument  # pylint: disable=wrong-import-position
+from lib.project_version import (  # pylint: disable=wrong-import-position
+    add_version_argument,
+)
 
 PARTITION_ENV_VAR = "PARTITION"
 SINFO_BIN = "sinfo"

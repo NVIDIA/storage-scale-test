@@ -28,6 +28,12 @@ done
 [[ "$dir" == "/" ]] && { echo "Error: Could not find SCALE_TEST_BASE" >&2;
    exit 1; }
 SCALE_TEST_BASE="$dir"
+# Results record the version of the code this job runs, which can differ
+# from the submitting checkout if it changed while the job was queued.
+# shellcheck source=lib/project_version.sh
+# shellcheck disable=SC1091
+source "$SCALE_TEST_BASE/lib/project_version.sh" || exit 1
+project_version_export "$SCALE_TEST_BASE"
 
 if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
         "${SCALE_TEST_BASE}/env.sh" 2>&1); then

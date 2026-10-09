@@ -29,6 +29,7 @@ export NETBENCH_TARGET_RUNTIME="$8"
 export NETBENCH_ITERATIONS="$9"
 # Thread list is passed as comma-separated string in $10
 threads_str="${10}"
+export STORAGE_SCALE_TEST_VERSION="${11:-unknown}"
 
 export ELBENCHO=./elbencho
 

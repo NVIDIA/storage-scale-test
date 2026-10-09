@@ -5364,6 +5364,16 @@ def _mixed_batch_report(
             raise IntegrationTestError(
                 f"mixed batch group {identity} lacks its separate report"
             )
+        # Every result must have carried its version record back from the run.
+        produced = re.search(
+            r"^Produced by storage-scale-test: (.+)$",
+            report.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        if not produced or "unknown" in produced.group(1):
+            raise IntegrationTestError(
+                f"mixed batch group {identity} report lacks result versions"
+            )
 
 
 def _assert_mixed_batch_kubectl_progress(

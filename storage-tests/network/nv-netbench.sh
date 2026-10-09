@@ -15,12 +15,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Only run directly, not from within slurm unless SSH_ENABLED is set
-if [ -n "${SLURM_JOB_ID:-}" ] && [ -z "${SSH_ENABLED:-}" ]; then
-    echo "Error: Don't run this with slurm, just run it directly." >&2
-    exit 1
-fi
-
 # Boilerplate to find and source env.sh
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd) || {
     echo "Error: Failed to determine script directory" >&2
@@ -31,21 +25,10 @@ if [[ ! -d "${SCRIPT_DIR}" ]]; then
     exit 1
 fi
 readonly SCRIPT_DIR
-
-if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
-        "${SCRIPT_DIR}/../../env.sh" 2>&1); then
-    printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
-    exit 1
-fi
-
+# shellcheck source=lib/project_version.sh
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/../../env.sh"
-
-if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
-    echo "Error: kubectl execution is not supported by nv-netbench.sh" >&2
-    exit 1
-fi
-
+source "$SCRIPT_DIR/../../lib/project_version.sh" || exit 1
+project_version_option "$SCRIPT_DIR/../.." "$@"
 usage() {
     cat <<EOF
 Usage: $(basename "$0") --nodes <node_spec> [--mode <mode>] [--bidirectional]
@@ -81,15 +64,16 @@ OPTIONS:
                       Runs 2 coordinator processes in parallel (A→B and B→A).
                       Tests full duplex network capacity with no localhost traffic.
   -h, --help          Display this help message
+  --version           Print the project version and exit
 
 ENVIRONMENT VARIABLES (from env.sh):
-  NETBENCH_HOST_NIC_GBPS  Host NIC speed in Gbps (currently: ${NETBENCH_HOST_NIC_GBPS})
-  NETBENCH_TARGET_RUNTIME Target runtime in seconds (currently: ${NETBENCH_TARGET_RUNTIME})
-  NETBENCH_PORT           Service port (currently: ${NETBENCH_PORT})
-  NETBENCH_BLOCKSIZE      Bytes sent per request (currently: ${NETBENCH_BLOCKSIZE})
-  NETBENCH_RESPSIZE       Bytes returned per response (currently: ${NETBENCH_RESPSIZE})
-  NETBENCH_THREADS        Thread counts to sweep (currently: ${NETBENCH_THREADS[*]})
-  NETBENCH_ITERATIONS     Number of iterations (currently: ${NETBENCH_ITERATIONS})
+  NETBENCH_HOST_NIC_GBPS  Host NIC speed in Gbps (currently: ${NETBENCH_HOST_NIC_GBPS:-unset})
+  NETBENCH_TARGET_RUNTIME Target runtime in seconds (currently: ${NETBENCH_TARGET_RUNTIME:-unset})
+  NETBENCH_PORT           Service port (currently: ${NETBENCH_PORT:-unset})
+  NETBENCH_BLOCKSIZE      Bytes sent per request (currently: ${NETBENCH_BLOCKSIZE:-unset})
+  NETBENCH_RESPSIZE       Bytes returned per response (currently: ${NETBENCH_RESPSIZE:-unset})
+  NETBENCH_THREADS        Thread counts to sweep (currently: ${NETBENCH_THREADS[*]:-unset})
+  NETBENCH_ITERATIONS     Number of iterations (currently: ${NETBENCH_ITERATIONS:-unset})
 
   Per-thread size is calculated as: (TARGET_RUNTIME × NIC_GBPS × 125MB) / threads
   This normalizes runtime across different thread counts.
@@ -112,8 +96,34 @@ OUTPUT:
     - netbench-<mode>-c_<nodes>-t_<threads>_<datestamp>_iter<N>.csv
 
 EOF
-    exit 1
+    exit "${1:-1}"
 }
+
+if project_help_requested "$@"; then
+    usage 0
+fi
+
+# Only run directly, not from within slurm unless SSH_ENABLED is set
+if [ -n "${SLURM_JOB_ID:-}" ] && [ -z "${SSH_ENABLED:-}" ]; then
+    echo "Error: Don't run this with slurm, just run it directly." >&2
+    exit 1
+fi
+
+project_version_export "$SCRIPT_DIR/../.."
+
+if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
+        "${SCRIPT_DIR}/../../env.sh" 2>&1); then
+    printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
+    exit 1
+fi
+
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../../env.sh"
+
+if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
+    echo "Error: kubectl execution is not supported by nv-netbench.sh" >&2
+    exit 1
+fi
 
 # Initialize flags
 nodes_spec=""
@@ -124,7 +134,7 @@ bidirectional="false"
 while [[ $# -gt 0 ]]; do
     case $1 in
         -h|--help)
-            usage
+            usage 0
             ;;
         --nodes)
             if [[ $# -lt 2 ]]; then
@@ -226,6 +236,7 @@ mkdir -p "$OUTPUT_DIR"
 out_log="${OUTPUT_DIR}/netbench-${mode_abbrev}-sweep-${DS}-runner.log"
 exec 1> >(tee -a "${out_log}")
 exec 2> >(tee -a "${out_log}" >&2)
+echo "storage-scale-test $STORAGE_SCALE_TEST_VERSION"
 
 echo "Starting netbench sweep at $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
 echo "Mode: $mode"

@@ -22,7 +22,12 @@ Uses round-robin interleaving + local swap refinement.
 
 import csv
 import sys
+from pathlib import Path
 import argparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# pylint: disable-next=wrong-import-position
+from lib.project_version import add_version_argument
 
 
 def read_nodes(path: str) -> list[tuple[str, int]]:
@@ -194,6 +199,7 @@ def parse_args() -> argparse.Namespace:
             "  %(prog)s node_gbps_weights.csv 2>/dev/null   # stdout only\n"
         ),
     )
+    add_version_argument(parser)
     parser.add_argument(
         "input_csv",
         metavar="INPUT_CSV",

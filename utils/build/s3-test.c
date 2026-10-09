@@ -574,7 +574,15 @@ static int count_bucket_objects(S3Config *config) {
     return total_objects;
 }
 
+#ifndef STORAGE_SCALE_TEST_VERSION
+#define STORAGE_SCALE_TEST_VERSION "unknown"
+#endif
+
 int main(int argc, char *argv[]) {
+    if (argc > 1 && strcmp(argv[1], "--version") == 0) {
+        puts(STORAGE_SCALE_TEST_VERSION);
+        return 0;
+    }
     if (argc > 1 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         print_usage();
     }

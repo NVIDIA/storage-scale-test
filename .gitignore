@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Benchmark binaries are ignored, but build_tarball.sh ships them.
 /utils/warp*
 /utils/elbencho*
 /utils/s3test*
@@ -34,3 +35,16 @@ __pycache__/
 .claude
 .DS_Store
 .pytest_cache/
+
+# Local work and output that build_tarball.sh also leaves out. Ignoring them
+# keeps them from marking the project version as modified.
+/plans/
+/static-binaries/
+/bin-amd64/
+/bin-arm64/
+/results/
+/.ci-cache/
+
+# Written only into deployment and source archives.
+/VERSION
+/SOURCE_SHA256

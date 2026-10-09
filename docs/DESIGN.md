@@ -838,6 +838,9 @@ source and cannot be combined with raw result directories. Malformed filters
 and filters that match neither aggregate nor live metrics fail instead of
 silently producing an unfiltered or empty report.
 
+Reports begin with the project versions that produced their results and the
+reporter's version; see [VERSIONING.md](VERSIONING.md).
+
 ### 9.5 Plot Design Principles
 
 - **Analyzer-specific accessible colors:** Filesystem IO and object plots use
