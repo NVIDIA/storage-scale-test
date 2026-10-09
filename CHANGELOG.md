@@ -23,6 +23,8 @@ section below.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-10-09
+
 ### Added
 
 - Kubernetes (`EXECUTION_SUBSTRATE=kubectl`) runs filesystem IO and
@@ -31,7 +33,8 @@ section below.
   [Kubernetes](README.md#kubernetes).
 - Prepared filesystem batches: build a set of IO and metadata sweeps with
   `--batch` and `--append`, run them together with `--start`, and report
-  them with `utils/extract-filesystem.sh`. See
+  them with `utils/extract-filesystem.py`, which also saves one combined
+  `reports.txt`. See
   [Prepared filesystem batches](docs/FILESYSTEM_TESTING.md#prepared-filesystem-batches).
 - Workload override files: `--env-override FILE` changes selected workload
   settings for one run or batch group without editing `env.sh`. See
@@ -49,6 +52,9 @@ section below.
 
 ### Changed
 
+- Result tools are executable Python (`utils/extract-*.py`,
+  `utils/summarize-elbencho.py`) that set up `.venv` on first use; the
+  `.sh` wrappers are gone, so update scripts that call them.
 - elbencho v3.2-1 is the pinned download and default Kubernetes image.
 - Deployment tarballs leave out object storage credentials. See
   [Prepare the tools](docs/OBJECT_STORAGE_TESTING.md#prepare-the-tools).
