@@ -56,21 +56,26 @@ from typing import (
     get_type_hints,
 )
 
-import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
-import numpy as np
-
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+# Bootstrap must precede runtime dependencies, including imports for plotting.
+# pylint: disable=wrong-import-position,wrong-import-order
+from lib.report_cli import extract_elbencho_parser, prepare_report_runtime
+
+if __name__ == "__main__":
+    prepare_report_runtime(__file__, extract_elbencho_parser)
+
+import matplotlib.pyplot as plt  # pylint: disable=wrong-import-position
+from matplotlib.ticker import FuncFormatter
+import numpy as np
 
 # Local import after sys.path: repo root must be on path first.
 # pylint: disable=wrong-import-position
 from lib.env_used_yaml import apply_env_used_to_metrics, load_env_used_yaml
 from lib.filesystem_batch import route_batch_report
 from lib.filesystem_report_options import (
-    add_analysis_arguments,
-    add_report_destination_arguments,
     validate_analysis_arguments,
 )
 from lib.elbencho_live_report import (
@@ -4467,17 +4472,7 @@ def print_markdown_metrics_table_and_command(
 
 def main() -> None:
     """Script entry point."""
-    parser = argparse.ArgumentParser(
-        description="Analyze elbencho results",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "input_dirs",
-        nargs="*",
-        help="Directories containing elbencho output files (optional if --from-csv is provided)",
-    )
-    add_analysis_arguments(parser, "io")
-    add_report_destination_arguments(parser)
+    parser = extract_elbencho_parser()
     args = parser.parse_args()
     try:
         validate_analysis_arguments(args)

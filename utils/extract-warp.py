@@ -17,7 +17,6 @@
 
 """Parse and analyze Warp benchmark results."""
 
-import argparse
 import json
 import math
 import os
@@ -28,13 +27,21 @@ from collections import defaultdict
 from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
-import numpy as np
-
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+# Bootstrap must precede runtime dependencies, including imports for plotting.
+# pylint: disable=wrong-import-position,wrong-import-order
+from lib.report_cli import extract_warp_parser, prepare_report_runtime
+
+if __name__ == "__main__":
+    prepare_report_runtime(__file__, extract_warp_parser)
+
+import matplotlib.pyplot as plt  # pylint: disable=wrong-import-position
+from matplotlib.ticker import FuncFormatter
+import numpy as np
+
 
 from lib.parse_only_sizes import (  # pylint: disable=wrong-import-position
     parse_only_sizes_arg,
@@ -64,7 +71,7 @@ _DATESTAMP_STRFTIME = "%Y%m%dZ%H%M%S"
 
 _ZST_INSTALL_HINT = (
     "Install with: pip install -r requirements.txt "
-    "(or run via ./utils/extract-warp.sh)"
+    "(or run via ./utils/extract-warp.py)"
 )
 
 
@@ -3891,96 +3898,7 @@ def _should_include_file_for_earliest_mtime(filename: str, file_format: str) -> 
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description="""
-    Analyze Warp benchmark results.
-
-    Usage:
-      # Parse benchmark files in a directory
-      %(prog)s /path/to/results [--to-json]
-
-      # Read from analyzed JSON (with relative path - directory required)
-      %(prog)s /path/to/results --from-json 20251029Z194526-analyzed
-
-      # Read from analyzed JSON (with absolute path - directory optional)
-      %(prog)s --from-json /path/to/results/20251029Z194526-analyzed.json.zst
-
-      # Read from analyzed JSON (directory - finds first analyzed file)
-      %(prog)s --from-json /path/to/results
-
-      # Specify different output directory for plots
-      %(prog)s /path/to/results --output-dir /path/to/plots
-    """,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "directory",
-        nargs="?",
-        help="Directory containing Warp benchmark files. "
-        "Required when parsing benchmarks or using relative paths with --from-json. "
-        "Optional when using --from-json with absolute path.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        metavar="DIR",
-        help="Directory to save plots and reports. "
-        "Defaults to: input directory when parsing, JSON's directory with --from-json, "
-        "or current directory if neither is available.",
-    )
-    parser.add_argument(
-        "--to-json",
-        action="store_true",
-        help="Write analyzed results to <datestamp>-analyzed.json.zst in the output directory. "
-        "Includes complete data for all analysis including per-client metrics and histograms.",
-    )
-    parser.add_argument(
-        "--from-json",
-        metavar="PATH",
-        type=str,
-        help="Read metrics from a previously analyzed JSON file. "
-        "Accepts absolute file path (/path/to/file.json.zst), "
-        "directory path (will find first analyzed file), "
-        "relative path (file.json.zst), "
-        "or just datestamp (20251029Z194526). Will try .json.zst and .json extensions.",
-    )
-    parser.add_argument(
-        "--only-sizes",
-        action="append",
-        metavar="SIZE",
-        help=(
-            "Only include benchmarks with these object sizes (repeat flag for multiple). "
-            "Commas are not split; use ';' inside one argument for several sizes "
-            "(e.g. '1MiB;1GiB') or pass --only-sizes multiple times. "
-            "Former comma-separated lists must use ';' or multiple --only-sizes flags."
-        ),
-    )
-    parser.add_argument(
-        "--only-threads",
-        help="Comma-separated list of thread counts to include (e.g., 1,2,4)",
-    )
-    parser.add_argument(
-        "--per-client-plots",
-        action="store_true",
-        help="Generate per-client comparison plots for multi-node runs. "
-        "Identifies underperforming clients and visualizes performance clustering.",
-    )
-    parser.add_argument(
-        "--client-outlier-threshold",
-        type=float,
-        default=2.0,
-        help="Z-score threshold for identifying underperforming clients. "
-        "Default: 2.0 (95%% confidence, ~2.5%% of normal distribution). "
-        "Lower values (e.g., 1.5) detect more outliers but may include random variance. "
-        "Higher values (e.g., 3.0) detect only severe outliers (99.7%% confidence).",
-    )
-    parser.add_argument(
-        "--client-min-underperform-segments",
-        type=int,
-        default=1,
-        help="Minimum number of time segments a client must underperform to be flagged. "
-        "Default: 1 (flag if underperforms in any segment). "
-        "Higher values (e.g., 10) require persistent underperformance.",
-    )
+    parser = extract_warp_parser()
     args = parser.parse_args()
 
     # Parse filters if provided

@@ -42,7 +42,7 @@ configuration. Either filesystem launcher can start or resume the mixed batch.
 ./storage-tests/fs/nv-elbencho-sweep.sh --status "$batch_dir"
 # For Kubernetes, collect the terminal attempt before resuming.
 ./storage-tests/fs/nv-elbencho-sweep.sh --resume "$batch_dir"
-./utils/extract-filesystem.sh "$batch_dir"
+./utils/extract-filesystem.py "$batch_dir"
 ```
 
 Kubernetes remains asynchronous and requires terminal collection before resume.

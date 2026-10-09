@@ -797,33 +797,22 @@ error_exit() {
 #  "$python_path" ./my_script.py
 setup_python_venv() {
     local requirements_file="${1:-${SCALE_TEST_BASE:?}/requirements.txt}"
-    local venv_dir="${SCALE_TEST_BASE:?}/.venv"
-    local stamp_file="${venv_dir}/.requirements.sha256"
-    local req_hash
+    local bootstrap_script="${SCALE_TEST_BASE:?}/lib/python_bootstrap.py"
+    local python_path
 
     type -P python3 >/dev/null 2>&1 || error_exit "python3 not found"
-
-    if [[ ! -f "$requirements_file" ]]; then
-        error_exit "Requirements file not found: ${requirements_file}"
+    if [[ ! -f "$bootstrap_script" ]]; then
+        error_exit "Python bootstrap not found: ${bootstrap_script}"
     fi
 
-    if [ ! -d "$venv_dir" ]; then
-        echo "Creating virtual environment..." >&2
-        python3 -m venv "$venv_dir" >&2 || error_exit "Failed to create virtual environment"
+    if [[ "$requirements_file" == "${SCALE_TEST_BASE}/requirements.txt" ]]; then
+        python_path=$(python3 "$bootstrap_script" "$SCALE_TEST_BASE") ||
+            error_exit "Failed to prepare Python environment"
+    else
+        python_path=$(python3 "$bootstrap_script" --requirements "$requirements_file" "$SCALE_TEST_BASE") ||
+            error_exit "Failed to prepare Python environment"
     fi
-
-    # shellcheck disable=SC1091
-    source "$venv_dir/bin/activate" >&2 || error_exit "Failed to activate virtual environment"
-
-    req_hash=$(python3 -c "import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())" "$requirements_file") || error_exit "Failed to hash requirements file"
-
-    if [[ ! -f "$stamp_file" ]] || [[ "$(<"$stamp_file")" != "$req_hash" ]]; then
-        echo "Installing required packages from ${requirements_file}..." >&2
-        pip install -r "$requirements_file" >&2 || error_exit "Failed to install required packages"
-        printf '%s\n' "$req_hash" >"$stamp_file"
-    fi
-
-    printf "%s\n" "${venv_dir}/bin/python"
+    printf '%s\n' "$python_path"
 }
 
 # Generate a list of test directories based on TEST_DIRS associative array

@@ -22,23 +22,29 @@ Emits three lines per directory: basename, W/R duration, nodes, optional TEST_DI
 Compares env_used.yaml to elbencho-*-c_*-s_*-d_*_<DS>.out files in the directory;
 if any expected benchmark outputs are missing, all three lines are flagged INCOMPLETE.
 
-Requires PyYAML (e.g. run via ./utils/summarize-elbencho.sh which sets up a venv).
+Runtime dependencies are provisioned automatically in the repository virtual environment.
 """
 
 from __future__ import annotations
 
-import argparse
 import os
 import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+# pylint: disable=wrong-import-position
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-# pylint: disable=wrong-import-position
+# Bootstrap must precede runtime dependencies, including imports for plotting.
+# pylint: disable=wrong-import-position,wrong-import-order
+from lib.report_cli import summarize_elbencho_parser, prepare_report_runtime
+
+if __name__ == "__main__":
+    prepare_report_runtime(__file__, summarize_elbencho_parser)
+
 from lib.env_used_yaml import load_env_used_yaml
 
 _DS_TAIL_RE = re.compile(r"^elbencho-(\d{8}Z\d{6})$")
@@ -460,17 +466,7 @@ def _summarize_directory(path: str) -> Optional[Tuple[str, str, str]]:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Print a three-line summary per nv-elbencho-sweep result directory "
-            "(reads env_used.yaml)."
-        )
-    )
-    parser.add_argument(
-        "directories",
-        nargs="+",
-        help="One or more result directories (e.g. elbencho-<DS> under RESULTS_DIR)",
-    )
+    parser = summarize_elbencho_parser()
     args = parser.parse_args(argv)
     sorted_dirs = sorted(args.directories, key=_sort_key)
     blocks: List[str] = []

@@ -109,8 +109,9 @@ literal duplicates an existing one.
    sandbox, set `CI_CHECK_JOBS=1` to disable parallel execution.
 5. Prefer the alternate quote character inside f-string expressions when it
    improves readability; Python 3.12 supports either form.
-6. Run analysis scripts via their shell wrappers (e.g. `utils/extract-elbencho.sh`),
-   not the `.py` directly, so the venv is set up.
+6. Run analysis tools through their executable Python entry points (e.g.
+   `utils/extract-elbencho.py`). They bootstrap the pinned runtime environment
+   automatically; `--help` and `--version` use only the standard library.
 
 ## Shell
 

@@ -75,7 +75,7 @@ depth values for the scale sweep:
 ./storage-tests/fs/nv-elbencho-sweep.sh --nodes 1
 # Set RUN to the complete result-directory path printed by the sweep.
 # Kubernetes: collect terminal results before reporting (see below).
-./utils/extract-filesystem.sh "$RUN"
+./utils/extract-filesystem.py "$RUN"
 ./storage-tests/fs/nv-elbencho-sweep.sh --nodes 1,2,4,8
 ```
 
@@ -279,7 +279,7 @@ until the time limit; buffered IO or `--run-to-completion` reads the file once,
 to completion (see the [IO policy](#first-io-sweep)). Host assignment rotates
 between read cells to reduce cross-run client-cache reuse.
 
-`utils/extract-elbencho.sh` handles these results normally. See Recipe 4 in
+`utils/extract-elbencho.py` handles these results normally. See Recipe 4 in
 [BENCHMARK_RECIPES_FILESYSTEM.md](../BENCHMARK_RECIPES_FILESYSTEM.md).
 
 ## Metadata sweeps
@@ -293,7 +293,7 @@ reuse. Configure `MDTEST_BRANCH_FACTOR`, `MDTEST_ITEMS_PER_DIR`, and
 ./storage-tests/fs/nv-mdtest-elbencho.sh --nodes 1,2,4,8 --tasks 64,128
 # Set RUN to this sweep's complete printed result-directory path.
 # Kubernetes: collect terminal results before reporting.
-./utils/extract-filesystem.sh "$RUN"
+./utils/extract-filesystem.py "$RUN"
 ```
 
 Each `(nodes, tasks)` pair is saved as a numbered execution. SSH and Slurm
@@ -339,7 +339,7 @@ Assemble IO and metadata sweeps before running them. Each invocation saves one
 # After a failure, collect first on Kubernetes, then resume:
 # ./storage-tests/fs/nv-elbencho-sweep.sh --resume "$BATCH"
 # Once results are local:
-./utils/extract-filesystem.sh "$BATCH"
+./utils/extract-filesystem.py "$BATCH"
 ```
 
 Either launcher can start or resume the complete batch on SSH, Slurm, or
@@ -437,7 +437,7 @@ so later edits to the file have no effect.
 
 ## Filesystem reporting
 
-Use `./utils/extract-filesystem.sh "$RUN"` as the unified front door for
+Use `./utils/extract-filesystem.py "$RUN"` as the unified front door for
 ordinary IO or metadata runs and mixed batches. It dispatches each kind to
 its analyzer without combining unlike metrics.
 
@@ -478,8 +478,8 @@ are excluded; when fewer than two valid group reports remain, `reports.txt`
 is removed:
 
 ```bash
-./utils/extract-filesystem.sh --normalize-to 1 --only-nodes 2,4 "$BATCH"
-./utils/extract-filesystem.sh --kind io --per-client-plots "$BATCH"
+./utils/extract-filesystem.py --normalize-to 1 --only-nodes 2,4 "$BATCH"
+./utils/extract-filesystem.py --kind io --per-client-plots "$BATCH"
 ```
 
 Use `--help` for all options. Cached CSV input and single-file parsing require
@@ -501,8 +501,8 @@ Use `--help` for all options. Cached CSV input and single-file parsing require
 | IO | `--client-max-heatmap-rows N` | Limit clients per heatmap (default 50) |
 | Metadata | `--normalize-to N` | Scale rates/stddev to N nodes, not latency |
 
-For several result directories at once, use `extract-elbencho.sh` or
-`extract-mdtest-elbencho.sh`, which accept the same filters, CSV
+For several result directories at once, use `extract-elbencho.py` or
+`extract-mdtest-elbencho.py`, which accept the same filters, CSV
 export/import, and `--markdown`. IO reports show IOPS or throughput and
 latency by operation, size, thread count, node count, and I/O depth. Metadata
 reports show create/stat/delete rates, elapsed times, latency distributions,
@@ -510,7 +510,7 @@ variance, and scaling efficiency.
 
 For per-client filesystem I/O diagnostics, set
 `ELBENCHO_LIVE_CSV_EXTENDED=1` before the run and analyze with
-`utils/extract-elbencho.sh --per-client-plots`. Extended capture can generate
+`utils/extract-elbencho.py --per-client-plots`. Extended capture can generate
 large files at scale; tune `ELBENCHO_LIVEINT` deliberately.
 
 ## Advanced node selection and Slurm options

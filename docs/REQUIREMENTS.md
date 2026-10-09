@@ -199,9 +199,9 @@ These requirements address the infrastructure and runtime constraints the tool m
 
 | ID | Requirement | Satisfied? |
 |----|-------------|:----------:|
-| EE-4.1 | Python analysis scripts shall be invoked through shell wrappers that automatically create and manage a Python virtual environment. | Yes |
-| EE-4.2 | The virtual environment shall be cached to avoid re-creating it on every invocation. | Yes |
-| EE-4.3 | Required Python dependencies (matplotlib, numpy, etc.) shall be installed automatically by the shell wrapper. | Yes |
+| EE-4.1 | Executable Python analysis tools shall prepare and use the repository virtual environment automatically. | Yes |
+| EE-4.2 | The virtual environment shall be cached and refreshed when the pinned requirements change. | Yes |
+| EE-4.3 | Required Python dependencies (matplotlib, numpy, etc.) shall be installed automatically by the Python bootstrap. | Yes |
 
 ## 3. Configuration & Validation Requirements
 
@@ -306,7 +306,7 @@ These requirements address the infrastructure and runtime constraints the tool m
 | ID | Requirement | Satisfied? |
 |----|-------------|:----------:|
 | RA-1.1 | Each benchmark type shall have a dedicated analysis/reporting script. | Yes |
-| RA-1.2 | Analysis scripts shall be invoked through shell wrappers that manage the Python environment. | Yes |
+| RA-1.2 | Analysis scripts shall be directly executable and manage the Python environment automatically. | Yes |
 | RA-1.3 | Terminal output shall include summary tables formatted for fixed-width fonts. | Yes |
 | RA-1.4 | Analysis scripts shall support filtering output by relevant dimensions (nodes, threads, sizes, IO depths, modes). | Yes |
 

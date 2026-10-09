@@ -49,9 +49,10 @@ The overarching design priorities:
 4. **Self-contained benchmark execution.** Once the user has prepared a complete
    deployment tarball with the required benchmark binaries, benchmark execution
    does not require internet access, package installation, or compilation on the
-   target system. Reporting has separate Python dependencies; its wrapper creates
-   a virtual environment and installs them when necessary, so reporting may instead
-   be run on a connected analysis host after the results are copied out.
+   target system. Reporting has separate Python dependencies; its executable
+   Python tools create a virtual environment and install them when necessary,
+   so reporting may instead be run on a connected analysis host after the results
+   are copied out.
 5. **Reproducible and resumable results.** Every run is timestamped and isolated.
    Configuration snapshots accompany filesystem results, and filesystem IO sweeps
    persist per-execution state so interrupted work can be resumed. Analysis scripts
@@ -87,8 +88,8 @@ storage-scale-test/
 │   ├── warp.aarch64         # User-provided or source-built binary (ARM64)
 │   ├── s3test               # Helper-built S3 connectivity test (x86_64)
 │   ├── s3test.aarch64       # Helper-built S3 connectivity test (ARM64)
-│   ├── extract-*.sh         # Analysis shell wrappers
-│   └── extract-*.py         # Analysis Python scripts
+│   ├── extract-*.py         # Self-bootstrapping analysis entry points
+│   └── summarize-elbencho.py
 └── README.md
 ```
 
@@ -409,7 +410,7 @@ collection/resume gates; its canonical control root comes from the sealed union
 of test roots. Control bundles retain the full
 batch manifest and group provenance, including on partial resume.
 
-`utils/extract-filesystem.sh` delegates to the existing reporters independently
+`utils/extract-filesystem.py` delegates to the existing reporters independently
 per group. It snapshots only authoritative successful evidence into temporary
 inputs, writes disjoint group reports and an index, and never averages across
 group boundaries or contacts the cluster. The specialized reporter entry points
@@ -766,33 +767,36 @@ glob-based filtering for partial re-analysis.
 
 ## 9. Reporting & Analysis
 
-### 9.1 Shell Wrapper → Python Script Pattern
+### 9.1 Self-Bootstrapping Python Analysis Tools
 
-Each benchmark has a paired shell wrapper and Python analysis script:
+Each analysis tool is an executable Python entry point:
 
 ```
-utils/extract-elbencho.sh  →  utils/extract-elbencho.py
-utils/extract-warp.sh      →  utils/extract-warp.py
-utils/extract-mdtest-elbencho.sh → utils/extract-mdtest-elbencho.py
-utils/extract-netbench.sh  →  utils/extract-netbench.py
+utils/extract-elbencho.py
+utils/extract-warp.py
+utils/extract-mdtest-elbencho.py
+utils/extract-netbench.py
+utils/extract-filesystem.py
+utils/summarize-elbencho.py
 ```
 
-The shell wrapper:
+The Python entry point handles its own runtime setup:
 
-1. Sources `env.sh` to locate the repository root.
-2. Calls `setup_python_venv()` from `lib/env_functions.sh`, which creates (or
-   reuses) a Python virtualenv under `.venv/` and installs from `requirements.txt`.
-3. Invokes the Python script with all arguments passed through.
+1. Parses help and version requests with the standard library before importing
+   runtime dependencies.
+2. Locates the repository root and uses the standard-library bootstrap in
+   `lib/python_bootstrap.py` to create or reuse `.venv/` and install pinned
+   `requirements.txt` when its hash changes.
+3. Re-executes under that environment, then imports the reporting implementation.
 
-**Rationale:** Users never manage Python environments. The wrapper handles
-everything. The virtualenv is cached, so subsequent runs are fast. The Python
-script itself has no knowledge of the wrapper — it's a standard argparse CLI
-tool that could be invoked directly if dependencies were manually installed.
+The virtualenv is cached and bootstrap operations are locked, so concurrent
+entry points safely share setup. Users can invoke the Python files directly;
+they do not need a wrapper or a manually activated environment.
 
 ### 9.2 Analysis Workflow
 
 ```
-Results directory → extract-*.sh → Terminal tables + PNG plots [+ Markdown report]
+Results directory → extract-*.py → Terminal tables + PNG plots [+ Markdown report]
 ```
 
 Each analysis script:
@@ -809,7 +813,7 @@ Each analysis script:
 The `--markdown` flag produces a complete report in Markdown on stdout. The
 intended workflow:
 
-1. `./utils/extract-elbencho.sh --markdown results/elbencho-20250815Z143022/ > report.md`
+1. `./utils/extract-elbencho.py --markdown results/elbencho-20250815Z143022/ > report.md`
 2. Open Google Docs → Edit → Paste from Markdown
 3. For each plot reference: Insert → Image → Upload from computer → select the
    corresponding PNG
@@ -823,8 +827,8 @@ references.
 All analysis scripts support filtering to reduce clutter:
 
 ```bash
-./utils/extract-elbencho.sh --only-sizes 4K --only-sizes 1M --only-threads 32,64 results/
-./utils/extract-warp.sh --only-sizes 16MiB --only-threads 64,128 results/
+./utils/extract-elbencho.py --only-sizes 4K --only-sizes 1M --only-threads 32,64 results/
+./utils/extract-warp.py --only-sizes 16MiB --only-threads 64,128 results/
 ```
 
 Intermediate data can be cached (`--to-csv`, `--to-json`) and reloaded

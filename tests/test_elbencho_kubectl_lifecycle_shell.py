@@ -1430,6 +1430,41 @@ def test_control_upload_atomic_publication_and_safe_retry(tmp_path, fault):
     assert len(result.stderr) < 9000
 
 
+@pytest.mark.parametrize("source_mode", [0o755, 0o777])
+def test_control_upload_preserves_private_root_and_nested_executable(
+    tmp_path: Path, source_mode: int
+) -> None:
+    """Archive root metadata must not replace the private publication root."""
+    source = tmp_path / "bundle"
+    executions = source / "executions"
+    executions.mkdir(parents=True)
+    source.chmod(source_mode)
+    executable = executions / "0001.sh"
+    executable.write_text("#!/bin/bash\nprintf 'verified executable\\n'\n")
+    executable.chmod(0o700)
+    remote = tmp_path / "remote"
+    (remote / "control/executions").mkdir(parents=True)
+    result = _bash(f"""
+        umask 022
+        kubectl_attempt_remote_root() {{ printf '%s\\n' {str(remote)!r}; }}
+        kubectl_remote_tree_guard_script() {{ printf 'run=$1; run_real=$run;'; }}
+        kubectl_pvc_exec_stdin() {{ shift 2; "$@"; }}
+        kubectl_upload_control_bundle test-ns transfer 1234abcd {str(source)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    published = remote / "control"
+    assert published.stat().st_mode & 0o777 == 0o700
+    published_executable = published / "executions/0001.sh"
+    assert published_executable.read_bytes() == executable.read_bytes()
+    assert published_executable.stat().st_mode & 0o777 == 0o700
+    invocation = subprocess.run(
+        [str(published_executable)], capture_output=True, text=True, check=False
+    )
+    assert invocation.returncode == 0, invocation.stderr
+    assert invocation.stdout == "verified executable\n"
+    assert not list(remote.glob(".control-upload.*"))
+
+
 def test_collection_stream_failure_removes_partial_and_reports_auth(
     tmp_path: Path,
 ) -> None:

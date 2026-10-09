@@ -24,7 +24,6 @@ import importlib.util
 import io
 import os
 from pathlib import Path
-import shlex
 import subprocess
 import shutil
 import sys
@@ -1100,7 +1099,7 @@ def test_unified_ordinary_option_errors(unified_reporter, capsys, arguments, mes
 def test_unified_real_metadata_report_exports_and_reimports_normalized_metrics(
     tmp_path, reporting_checkout
 ):
-    """Exercise actual engines and wrappers, not just option-forwarding mocks."""
+    """Exercise actual entrypoints and engines, not just option-forwarding mocks."""
     from tests.test_extract_mdtest_elbencho import _DENSE_CSV, _DENSE_OUT
 
     manifest = _create_batch(tmp_path / "batch", kinds=("mdtest",))
@@ -1108,10 +1107,10 @@ def test_unified_real_metadata_report_exports_and_reimports_normalized_metrics(
     source = _publish_result(manifest, group)
     (source / f"{MD_STEM}.csv").write_text(_DENSE_CSV, encoding="utf-8")
     (source / f"{MD_STEM}.out").write_text(_DENSE_OUT, encoding="utf-8")
-    wrapper = reporting_checkout / "utils/extract-filesystem.sh"
+    wrapper = reporting_checkout / "utils/extract-filesystem.py"
     completed = subprocess.run(
         [
-            "bash",
+            sys.executable,
             str(wrapper),
             "--normalize-to",
             "1",
@@ -1134,7 +1133,7 @@ def test_unified_real_metadata_report_exports_and_reimports_normalized_metrics(
     assert len(exported) == 1
     completed = subprocess.run(
         [
-            "bash",
+            sys.executable,
             str(wrapper),
             "--kind",
             "mdtest",
@@ -1195,42 +1194,6 @@ def test_ordinary_reporter_routing_is_unchanged(tmp_path):
         route_batch_report(args, "io", [])
 
 
-@pytest.mark.parametrize(
-    "wrapper",
-    ["extract-filesystem.sh", "extract-elbencho.sh", "extract-mdtest-elbencho.sh"],
-)
-def test_batch_wrappers_do_not_load_current_environment(tmp_path, wrapper):
-    repository = tmp_path / "repo 'spaces'"
-    utilities = repository / "utils"
-    utilities.mkdir(parents=True)
-    libraries = repository / "lib"
-    libraries.mkdir()
-    source = Path(__file__).resolve().parents[1] / "utils" / wrapper
-    shutil.copyfile(source, utilities / wrapper)
-    (repository / "env.sh").write_text("exit 73\n", encoding="utf-8")
-    interpreter = repository / "python-stub"
-    interpreter.write_text(
-        "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\"\n", encoding="utf-8"
-    )
-    interpreter.chmod(0o755)
-    (libraries / "env_functions.sh").write_text(
-        'setup_python_venv() { printf "%s\\n" "$SCALE_TEST_BASE/python-stub"; }\n',
-        encoding="utf-8",
-    )
-    batch = tmp_path / "batch"
-    batch.mkdir()
-    (batch / MANIFEST_FILENAME).write_text("version\t1\n", encoding="utf-8")
-    completed = subprocess.run(
-        ["bash", str(utilities / wrapper), str(batch)],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert wrapper.replace(".sh", ".py") in completed.stdout
-    assert str(batch) in completed.stdout
-
-
 def test_markdown_batch_reports_have_persistent_report_file(tmp_path):
     manifest = _create_batch(tmp_path / "batch", kinds=("io",))
     _publish_result(manifest, manifest.groups[0])
@@ -1247,20 +1210,19 @@ def test_markdown_batch_reports_have_persistent_report_file(tmp_path):
 
 @pytest.fixture(name="reporting_checkout")
 def reporting_checkout_fixture(tmp_path):
-    """Actual reporter wrappers and engines with pinned Python and invalid env.sh."""
+    """Actual reporters with pinned Python, bootstrap stub, and invalid env.sh."""
     repository = tmp_path / "reporter checkout"
     source = Path(__file__).resolve().parents[1]
-    shutil.copytree(source / "lib", repository / "lib")
+    shutil.copytree(
+        source / "lib", repository / "lib", ignore=shutil.ignore_patterns("__pycache__")
+    )
     (repository / "utils").mkdir()
-    for entry in source.glob("utils/extract-*.sh"):
+    for entry in source.glob("utils/extract-*.py"):
         shutil.copyfile(entry, repository / "utils" / entry.name)
-        shutil.copyfile(
-            entry.with_suffix(".py"),
-            repository / "utils" / entry.with_suffix(".py").name,
-        )
     (repository / "env.sh").write_text("exit 73\n", encoding="utf-8")
-    (repository / "lib/env_functions.sh").write_text(
-        f"setup_python_venv() {{ printf '%s\\n' {shlex.quote(sys.executable)}; }}\n",
+    (repository / "lib/python_bootstrap.py").write_text(
+        "def ensure_runtime(_script): pass\n"
+        "def project_version(_root): return 'test fixture'\n",
         encoding="utf-8",
     )
     return repository
@@ -1268,14 +1230,14 @@ def reporting_checkout_fixture(tmp_path):
 
 @pytest.mark.parametrize(
     "wrapper",
-    ["extract-filesystem.sh", "extract-elbencho.sh", "extract-mdtest-elbencho.sh"],
+    ["extract-filesystem.py", "extract-elbencho.py", "extract-mdtest-elbencho.py"],
 )
 @pytest.mark.parametrize("input_kind", ["group", "alias", "groups-parent"])
 def test_raw_group_inputs_cannot_bypass_root_success_filter(
     tmp_path, reporting_checkout, wrapper, input_kind
 ):
     manifest = _create_batch(tmp_path / "batch", kinds=("io", "mdtest"))
-    group = manifest.groups[1 if wrapper == "extract-mdtest-elbencho.sh" else 0]
+    group = manifest.groups[1 if wrapper == "extract-mdtest-elbencho.py" else 0]
     source = _publish_result(manifest, group, status="FAILED")
     input_path = source
     if input_kind == "alias":
@@ -1284,7 +1246,7 @@ def test_raw_group_inputs_cannot_bypass_root_success_filter(
     elif input_kind == "groups-parent":
         input_path = manifest.root / "groups"
     completed = subprocess.run(
-        ["bash", str(reporting_checkout / "utils" / wrapper), str(input_path)],
+        [sys.executable, str(reporting_checkout / "utils" / wrapper), str(input_path)],
         check=False,
         capture_output=True,
         text=True,
@@ -1354,14 +1316,14 @@ def test_exact_batch_markers_fail_closed_with_missing_manifest(
 
 @pytest.mark.parametrize(
     "wrapper",
-    ["extract-filesystem.sh", "extract-elbencho.sh", "extract-mdtest-elbencho.sh"],
+    ["extract-filesystem.py", "extract-elbencho.py", "extract-mdtest-elbencho.py"],
 )
 @pytest.mark.parametrize("input_kind", ["root", "group", "alias"])
 def test_missing_batch_manifest_cannot_enter_legacy_reporter_path(
     tmp_path, reporting_checkout, wrapper, input_kind
 ):
     manifest = _create_batch(tmp_path / "batch", kinds=("io", "mdtest"))
-    group = manifest.groups[1 if wrapper == "extract-mdtest-elbencho.sh" else 0]
+    group = manifest.groups[1 if wrapper == "extract-mdtest-elbencho.py" else 0]
     source = _publish_result(manifest, group, status="FAILED")
     (manifest.root / MANIFEST_FILENAME).unlink()
     (manifest.root / "batch-profile.tsv").write_text(
@@ -1372,7 +1334,7 @@ def test_missing_batch_manifest_cannot_enter_legacy_reporter_path(
         input_path = tmp_path / "batch alias"
         input_path.symlink_to(manifest.root, target_is_directory=True)
     completed = subprocess.run(
-        ["bash", str(reporting_checkout / "utils" / wrapper), str(input_path)],
+        [sys.executable, str(reporting_checkout / "utils" / wrapper), str(input_path)],
         check=False,
         capture_output=True,
         text=True,

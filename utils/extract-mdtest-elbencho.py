@@ -22,7 +22,6 @@ Parses result files from nv-mdtest-elbencho tests, aggregates metrics across
 iterations, and generates performance reports and visualizations.
 """
 
-import argparse
 import csv
 import json
 import math
@@ -34,14 +33,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-import matplotlib.pyplot as plt
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# Bootstrap must precede runtime dependencies, including imports for plotting.
+# pylint: disable=wrong-import-position,wrong-import-order
+from lib.report_cli import extract_mdtest_elbencho_parser, prepare_report_runtime
+
+if __name__ == "__main__":
+    prepare_report_runtime(__file__, extract_mdtest_elbencho_parser)
+
+import matplotlib.pyplot as plt  # pylint: disable=wrong-import-position
 from matplotlib.axes import Axes
 from matplotlib.lines import Line2D
 from matplotlib.ticker import FuncFormatter
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
 
 from lib.env_used_yaml import (  # pylint: disable=wrong-import-position
     load_env_used_yaml,
@@ -50,8 +57,6 @@ from lib.filesystem_batch import (
     route_batch_report,
 )  # pylint: disable=wrong-import-position
 from lib.filesystem_report_options import (  # pylint: disable=wrong-import-position
-    add_analysis_arguments,
-    add_report_destination_arguments,
     validate_analysis_arguments,
 )
 from lib.join_datestamps import (  # pylint: disable=wrong-import-position
@@ -2283,17 +2288,7 @@ def filter_metrics(
 
 def main() -> None:
     """Script entry point."""
-    parser = argparse.ArgumentParser(
-        description="Analyze mdtest-elbencho metadata benchmark results.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "input_dirs",
-        nargs="*",
-        help="Directories containing mdtest-elbencho result files",
-    )
-    add_analysis_arguments(parser, "mdtest")
-    add_report_destination_arguments(parser)
+    parser = extract_mdtest_elbencho_parser()
     args = parser.parse_args()
     try:
         validate_analysis_arguments(args)

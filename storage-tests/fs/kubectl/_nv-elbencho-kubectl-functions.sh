@@ -4257,8 +4257,10 @@ _kubectl_upload_control_archive() {
                 cat > \"\$temporary/archive.tar\"
                 actual=\$(sha256sum \"\$temporary/archive.tar\" | cut -d ' ' -f 1)
                 [[ \"\$actual\" == \"\$expected_digest\" ]] || { echo 'upload checksum mismatch' >&2; exit 1; }
-                mkdir \"\$temporary/tree\"
-                tar -C \"\$temporary/tree\" -xf \"\$temporary/archive.tar\"
+                # Preserve the staging root's metadata: restoring the archive's
+                # '.' entry can fail GNU tar's identity check on shared filesystems.
+                mkdir -m 0700 \"\$temporary/tree\"
+                tar -C \"\$temporary/tree\" --no-overwrite-dir -xf \"\$temporary/archive.tar\"
                 if [[ -d \"\$control\" ]]; then
                     if find -P \"\$control\" ! -type d ! -type f -print -quit | grep -q .; then exit 1; fi
                     if [[ -n \$(find \"\$control\" -type f -print -quit) ]]; then

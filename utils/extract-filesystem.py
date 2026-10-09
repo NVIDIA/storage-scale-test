@@ -26,38 +26,26 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# Bootstrap must precede runtime dependencies, including imports for plotting.
+# pylint: disable=wrong-import-position,wrong-import-order
+from lib.report_cli import extract_filesystem_parser, prepare_report_runtime
+
+if __name__ == "__main__":
+    prepare_report_runtime(__file__, extract_filesystem_parser)
+
 from lib.filesystem_batch import (  # pylint: disable=wrong-import-position
-    KINDS,
     is_batch_directory,
     reject_batch_descendant_inputs,
     report_batch,
 )
 from lib.filesystem_report_options import (  # pylint: disable=wrong-import-position
-    add_analysis_arguments,
-    add_report_destination_arguments,
     options_by_kind,
 )
 
 
 def main(argv: list[str] | None = None) -> int:
     """Select independent groups, or delegate an ordinary directory unchanged."""
-    parser = argparse.ArgumentParser(
-        usage="%(prog)s [OPTIONS] [RESULTS_DIR]",
-        description="Report filesystem results; options apply only to matching groups.",
-        epilog="Cached input or parse-only mode requires --kind io|mdtest; not valid for batches.",
-        allow_abbrev=False,
-    )
-    parser.add_argument(
-        "results_dir", nargs="?", help="Batch or ordinary results directory."
-    )
-    parser.add_argument(
-        "--kind",
-        choices=KINDS,
-        default="all",
-        help="Workload selection (default: all).",
-    )
-    add_report_destination_arguments(parser)
-    add_analysis_arguments(parser, "all", explicit_only=True)
+    parser = extract_filesystem_parser()
     args = parser.parse_args(argv)
     try:
         if args.results_dir:
