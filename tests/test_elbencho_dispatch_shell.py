@@ -2282,6 +2282,8 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             validate_elbencho_duration() { return 0; }
             validate_elbencho_live_csv() { return 0; }
             validate_elbencho_file_workload_env() { return 0; }
+            validate_storage_target_name() { return 0; }
+            print_storage_target_summary() { :; }
             validate_elbencho_single_big_file_env() { return 0; }
             validate_elbencho_sweep_workload_mode() { printf 'VALIDATED=%s\\n' "$4"; }
             validate_elbencho_sweep_single_test_dirs_key() { return 0; }

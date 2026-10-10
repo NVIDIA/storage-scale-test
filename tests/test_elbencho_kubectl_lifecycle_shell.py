@@ -4119,6 +4119,40 @@ def test_status_view_separates_execution_progress_from_collection(
     assert not any(key.startswith("STORAGE_SCALE_TEST_") for key in fields)
 
 
+def test_status_view_of_a_sealed_batch_reports_each_groups_target(tmp_path):
+    """Batch status keys: one unique KIND/TARGET pair per committed group."""
+    for group, kind, name in (
+        ("0001", "elbencho", "ns-a/pvc-a"),
+        ("0002", "mdtest-elbencho", ""),
+    ):
+        directory = tmp_path / "groups" / group / f"{kind}-20260101Z000000"
+        directory.mkdir(parents=True)
+        (directory / "env_used.sh").write_text(
+            "declare -gA TEST_DIRS=(['/mnt/x/']=1)\n"
+            f"export STORAGE_TARGET_NAME={name}\n"
+        )
+    (tmp_path / "batch-manifest.tsv").write_text(
+        "version\t1\nrevision\t2\ndatestamp\t20260101Z000000\n"
+        "group\t0001\tio\tgroups/0001/elbencho-20260101Z000000\tx\ty\n"
+        "group\t0002\tmdtest\tgroups/0002/mdtest-elbencho-20260101Z000000\tx\ty\n"
+    )
+    result = _bash(f"""
+        source {_ROOT / "lib/env_functions.sh"}
+        kubectl_emit_status_view {str(tmp_path)!r} 1234abcd RUNNING \
+            PVC PENDING '1 0 1 0'
+        """)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert "BATCH=SEALED" in lines
+    assert lines[-4:] == [
+        "GROUP_0001_KIND=io",
+        "GROUP_0001_TARGET=ns-a/pvc-a",
+        "GROUP_0002_KIND=mdtest",
+        "GROUP_0002_TARGET=/mnt/x",
+    ]
+    assert len({line.partition("=")[0] for line in lines}) == len(lines)
+
+
 def test_status_refreshes_outcome_and_counts_after_completion(tmp_path):
     """The final state read wins over the earlier RUNNING observation."""
     events = tmp_path / "events"

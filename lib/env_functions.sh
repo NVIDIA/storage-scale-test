@@ -1350,7 +1350,7 @@ filesystem_env_override_names() {
         ELBENCHO_SCALE_READ_WRITE_DURATION ELBENCHO_READ_AFTER_WRITE_PAUSE \
         ELBENCHO_LIVE_CSV_EXTENDED ELBENCHO_LIVEINT ELBENCHO_SINGLE_BIG_FILE \
         ELBENCHO_SINGLE_BIG_FILE_BASENAME ELBENCHO_SINGLE_BIG_FILE_SIZE \
-        ELBENCHO_ALL_NODES_ACCESS_ALL_DATA
+        ELBENCHO_ALL_NODES_ACCESS_ALL_DATA STORAGE_TARGET_NAME
 }
 
 # Recompute FS_ENABLED from TEST_DIRS ("" if not enabled, "1" if it is).
@@ -1414,6 +1414,9 @@ apply_filesystem_workload_defaults() {
     export ELBENCHO_SINGLE_BIG_FILE_SIZE=${ELBENCHO_SINGLE_BIG_FILE_SIZE:-}
     # When 1, maps to elbencho --nosvcshare (each service touches full file)
     export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=${ELBENCHO_ALL_NODES_ACCESS_ALL_DATA:-0}
+    # Operator-chosen storage target label (reporting metadata only). Empty means
+    # "derive it when a snapshot is written"; the derived value is never stored here.
+    export STORAGE_TARGET_NAME=${STORAGE_TARGET_NAME:-}
 }
 
 # Clear the provenance recorded in env_used snapshots. Launchers call this on
@@ -1607,6 +1610,78 @@ print_env_override_summary() {
         "${STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES:-no settings changed}"
 }
 
+# =============================================================================
+# Storage target identity (reporting metadata only)
+# =============================================================================
+
+# Accepted shape of an explicit STORAGE_TARGET_NAME.
+_STORAGE_TARGET_NAME_REGEX='^[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,127}$'
+
+# Print the derived storage target name, followed by one newline. Reads
+# EXECUTION_SUBSTRATE, KUBECTL_NAMESPACE, KUBECTL_PVC and TEST_DIRS. On kubectl
+# with a namespace and a claim it is "<namespace>/<pvc>"; otherwise it is the
+# TEST_DIRS keys with trailing slashes stripped (a bare "/" stays "/"),
+# de-duplicated, sorted bytewise and joined with ",". Prints nothing and
+# returns 1 when neither source is available. lib/storage_target.py mirrors
+# this rule; keep the two in step.
+storage_target_name_default() {
+    if [[ "${EXECUTION_SUBSTRATE:-}" == kubectl \
+        && -n "${KUBECTL_NAMESPACE:-}" && -n "${KUBECTL_PVC:-}" ]]; then
+        printf '%s/%s\n' "$KUBECTL_NAMESPACE" "$KUBECTL_PVC"
+        return 0
+    fi
+    declare -p TEST_DIRS &>/dev/null || return 1
+    [[ "${#TEST_DIRS[@]}" -gt 0 ]] || return 1
+    local key root joined="" sep=""
+    local -a roots=()
+    for key in "${!TEST_DIRS[@]}"; do
+        [[ -n "$key" ]] || continue
+        root="${key%"${key##*[!/]}"}"
+        [[ -n "$root" ]] || root="/"
+        roots+=("$root")
+    done
+    [[ "${#roots[@]}" -gt 0 ]] || return 1
+    while IFS= read -r -d '' root; do
+        joined+="${sep}${root}"
+        sep=","
+    done < <(printf '%s\0' "${roots[@]}" | LC_ALL=C sort -zu)
+    printf '%s\n' "$joined"
+}
+
+# Print the effective storage target name: the explicit STORAGE_TARGET_NAME, or
+# the derived default. Returns 1 (printing nothing) when neither exists.
+storage_target_name_effective() {
+    if [[ -n "${STORAGE_TARGET_NAME:-}" ]]; then
+        printf '%s\n' "$STORAGE_TARGET_NAME"
+        return 0
+    fi
+    storage_target_name_default
+}
+
+# Reject an explicit STORAGE_TARGET_NAME that is not a short, printable token.
+# An empty value is valid (the name is derived).
+validate_storage_target_name() {
+    [[ -n "${STORAGE_TARGET_NAME:-}" ]] || return 0
+    # Reports use "unknown" for a target they cannot identify.
+    if [[ "$STORAGE_TARGET_NAME" == unknown ]]; then
+        printf 'Error: STORAGE_TARGET_NAME "unknown" is reserved\n' >&2
+        return 1
+    fi
+    if [[ "$STORAGE_TARGET_NAME" =~ $_STORAGE_TARGET_NAME_REGEX ]]; then
+        return 0
+    fi
+    printf 'Error: STORAGE_TARGET_NAME must match %s (1-128 characters, no whitespace), got: %q\n' \
+        "$_STORAGE_TARGET_NAME_REGEX" "$STORAGE_TARGET_NAME" >&2
+    return 1
+}
+
+# Print the storage target this submission will record.
+print_storage_target_summary() {
+    local name
+    name=$(storage_target_name_effective) || name="unknown"
+    printf 'Storage target: %s\n' "$name"
+}
+
 # Emit env_used.sh provenance. Always written, empty without an override, so
 # sourcing one group's snapshot after another's cannot inherit its provenance.
 _emit_env_override_provenance_sh() {
@@ -1699,6 +1774,26 @@ _elbencho_env_used_emit_treefile_cache_sh() {
     return 0
 }
 
+# Print the storage target name a snapshot records: the effective name, or
+# nothing when it is unknown (stored as an empty string).
+_storage_target_name_recorded() {
+    storage_target_name_effective 2>/dev/null || true
+}
+
+# Emit the kubectl claim identity (namespace, PV, PVC) as env_used.yaml lines.
+_emit_kubectl_target_yaml() {
+    printf 'KUBECTL_NAMESPACE: %s\n' "$(yaml_double_quote "${KUBECTL_NAMESPACE:?}")"
+    printf 'KUBECTL_PV: %s\n' "$(yaml_double_quote "${KUBECTL_PV:?}")"
+    printf 'KUBECTL_PVC: %s\n' "$(yaml_double_quote "${KUBECTL_PVC:?}")"
+}
+
+# Emit the kubectl claim identity (namespace, PV, PVC) as env_used.sh lines.
+_emit_kubectl_target_sh() {
+    printf 'export KUBECTL_NAMESPACE=%q\n' "${KUBECTL_NAMESPACE:?}"
+    printf 'export KUBECTL_PV=%q\n' "${KUBECTL_PV:?}"
+    printf 'export KUBECTL_PVC=%q\n' "${KUBECTL_PVC:?}"
+}
+
 yaml_double_quote() {
     # Emit one YAML double-quoted scalar for generated immutable snapshots.
     # The shell snapshot remains authoritative for arbitrary Bash values.
@@ -1729,12 +1824,12 @@ write_elbencho_env_used() {
         printf '# Generated: %s\n\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
         printf 'EXECUTION_SUBSTRATE: "%s"\n' "${EXECUTION_SUBSTRATE:?}"
-        printf 'ORDER_NODES: %s\n\n' "$(yaml_double_quote "${ORDER_NODES:-0}")"
+        printf 'ORDER_NODES: %s\n' "$(yaml_double_quote "${ORDER_NODES:-0}")"
+        printf 'STORAGE_TARGET_NAME: %s\n\n' \
+            "$(yaml_double_quote "$(_storage_target_name_recorded)")"
 
         if [[ "${EXECUTION_SUBSTRATE:?}" == kubectl ]]; then
-            printf 'KUBECTL_NAMESPACE: %s\n' "$(yaml_double_quote "${KUBECTL_NAMESPACE:?}")"
-            printf 'KUBECTL_PV: %s\n' "$(yaml_double_quote "${KUBECTL_PV:?}")"
-            printf 'KUBECTL_PVC: %s\n' "$(yaml_double_quote "${KUBECTL_PVC:?}")"
+            _emit_kubectl_target_yaml
             printf 'KUBECTL_NODE_SELECTOR: %s\n' "$(yaml_double_quote "${KUBECTL_NODE_SELECTOR:?}")"
             printf 'KUBECTL_ELBENCHO_IMAGE: %s\n' "$(yaml_double_quote "${KUBECTL_ELBENCHO_IMAGE:?}")"
             printf 'KUBECTL_IMAGE_PULL_POLICY: %s\n' "$(yaml_double_quote "${KUBECTL_IMAGE_PULL_POLICY:?}")"
@@ -1871,12 +1966,11 @@ _write_elbencho_env_used_sh() {
 
         printf 'export EXECUTION_SUBSTRATE=%q\n' "${EXECUTION_SUBSTRATE:?}"
         printf 'export ORDER_NODES=%q\n' "${ORDER_NODES:-0}"
-        printf 'export ORDER_NODES_ENABLED=%q\n\n' "${ORDER_NODES_ENABLED:-}"
+        printf 'export ORDER_NODES_ENABLED=%q\n' "${ORDER_NODES_ENABLED:-}"
+        printf 'export STORAGE_TARGET_NAME=%q\n\n' "$(_storage_target_name_recorded)"
 
         if [[ "${EXECUTION_SUBSTRATE:?}" == kubectl ]]; then
-            printf 'export KUBECTL_NAMESPACE=%q\n' "${KUBECTL_NAMESPACE:?}"
-            printf 'export KUBECTL_PV=%q\n' "${KUBECTL_PV:?}"
-            printf 'export KUBECTL_PVC=%q\n' "${KUBECTL_PVC:?}"
+            _emit_kubectl_target_sh
             printf 'export KUBECTL_NODE_SELECTOR=%q\n' "${KUBECTL_NODE_SELECTOR:?}"
             printf 'export KUBECTL_ELBENCHO_IMAGE=%q\n' "${KUBECTL_ELBENCHO_IMAGE:?}"
             printf 'export KUBECTL_IMAGE_PULL_POLICY=%q\n' "${KUBECTL_IMAGE_PULL_POLICY:?}"
@@ -1952,6 +2046,10 @@ update_elbencho_env_used_treefile_cache_usage() {
         ELBENCHO_FILES_PER_NODE=
         ELBENCHO_FILE_SIZE=
         export ELBENCHO_FILE_LAYOUT ELBENCHO_FILES_PER_NODE ELBENCHO_FILE_SIZE
+        # Snapshots older than the storage target name must derive it from their
+        # own settings, not inherit the current environment's value.
+        STORAGE_TARGET_NAME=
+        export STORAGE_TARGET_NAME
         # Snapshots older than --env-override carry no provenance.
         reset_env_override_provenance
         # shellcheck disable=SC1090
@@ -2059,9 +2157,15 @@ write_mdtest_elbencho_env_used() {
         printf '# env_used.yaml - mdtest-elbencho configuration snapshot\n'
         printf '# Generated: %s\n\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-        printf 'EXECUTION_SUBSTRATE: "%s"\n\n' "${EXECUTION_SUBSTRATE:?}"
+        printf 'EXECUTION_SUBSTRATE: "%s"\n' "${EXECUTION_SUBSTRATE:?}"
+        printf 'ORDER_NODES: %s\n' "$(yaml_double_quote "${ORDER_NODES:-0}")"
+        printf 'STORAGE_TARGET_NAME: %s\n' \
+            "$(yaml_double_quote "$(_storage_target_name_recorded)")"
+        if [[ "$EXECUTION_SUBSTRATE" == kubectl ]]; then
+            _emit_kubectl_target_yaml
+        fi
 
-        printf 'TEST_DIRS:\n'
+        printf '\nTEST_DIRS:\n'
         local _path
         for _path in "${!TEST_DIRS[@]}"; do
             printf '  "%s": %s\n' "$_path" "${TEST_DIRS[$_path]}"
@@ -2107,10 +2211,9 @@ _write_mdtest_elbencho_env_used_sh() {
         printf 'export EXECUTION_SUBSTRATE=%q\n' "${EXECUTION_SUBSTRATE:?}"
         printf 'export ORDER_NODES=%q\n' "${ORDER_NODES:-0}"
         printf 'export ORDER_NODES_ENABLED=%q\n' "${ORDER_NODES_ENABLED:-}"
+        printf 'export STORAGE_TARGET_NAME=%q\n' "$(_storage_target_name_recorded)"
         if [[ "${EXECUTION_SUBSTRATE:?}" == kubectl ]]; then
-            printf 'export KUBECTL_NAMESPACE=%q\n' "${KUBECTL_NAMESPACE:?}"
-            printf 'export KUBECTL_PV=%q\n' "${KUBECTL_PV:?}"
-            printf 'export KUBECTL_PVC=%q\n' "${KUBECTL_PVC:?}"
+            _emit_kubectl_target_sh
             printf 'export KUBECTL_NODE_SELECTOR=%q\n' "${KUBECTL_NODE_SELECTOR:?}"
             printf 'export KUBECTL_ELBENCHO_IMAGE=%q\n' "${KUBECTL_ELBENCHO_IMAGE:?}"
             printf 'export KUBECTL_IMAGE_PULL_POLICY=%q\n' "${KUBECTL_IMAGE_PULL_POLICY:?}"

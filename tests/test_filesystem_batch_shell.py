@@ -429,6 +429,28 @@ def test_batch_status_labels_counts_as_local(checkout):
     assert "NEXT_ACTION=START" in result.stdout
 
 
+def test_batch_status_and_publish_report_each_groups_storage_target(checkout):
+    batch = create(checkout)
+    override = checkout / "named.env"
+    override.write_text("STORAGE_TARGET_NAME=vendor-b:fs-1\n")
+    appended = launch(
+        checkout, MD, "--append", batch, "--nodes", "1", "--tasks", "1",
+        "--env-override", override,
+    )  # fmt: skip
+    assert appended.returncode == 0, appended.stdout + appended.stderr
+    assert "STORAGE_SCALE_TEST_BATCH_GROUP_TARGET=vendor-b:fs-1\n" in appended.stdout
+    result = launch(checkout, IO, "--status", batch)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[lines.index("NEXT_ACTION=START") + 1 :] == [
+        "GROUP_0001_KIND=io",
+        "GROUP_0001_TARGET=/data/one",
+        "GROUP_0002_KIND=mdtest",
+        "GROUP_0002_TARGET=vendor-b:fs-1",
+    ]
+    assert len({line.partition("=")[0] for line in lines}) == len(lines)
+
+
 @pytest.mark.parametrize(
     "cell,owner,state,next_action",
     [

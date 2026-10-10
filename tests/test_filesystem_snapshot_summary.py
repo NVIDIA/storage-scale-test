@@ -77,6 +77,7 @@ def test_representative_summary_is_six_readable_lines_with_units(snapshot):
         "Lifecycle",
         "Override",
     ]
+    assert 'name="dgxc-system/grtmk04-local-pvc" (derived); roots=' in lines[1]
     for value in ("kubectl", "dgxc-system", "grtmk04-local-pvc", "scale-test", "1G"):
         assert value in summary
     assert "nodeGroup=customer-cpu" in summary
@@ -243,14 +244,31 @@ def test_shared_layout_count_weighted_targets_and_compound_sizes_are_unambiguous
         ELBENCHO_SCALE_IO_SIZES=["1M,r4K", "r64K"],
         TEST_DIRS={"/data/one": 1, "/data/two": 3},
         KUBECTL_MAPPED_TEST_DIRS={"/pod/one": 1, "/pod/two": 3},
+        KUBECTL_NODE_SELECTOR="",
     )
     summary = format_io_snapshot_summary(snapshot)
     assert '"1M,r4K"' in summary and '"r64K"' in summary
     assert '"1M", "r4K"' not in summary
     assert "shared-directory" in summary and 'files/node="8"' in summary
-    for target in ("/data/one", "/data/two", "/pod/one", "/pod/two"):
-        assert target in summary
-    assert "weight=1" in summary and "weight=3" in summary
+    targets = summary.splitlines()[1]
+    assert len(targets) <= 132
+    # The name and both path lists cannot fit one line: lists shrink, then clip.
+    assert "/data/one" in targets and "/data/two" not in targets
+    assert "(+1 more)" in targets and targets.endswith(ELLIPSIS)
+    assert "weight=1" in targets
+
+
+def test_short_weighted_roots_are_listed_in_full(snapshot):
+    snapshot.update(
+        EXECUTION_SUBSTRATE="ssh",
+        STORAGE_TARGET_NAME="fs-a",
+        TEST_DIRS={"/data/one": 1, "/data/two": 3},
+        KUBECTL_NODE_SELECTOR="",
+    )
+    row = format_io_snapshot_summary(snapshot).splitlines()[1]
+    assert row == (
+        'Targets: name="fs-a"; roots={"/data/one" (weight=1), "/data/two" (weight=3)}'
+    )
 
 
 def test_special_characters_and_long_provenance_stay_on_six_physical_lines(snapshot):
@@ -288,3 +306,75 @@ def test_explicit_null_and_incomplete_provenance_remain_distinct(
     )
     del snapshot["env_override"]
     assert format_io_snapshot_summary(snapshot).splitlines()[-1] == "Override: unknown"
+
+
+@pytest.mark.parametrize(
+    "changes, expected",
+    [
+        ({"STORAGE_TARGET_NAME": "lustre-a"}, 'name="lustre-a"; roots='),
+        (
+            {"STORAGE_TARGET_NAME": ""},
+            'name="dgxc-system/grtmk04-local-pvc" (derived); ',
+        ),
+        (
+            {"EXECUTION_SUBSTRATE": "ssh", "TEST_DIRS": {"/mnt/b/": 1, "/mnt/a": 1}},
+            'name="/mnt/a,/mnt/b" (derived); roots=',
+        ),
+        ({"EXECUTION_SUBSTRATE": "ssh", "TEST_DIRS": {}}, "name=unknown; roots="),
+    ],
+)
+def test_targets_row_leads_with_the_storage_target_and_stays_compact(
+    snapshot, changes, expected
+):
+    snapshot.update(changes)
+    lines = format_io_snapshot_summary(snapshot).splitlines()
+    assert len(lines) == 6 and max(map(len, lines)) <= 132
+    assert lines[1].startswith(f"Targets: {expected}")
+
+
+def test_missing_snapshot_has_an_unknown_target():
+    summary = format_io_snapshot_summary({})
+    assert "Targets: name=unknown; roots=unknown" in summary
+
+
+READ_FROM_KEY = "sweep_read_from"
+ELLIPSIS = "…"
+
+
+def _row_of(snapshot, label):
+    summary = format_io_snapshot_summary(snapshot)
+    assert len(summary.splitlines()) == 6
+    return next(line for line in summary.splitlines() if line.startswith(f"{label}: "))
+
+
+def test_targets_row_fits_with_a_very_long_name_and_many_roots(snapshot):
+    roots = {f"/mnt/filesystem-{index:02d}/{'x' * 20}": 1 for index in range(12)}
+    snapshot.update(
+        EXECUTION_SUBSTRATE="ssh", STORAGE_TARGET_NAME="n" * 120, TEST_DIRS=roots
+    )
+    row = _row_of(snapshot, "Targets")
+    assert len(row) <= 132
+    assert f'name="{"n" * 20}' in row and f'{ELLIPSIS}"' in row
+    assert "n" * 120 not in row
+    assert "filesystem-00" in row and "filesystem-11" not in row
+    assert "(+11 m" in row
+
+
+def test_targets_row_shortens_one_overlong_root_with_an_ellipsis(snapshot):
+    snapshot.update(TEST_DIRS={"/r/" + "z" * 400: 1}, KUBECTL_NODE_SELECTOR="")
+    row = _row_of(snapshot, "Targets")
+    assert len(row) == 132 and row.endswith(ELLIPSIS)
+
+
+def test_other_rows_with_user_names_also_fit_the_line(snapshot):
+    snapshot["KUBECTL_NAMESPACE"] = "n" * 300
+    row = _row_of(snapshot, "Runner")
+    assert len(row) == 132 and row.endswith(ELLIPSIS)
+    snapshot[READ_FROM_KEY] = {"/p/" + "q" * 300: 1}
+    row = _row_of(snapshot, "Files/sizing")
+    assert len(row) == 132 and row.endswith(ELLIPSIS)
+
+
+def test_name_with_a_quote_is_json_escaped_in_the_targets_row(snapshot):
+    snapshot.update(STORAGE_TARGET_NAME='a"b')
+    assert 'name="a\\"b"; ' in _row_of(snapshot, "Targets")

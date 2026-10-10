@@ -726,6 +726,7 @@ kubectl_emit_status_view() {
         "$total" "$pending" "$running"
     printf 'EXECUTIONS_SUCCEEDED=%s\nEXECUTIONS_FAILED=%s\n' "$success" "$failed"
     printf 'RESULT_COLLECTION=%s\nNEXT_ACTION=%s\n' "$collection" "$next"
+    [[ ! -f "$results/batch-manifest.tsv" ]] || _elbencho_batch_print_group_targets "$results"
 }
 
 kubectl_read_collected_execution_progress() {

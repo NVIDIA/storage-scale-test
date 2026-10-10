@@ -83,15 +83,23 @@ def _natural_key(version: str) -> list:
 
 
 def with_versions(
-    printer: Callable, versions: Iterable[str], markdown: bool = False
+    printer: Callable,
+    versions: Iterable[str],
+    markdown: bool = False,
+    target: str | None = None,
 ) -> Callable:
-    """Wrap a report printer so the report starts with its project versions."""
+    """Wrap a report printer so the report starts with its project versions.
+
+    A given storage target label follows them.
+    """
     produced = ", ".join(sorted(set(versions), key=_natural_key)) or UNKNOWN
     prefix = "- " if markdown else ""
 
     def print_report(*args, **kwargs):
         print(f"{prefix}Produced by storage-scale-test: {produced}")
         print(f"{prefix}Reported by storage-scale-test: {project_version()}")
+        if target is not None:
+            print(f"{prefix}Storage target: {target}")
         print()
         printer(*args, **kwargs)
 

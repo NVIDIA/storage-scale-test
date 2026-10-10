@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 import math
 from typing import Any
 
+from lib.storage_target import ALLOW_MIXED_TARGETS_FLAG
+
 
 @dataclass(frozen=True)
 class ReportOption:
@@ -45,6 +47,14 @@ REPORT_OPTIONS = (
         "common",
         "Read cached metrics instead of raw results.",
         {"metavar": "FILE"},
+    ),
+    ReportOption(
+        ALLOW_MIXED_TARGETS_FLAG,
+        "common",
+        "Report inputs from different storage targets together, labelled "
+        "'mixed: ...'. mdtest keeps same-coordinate results from each target "
+        "instead of rejecting them as duplicates.",
+        {"action": "store_true"},
     ),
     ReportOption(
         "--only-threads",

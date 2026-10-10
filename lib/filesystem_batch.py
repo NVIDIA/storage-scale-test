@@ -33,6 +33,11 @@ from urllib.parse import quote
 from lib.filesystem_report_options import options_by_kind
 from lib.filesystem_snapshot_summary import format_io_snapshot_summary
 from lib.report_provenance import VERSION_SUFFIX
+from lib.storage_target import (
+    UNKNOWN_TARGET,
+    describe_storage_target,
+    storage_target_from_env,
+)
 
 MANIFEST_FILENAME = "batch-manifest.tsv"
 SEAL_FILENAME = "batch-sealed.sha256"
@@ -535,8 +540,8 @@ def _write_report_index(
         "",
         f"Batch: `{manifest.root.name}`",
         "",
-        "| Group | Kind | Saved settings | Cell states | Reports |",
-        "| --- | --- | --- | --- | --- |",
+        "| Group | Kind | Target | Saved settings | Cell states | Reports |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     if combined is not None and combined.is_file():
         lines[4:4] = [_markdown_link("Combined report", combined, output), ""]
@@ -561,10 +566,47 @@ def _write_report_index(
         states = ", ".join(
             f"{state}: {count}" for state, count in sorted(counts.items())
         )
+        target = _markdown_cell(_group_target(manifest, group))
         lines.append(
-            f"| {group.group_id} | {group.kind} | {settings} | {states} | {result} |"
+            f"| {group.group_id} | {group.kind} | {target} | {settings} | "
+            f"{states} | {result} |"
         )
     _publish_report_text(output / "index.md", "\n".join(lines) + "\n")
+
+
+def _group_target(manifest: BatchManifest, group: BatchGroup) -> str:
+    """Describe the storage target saved with the group; unknown when unreadable."""
+    source = manifest.group_path(group) / ENV_YAML
+    try:
+        environment = _verify_digest(source, group.yaml_digest).decode("utf-8")
+        snapshot = _parse_report_snapshot(environment, source)
+    except (OSError, ValueError):
+        return UNKNOWN_TARGET
+    label = describe_storage_target(storage_target_from_env(snapshot))
+    return label.replace("\r", " ").replace("\n", " ")
+
+
+_CELL_ESCAPES = (
+    ("\\", "\\\\"),
+    ("|", "\\|"),
+    ("`", "\\`"),
+    ("&", "&amp;"),
+    ("<", "&lt;"),
+    ("\r", " "),
+    ("\n", " "),
+)
+
+
+def _markdown_cell(text: str) -> str:
+    """Render text literally inside one GitHub-flavored Markdown table cell.
+
+    Backslash is escaped first so the backslashes added for ``|`` and the
+    backtick are not themselves doubled. ``&`` and ``<`` become entities so a
+    name cannot form an entity reference, tag or autolink.
+    """
+    for character, replacement in _CELL_ESCAPES:
+        text = text.replace(character, replacement)
+    return text
 
 
 def _write_combined_report(
@@ -600,7 +642,8 @@ def _write_combined_report(
             snapshot = _parse_report_snapshot(environment, source)
             annotated = format_io_snapshot_summary(snapshot) + "\n" + content
         sections.append(
-            f"\n\n{'=' * 80}\nGroup {group.group_id} ({group.kind})\n"
+            f"\n\n{'=' * 80}\nGroup {group.group_id} ({group.kind}) "
+            f'target: "{_group_target(manifest, group)}"\n'
             f"Report: {report}\nSaved settings: {source}\n\n" + annotated
         )
     _publish_report_text(destination, "".join(sections) + "\n")

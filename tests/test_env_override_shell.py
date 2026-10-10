@@ -457,6 +457,72 @@ def test_override_path_must_be_a_readable_file(checkout, path, message):
     assert result.returncode == 1 and message in result.stderr
 
 
+@pytest.mark.parametrize(
+    ("entry", "args", "glob"),
+    [
+        (IO, ("--nodes", "1"), "elbencho-*"),
+        (MD, ("--nodes", "1", "--tasks", "1"), "mdtest-elbencho-*"),
+    ],
+)
+def test_override_sets_the_storage_target_name(checkout, entry, args, glob):
+    override = write_override(
+        checkout, "name.env", "STORAGE_TARGET_NAME=vendor-a:fs1\n"
+    )
+    submitted = launch(checkout, entry, OVERRIDE_FLAG, override, *args)
+    assert "Storage target: vendor-a:fs1\n" in submitted.stdout
+    result = next((checkout / "results").glob(glob))
+    saved = yaml.safe_load((result / "env_used.yaml").read_text())
+    assert saved["STORAGE_TARGET_NAME"] == "vendor-a:fs1"
+    assert saved["env_override"]["variables"] == ["STORAGE_TARGET_NAME"]
+    reloaded = shell(
+        checkout,
+        f"source {shlex.quote(str(result))}/env_used.sh; "
+        'printf %s "$STORAGE_TARGET_NAME"',
+    )
+    assert reloaded.stdout == "vendor-a:fs1", reloaded.stderr
+
+
+@pytest.mark.parametrize(
+    ("entry", "args", "glob"),
+    [
+        (IO, ("--nodes", "1"), "elbencho-*"),
+        (MD, ("--nodes", "1", "--tasks", "1"), "mdtest-elbencho-*"),
+    ],
+)
+def test_unset_storage_target_name_is_derived_at_snapshot_time(
+    checkout, entry, args, glob
+):
+    """Never frozen at env load: an override's TEST_DIRS decides the default."""
+    override = write_override(checkout, "roots.env", 'TEST_DIRS=(["/data/two/"]=1)\n')
+    submitted = launch(checkout, entry, OVERRIDE_FLAG, override, *args)
+    assert "Storage target: /data/two\n" in submitted.stdout
+    result = next((checkout / "results").glob(glob))
+    saved = yaml.safe_load((result / "env_used.yaml").read_text())
+    assert saved["STORAGE_TARGET_NAME"] == "/data/two"
+
+
+@pytest.mark.parametrize(
+    ("entry", "args", "glob"),
+    [
+        (IO, ("--nodes", "1"), "elbencho-*"),
+        (MD, ("--nodes", "1", "--tasks", "1"), "mdtest-elbencho-*"),
+    ],
+)
+@pytest.mark.parametrize("name", ["has space", "-leading", "a,b", "x" * 129, "unknown"])
+def test_invalid_storage_target_name_is_rejected_before_any_output(
+    checkout, entry, args, glob, name
+):
+    override = write_override(
+        checkout, "bad-name.env", f"STORAGE_TARGET_NAME={shlex.quote(name)}\n"
+    )
+    result = launch(checkout, entry, OVERRIDE_FLAG, override, *args)
+    assert result.returncode == 1
+    assert "Error: STORAGE_TARGET_NAME" in result.stderr
+    assert not (checkout / "results").exists() or not any(
+        (checkout / "results").glob(glob)
+    )
+
+
 def test_override_names_are_snapshotted_and_cover_every_default():
     """Every overridable name must survive later env.sh reloads."""
     library = (ROOT / "lib/env_functions.sh").read_text()

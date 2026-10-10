@@ -1066,6 +1066,12 @@ if [ -n "$FS_ENABLED" ]; then
                 register_error "$line"
             done <<< "$validation_output"
         fi
+
+        if ! validation_output=$(validate_storage_target_name 2>&1); then
+            while IFS= read -r line; do
+                register_error "$line"
+            done <<< "$validation_output"
+        fi
     }
     check_elbencho_config
 

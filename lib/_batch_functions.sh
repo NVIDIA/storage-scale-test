@@ -391,6 +391,8 @@ _elbencho_batch_publish_group() {
     mv "$temp_manifest" "$root/batch-manifest.tsv" || return 1
     _elbencho_batch_refresh_union "$root" || return 1
     printf 'STORAGE_SCALE_TEST_BATCH_RESULTS=%s\nSTORAGE_SCALE_TEST_BATCH_GROUP=%s\n' "$root" "$gid"
+    printf 'STORAGE_SCALE_TEST_BATCH_GROUP_TARGET=%q\n' \
+        "$(_elbencho_batch_group_target "$target")"
     printf 'STORAGE_SCALE_TEST_BATCH_EXECUTIONS=%04d-%s\n' "$((offset-count+1))" "$id"
 }
 
@@ -491,6 +493,29 @@ _elbencho_batch_validate_candidate() {
     done < <(list_elbencho_execution_ids "$stage/executions")
 }
 
+# Print the effective storage target recorded in a group's env_used.sh, or
+# "unknown" when it records none. The snapshot is read in a subshell that clears
+# the name and the sources of its default first, so one group's value never
+# leaks into another's.
+_elbencho_batch_group_target() {
+    (
+        STORAGE_TARGET_NAME=
+        unset TEST_DIRS KUBECTL_NAMESPACE KUBECTL_PVC
+        source "$1/env_used.sh" >/dev/null 2>&1 || exit 1
+        storage_target_name_effective
+    ) 2>/dev/null || printf 'unknown\n'
+}
+
+# Print GROUP_<NNNN>_KIND and GROUP_<NNNN>_TARGET for every committed group.
+_elbencho_batch_print_group_targets() {
+    local root="$1" row gid kind relative unused target
+    while IFS=$'\t' read -r row gid kind relative unused; do
+        [[ "$row" == group ]] || continue
+        target=$(_elbencho_batch_group_target "$root/$relative")
+        printf 'GROUP_%s_KIND=%s\nGROUP_%s_TARGET=%q\n' "$gid" "$kind" "$gid" "$target"
+    done < "$root/batch-manifest.tsv"
+}
+
 _elbencho_batch_status() {
     local root="$1" batch=DRAFT state=NOT_STARTED next=START id value
     local pending=0 running=0 success=0 failed=0 active=1
@@ -528,6 +553,7 @@ _elbencho_batch_status() {
         "$((pending + running + success + failed))" "$pending" "$running"
     printf 'EXECUTIONS_SUCCEEDED=%s\nEXECUTIONS_FAILED=%s\n' "$success" "$failed"
     printf 'RESULT_COLLECTION=NOT_REQUIRED\nNEXT_ACTION=%s\n' "$next"
+    _elbencho_batch_print_group_targets "$root"
 }
 
 _elbencho_batch_preflight() {

@@ -29,6 +29,7 @@ import csv
 import importlib
 import importlib.util
 import io
+import shutil
 import sys
 import tempfile
 import types
@@ -640,6 +641,322 @@ class TestDenseResultsParse(unittest.TestCase):
                 self.assertRaises(ValueError),
             ):
                 _EXTRACT_MOD.main()
+
+
+_OTHER_DATESTAMP = "20260813Z120000"
+_TARGET_LINE = "Storage target: "
+_ALLOW_MIXED = "--allow-mixed-targets"
+
+
+class TestStorageTargetGuard(unittest.TestCase):
+    """Results from different storage targets are refused unless allowed."""
+
+    def setUp(self) -> None:
+        # pylint: disable=consider-using-with
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.first = self._results("a", _DATESTAMP, "lustre-a")
+        self.second = self._results("b", _OTHER_DATESTAMP, "weka-b")
+
+    def _results(self, name, datestamp, target):
+        directory = self.root / name
+        directory.mkdir()
+        stem = _STEM.replace(_DATESTAMP, datestamp)
+        (directory / f"{stem}.csv").write_text(_DENSE_CSV, encoding="utf-8")
+        (directory / f"{stem}.out").write_text(_DENSE_OUT, encoding="utf-8")
+        if target is not None:
+            (directory / "env_used.yaml").write_text(
+                f"STORAGE_TARGET_NAME: {target}\n", encoding="utf-8"
+            )
+        return directory
+
+    def _run(self, *arguments):
+        """Run main; return (exit code, stdout, stderr, plot calls)."""
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with (
+            mock.patch.object(
+                sys, "argv", ["extract-mdtest-elbencho.py", *map(str, arguments)]
+            ),
+            mock.patch.object(_EXTRACT_MOD, "plot_all") as plot,
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            try:
+                _EXTRACT_MOD.main()
+            except SystemExit as exit_request:
+                code = exit_request.code
+        return code, out.getvalue(), err.getvalue(), plot.call_count
+
+    def _target_lines(self, output):
+        return [line for line in output.splitlines() if _TARGET_LINE in line]
+
+    def test_mixed_targets_exit_before_anything_is_written(self) -> None:
+        output = self.root / "out"
+        code, _, err, plots = self._run(
+            self.first, self.second, "--to-csv", f"--output-dir={output}"
+        )
+        self.assertEqual(code, 1)
+        for needle in ('"lustre-a": ', str(self.first), '"weka-b": ', str(self.second)):
+            self.assertIn(needle, err)
+        self.assertIn(_ALLOW_MIXED, err)
+        self.assertFalse(output.exists())
+        self.assertEqual(plots, 0)
+        self.assertEqual(list(self.root.rglob("report.txt")), [])
+        self.assertEqual(list(self.root.rglob("mdtest-elbencho-metrics-*")), [])
+
+    def test_allowed_mixed_targets_warn_label_and_export_the_label(self) -> None:
+        output = self.root / "out"
+        code, out, err, plots = self._run(
+            self.first,
+            self.second,
+            "--markdown",
+            _ALLOW_MIXED,
+            "--to-csv",
+            f"--output-dir={output}",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self._target_lines(out), ['- Storage target: mixed: "lustre-a", "weka-b"']
+        )
+        self.assertIn("WARNING: report mixes storage targets", err)
+        self.assertEqual(plots, 1)
+        exported = next(output.glob("mdtest-elbencho-metrics-*.csv"))
+        with exported.open(newline="", encoding="utf-8") as stream:
+            labels = {row["storage_target_name"] for row in csv.DictReader(stream)}
+        self.assertEqual(labels, {'mixed: "lustre-a", "weka-b"'})
+
+    def test_one_target_is_named_in_both_report_forms(self) -> None:
+        third = self._results("c", "20260814Z120000", "lustre-a")
+        code, out, _, _ = self._run(self.first, third, "--markdown")
+        self.assertEqual(code, 0)
+        self.assertEqual(self._target_lines(out), ["- Storage target: lustre-a"])
+        code, _, _, _ = self._run(self.first, third)
+        self.assertEqual(code, 0)
+        report = (self.first / "report.txt").read_text(encoding="utf-8")
+        self.assertIn("Storage target: lustre-a\n", report)
+
+    def test_known_and_unverifiable_inputs_warn_without_failing(self) -> None:
+        third = self._results("c", "20260814Z120000", None)
+        code, out, err, _ = self._run(self.first, third, "--markdown")
+        self.assertEqual(code, 0)
+        self.assertEqual(self._target_lines(out), ["- Storage target: lustre-a"])
+        self.assertIn(f"cannot verify storage target of 1 input(s): {third}", err)
+
+    def test_unknown_targets_are_silent_and_exported_empty(self) -> None:
+        unnamed = self._results("c", "20260814Z120000", None)
+        code, out, err, _ = self._run(unnamed, "--markdown", "--to-csv")
+        self.assertEqual(code, 0)
+        self.assertEqual(self._target_lines(out), ["- Storage target: unknown"])
+        self.assertNotIn("WARNING", err)
+        exported = next(unnamed.glob("mdtest-elbencho-metrics-*.csv"))
+        imported, _ = _EXTRACT_MOD.read_csv_import(str(exported))
+        self.assertEqual([m.storage_target_name for m in imported], [""])
+
+    def test_csv_round_trip_keeps_the_target(self) -> None:
+        code, _, _, _ = self._run(self.first, "--to-csv", "--markdown")
+        self.assertEqual(code, 0)
+        cached = next(self.first.glob("mdtest-elbencho-metrics-*.csv"))
+        imported, _ = _EXTRACT_MOD.read_csv_import(str(cached))
+        self.assertEqual([m.storage_target_name for m in imported], ["lustre-a"])
+        code, out, _, _ = self._run("--from-csv", cached, "--markdown")
+        self.assertEqual(code, 0)
+        self.assertEqual(self._target_lines(out), ["- Storage target: lustre-a"])
+
+    def _cached(self, labels, drop_column=False):
+        """Write a cache with one row per label, optionally without the column."""
+        metrics = _EXTRACT_MOD.aggregate_metrics(
+            [
+                _EXTRACT_MOD.parse_file_pair(
+                    str(path / f"{_STEM.replace(_DATESTAMP, stamp)}.csv"),
+                    str(path / f"{_STEM.replace(_DATESTAMP, stamp)}.out"),
+                    1,
+                    8,
+                    stamp,
+                    1,
+                )
+                for path, stamp in (
+                    (self.first, _DATESTAMP),
+                    (self.second, _OTHER_DATESTAMP),
+                )
+            ]
+        )
+        rows = list(metrics.values())
+        path = self.root / "cache.csv"
+        _EXTRACT_MOD.write_csv_export(str(path), rows, None, labels[0])
+        with path.open(newline="", encoding="utf-8") as stream:
+            reader = csv.DictReader(stream)
+            fieldnames = list(reader.fieldnames or [])
+            table = list(reader)
+        table = [dict(table[0]) for _ in labels]
+        for index, (row, label) in enumerate(zip(table, labels), 1):
+            row["storage_target_name"] = label
+            row["node_count"] = str(index)
+        if drop_column:
+            fieldnames.remove("storage_target_name")
+        with path.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(
+                stream, fieldnames=fieldnames, extrasaction="ignore"
+            )
+            writer.writeheader()
+            writer.writerows(table)
+        return path
+
+    def test_cache_without_the_column_loads_with_unknown_target(self) -> None:
+        path = self._cached(["x"], drop_column=True)
+        imported, _ = _EXTRACT_MOD.read_csv_import(str(path))
+        self.assertEqual([m.storage_target_name for m in imported], [""])
+        code, out, err, _ = self._run("--from-csv", path, "--markdown")
+        self.assertEqual(code, 0)
+        self.assertEqual(self._target_lines(out), ["- Storage target: unknown"])
+        self.assertNotIn("WARNING", err)
+
+    def test_mixed_cache_is_refused_unless_allowed(self) -> None:
+        path = self._cached(["lustre-a", "weka-b"])
+        code, _, err, plots = self._run("--from-csv", path, "--markdown")
+        self.assertEqual(code, 1)
+        for needle in ('"lustre-a": ', '"weka-b": ', f"{path} rows"):
+            self.assertIn(needle, err)
+        self.assertEqual(plots, 0)
+        code, out, _, _ = self._run("--from-csv", path, "--markdown", _ALLOW_MIXED)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self._target_lines(out), ['- Storage target: mixed: "lustre-a", "weka-b"']
+        )
+
+    def _exported_labels(self, directory):
+        exported = next(Path(directory).glob("mdtest-elbencho-metrics-*.csv"))
+        with exported.open(newline="", encoding="utf-8") as stream:
+            return exported, {
+                row["storage_target_name"] for row in csv.DictReader(stream)
+            }
+
+    def test_known_and_unknown_inputs_are_not_laundered_into_the_csv(self) -> None:
+        third = self._results("c", "20260814Z120000", None)
+        output = self.root / "out"
+        code, _, _, _ = self._run(
+            self.first, third, "--markdown", "--to-csv", f"--output-dir={output}"
+        )
+        self.assertEqual(code, 0)
+        exported, labels = self._exported_labels(output)
+        self.assertEqual(labels, {'mixed: "lustre-a", unknown'})
+        # The cache stays readable and the old name is still visible.
+        code, out, err, _ = self._run("--from-csv", exported, "--markdown")
+        self.assertEqual(code, 0)
+        self.assertEqual(self._target_lines(out), ["- Storage target: lustre-a"])
+        self.assertIn("WARNING: cannot verify storage target of 1 input(s)", err)
+        self.assertIn("rows without a target", err)
+
+    def test_reexporting_a_partly_unknown_cache_keeps_the_uncertainty(self) -> None:
+        path = self._cached(["lustre-a", ""])
+        output = self.root / "again"
+        code, _, err, _ = self._run(
+            "--from-csv", path, "--markdown", "--to-csv", f"--output-dir={output}"
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("cannot verify storage target", err)
+        _, labels = self._exported_labels(output)
+        self.assertEqual(labels, {'mixed: "lustre-a", unknown'})
+
+    def test_allowed_mixed_inputs_with_an_unknown_one_export_all_three(self) -> None:
+        third = self._results("c", "20260814Z120000", None)
+        output = self.root / "out"
+        code, _, _, _ = self._run(
+            self.first,
+            self.second,
+            third,
+            _ALLOW_MIXED,
+            "--markdown",
+            "--to-csv",
+            f"--output-dir={output}",
+        )
+        self.assertEqual(code, 0)
+        _, labels = self._exported_labels(output)
+        self.assertEqual(labels, {'mixed: "lustre-a", "weka-b", unknown'})
+
+    def test_target_name_with_a_quote_survives_the_csv_round_trip(self) -> None:
+        odd = self._results("c", "20260814Z120000", "'\"x\"'")
+        output = self.root / "out"
+        code, _, _, _ = self._run(
+            self.first,
+            odd,
+            _ALLOW_MIXED,
+            "--markdown",
+            "--to-csv",
+            f"--output-dir={output}",
+        )
+        self.assertEqual(code, 0)
+        exported, labels = self._exported_labels(output)
+        self.assertEqual(labels, {'mixed: "\\"x\\"", "lustre-a"'})
+        code, _, err, _ = self._run("--from-csv", exported, "--markdown")
+        self.assertEqual(code, 1)
+        self.assertIn('"\\"x\\"": ', err)
+        self.assertIn('"lustre-a": ', err)
+
+    def test_cached_guard_runs_before_the_only_filters(self) -> None:
+        path = self._cached(["lustre-a", "weka-b"])
+        for selected in ("1", "2", "99"):
+            with self.subTest(only_nodes=selected):
+                code, _, err, plots = self._run(
+                    "--from-csv", path, "--markdown", "--only-nodes", selected
+                )
+                self.assertEqual(code, 1)
+                self.assertIn("inputs come from different storage targets", err)
+                self.assertNotIn("After filtering", err)
+                self.assertEqual(plots, 0)
+        code, out, err, _ = self._run(
+            "--from-csv", path, "--markdown", "--only-nodes", "1", _ALLOW_MIXED
+        )
+        self.assertEqual(code, 0)
+        # The label describes the whole cache even when a filter keeps one target.
+        self.assertEqual(
+            self._target_lines(out), ['- Storage target: mixed: "lustre-a", "weka-b"']
+        )
+        self.assertIn("After filtering: 1 groups", err)
+
+    def test_same_coordinates_in_two_targets_are_kept_when_mixing_is_allowed(
+        self,
+    ) -> None:
+        clash = self._results("c", _DATESTAMP, "weka-b")
+        code, _, err, _ = self._run(self.first, clash, "--markdown", _ALLOW_MIXED)
+        self.assertEqual(code, 0)
+        self.assertNotIn("Duplicate result pair", err)
+        self.assertIn("Found 2 file pairs", err)
+        self.assertIn("Parsed 2 iterations", err)
+
+    def test_same_coordinates_inside_one_target_are_still_ambiguous(self) -> None:
+        for target, extra in (
+            ("lustre-a", ()),
+            (None, ()),
+            ("lustre-a", (_ALLOW_MIXED,)),
+        ):
+            with self.subTest(target=target, extra=extra):
+                clash = self._results(f"d{target}{extra}", _DATESTAMP, target)
+                code, _, err, _ = self._run(self.first, clash, "--markdown", *extra)
+                self.assertEqual(code, 1)
+                self.assertIn("Duplicate result pair", err)
+                self.assertIn("skipping both", err)
+                shutil.rmtree(clash)
+
+    def test_discover_files_keys_same_coordinates_by_target_group(self) -> None:
+        clash = self._results("c", _DATESTAMP, "weka-b")
+        pairs = _EXTRACT_MOD.discover_files(
+            [str(self.first), str(clash)],
+            {"lustre-a": [str(self.first)], "weka-b": [str(clash)]},
+        )
+        self.assertEqual(
+            sorted(pairs),
+            [(1, 8, _DATESTAMP, 1, "lustre-a"), (1, 8, _DATESTAMP, 1, "weka-b")],
+        )
+        self.assertEqual(len(_EXTRACT_MOD.discover_files([str(self.first)])), 1)
+
+    def test_cache_written_by_an_allowed_mixed_run_is_still_refused(self) -> None:
+        path = self._cached(['mixed: "lustre-a", "weka-b"'])
+        code, _, err, _ = self._run("--from-csv", path, "--markdown")
+        self.assertEqual(code, 1)
+        self.assertIn('"lustre-a": ', err)
+        self.assertIn('"weka-b": ', err)
 
 
 if __name__ == "__main__":

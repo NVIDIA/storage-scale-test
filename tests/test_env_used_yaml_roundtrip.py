@@ -347,5 +347,142 @@ export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=0
             self.assertEqual(loaded["MDTEST_ITERATIONS"], 3)
 
 
+_IO_MIN_ENV = """export ELBENCHO_SCALE_THREAD_LIST=("1")
+export ELBENCHO_SCALE_IO_SIZES=("4K")
+export ELBENCHO_IODEPTH_LIST=("1")
+export ELBENCHO_FILE_SIZE_MULTIPLIER=1024
+export ELBENCHO_SCALE_READ_WRITE_DURATION=60
+export ELBENCHO_READ_AFTER_WRITE_PAUSE=0
+export ELBENCHO_SINGLE_BIG_FILE=0
+export ELBENCHO_SINGLE_BIG_FILE_BASENAME=elbencho-bigfile
+export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=0
+export MDTEST_BRANCH_FACTOR=7
+export MDTEST_ITEMS_PER_DIR=100
+export MDTEST_ITERATIONS=3
+"""
+_KUBECTL_ENV = """export EXECUTION_SUBSTRATE=kubectl
+export KUBECTL_NAMESPACE=vendor-ns
+export KUBECTL_PV=vendor-pv
+export KUBECTL_PVC=vendor-pvc
+export KUBECTL_NODE_SELECTOR=storage-test=true
+export KUBECTL_ELBENCHO_IMAGE=example.invalid/elbencho@sha256:abc
+export KUBECTL_IMAGE_PULL_POLICY=Never
+export KUBECTL_RUN_AS_USER=2000
+export KUBECTL_RUN_AS_GROUP=2000
+"""
+_IO_WRITE = 'write_elbencho_env_used "{out}/env_used.yaml" dio 0 0 0 0 "" 1\n'
+_MD_WRITE = 'write_mdtest_elbencho_env_used "{out}/env_used.yaml" "1" "2"\n'
+# TEST_DIRS keys sorted bytewise: "foo bar" < "fs1" because "o" < "s".
+_DERIVED_ROOTS = "/mnt/foo bar/baz,/mnt/fs1"
+_SH_NAME_PREFIX = "export STORAGE_TARGET_NAME="
+
+
+def _sourced_name(out_dir: str) -> str:
+    """STORAGE_TARGET_NAME as a resumed shell sees it after sourcing env_used.sh."""
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1/env_used.sh"; printf %s "$STORAGE_TARGET_NAME"',
+            "-",
+            out_dir,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def _write_snapshot(out_dir: str, preamble: str, writer: str) -> tuple[dict, str]:
+    """Run one env_used writer and return (YAML mapping, env_used.sh text)."""
+    script = _bash_script_with_repo(
+        "export EXECUTION_SUBSTRATE=slurm\n"
+        + _IO_MIN_ENV
+        + preamble
+        + writer.format(out=out_dir)
+    )
+    _run_bash_write(out_dir, script)
+    sh_text = (Path(out_dir) / "env_used.sh").read_text(encoding="utf-8")
+    return load_env_used_yaml(out_dir), sh_text
+
+
+class TestStorageTargetNameSnapshots(unittest.TestCase):
+    """Both writers record the EFFECTIVE storage target name, YAML and shell."""
+
+    writers = (("io", _IO_WRITE), ("mdtest", _MD_WRITE))
+
+    def test_name_derived_from_test_dirs_when_unset(self):
+        for label, writer in self.writers:
+            with self.subTest(writer=label), tempfile.TemporaryDirectory() as tmp:
+                loaded, sh_text = _write_snapshot(tmp, "", writer)
+                self.assertEqual(loaded["STORAGE_TARGET_NAME"], _DERIVED_ROOTS)
+                self.assertEqual(_sourced_name(tmp), _DERIVED_ROOTS)
+                self.assertIn(_SH_NAME_PREFIX, sh_text)
+
+    def test_trailing_slash_and_duplicate_roots_are_normalized(self):
+        preamble = "TEST_DIRS=(['/mnt/b/']=1 ['/mnt/a']=1 ['/mnt/b']=1)\n"
+        for label, writer in self.writers:
+            with self.subTest(writer=label), tempfile.TemporaryDirectory() as tmp:
+                loaded, _ = _write_snapshot(tmp, preamble, writer)
+                self.assertEqual(loaded["STORAGE_TARGET_NAME"], "/mnt/a,/mnt/b")
+
+    def test_explicit_name_wins_over_derivation(self):
+        preamble = "export STORAGE_TARGET_NAME=vendor-a:fs1\n"
+        for label, writer in self.writers:
+            with self.subTest(writer=label), tempfile.TemporaryDirectory() as tmp:
+                loaded, sh_text = _write_snapshot(tmp, preamble, writer)
+                self.assertEqual(loaded["STORAGE_TARGET_NAME"], "vendor-a:fs1")
+                self.assertIn(_SH_NAME_PREFIX + "vendor-a:fs1\n", sh_text)
+
+    def test_kubectl_default_is_namespace_slash_claim(self):
+        preamble = _KUBECTL_ENV.replace("slurm", "kubectl")
+        for label, writer in self.writers:
+            with self.subTest(writer=label), tempfile.TemporaryDirectory() as tmp:
+                loaded, sh_text = _write_snapshot(tmp, preamble, writer)
+                self.assertEqual(loaded["STORAGE_TARGET_NAME"], "vendor-ns/vendor-pvc")
+                self.assertIn(_SH_NAME_PREFIX + "vendor-ns/vendor-pvc\n", sh_text)
+                self.assertEqual(loaded["KUBECTL_NAMESPACE"], "vendor-ns")
+                self.assertEqual(loaded["KUBECTL_PV"], "vendor-pv")
+                self.assertEqual(loaded["KUBECTL_PVC"], "vendor-pvc")
+                self.assertIn("export KUBECTL_PVC=vendor-pvc\n", sh_text)
+
+    def test_mdtest_snapshot_records_order_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded, sh_text = _write_snapshot(
+                tmp, "export ORDER_NODES=yes\n", _MD_WRITE
+            )
+            self.assertEqual(loaded["ORDER_NODES"], "yes")
+            self.assertIn("export ORDER_NODES=yes\n", sh_text)
+
+    def test_unknown_target_records_empty_name(self):
+        preamble = "unset TEST_DIRS\ndeclare -A TEST_DIRS=()\n"
+        for label, writer in self.writers:
+            with self.subTest(writer=label), tempfile.TemporaryDirectory() as tmp:
+                loaded, sh_text = _write_snapshot(tmp, preamble, writer)
+                self.assertEqual(loaded["STORAGE_TARGET_NAME"], "")
+                self.assertIn(_SH_NAME_PREFIX + "''\n", sh_text)
+
+    def test_regenerating_an_old_snapshot_ignores_the_current_name(self):
+        """A snapshot without the key derives from its own TEST_DIRS."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_snapshot(tmp, "", _IO_WRITE)
+            snapshot = Path(tmp) / "env_used.sh"
+            lines = snapshot.read_text(encoding="utf-8").splitlines(keepends=True)
+            snapshot.write_text(
+                "".join(x for x in lines if _SH_NAME_PREFIX not in x),
+                encoding="utf-8",
+            )
+            (Path(tmp) / "executions").mkdir()
+            script = _bash_script_with_repo(
+                "export STORAGE_TARGET_NAME=leaked-from-env-sh\n"
+                f'update_elbencho_env_used_treefile_cache_usage "{tmp}"\n'
+            )
+            _run_bash_write(tmp, script)
+            self.assertEqual(
+                load_env_used_yaml(tmp)["STORAGE_TARGET_NAME"], _DERIVED_ROOTS
+            )
+            self.assertEqual(_sourced_name(tmp), _DERIVED_ROOTS)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -364,6 +364,11 @@ collecting; `STATE=UNKNOWN` is not success.
 | `EXECUTIONS_{TOTAL,PENDING,RUNNING,SUCCEEDED,FAILED}` | Cell counts within that scope |
 | `RESULT_COLLECTION` | `PENDING` (results remote), `CLEANUP_PENDING` (published, cleanup needed), `COMPLETE`; SSH/Slurm: `NOT_REQUIRED` |
 | `NEXT_ACTION` | `START`, `WAIT`, `COLLECT`, `RESUME`, `INSPECT`, or `NONE` |
+| `GROUP_<NNNN>_KIND` | Batches only, one pair per committed group: `io` or `mdtest` |
+| `GROUP_<NNNN>_TARGET` | Batches only: the group's recorded storage target name, shell-quoted (`unknown` when none) |
+
+`--batch` and `--append` also print
+`STORAGE_SCALE_TEST_BATCH_GROUP_TARGET=<name>` after the group line.
 
 Groups may use different test roots, weights, IO modes, sizes, durations, and
 metadata layouts. The substrate, executable identity, architecture, ordering,

@@ -21,10 +21,19 @@ import json
 from pathlib import Path
 from typing import Any
 
+from lib.storage_target import StorageTarget, storage_target_from_env
+
 UNKNOWN = "unknown"
 NONE_RECORDED = "none recorded"
 FIELD_SEPARATOR = "; "
 READ_FROM_FIELD = "sweep_read_from"
+OVERRIDE_LABEL = "Override"
+LINE_LIMIT = 132
+ELLIPSIS = "\u2026"
+TARGETS_LABEL = "Targets"
+NAME_LIMIT = 48
+ROOTS_FIELD = "TEST_DIRS"
+MAPPED_FIELD = "KUBECTL_MAPPED_TEST_DIRS"
 
 
 def _display(value: Any) -> str:
@@ -80,13 +89,57 @@ def _runner(snapshot: dict) -> str:
     return text
 
 
-def _targets(snapshot: dict) -> str:
-    text = _field(snapshot, "TEST_DIRS", "roots")
-    if snapshot.get("KUBECTL_NODE_SELECTOR"):
-        text += "; " + _field(snapshot, "KUBECTL_NODE_SELECTOR", "selector")
-    if snapshot.get("KUBECTL_MAPPED_TEST_DIRS"):
-        text += "; " + _field(snapshot, "KUBECTL_MAPPED_TEST_DIRS", "mapped_roots")
+def _display_fit(value: str, limit: int) -> str:
+    """Quote a string like ``_display``, shortening its text with an ellipsis."""
+    text = _display(value)
+    keep = len(value)
+    while len(text) > limit and keep > 0:
+        keep -= 1
+        text = _display(value[:keep] + ELLIPSIS)
     return text
+
+
+def _target_name(target: StorageTarget) -> str:
+    """Quote a known name, marking one derived rather than recorded."""
+    if target.name is None:
+        return f"name={UNKNOWN}"
+    suffix = "" if target.recorded else " (derived)"
+    return f"name={_display_fit(target.name, NAME_LIMIT)}{suffix}"
+
+
+def _fit_mapping(snapshot: dict, key: str, label: str, limit: int) -> str:
+    """A path-weight field, ending "(+K more)" so it fits within limit when listed."""
+    value = snapshot.get(key)
+    if not isinstance(value, dict) or len(value) < 2:
+        return _field(snapshot, key, label)
+    entries = [_display({path: weight}) for path, weight in value.items()]
+    for shown in range(len(entries), 0, -1):
+        text = f"{label}={{" + ", ".join(entry[1:-1] for entry in entries[:shown]) + "}"
+        if shown < len(entries):
+            text += f" (+{len(entries) - shown} more)"
+        if len(text) <= limit or shown == 1:
+            return text
+    return f"{label}={UNKNOWN}"
+
+
+def _targets(snapshot: dict) -> str:
+    """Name, roots and optional selectors; the path lists shrink to fit the line."""
+    parts = [_target_name(storage_target_from_env(snapshot))]
+    if snapshot.get("KUBECTL_NODE_SELECTOR"):
+        parts.append(_field(snapshot, "KUBECTL_NODE_SELECTOR", "selector"))
+    budget = LINE_LIMIT - len(f"{TARGETS_LABEL}: ") - len(FIELD_SEPARATOR.join(parts))
+    budget -= len(FIELD_SEPARATOR)
+    roots = _field(snapshot, ROOTS_FIELD, "roots")
+    if not snapshot.get(MAPPED_FIELD):
+        parts.insert(1, _fit_mapping(snapshot, ROOTS_FIELD, "roots", budget))
+        return FIELD_SEPARATOR.join(parts)
+    budget -= len(FIELD_SEPARATOR)
+    mapped = _fit_mapping(
+        snapshot, MAPPED_FIELD, "mapped_roots", max(budget // 2, budget - len(roots))
+    )
+    parts.insert(1, _fit_mapping(snapshot, ROOTS_FIELD, "roots", budget - len(mapped)))
+    parts.append(mapped)
+    return FIELD_SEPARATOR.join(parts)
 
 
 def _files(snapshot: dict) -> str:
@@ -191,6 +244,18 @@ def _override(snapshot: dict) -> str:
     return _display(Path(str(filename)).name) if filename else NONE_RECORDED
 
 
+def _row(label: str, value: str) -> str:
+    """One summary line, shortened with an ellipsis to the line limit.
+
+    The Override row is exempt: it already fits by listing whole file names
+    ("+K more") and always shows the first name in full.
+    """
+    line = f"{label}: {value}"
+    if label != OVERRIDE_LABEL and len(line) > LINE_LIMIT:
+        line = line[: LINE_LIMIT - 1] + ELLIPSIS
+    return line + "\n"
+
+
 def format_io_snapshot_summary(snapshot: dict) -> str:
     """Describe the snapshot in six lines without supplying execution defaults."""
     sweep = _fields(
@@ -207,10 +272,10 @@ def format_io_snapshot_summary(snapshot: dict) -> str:
         sweep += "; random_flag=1"
     rows = (
         ("Runner", _runner(snapshot)),
-        ("Targets", _targets(snapshot)),
+        (TARGETS_LABEL, _targets(snapshot)),
         ("Sweep", sweep),
         ("Files/sizing", _files(snapshot)),
         ("Lifecycle", _lifecycle(snapshot)),
-        ("Override", _override(snapshot)),
+        (OVERRIDE_LABEL, _override(snapshot)),
     )
-    return "".join(f"{label}: {value}\n" for label, value in rows)
+    return "".join(_row(label, value) for label, value in rows)

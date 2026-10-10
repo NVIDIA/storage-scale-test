@@ -159,6 +159,10 @@ if [[ "$operation" == resume ]]; then
         echo "Error: results directory has no reified MD sweep snapshot" >&2; exit 1;
     }
     DS="${OUTPUT_DIR##*-}"
+    # A snapshot from before the storage target name derives it from its own
+    # settings; it must not inherit the caller's or env.sh's value.
+    STORAGE_TARGET_NAME=
+    export STORAGE_TARGET_NAME
     unset EXECUTION_SUBSTRATE
     # shellcheck disable=SC1090,SC1091  # Trusted canonical snapshot.
     source "$OUTPUT_DIR/env_used.sh" || exit 1
@@ -189,6 +193,8 @@ if [[ "$operation" == resume ]]; then
         echo "Error: current env.sh substrate differs from saved substrate" >&2
         exit 1
     }
+    STORAGE_TARGET_NAME=
+    export STORAGE_TARGET_NAME
     unset EXECUTION_SUBSTRATE
     # shellcheck disable=SC1090,SC1091
     source "$OUTPUT_DIR/env_used.sh" || exit 1
@@ -234,6 +240,8 @@ if [[ "$operation" == resume ]]; then
     exit 1
 fi
 
+# Explicit names are checked after overrides apply and before any output exists.
+validate_storage_target_name || exit 1
 for value in "$MDTEST_BRANCH_FACTOR" "$MDTEST_ITEMS_PER_DIR" "$MDTEST_ITERATIONS"; do
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
         echo "Error: MDTEST_BRANCH_FACTOR, MDTEST_ITEMS_PER_DIR, and MDTEST_ITERATIONS must be positive integers" >&2
@@ -297,6 +305,7 @@ exec 1> >(tee -a "$runner_log")
 exec 2> >(tee -a "$runner_log" >&2)
 echo "storage-scale-test $STORAGE_SCALE_TEST_VERSION"
 print_env_override_summary
+print_storage_target_summary
 echo "Metadata sweep: nodes=${node_counts[*]} tasks=${task_counts[*]} output=$OUTPUT_DIR"
 if [[ -n "$single_dir_target_files" ]]; then
     print_mdtest_single_dir_target_summary "$single_dir_target_files" \

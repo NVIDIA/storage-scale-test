@@ -46,6 +46,7 @@ if __name__ == "__main__":
     prepare_report_runtime(__file__, summarize_elbencho_parser)
 
 from lib.env_used_yaml import load_env_used_yaml
+from lib.storage_target import storage_target_from_env, test_dirs_target_name
 
 _DS_TAIL_RE = re.compile(r"^elbencho-(\d{8}Z\d{6})$")
 _BENCH_OUT_BASENAME_RE = re.compile(
@@ -332,6 +333,25 @@ def _test_dirs_line_suffix(env: Dict[str, Any]) -> str:
     return ""
 
 
+def _target_line_suffix(env: Dict[str, Any]) -> str:
+    """Name the storage target unless line 1 already shows that name.
+
+    Only a lone TEST_DIRS key is displayed (several collapse to a marker), so
+    the name is redundant only when that one key, minus trailing slashes, is it.
+    """
+    name = storage_target_from_env(env).name
+    if name is None:
+        return ""
+    test_dirs = env.get("TEST_DIRS")
+    if (
+        isinstance(test_dirs, dict)
+        and len(test_dirs) == 1
+        and name == test_dirs_target_name(env)
+    ):
+        return ""
+    return f" target={name}"
+
+
 def _shorten_rf_under_test_dir(rf_raw: str, env: Dict[str, Any]) -> str:
     """If rf path is under a TEST_DIRS key, show path relative to that key."""
     stripped = str(rf_raw).strip()
@@ -371,7 +391,8 @@ def _format_three_lines(
         else f"dur: {dur_sec}s"
     )
     line1 = (
-        f"{basename} {duration} nodes: {nodes_spec}" f"{_test_dirs_line_suffix(env)}"
+        f"{basename} {duration} nodes: {nodes_spec}"
+        f"{_test_dirs_line_suffix(env)}{_target_line_suffix(env)}"
     )
     if comp:
         line1 = f"{comp} {line1}"

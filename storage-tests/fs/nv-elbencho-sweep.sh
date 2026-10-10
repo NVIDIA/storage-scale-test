@@ -422,7 +422,11 @@ _resume_prepare_saved_snapshot() {
     ELBENCHO_FILE_LAYOUT=worker-directories
     ELBENCHO_FILES_PER_NODE=
     ELBENCHO_FILE_SIZE=
-    export ELBENCHO_FILE_LAYOUT ELBENCHO_FILES_PER_NODE ELBENCHO_FILE_SIZE
+    # A snapshot from before the storage target name derives it from its own
+    # settings; it must not inherit the caller's or env.sh's value.
+    STORAGE_TARGET_NAME=
+    export ELBENCHO_FILE_LAYOUT ELBENCHO_FILES_PER_NODE ELBENCHO_FILE_SIZE \
+        STORAGE_TARGET_NAME
     unset EXECUTION_SUBSTRATE
     # shellcheck disable=SC1091  # Trusted, result-directory-local snapshot.
     source "$OUTPUT_DIR/env_used.sh" || {
@@ -492,7 +496,11 @@ if [[ "$SWEEP_OPERATION" == resume ]]; then
     ELBENCHO_FILE_LAYOUT=worker-directories
     ELBENCHO_FILES_PER_NODE=
     ELBENCHO_FILE_SIZE=
-    export ELBENCHO_FILE_LAYOUT ELBENCHO_FILES_PER_NODE ELBENCHO_FILE_SIZE
+    # A snapshot from before the storage target name derives it from its own
+    # settings; it must not inherit the caller's or env.sh's value.
+    STORAGE_TARGET_NAME=
+    export ELBENCHO_FILE_LAYOUT ELBENCHO_FILES_PER_NODE ELBENCHO_FILE_SIZE \
+        STORAGE_TARGET_NAME
     unset EXECUTION_SUBSTRATE
     # shellcheck disable=SC1091  # Trusted, result-directory-local snapshot.
     source "$OUTPUT_DIR/env_used.sh" || exit 1
@@ -557,6 +565,11 @@ _validate_elbencho_sweep_environment() {
         validation_failed=1
     fi
     if ! validate_elbencho_live_csv >&2; then
+        validation_failed=1
+    fi
+    # A resumed snapshot records the effective (possibly derived) name, which
+    # was validated when it was submitted.
+    if [[ "$SWEEP_OPERATION" == submit ]] && ! validate_storage_target_name; then
         validation_failed=1
     fi
 
@@ -782,6 +795,7 @@ exec 2> >(tee -a "${out_log}" >&2)
 echo "storage-scale-test $STORAGE_SCALE_TEST_VERSION"
 
 print_env_override_summary
+print_storage_target_summary
 
 cd "${SCALE_TEST_BASE}/storage-tests/fs" || exit 1
 
