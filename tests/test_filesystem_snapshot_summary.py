@@ -337,6 +337,64 @@ def test_missing_snapshot_has_an_unknown_target():
     assert "Targets: name=unknown; roots=unknown" in summary
 
 
+def _override_row(snapshot, files):
+    snapshot["env_override"] = {
+        "file": files[-1],
+        "sha256": "c" * 64,
+        "variables": ["SETTING"],
+        "files": [
+            {"file": path, "sha256": "d" * 64, "variables": []} for path in files
+        ],
+    }
+    return format_io_snapshot_summary(snapshot).splitlines()[-1]
+
+
+def test_override_row_lists_basenames_in_application_order(snapshot):
+    row = _override_row(
+        snapshot, ["/ops/targets/fs-a.env", "/ops/recipes/large-seq.env", "c.env"]
+    )
+    assert row == 'Override: "fs-a.env", "large-seq.env", "c.env"'
+
+
+def test_override_row_truncates_with_a_count_and_fits_the_line(snapshot):
+    paths = [f"/ops/{'n' * 30}-{index:02d}.env" for index in range(10)]
+    row = _override_row(snapshot, paths)
+    assert len(row) <= 132
+    assert row.startswith(f'Override: "{"n" * 30}-00.env", "{"n" * 30}-01.env"')
+    shown, _, hidden = row.rpartition(" (+")
+    assert hidden.endswith(" more)") and shown.count(".env") + int(
+        hidden.split()[0]
+    ) == len(paths)
+    assert "-09.env" not in row
+
+
+def test_override_row_always_shows_the_first_file_and_one_line(snapshot):
+    row = _override_row(snapshot, ["/x/" + "a" * 200 + ".env", "/x/b\nb.env"])
+    assert row.startswith('Override: "' + "a" * 200) and row.endswith(" (+1 more)")
+    assert len(format_io_snapshot_summary(snapshot).splitlines()) == 6
+    assert "b.env" not in row
+
+
+def test_override_row_with_one_listed_file_matches_the_legacy_rendering(snapshot):
+    assert _override_row(snapshot, ["/ops/only.env"]) == 'Override: "only.env"'
+
+
+@pytest.mark.parametrize(
+    "mapping, expected",
+    [
+        ({"file": "/ops/old.env", "sha256": "e" * 64}, 'Override: "old.env"'),
+        ({"file": "", "files": []}, "Override: none recorded"),
+        ({"file": "/ops/last.env", "files": "oops"}, 'Override: "last.env"'),
+        ({"files": [{"sha256": "f"}]}, "Override: unknown"),
+    ],
+)
+def test_override_row_without_a_usable_files_list_uses_the_legacy_mapping(
+    snapshot, mapping, expected
+):
+    snapshot["env_override"] = mapping
+    assert format_io_snapshot_summary(snapshot).splitlines()[-1] == expected
+
+
 READ_FROM_KEY = "sweep_read_from"
 ELLIPSIS = "…"
 

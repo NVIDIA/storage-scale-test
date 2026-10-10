@@ -232,8 +232,8 @@ most effective ergonomic investment.
 
 ### 3.5 Workload Override Files
 
-Filesystem launchers accept one `--env-override <file>` per new submission,
-`--batch`, or `--append`; see
+Filesystem launchers accept repeatable `--env-override <file>` flags per new
+submission, `--batch`, or `--append`; see
 [Workload override files](FILESYSTEM_TESTING.md#workload-override-files) for
 usage. After `env.sh`, `filesystem_env_override_declarations`
 (`lib/env_functions.sh`) sources the file in an isolated child shell seeded
@@ -242,7 +242,10 @@ such as `LIST+=(x)` work. Only names listed by `filesystem_env_override_names`
 may change; new lowercase scratch variables are discarded, and any other change
 is an error. Values are type-checked (associative array, indexed array, or
 scalar) and returned as declarations that the launcher `eval`s, followed by
-`apply_filesystem_workload_defaults`.
+`apply_filesystem_workload_defaults`. The launcher evaluates each file's
+declarations before running the next file's loader, so later files build on
+earlier ones; `resolve_env_override_chain` resolves the paths and rejects the
+same file given twice.
 
 - **Allowlist equals the snapshot.** The names are exactly the workload
   settings that `env_used.sh` records. Slurm coordinators re-source `env.sh`
@@ -250,10 +253,14 @@ scalar) and returned as declarations that the launcher `eval`s, followed by
   revert.
 - **`env_base.sh` is not re-sourced.** It is not idempotent (modules, `PATH`,
   Slurm queries); only the workload defaults are re-applied.
-- **Evaluated once per group.** Batch preparation reuses the launcher's
-  validated declarations instead of re-sourcing the file.
-- **Provenance.** `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}`
-  record the file path, its SHA-256, and the changed names (§8.1).
+- **Evaluated once per group.** Batch preparation stages each file as
+  `.env-override-<n>.sh` (the operator's paths go in `.env-override-origins`)
+  and reuses the launcher's concatenated, validated declarations instead of
+  re-sourcing the files.
+- **Provenance.** `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILES,SHA256S,FILE_VARIABLES}`
+  arrays record each file's path, SHA-256, and changed names in application
+  order. The scalars `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}`
+  keep the last file and the union of names (§8.1).
 
 ---
 
@@ -740,10 +747,13 @@ directory is the execution ledger and may also contain exit codes, Slurm job IDs
 exact-completion JSON, workload TSV records, core files, and treefile-cache usage
 records. Metadata sweeps write `env_used.yaml` and a sourceable `env_used.sh`
 snapshot and use the same typed execution ledger. Filesystem `env_used.sh`
-always records `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}`
+always records `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}` and
+the arrays `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILES,SHA256S,FILE_VARIABLES}`
 (empty without an override, so sourcing one group's snapshot after another's
-cannot inherit provenance); `env_used.yaml` carries an `env_override` mapping
-(`file`, `sha256`, `variables`) or `null` (§3.5). Separately, staged
+cannot inherit provenance; snapshots with only the scalars are normalized to
+one-entry arrays); `env_used.yaml` carries an `env_override` mapping (`file`,
+`sha256`, `variables` for the last file and the union, plus `files`, a list of
+`{file, sha256, variables}` in application order) or `null` (§3.5). Separately, staged
 directory reads can persist their reusable treefile cache in the dataset,
 outside the result directory.
 

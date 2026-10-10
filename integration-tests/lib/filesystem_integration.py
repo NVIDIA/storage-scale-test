@@ -5253,9 +5253,13 @@ def _assert_mixed_batch_overrides(
 ) -> None:
     """Each cell records exactly the override its own append command used."""
     for execution, step in zip(executions, steps, strict=True):
-        expected = ""
-        if "--env-override" in step.arguments:
-            expected = step.arguments[step.arguments.index("--env-override") + 1]
+        # The legacy scalar records the last override applied.
+        overrides = [
+            step.arguments[index + 1]
+            for index, argument in enumerate(step.arguments[:-1])
+            if argument == "--env-override"
+        ]
+        expected = overrides[-1] if overrides else ""
         recorded = _env_override_provenance(
             result / "executions" / f"{execution[1]}.sh"
         )

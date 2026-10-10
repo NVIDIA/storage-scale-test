@@ -42,13 +42,13 @@ fi
 usage() {
     cat <<USAGE
 Usage: $0 --nodes <node_spec> --tasks <task_spec> [--single-dir-file-target <count>]
-          [--env-override <file>]
+          [--env-override <file>]...
        $0 --resume <results_dir>
        $0 --status <results_dir>
        $0 --cancel <results_dir>
        $0 --collect <results_dir>
-       $0 --batch [--env-override <file>] --nodes <node_spec> --tasks <task_spec>
-       $0 --append <batch_dir> [--env-override <file>] --nodes <node_spec> --tasks <task_spec>
+       $0 --batch [--env-override <file>]... --nodes <node_spec> --tasks <task_spec>
+       $0 --append <batch_dir> [--env-override <file>]... --nodes <node_spec> --tasks <task_spec>
        $0 --start <batch_dir>
        $0 --version
 
@@ -67,9 +67,12 @@ zero-byte files. It requires one node count, one task count, and one generated
 target directory. The achievable file count is rounded to whole workers.
 
 --env-override sources <file> after env.sh so its filesystem workload settings
-(TEST_DIRS, FS_MAX_*, MDTEST_*, ELBENCHO_*) take precedence. It is accepted
-once, only for a new submission or --batch/--append. Values are saved in
-env_used.sh; later lifecycle operations never reread the file or env.sh.
+(TEST_DIRS, FS_MAX_*, MDTEST_*, ELBENCHO_*, STORAGE_TARGET_NAME) take
+precedence. It may be repeated: files apply in command-line order, each on top
+of the previous result (a later LIST+=(x) extends an earlier list), and the
+same file twice is an error. It is accepted only for a new submission or
+--batch/--append. Values and the file list are saved in env_used.sh; later
+lifecycle operations never reread the files or env.sh.
 
 --resume restores the saved execution definitions and retries non-SUCCESS cells.
 For Kubernetes, first collect the terminal attempt. --status, --cancel, and
@@ -80,7 +83,8 @@ USAGE
 nodes_spec=""
 tasks_spec=""
 single_dir_target_files=""
-env_override_file=""
+env_override_files=()
+env_override_labels=()
 operation="submit"
 operation_dir=""
 while [[ $# -gt 0 ]]; do
@@ -106,11 +110,7 @@ while [[ $# -gt 0 ]]; do
                         echo "Error: --single-dir-file-target may be specified only once" >&2; exit 1;
                     }
                     single_dir_target_files="$2" ;;
-                --env-override)
-                    [[ -z "$env_override_file" ]] || {
-                        echo "Error: --env-override may be specified only once" >&2; exit 1;
-                    }
-                    env_override_file="$2" ;;
+                --env-override) env_override_files+=("$2") ;;
                 *)
                     [[ "$operation" == submit ]] || {
                         echo "Error: lifecycle operations are mutually exclusive" >&2; exit 1;
@@ -123,7 +123,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$operation" != submit && -n "$env_override_file" ]]; then
+if [[ "$operation" != submit && "${#env_override_files[@]}" -gt 0 ]]; then
     echo "Error: --env-override applies only to a new submission or --batch/--append;" \
         "existing results always use their saved env_used.sh" >&2
     exit 1
@@ -199,21 +199,27 @@ if [[ "$operation" == resume ]]; then
     # shellcheck disable=SC1090,SC1091
     source "$OUTPUT_DIR/env_used.sh" || exit 1
 fi
-# A new submission layers its --env-override over env.sh at top level, before
-# any validation or output, so every check and snapshot sees effective values.
+# A new submission layers its --env-override files over env.sh at top level,
+# in command-line order (each on top of the previous result), before any
+# validation or output, so every check and snapshot sees effective values.
 if [[ "$operation" == submit ]]; then
     reset_env_override_provenance
-    if [[ -n "$env_override_file" ]]; then
-        env_override_file=$(resolve_env_override_file "$env_override_file") || exit 1
-        # Batch preparation passes a staged copy; record the operator's file.
-        env_override_label="$env_override_file"
+    if [[ "${#env_override_files[@]}" -gt 0 ]]; then
+        resolve_env_override_chain env_override_files env_override_labels || exit 1
+        # Batch preparation passes staged copies and gets the operator's paths
+        # as labels; it reuses the combined declarations rather than the files.
+        env_override_saved="reset_env_override_provenance"$'\n'
+        for env_override_index in "${!env_override_files[@]}"; do
+            env_override_declarations=$(filesystem_env_override_declarations \
+                "${env_override_files[env_override_index]}" \
+                "${env_override_labels[env_override_index]}") || exit 1
+            eval "$env_override_declarations"
+            env_override_saved+="$env_override_declarations"$'\n'
+        done
         if [[ -n "${ELBENCHO_BATCH_PREPARE_DIR:-}" ]]; then
-            env_override_label="${ELBENCHO_BATCH_ENV_OVERRIDE_ORIGIN:-$env_override_file}"
+            printf '%s' "$env_override_saved" \
+                > "$ELBENCHO_BATCH_PREPARE_DIR/.env-override-declarations.sh" || exit 1
         fi
-        env_override_declarations=$(filesystem_env_override_declarations \
-            "$env_override_file" "$env_override_label" \
-            "${ELBENCHO_BATCH_PREPARE_DIR:+$ELBENCHO_BATCH_PREPARE_DIR/.env-override-declarations.sh}") || exit 1
-        eval "$env_override_declarations"
     fi
 fi
 if [[ -n "${SLURM_JOB_ID:-}" && -z "${SSH_ENABLED:-}" ]]; then

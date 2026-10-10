@@ -227,8 +227,11 @@ Important configuration relationships:
   Object tests use a dedicated `OBJ_BUCKET`, endpoint settings, and credentials
   sourced from `OBJ_AUTH_FILE`.
 
-Filesystem launchers accept one `--env-override <file>` per new submission,
-`--batch`, or `--append`. After `env.sh`, `filesystem_env_override_declarations`
+Filesystem launchers accept repeatable `--env-override <file>` flags per new
+submission, `--batch`, or `--append`; files apply in command-line order, each
+`eval`ed at the launcher's top level before the next loader runs, and
+`resolve_env_override_chain` rejects the same file twice. For each file,
+`filesystem_env_override_declarations`
 (`lib/env_functions.sh`) sources the file in an isolated child shell seeded with
 the current allowed values. It rejects changes to anything outside
 `filesystem_env_override_names` (workload settings that `env_used.sh` records),
@@ -240,17 +243,24 @@ declarations that the caller `eval`s in its own scope, followed by
   Slurm queries).
 - Slurm coordinators re-source `env.sh` and then only `env_used.sh`, so names
   outside the snapshot cannot be overridden safely.
-- Batch prepare applies the override in its own shell too, because the group
+- Batch prepare applies the overrides in its own shell too, because the group
   snapshot also captures that shell's `ELBENCHO_*`/`MDTEST_*`/`FS_MAX_*` values.
-  The launcher evaluates the staged file once; prepare reuses its validated
-  declarations so relative edits and side effects are not repeated.
+  `_elbencho_batch_stage_env_override` copies each file to
+  `.env-override-<n>.sh` and records the operator's paths NUL-separated in
+  `.env-override-origins`; the launcher evaluates the staged files once and
+  writes the concatenated declarations to `.env-override-declarations.sh`,
+  which prepare sources so relative edits and side effects are not repeated.
 - Override read context intentionally includes only allowlisted workload
   variables and exported environment values. Nonexported site helpers are
   unsupported; expanding this context to emulate parent-shell sourcing is
   outside the feature's intended scope.
-- `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}` provenance is
-  always written to `env_used.sh` (empty without an override) so treefile-cache
-  YAML rewrites keep it and sequentially sourced groups cannot inherit it.
+- `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}` (last file, its
+  hash, union of names) and the per-file arrays
+  `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILES,SHA256S,FILE_VARIABLES}` are always
+  written to `env_used.sh` (empty without an override) so treefile-cache YAML
+  rewrites keep them and sequentially sourced groups cannot inherit them.
+  `normalize_env_override_provenance` upgrades scalar-only snapshots to
+  one-entry arrays; `env_used.yaml` `env_override` gains a `files` list.
 
 `env.sh`, `OBJ_AUTH_FILE`, `--env-override` files, filesystem resume snapshots,
 and reified execution definitions are sourced as Bash. They are executable

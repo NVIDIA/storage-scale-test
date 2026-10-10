@@ -34,9 +34,22 @@ can run recipes without editing `env.sh`:
     --env-override overrides/r2-requirements.env --nodes 8,16
 ```
 
-Queue several with `--batch`/`--append`. Override values apply on top of
-`env.sh`, not on top of a previous recipe, so make each file self-contained.
-See [Workload override files](docs/FILESYSTEM_TESTING.md#workload-override-files).
+Queue several with `--batch`/`--append`; each group keeps its own overrides.
+`--env-override` may repeat within one command: the files apply in order, each
+on top of the previous one, so a target file and a recipe stack. For example,
+a file that sets `STORAGE_TARGET_NAME` and `TEST_DIRS` for one filesystem
+combines with any recipe:
+
+```bash
+./storage-tests/fs/nv-elbencho-sweep.sh \
+    --env-override targets/fs-a.env \
+    --env-override overrides/r2-requirements.env --nodes 8,16
+```
+
+Recipes that edit a list with `+=` build on the earlier file's list, so make
+each recipe set the lists it depends on outright when it must not depend on
+what came before. See
+[Workload override files](docs/FILESYSTEM_TESTING.md#workload-override-files).
 
 ---
 

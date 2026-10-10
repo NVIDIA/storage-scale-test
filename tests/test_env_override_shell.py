@@ -19,6 +19,7 @@
 # pylint: disable=protected-access
 
 from pathlib import Path
+import hashlib
 import importlib.util
 import os
 import re
@@ -35,9 +36,13 @@ ROOT = Path(__file__).resolve().parents[1]
 IO = "nv-elbencho-sweep.sh"
 MD = "nv-mdtest-elbencho.sh"
 OVERRIDE_FLAG = "--env-override"
-PROVENANCE = "STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE"
+PREFIX = "STORAGE_SCALE_TEST_ENV_OVERRIDE"
+PROVENANCE = f"{PREFIX}_FILE"
 SAVED_ONLY = "existing results always use their saved env_used.sh"
 MDTEST_ITEMS_SETTING = "MDTEST_ITEMS_PER_DIR"
+DUPLICATE = "given more than once for the same file"
+THREAD_LIST = "ELBENCHO_SCALE_THREAD_LIST"
+ARGS_BY_ENTRY = {IO: ("--nodes", "1"), MD: ("--nodes", "1", "--tasks", "1")}
 
 
 @pytest.fixture(name="checkout")
@@ -427,11 +432,12 @@ def test_submission_without_override_records_none(checkout):
         (MD, ("--resume", "/missing"), SAVED_ONLY),
         (MD, ("--collect", "/missing"), SAVED_ONLY),
         (IO, ("--start", "{batch}"), "rejects workload arguments (--env-override)"),
-        (IO, (OVERRIDE_FLAG, "{file}", "--nodes", "1"), "only once"),
+        (IO, ("--status", "/missing", OVERRIDE_FLAG, "{file}"), SAVED_ONLY),
+        (IO, (OVERRIDE_FLAG, "{file}", "--nodes", "1"), DUPLICATE),
         (
             MD,
             ("--batch", OVERRIDE_FLAG, "{file}", "--nodes", "1", "--tasks", "1"),
-            "only once",
+            DUPLICATE,
         ),
         (IO, ("--batch", "--nodes", "1"), "--env-override requires a file argument"),
     ],
@@ -446,6 +452,317 @@ def test_cli_rejections(checkout, entry, args, message):
     result = launch(checkout, entry, *rendered, OVERRIDE_FLAG, *trailing)
     assert result.returncode != 0
     assert message in result.stderr
+
+
+def flags(*files):
+    """Repeat --env-override once per file."""
+    return [part for file in files for part in (OVERRIDE_FLAG, file)]
+
+
+def sha256_of(path):
+    """Hex digest of an override file's bytes."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def saved_files(snapshot_dir):
+    """The ordered `files` list recorded in a result or group directory."""
+    saved = yaml.safe_load((snapshot_dir / "env_used.yaml").read_text())
+    return saved["env_override"]["files"]
+
+
+def sourced_provenance(checkout, snapshot_sh):
+    """Source a saved env_used.sh and return its provenance arrays."""
+    names = ("FILES", "SHA256S", "FILE_VARIABLES")
+    printed = "".join(
+        f"printf '%s\\n' \"${{{PREFIX}_{name}[@]}}\"; echo ---; " for name in names
+    )
+    result = shell(checkout, f"source {shlex.quote(str(snapshot_sh))}; {printed}")
+    assert result.returncode == 0, result.stderr
+    sections = result.stdout.split("---\n")
+    return [section.splitlines() for section in sections[:3]]
+
+
+def test_duplicate_override_paths_are_rejected_however_they_are_spelled(checkout):
+    override = write_override(checkout, "same.env", "MDTEST_ITERATIONS=2\n")
+    link = checkout / "overrides" / "link.env"
+    link.symlink_to(override)
+    spellings = (
+        (override, override),
+        (Path("overrides/same.env"), override),
+        (override, Path("overrides/../overrides/same.env")),
+        (override, link),
+    )
+    for first, second in spellings:
+        result = launch(checkout, IO, *flags(first, second), "--nodes", "1")
+        assert result.returncode == 1, (first, second)
+        assert DUPLICATE in result.stderr
+    batched = launch(checkout, IO, "--batch", *flags(override, link), "--nodes", "1")
+    assert batched.returncode == 1 and DUPLICATE in batched.stderr
+    assert not (checkout / "results").exists() or not any(
+        (checkout / "results").glob("*")
+    )
+
+
+@pytest.mark.parametrize("entry", [IO, MD])
+def test_repeated_overrides_apply_in_order(checkout, entry):
+    first = write_override(
+        checkout, "first.env", f"{THREAD_LIST}=(1 2)\nMDTEST_ITERATIONS=5\n"
+    )
+    second = write_override(
+        checkout, "second.env", f"{THREAD_LIST}+=(4)\nMDTEST_ITERATIONS=9\n"
+    )
+    created = launch(
+        checkout, entry, "--batch", *flags(first, second), *ARGS_BY_ENTRY[entry]
+    )
+    assert created.returncode == 0, created.stderr
+    batch = batch_root(created.stdout)
+    context = (
+        f'r={shlex.quote(str(batch))}; elbencho_batch_verify_manifest "$r"; '
+        'for id in $(list_elbencho_execution_ids "$r/executions"); do '
+        '(elbencho_batch_load_execution_context "$r" "$id"; '
+        f'echo "${{{THREAD_LIST}[*]}} $MDTEST_ITERATIONS"); done'
+    )
+    result = shell(checkout, context)
+    assert result.returncode == 0, result.stderr
+    assert set(result.stdout.splitlines()) == {"1 2 4 9"}
+    # The reverse order is not equivalent: the second file replaces the list.
+    result = apply_in_order(checkout, (second, first), THREAD_LIST)
+    assert result.stdout.split()[:2] == ["1", "2"] and result.stdout.split()[-1] != "4"
+
+
+def apply_in_order(checkout, files, name):
+    """Apply override files like a launcher does; print one setting."""
+    return shell(
+        checkout,
+        "for f in "
+        + " ".join(shlex.quote(str(file)) for file in files)
+        + '; do d=$(filesystem_env_override_declarations "$f") || exit 1; '
+        f'eval "$d"; done; echo "${{{name}[*]}}"',
+    )
+
+
+def test_every_override_can_be_edited_relative_to_the_previous_result(checkout):
+    files = [
+        write_override(checkout, f"step{i}.env", f"{THREAD_LIST}+=({i})\n")
+        for i in (7, 8, 9)
+    ]
+    result = apply_in_order(checkout, files, THREAD_LIST)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split()[-3:] == ["7", "8", "9"]
+
+
+@pytest.mark.parametrize(
+    ("entry", "glob", "setting"),
+    [(IO, "elbencho-*", "ELBENCHO_SCALE_IO_SIZES"), (MD, "mdtest-elbencho-*", None)],
+)
+def test_provenance_lists_every_file_and_keeps_the_legacy_scalars(
+    checkout, entry, glob, setting
+):
+    first = write_override(checkout, "a-target.env", "STORAGE_TARGET_NAME=fs-a\n")
+    second = write_override(
+        checkout,
+        "b-recipe.env",
+        "MDTEST_ITERATIONS=4\n"
+        + (f"{setting}=(1M)\n" if setting else "MDTEST_ITEMS_PER_DIR=7\n"),
+    )
+    submitted = launch(checkout, entry, *flags(first, second), *ARGS_BY_ENTRY[entry])
+    lines = [line for line in submitted.stdout.splitlines() if "Env override" in line]
+    assert [line.split(":")[0] for line in lines] == [
+        "Env override 1/2",
+        "Env override 2/2",
+    ]
+    assert f"{first} (sha256 {sha256_of(first)}): STORAGE_TARGET_NAME" in lines[0]
+    result = next((checkout / "results").glob(glob))
+    union = sorted(
+        {"STORAGE_TARGET_NAME", "MDTEST_ITERATIONS"}
+        | {setting or "MDTEST_ITEMS_PER_DIR"}
+    )
+    saved = yaml.safe_load((result / "env_used.yaml").read_text())["env_override"]
+    assert saved["file"] == str(second) and saved["sha256"] == sha256_of(second)
+    assert saved["variables"] == union
+    assert saved["files"] == [
+        {
+            "file": str(first),
+            "sha256": sha256_of(first),
+            "variables": ["STORAGE_TARGET_NAME"],
+        },
+        {
+            "file": str(second),
+            "sha256": sha256_of(second),
+            "variables": sorted(set(union) - {"STORAGE_TARGET_NAME"}),
+        },
+    ]
+    assert provenance(result / "env_used.sh") == str(second)
+    files, digests, per_file = sourced_provenance(checkout, result / "env_used.sh")
+    assert files == [str(first), str(second)]
+    assert digests == [sha256_of(first), sha256_of(second)]
+    assert per_file[0] == "STORAGE_TARGET_NAME"
+    assert (
+        " " not in per_file[0] and per_file[1].split() == saved["files"][1]["variables"]
+    )
+    reloaded = shell(
+        checkout,
+        f"source {shlex.quote(str(result))}/env_used.sh; "
+        f'echo "$STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES"',
+    )
+    assert reloaded.stdout.split() == union
+
+
+def test_one_override_keeps_the_single_file_output(checkout):
+    override = write_override(checkout, "only.env", "MDTEST_ITERATIONS=4\n")
+    submitted = launch(checkout, MD, *flags(override), *ARGS_BY_ENTRY[MD])
+    assert f"Env override: {override} (sha256 " in submitted.stdout
+    assert "Env override 1/1" not in submitted.stdout
+    result = next((checkout / "results").glob("mdtest-elbencho-*"))
+    assert [entry["file"] for entry in saved_files(result)] == [str(override)]
+
+
+@pytest.mark.parametrize("entry", [IO, MD])
+def test_batch_and_append_record_each_groups_own_ordered_overrides(checkout, entry):
+    names = ("t1.env", "w1.env", "t2.env", "w2.env")
+    t1, w1, t2, w2 = (
+        write_override(
+            checkout, name, f"STORAGE_TARGET_NAME=fs-{name[1]}\nMDTEST_ITERATIONS={i}\n"
+        )
+        for i, name in enumerate(names, start=2)
+    )
+    other = MD if entry == IO else IO
+    created = launch(checkout, entry, "--batch", *flags(t1, w1), *ARGS_BY_ENTRY[entry])
+    assert created.returncode == 0, created.stderr
+    batch = batch_root(created.stdout)
+    # Relative spellings on the second group still record absolute paths.
+    appended = launch(
+        checkout,
+        other,
+        "--append",
+        batch,
+        *flags(t2.relative_to(checkout), w2.relative_to(checkout)),
+        *ARGS_BY_ENTRY[other],
+    )
+    assert appended.returncode == 0, appended.stderr
+    manifest = [
+        line.split("\t")
+        for line in (batch / "batch-manifest.tsv").read_text().splitlines()
+    ]
+    groups = {row[2]: batch / row[3] for row in manifest if row[0] == "group"}
+    expected = {entry_kind(entry): (t1, w1), entry_kind(other): (t2, w2)}
+    for kind, (target, workload) in expected.items():
+        recorded = saved_files(groups[kind])
+        assert [item["file"] for item in recorded] == [str(target), str(workload)]
+        assert [item["sha256"] for item in recorded] == [
+            sha256_of(target),
+            sha256_of(workload),
+        ]
+        assert provenance(groups[kind] / "env_used.sh") == str(workload)
+    assert not any(batch.rglob(".env-override*"))
+    # Each execution loads its own group's final settings.
+    result = shell(
+        checkout,
+        f'r={shlex.quote(str(batch))}; elbencho_batch_verify_manifest "$r"; '
+        'for id in $(list_elbencho_execution_ids "$r/executions"); do '
+        '(elbencho_batch_load_execution_context "$r" "$id"; '
+        'echo "$ELBENCHO_EXECUTION_KIND $MDTEST_ITERATIONS"); done',
+    )
+    assert result.returncode == 0, result.stderr
+    iterations = {
+        entry_kind(entry): 3,
+        entry_kind(other): 5,
+    }
+    assert {
+        line.split()[0]: line.split()[1] for line in result.stdout.splitlines()
+    } == {kind: str(value) for kind, value in iterations.items()}
+
+
+def entry_kind(entry):
+    """The batch group kind a launcher creates."""
+    return "io" if entry == IO else "mdtest"
+
+
+@pytest.mark.parametrize(
+    ("scalars", "expected"),
+    [
+        (
+            f"{PREFIX}_FILE=/ops/old.env\n"
+            f"{PREFIX}_SHA256=abc123\n"
+            f"{PREFIX}_VARIABLES='FS_MAX_NODE_IOPS MDTEST_ITERATIONS'\n",
+            [
+                {
+                    "file": "/ops/old.env",
+                    "sha256": "abc123",
+                    "variables": ["FS_MAX_NODE_IOPS", "MDTEST_ITERATIONS"],
+                }
+            ],
+        ),
+        (f"{PREFIX}_FILE=''\n", None),
+    ],
+)
+def test_old_scalar_only_snapshots_normalize_to_one_entry_files(
+    checkout, scalars, expected
+):
+    old = checkout / "old-env-used.sh"
+    old.write_text(scalars)
+    # Stale arrays from some other snapshot must never leak into this one.
+    result = shell(
+        checkout,
+        f"{PREFIX}_FILES=(/stale.env); {PREFIX}_SHA256S=(dead); "
+        f"{PREFIX}_FILE_VARIABLES=(STALE); source {shlex.quote(str(old))}; "
+        "_emit_env_override_provenance_yaml; _emit_env_override_provenance_sh",
+    )
+    assert result.returncode == 0, result.stderr
+    yaml_text, _, shell_text = result.stdout.partition("# --env-override")
+    recorded = yaml.safe_load(yaml_text)["env_override"]
+    assert "stale" not in result.stdout.lower()
+    if expected is None:
+        assert recorded is None
+        assert f"{PREFIX}_FILES=()" in shell_text
+        return
+    assert recorded["files"] == expected
+    assert recorded["file"] == "/ops/old.env" and recorded["sha256"] == "abc123"
+    assert f"{PREFIX}_FILES=(/ops/old.env)" in shell_text
+
+
+def test_summary_of_old_snapshot_state_prints_one_unnumbered_line(checkout):
+    result = shell(
+        checkout,
+        f"{PREFIX}_FILE=/ops/old.env; {PREFIX}_SHA256=ab; "
+        f"{PREFIX}_VARIABLES=MDTEST_ITERATIONS; print_env_override_summary",
+    )
+    assert (
+        result.stdout == "Env override: /ops/old.env (sha256 ab): MDTEST_ITERATIONS\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("entry", "glob", "key", "expected"),
+    [
+        (IO, "elbencho-*", "ELBENCHO_SCALE_IO_SIZES", ["1M"]),
+        (MD, "mdtest-elbencho-*", MDTEST_ITEMS_SETTING, 7),
+    ],
+)
+def test_a_target_file_and_a_workload_file_both_apply(
+    checkout, entry, glob, key, expected
+):
+    target = write_override(
+        checkout,
+        "target.env",
+        'STORAGE_TARGET_NAME=vendor-a:fs1\nTEST_DIRS=(["/data/two"]=1)\n',
+    )
+    workload = write_override(
+        checkout,
+        "recipe.env",
+        "ELBENCHO_SCALE_IO_SIZES=(1M)\nMDTEST_ITEMS_PER_DIR=7\n",
+    )
+    submitted = launch(checkout, entry, *flags(target, workload), *ARGS_BY_ENTRY[entry])
+    assert "Storage target: vendor-a:fs1\n" in submitted.stdout
+    result = next((checkout / "results").glob(glob))
+    saved = yaml.safe_load((result / "env_used.yaml").read_text())
+    assert saved["STORAGE_TARGET_NAME"] == "vendor-a:fs1"
+    assert list(saved["TEST_DIRS"]) == ["/data/two"]
+    assert saved[key] == expected
+    assert [item["variables"] for item in saved["env_override"]["files"]] == [
+        ["STORAGE_TARGET_NAME", "TEST_DIRS"],
+        ["ELBENCHO_SCALE_IO_SIZES", "MDTEST_ITEMS_PER_DIR"],
+    ]
 
 
 @pytest.mark.parametrize(

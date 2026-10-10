@@ -416,12 +416,14 @@ _elbencho_batch_prepare() (
     stage=$(mktemp -d "$RESULTS_DIR/.group-staging.XXXXXX") || exit 1
     trap 'rm -r "$stage"' EXIT
     local -a launcher_args=("$@")
+    reset_env_override_provenance
     _elbencho_batch_stage_env_override "$stage" launcher_args || exit 1
     ELBENCHO_BATCH_PREPARE_DIR="$stage" ELBENCHO_BATCH_DATESTAMP="$ds" \
         "$BASH" "$launcher" "${launcher_args[@]}" || exit 1
-    if [[ -n "${ELBENCHO_BATCH_ENV_OVERRIDE_ORIGIN:-}" ]]; then
-        # Reuse the launcher's evaluated values; sourcing the original override
-        # here would repeat relative edits and any other evaluation side effects.
+    if [[ "${ELBENCHO_BATCH_ENV_OVERRIDE_COUNT:-0}" -gt 0 ]]; then
+        # Reuse the launcher's evaluated values (every override, in order);
+        # sourcing the original files here would repeat relative edits and any
+        # other evaluation side effects.
         # shellcheck disable=SC1091
         source "$stage/.env-override-declarations.sh" || exit 1
     fi
@@ -447,27 +449,34 @@ _elbencho_batch_prepare() (
     exit "$rc"
 )
 
-# Copy a group's --env-override file into its staging directory exactly once
-# and point the launcher arguments at that copy. The launcher evaluates it once
-# and returns declarations for the prepare shell's complete group snapshot.
-# Exports ELBENCHO_BATCH_ENV_OVERRIDE_ORIGIN (the operator's path) when present.
+# Copy each of a group's --env-override files into its staging directory
+# (.env-override-<n>.sh, numbered from 1 in command-line order) and point the
+# launcher arguments at the copies. The launcher evaluates the files once, in
+# order, and returns declarations for the prepare shell's complete group
+# snapshot. The operator's absolute paths are recorded NUL-separated in
+# .env-override-origins for provenance. The same file given twice is rejected
+# here, while the originals are still comparable.
+# Exports ELBENCHO_BATCH_ENV_OVERRIDE_COUNT (0 when the group has none).
 _elbencho_batch_stage_env_override() {
-    local stage="$1" index="" position origin
+    local stage="$1" position index
     # shellcheck disable=SC2178  # Nameref to the caller's argument array.
     local -n args_ref="$2"
-    unset ELBENCHO_BATCH_ENV_OVERRIDE_ORIGIN
+    local -a positions=() origins=() labels=()
+    export ELBENCHO_BATCH_ENV_OVERRIDE_COUNT=0
     for position in "${!args_ref[@]}"; do
         [[ "${args_ref[$position]}" == --env-override ]] || continue
-        [[ -z "$index" ]] || {
-            _elbencho_batch_error '--env-override may be specified only once'; return 1;
-        }
-        index="$position"
+        positions+=("$position")
+        origins+=("${args_ref[$((position + 1))]:-}")
     done
-    [[ -n "$index" ]] || return 0
-    origin=$(resolve_env_override_file "${args_ref[$((index + 1))]:-}") || return 1
-    cp -- "$origin" "$stage/.env-override.sh" || return 1
-    args_ref[index + 1]="$stage/.env-override.sh"
-    export ELBENCHO_BATCH_ENV_OVERRIDE_ORIGIN="$origin"
+    [[ "${#positions[@]}" -gt 0 ]] || return 0
+    resolve_env_override_chain origins labels || return 1
+    : > "$stage/.env-override-origins" || return 1
+    for index in "${!positions[@]}"; do
+        cp -- "${origins[index]}" "$stage/.env-override-$((index + 1)).sh" || return 1
+        args_ref[positions[index] + 1]="$stage/.env-override-$((index + 1)).sh"
+        printf '%s\0' "${origins[index]}" >> "$stage/.env-override-origins" || return 1
+    done
+    export ELBENCHO_BATCH_ENV_OVERRIDE_COUNT="${#positions[@]}"
 }
 
 _elbencho_batch_validate_candidate() {

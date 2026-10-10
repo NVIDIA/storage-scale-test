@@ -27,6 +27,7 @@ UNKNOWN = "unknown"
 NONE_RECORDED = "none recorded"
 FIELD_SEPARATOR = "; "
 READ_FROM_FIELD = "sweep_read_from"
+FILE_KEY = "file"
 OVERRIDE_LABEL = "Override"
 LINE_LIMIT = 132
 ELLIPSIS = "\u2026"
@@ -232,13 +233,42 @@ def _lifecycle(snapshot: dict) -> str:
     return FIELD_SEPARATOR.join(parts)
 
 
+def _override_basenames(provenance: dict) -> list[str]:
+    """Quoted basenames of the applied override files, in application order."""
+    files = provenance.get("files")
+    if not isinstance(files, list):
+        return []
+    return [
+        _display(Path(str(entry[FILE_KEY])).name)
+        for entry in files
+        if isinstance(entry, dict) and entry.get(FILE_KEY)
+    ]
+
+
+def _fit_names(names: list[str], limit: int) -> str:
+    """Join names, ending with "(+K more)" so the text fits within limit.
+
+    The first name is always shown, even when it alone exceeds the limit.
+    """
+    for shown in range(len(names), 0, -1):
+        text = ", ".join(names[:shown])
+        if shown < len(names):
+            text += f" (+{len(names) - shown} more)"
+        if len(text) <= limit or shown == 1:
+            return text
+    return NONE_RECORDED
+
+
 def _override(snapshot: dict) -> str:
     provenance = snapshot.get("env_override")
     if "env_override" in snapshot and provenance is None:
         return NONE_RECORDED
     if not isinstance(provenance, dict):
         return UNKNOWN
-    filename = provenance.get("file")
+    names = _override_basenames(provenance)
+    if names:
+        return _fit_names(names, LINE_LIMIT - len(f"{OVERRIDE_LABEL}: "))
+    filename = provenance.get(FILE_KEY)
     if filename is None:
         return UNKNOWN
     return _display(Path(str(filename)).name) if filename else NONE_RECORDED

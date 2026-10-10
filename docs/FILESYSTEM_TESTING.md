@@ -380,9 +380,10 @@ Its durable control directory is chosen from the union of all group test roots.
 ## Workload override files
 
 `--env-override <file>` varies a workload without editing `env.sh`. Either
-launcher, IO or metadata, accepts one file on a new run, `--batch`, or
-`--append`, on any substrate. Each appended group keeps its own override, so a
-directory of small numbered files and a short script can build a mixed batch:
+launcher, IO or metadata, accepts the flag on a new run, `--batch`, or
+`--append`, on any substrate. Each appended group keeps its own override list,
+so a directory of small numbered files and a short script can build a mixed
+batch:
 
 ```bash
 # overrides/10-small-random.env
@@ -405,7 +406,33 @@ test -n "$BATCH"
 "$IO" --start "$BATCH"
 ```
 
-The file is trusted Bash, sourced after `env.sh` in an isolated shell. It sees
+The flag may repeat. The files apply in command-line order, each on top of the
+result of the previous one (and `env.sh` under the first), so a later
+`ELBENCHO_SCALE_THREAD_LIST+=(4)` extends a list an earlier file set, and a
+later assignment to the same scalar wins. Each group's list is independent of
+the others. Giving the same file twice, even through a symlink or a different
+spelling of its path, is an error: it would repeat every relative edit.
+
+A common stack is a target file followed by a recipe file. The target file
+holds what identifies the storage under test, and the recipe holds the
+workload:
+
+```bash
+# targets/fs-a.env
+STORAGE_TARGET_NAME=fs-a
+TEST_DIRS=(["/mnt/fs-a/scale-test"]=1)
+```
+
+```bash
+./storage-tests/fs/nv-elbencho-sweep.sh \
+    --env-override targets/fs-a.env --env-override recipes/large-seq.env \
+    --nodes 1,8
+```
+
+The same target file works unchanged with any recipe file or launcher, and a
+second storage target needs only a different target file.
+
+Each file is trusted Bash, sourced after `env.sh` in an isolated shell. It sees
 the exported environment and the current values of the allowed settings, so
 `+=` and `$((MDTEST_ITERATIONS + 1))` build on `env.sh`; unexported `env.sh`
 helper variables are not visible. `unset NAME` gives a setting its usual
@@ -432,13 +459,23 @@ lists every allowed name. A value of the wrong type is also an error. Either
 fails before a results directory is created or a group is appended. New
 lowercase variables, such as loop counters, are discarded.
 
-Each submission prints
-`Env override: <path> (sha256 <hash>): <changed variables | no settings changed>`
-and records the same in `env_used.sh`
-(`STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}`) and `env_used.yaml`
-(`env_override`). `--start`, `--resume`, `--status`, `--cancel`, `--collect`,
-and `--delete-only` reject the flag; lifecycle commands use the saved values,
-so later edits to the file have no effect.
+Each submission prints one line per file,
+`Env override: <path> (sha256 <hash>): <changed variables | no settings changed>`;
+with more than one file the prefix is `Env override <i>/<N>:`. The snapshots
+record the same, in application order. In `env_used.sh`, the arrays
+`STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILES,SHA256S,FILE_VARIABLES}` hold one entry
+per file (each `FILE_VARIABLES` entry is a space-separated list of names), and
+the scalars `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}` keep their
+single-file meaning: the last file applied, its hash, and the sorted union of
+changed names. In `env_used.yaml`, `env_override` is `null` without an override;
+otherwise `file`, `sha256`, and `variables` describe the last file and the union,
+and `files` lists `{file, sha256, variables}` for every file in order. Older
+snapshots with only the scalars read as a one-file list. Batch groups record the
+operator's paths, not the staged copies, and the snapshot summary's Override row
+shows the file basenames in order (`(+K more)` when the row would overflow).
+`--start`, `--resume`, `--status`, `--cancel`, `--collect`, and `--delete-only`
+reject the flag; lifecycle commands use the saved values, so later edits to the
+files have no effect.
 
 ## Filesystem reporting
 

@@ -1419,12 +1419,78 @@ apply_filesystem_workload_defaults() {
     export STORAGE_TARGET_NAME=${STORAGE_TARGET_NAME:-}
 }
 
+# Make the provenance arrays readable under `set -u` before any reset, without
+# clobbering values a caller or a sourced snapshot already set.
+_init_env_override_provenance_arrays() {
+    local name
+    for name in STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S \
+            STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES; do
+        declare -p "$name" &>/dev/null || declare -ga "$name=()"
+    done
+}
+_init_env_override_provenance_arrays
+
 # Clear the provenance recorded in env_used snapshots. Launchers call this on
 # every new submission so a value inherited from a caller is never recorded.
+# The arrays hold one entry per applied --env-override file, in application
+# order; the scalars keep the legacy meaning (last file, union of variables).
 reset_env_override_provenance() {
     STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE=""
     STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256=""
     STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES=""
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES=()
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S=()
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES=()
+}
+
+# Recompute the legacy scalars from the arrays: _FILE and _SHA256 are the last
+# applied file's, _VARIABLES is the sorted union of every file's variables.
+_refresh_env_override_scalars() {
+    local count=${#STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[@]}
+    local -a words=() union=()
+    if [[ "$count" -eq 0 ]]; then
+        STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE=""
+        STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256=""
+        STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES=""
+        return 0
+    fi
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE="${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[count-1]}"
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256="${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S[count-1]:-}"
+    read -r -a words <<< "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES[*]:-}"
+    if [[ "${#words[@]}" -gt 0 ]]; then
+        mapfile -t union < <(printf '%s\n' "${words[@]}" | LC_ALL=C sort -u)
+    fi
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES="${union[*]:-}"
+}
+
+# Record one applied --env-override file: <label> <sha256> <variables>, where
+# <variables> is the space-separated list of names the file changed. The
+# declarations printed by filesystem_env_override_declarations call this.
+record_env_override_applied() {
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES+=("$1")
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S+=("$2")
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES+=("${3:-}")
+    _refresh_env_override_scalars
+}
+
+# Upgrade provenance loaded from a snapshot that predates the arrays (it has
+# only the scalars) into one-entry arrays. Arrays that already agree with the
+# scalars are left alone; anything else is rebuilt from the scalars so a
+# snapshot never inherits another snapshot's list.
+normalize_env_override_provenance() {
+    local file="${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE:-}"
+    local count=${#STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[@]}
+    if [[ "$count" -gt 0 \
+            && "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[count-1]}" == "$file" ]]; then
+        return 0
+    fi
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES=()
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S=()
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES=()
+    [[ -n "$file" ]] || return 0
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES=("$file")
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S=("${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256:-}")
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES=("${STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES:-}")
 }
 
 # Print the absolute path of an --env-override file, relative to the current
@@ -1447,6 +1513,45 @@ resolve_env_override_file() {
     printf '%s/%s\n' "$dir" "$(basename -- "$path")"
 }
 
+# Resolve every --env-override path of one submission and label each for
+# provenance.
+#
+# Usage: resolve_env_override_chain <files_array> <labels_array>
+# <files_array> names an array of operator-supplied paths, replaced in place by
+# absolute paths. <labels_array> receives each file's provenance label: the
+# resolved path, or in batch preparation (ELBENCHO_BATCH_PREPARE_DIR set) the
+# operator's original path recorded beside the staged copies. The same file
+# given twice (even through a symlink) is an error: applying it again would
+# double every relative edit.
+resolve_env_override_chain() {
+    # shellcheck disable=SC2178  # Namerefs to the caller's arrays.
+    local -n __eoc_files="$1" __eoc_labels="$2"
+    local __eoc_index __eoc_other __eoc_resolved
+    local -a __eoc_origins=()
+    for __eoc_index in "${!__eoc_files[@]}"; do
+        __eoc_resolved=$(resolve_env_override_file "${__eoc_files[__eoc_index]}") || return 1
+        __eoc_files[__eoc_index]="$__eoc_resolved"
+    done
+    __eoc_labels=("${__eoc_files[@]}")
+    if [[ -n "${ELBENCHO_BATCH_PREPARE_DIR:-}" \
+            && -f "$ELBENCHO_BATCH_PREPARE_DIR/.env-override-origins" ]]; then
+        mapfile -d '' -t __eoc_origins < "$ELBENCHO_BATCH_PREPARE_DIR/.env-override-origins"
+        if [[ "${#__eoc_origins[@]}" -ne "${#__eoc_files[@]}" ]]; then
+            echo "Error: staged env override origins do not match the override files" >&2
+            return 1
+        fi
+        __eoc_labels=("${__eoc_origins[@]}")
+    fi
+    for __eoc_index in "${!__eoc_files[@]}"; do
+        for ((__eoc_other = 0; __eoc_other < __eoc_index; __eoc_other++)); do
+            [[ "${__eoc_files[__eoc_index]}" -ef "${__eoc_files[__eoc_other]}" ]] || continue
+            printf 'Error: --env-override given more than once for the same file: %s\n' \
+                "${__eoc_labels[__eoc_index]}" >&2
+            return 1
+        done
+    done
+}
+
 # Child-shell program for filesystem_env_override_declarations. It restores the
 # caller's allowed settings, sources the override at top level (so `declare`
 # stays global), and prints declarations for the allowed names it changed.
@@ -1454,6 +1559,7 @@ resolve_env_override_file() {
 _FILESYSTEM_ENV_OVERRIDE_LOADER='
 __ssto_file=$1
 __ssto_label=$2
+__ssto_digest=$__SSTO_DIGEST
 shift 2
 declare -A __ssto_kind=() __ssto_known=() __ssto_before=() __ssto_seen=()
 while [[ $# -ge 2 ]]; do
@@ -1464,7 +1570,7 @@ for __ssto_name in $__SSTO_KNOWN; do
     __ssto_known[$__ssto_name]=1
 done
 eval "$__SSTO_BASELINE" || exit 1
-unset __SSTO_KNOWN __SSTO_BASELINE
+unset __SSTO_KNOWN __SSTO_BASELINE __SSTO_DIGEST
 __ssto_ignored() {
     case $1 in
         __ssto_*|__SSTO_*|BASH*|_|RANDOM|SRANDOM|LINENO|SECONDS|EPOCHREALTIME \
@@ -1548,7 +1654,8 @@ for __ssto_name in "${__ssto_changed[@]}"; do
     printf "unset -v %s\n" "$__ssto_name"
     declare -p "$__ssto_name" 2>/dev/null || :
 done
-printf "STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES=%q\n" "${__ssto_changed[*]}"
+printf "record_env_override_applied %q %q %q\n" \
+    "$__ssto_label" "$__ssto_digest" "${__ssto_changed[*]}"
 printf ": env-override-complete\n"
 '
 
@@ -1557,13 +1664,17 @@ printf ": env-override-complete\n"
 # env.sh was sourced at top level (launchers) or in a function (batch prepare).
 # The file runs in an isolated child shell seeded with the caller's current
 # allowed settings, so relative edits such as LIST+=(x) work. Changing any
-# other existing or uppercase variable is an error. The printed text ends by
+# other existing or uppercase variable is an error. The printed text records
+# the file in the provenance arrays (record_env_override_applied) and ends by
 # re-applying workload defaults, which gives unset names their usual default.
 #
-# Usage: declarations=$(filesystem_env_override_declarations <file> [label] [save]) || exit 1
+# Several files compose: eval each result before evaluating the next, so each
+# file builds on the previous one's values. Concatenating the printed
+# declarations in order reproduces the combined result.
+#
+# Usage: declarations=$(filesystem_env_override_declarations <file> [label]) || exit 1
 #        eval "$declarations"
 # <label> is the path recorded as provenance (defaults to <file>).
-# <save> optionally saves the validated declarations for batch preparation.
 filesystem_env_override_declarations() {
     # Capture caller names before adding implementation locals. Lowercase
     # scratch variables must not collide with the loader's own bookkeeping.
@@ -1578,6 +1689,7 @@ filesystem_env_override_declarations() {
     digest=$(_elbencho_batch_sha256 "$file") || return 1
     if ! output=$(__SSTO_BASELINE="$baseline" \
             __SSTO_KNOWN="$__ssto_known" \
+            __SSTO_DIGEST="$digest" \
             env -u BASH_ENV -u ENV "$BASH" --noprofile --norc \
             -c "$_FILESYSTEM_ENV_OVERRIDE_LOADER" env-override "$file" "$label" \
             "${kinds[@]}"); then
@@ -1590,24 +1702,26 @@ filesystem_env_override_declarations() {
         return 1
     fi
     output+=$'\n'"$(
-        printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE=%q\n' "$label"
-        printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256=%q\n' "$digest"
         printf 'apply_filesystem_workload_defaults\n'
         printf 'filesystem_enabled_from_test_dirs\n'
     )"
-    if [[ -n "${3:-}" ]]; then
-        printf '%s\n' "$output" > "$3" || return 1
-    fi
     printf '%s\n' "$output"
 }
 
-# Print the override applied to this submission, if any.
+# Print the override files applied to this submission, one line each. The
+# "i/N" position appears only when more than one file was applied.
 print_env_override_summary() {
-    [[ -n "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE:-}" ]] || return 0
-    printf 'Env override: %s (sha256 %s): %s\n' \
-        "$STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE" \
-        "$STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256" \
-        "${STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES:-no settings changed}"
+    normalize_env_override_provenance
+    local count=${#STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[@]} index prefix
+    for ((index = 0; index < count; index++)); do
+        prefix="Env override"
+        [[ "$count" -eq 1 ]] || prefix+=" $((index + 1))/$count"
+        printf '%s: %s (sha256 %s): %s\n' "$prefix" \
+            "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[index]}" \
+            "${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S[index]:-}" \
+            "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES[index]:-no settings changed}"
+    done
+    return 0
 }
 
 # =============================================================================
@@ -1682,9 +1796,24 @@ print_storage_target_summary() {
     printf 'Storage target: %s\n' "$name"
 }
 
+# Print "<name>=(<%q words>)" for a bash array assignment, one word per element.
+_emit_sh_array_assignment() {
+    local name="$1" element sep=""
+    shift
+    printf '%s=(' "$name"
+    for element in "$@"; do
+        printf '%s%q' "$sep" "$element"
+        sep=" "
+    done
+    printf ')\n'
+}
+
 # Emit env_used.sh provenance. Always written, empty without an override, so
 # sourcing one group's snapshot after another's cannot inherit its provenance.
+# The scalars describe the last file and the union of variables; the arrays list
+# every file in application order (each variables entry is space-separated).
 _emit_env_override_provenance_sh() {
+    normalize_env_override_provenance
     printf '# --env-override provenance (empty when none was used).\n'
     printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE=%q\n' \
         "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE:-}"
@@ -1692,20 +1821,38 @@ _emit_env_override_provenance_sh() {
         "${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256:-}"
     printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES=%q\n' \
         "${STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES:-}"
+    _emit_sh_array_assignment STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES \
+        "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[@]}"
+    _emit_sh_array_assignment STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S \
+        "${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S[@]}"
+    _emit_sh_array_assignment STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES \
+        "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES[@]}"
 }
 
-# Emit env_used.yaml provenance: a mapping, or null without an override.
+# Emit env_used.yaml provenance: null without an override, else a mapping whose
+# file/sha256/variables describe the last file and the union of variables (the
+# original schema) plus "files": every file in application order.
 _emit_env_override_provenance_yaml() {
+    normalize_env_override_provenance
     if [[ -z "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE:-}" ]]; then
         printf 'env_override: null\n'
         return 0
     fi
     local -a variables=()
+    local index
     read -r -a variables <<< "${STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES:-}"
     printf 'env_override:\n'
     printf '  file: %s\n' "$(yaml_double_quote "$STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE")"
     printf '  sha256: "%s"\n' "${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256:-}"
     printf '  variables: [%s]\n' "$(_yaml_flow_seq "${variables[@]}")"
+    printf '  files:\n'
+    for index in "${!STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[@]}"; do
+        read -r -a variables <<< "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES[index]:-}"
+        printf '    - file: %s\n' \
+            "$(yaml_double_quote "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[index]}")"
+        printf '      sha256: "%s"\n' "${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S[index]:-}"
+        printf '      variables: [%s]\n' "$(_yaml_flow_seq "${variables[@]}")"
+    done
 }
 
 # Format bash array elements as a YAML flow sequence body: "v1", "v2", ...

@@ -121,11 +121,15 @@ Flags:
   --version           Print the project version and exit
   --env-override <file>
                       Source <file> after env.sh so its filesystem workload
-                      settings (TEST_DIRS, FS_MAX_*, MDTEST_*, the ELBENCHO_*
-                      sweep lists and file controls) take precedence. Accepted
-                      once, only when submitting or with --batch/--append.
-                      Values are saved in env_used.sh at submission; later
-                      lifecycle operations never reread the file or env.sh.
+                      settings (TEST_DIRS, FS_MAX_*, MDTEST_*, STORAGE_TARGET_NAME,
+                      the ELBENCHO_* sweep lists and file controls) take
+                      precedence. May be repeated: files apply in command-line
+                      order, each on top of the previous result (so a later
+                      LIST+=(x) extends an earlier list), and the same file
+                      twice is an error. Accepted only when submitting or with
+                      --batch/--append. Values and the file list are saved in
+                      env_used.sh at submission; later lifecycle operations
+                      never reread the files or env.sh.
   -b, --bio           Use bio instead of the default dio (direct IO)
   -r, --rand          Use random IO patterns (default: sequential IO; not with ELBENCHO_SINGLE_BIG_FILE=1)
   --run-to-completion Complete each requested write/read phase without
@@ -144,6 +148,7 @@ Examples:
   $0 --read-from /mnt/fs/elbencho-sweep-foo/elbencho-bigfile --nodes 8
   $0 --delete-only /mnt/fs/elbencho-sweep-foo
   $0 --append <batch_dir> --env-override overrides/large-seq.env --nodes 1,8
+  $0 --batch --env-override targets/fs-a.env --env-override recipes/large-seq.env --nodes 1,8
 
 EOF
 }
@@ -161,7 +166,8 @@ resume_dir=""
 status_dir=""
 cancel_dir=""
 collect_dir=""
-env_override_file=""
+env_override_files=()
+env_override_labels=()
 
 # Parse flags
 while [[ $# -gt 0 ]]; do
@@ -240,11 +246,7 @@ while [[ $# -gt 0 ]]; do
                 echo "Error: --env-override requires a file argument" >&2
                 exit 1
             fi
-            [[ -z "$env_override_file" ]] || {
-                echo "Error: --env-override may be specified only once" >&2
-                exit 1
-            }
-            env_override_file="$2"
+            env_override_files+=("$2")
             shift 2
             ;;
         --delete-only)
@@ -326,7 +328,7 @@ _has_workload_options() {
         || "$run_to_completion_option" != 0 || -n "$nodes_spec" \
         || "$sweep_write_only" != 0 || "$sweep_write_no_read" != 0 \
         || -n "$sweep_read_from" || -n "$delete_only_path" \
-        || -n "$env_override_file" ]]
+        || "${#env_override_files[@]}" -gt 0 ]]
 }
 
 # Validate that --resume is the only flag in play.
@@ -341,7 +343,7 @@ _validate_resume_mutual_exclusivity() {
 
 _select_operation() {
     local lifecycle_count=0
-    if [[ -n "$env_override_file" && ( -n "$resume_dir$status_dir$cancel_dir$collect_dir" \
+    if [[ "${#env_override_files[@]}" -gt 0 && ( -n "$resume_dir$status_dir$cancel_dir$collect_dir" \
             || -n "$delete_only_path" ) ]]; then
         echo "Error: --env-override applies only to a new submission or --batch/--append;" \
             "existing results always use their saved env_used.sh" >&2
@@ -508,21 +510,27 @@ if [[ "$SWEEP_OPERATION" == resume ]]; then
     export EXECUTION_SUBSTRATE
 fi
 
-# A new submission layers its --env-override over env.sh at top level, before
-# any validation or output, so every check and snapshot sees effective values.
+# A new submission layers its --env-override files over env.sh at top level,
+# in command-line order (each on top of the previous result), before any
+# validation or output, so every check and snapshot sees effective values.
 if [[ "$SWEEP_OPERATION" == submit ]]; then
     reset_env_override_provenance
-    if [[ -n "$env_override_file" ]]; then
-        env_override_file=$(resolve_env_override_file "$env_override_file") || exit 1
-        # Batch preparation passes a staged copy; record the operator's file.
-        env_override_label="$env_override_file"
+    if [[ "${#env_override_files[@]}" -gt 0 ]]; then
+        resolve_env_override_chain env_override_files env_override_labels || exit 1
+        # Batch preparation passes staged copies and gets the operator's paths
+        # as labels; it reuses the combined declarations rather than the files.
+        env_override_saved="reset_env_override_provenance"$'\n'
+        for env_override_index in "${!env_override_files[@]}"; do
+            env_override_declarations=$(filesystem_env_override_declarations \
+                "${env_override_files[env_override_index]}" \
+                "${env_override_labels[env_override_index]}") || exit 1
+            eval "$env_override_declarations"
+            env_override_saved+="$env_override_declarations"$'\n'
+        done
         if [[ -n "${ELBENCHO_BATCH_PREPARE_DIR:-}" ]]; then
-            env_override_label="${ELBENCHO_BATCH_ENV_OVERRIDE_ORIGIN:-$env_override_file}"
+            printf '%s' "$env_override_saved" \
+                > "$ELBENCHO_BATCH_PREPARE_DIR/.env-override-declarations.sh" || exit 1
         fi
-        env_override_declarations=$(filesystem_env_override_declarations \
-            "$env_override_file" "$env_override_label" \
-            "${ELBENCHO_BATCH_PREPARE_DIR:+$ELBENCHO_BATCH_PREPARE_DIR/.env-override-declarations.sh}") || exit 1
-        eval "$env_override_declarations"
     fi
 fi
 
