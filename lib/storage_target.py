@@ -23,10 +23,13 @@ the two in agreement.
 Identity rule, first match wins:
 
 1. ``STORAGE_TARGET_NAME`` is non-empty: that name (a *recorded* name).
-2. kubectl substrate with ``KUBECTL_NAMESPACE`` and ``KUBECTL_PVC``:
-   ``<namespace>/<pvc>``.
+2. kubectl substrate with ``KUBECTL_NAMESPACE`` and ``KUBECTL_PVC`` (a
+   snapshot written before v2.0.0): ``<namespace>/<pvc>``.
 3. ``TEST_DIRS`` keys, trailing ``/`` stripped, deduplicated, sorted by UTF-8
-   bytes, joined with ``,``.
+   bytes, joined with ``,``. On the kubectl substrate, when every key is a
+   valid claim-qualified root (``[namespace/]claim:path``), each key is first
+   normalized to ``<namespace>/<claim>:<path>``, the namespace defaulting to
+   ``KUBECTL_NAMESPACE``.
 4. Otherwise the target is unknown.
 
 Snapshots written by the current shell tooling always carry the effective name:
@@ -68,6 +71,11 @@ _NAMESPACE_KEY = "KUBECTL_NAMESPACE"
 _PVC_KEY = "KUBECTL_PVC"
 _TEST_DIRS_KEY = "TEST_DIRS"
 _SEPARATOR = ", "
+_RESERVED_COMPONENT = ".storage-scale-test"
+_NAMESPACE_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+_CLAIM_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
+_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 @dataclass(frozen=True)
@@ -103,14 +111,75 @@ def test_dirs_target_name(env: Mapping) -> str | None:
     return ",".join(sorted(roots, key=lambda root: root.encode("utf-8")))
 
 
+def _valid_claim(claim: str) -> bool:
+    """A DNS-1123 subdomain, as ``kubectl_validate_object_name`` checks it."""
+    if not claim or len(claim) > 253 or not _CLAIM_RE.match(claim):
+        return False
+    return all(
+        label and len(label) <= 63 and _LABEL_RE.match(label)
+        for label in claim.split(".")
+    )
+
+
+def _claim_path(value: str) -> str | None:
+    """The normalized claim-relative path of a key, or None when invalid."""
+    if not value or any(char in value for char in "\n\r\t"):
+        return None
+    components = [component for component in value.split("/") if component]
+    for component in components:
+        if component in (".", "..", _RESERVED_COMPONENT):
+            return None
+        if not _COMPONENT_RE.match(component):
+            return None
+    return "/".join(components) or None
+
+
+def qualified_root(key: str, default_namespace: str) -> str | None:
+    """``<namespace>/<claim>:<path>`` for a claim-qualified key, else None.
+
+    Mirrors ``kubectl_split_test_dir_key`` in the Kubernetes helpers.
+    """
+    if ":" not in key:
+        return None
+    qualifier, rest = key.split(":", 1)
+    if "/" in qualifier:
+        namespace, claim = qualifier.split("/", 1)
+    else:
+        namespace, claim = default_namespace, qualifier
+    if not namespace or len(namespace) > 63 or not _NAMESPACE_RE.match(namespace):
+        return None
+    if "/" in claim or not _valid_claim(claim):
+        return None
+    path = _claim_path(rest)
+    if path is None:
+        return None
+    return f"{namespace}/{claim}:{path}"
+
+
+def _qualified_roots_name(env: Mapping) -> str | None:
+    """Rule 3 for kubectl: the normalized claim-qualified roots, when all are."""
+    test_dirs = env.get(_TEST_DIRS_KEY)
+    if not isinstance(test_dirs, Mapping) or not test_dirs:
+        return None
+    namespace = _text(env, _NAMESPACE_KEY)
+    roots = {qualified_root(str(key), namespace) for key in test_dirs}
+    if None in roots:
+        return None
+    return ",".join(sorted(roots, key=lambda root: root.encode("utf-8")))
+
+
 def default_storage_target_name(env: Mapping | None) -> str | None:
     """Derive the name from the substrate or the roots, ignoring any explicit name."""
     if not isinstance(env, Mapping):
         return None
     namespace = _text(env, _NAMESPACE_KEY)
     claim = _text(env, _PVC_KEY)
-    if _text(env, _SUBSTRATE_KEY) == _KUBECTL and namespace and claim:
-        return f"{namespace}/{claim}"
+    if _text(env, _SUBSTRATE_KEY) == _KUBECTL:
+        if namespace and claim:
+            return f"{namespace}/{claim}"
+        qualified = _qualified_roots_name(env)
+        if qualified is not None:
+            return qualified
     return test_dirs_target_name(env)
 
 

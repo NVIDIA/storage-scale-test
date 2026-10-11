@@ -39,6 +39,8 @@ _KUBECTL_FUNCTIONS = _COORDINATOR.with_name("_nv-elbencho-kubectl-functions.sh")
 _ELBENCHO_FUNCTIONS = _REPOSITORY_ROOT / "lib" / "_elbencho_functions.sh"
 _PLATFORM_FUNCTIONS = _REPOSITORY_ROOT / "lib" / "_platform_functions.sh"
 _BASH = shutil.which("bash") or "/bin/bash"
+# The claims the fake bundles use; each is a subdirectory of the fake mount.
+_CLAIMS = ("pvc-a", "pvc-b")
 
 
 def test_deployed_kubectl_shell_avoids_gnu_find_printf() -> None:
@@ -64,7 +66,9 @@ def _refresh_bundle_manifest(control):
     (control / "bundle-manifest.tsv").write_text("".join(rows), encoding="utf-8")
 
 
-def _as_prepared_batch(control, kinds=("io", "io")):
+def _as_prepared_batch(
+    control, kinds=("io", "io"), roots=("pvc-a:z-io", "pvc-b:a-metadata")
+):
     """Freeze two independent group roots inside an existing fake bundle."""
     shutil.copy2(_REPOSITORY_ROOT / "lib/_batch_functions.sh", control)
     common = (control / "env_used.sh").read_text(encoding="utf-8")
@@ -72,16 +76,18 @@ def _as_prepared_batch(control, kinds=("io", "io")):
     outputs = []
     for number, kind in enumerate(kinds, 1):
         group_id = f"{number:04d}"
-        root = "z-io" if number == 1 else "a-metadata"
+        root = roots[number - 1]
         basename = "mdtest-elbencho" if kind == "mdtest" else "elbencho"
         relative = f"groups/{group_id}/{basename}-20260923Z010203"
         output = control / relative
         output.mkdir(parents=True)
-        snapshot = common.replace("[benchmark]=1", f"[{root}]=1")
+        snapshot = common.replace("[pvc-a:benchmark]=1", f"[{root}]=1")
         (output / "env_used.sh").write_text(snapshot, encoding="utf-8")
         (output / "env_used.yaml").write_text(f"kind: {kind}\n", encoding="utf-8")
         definition = control / "executions" / f"{group_id}.sh"
-        contents = definition.read_text(encoding="utf-8").replace("benchmark", root)
+        contents = definition.read_text(encoding="utf-8").replace(
+            "pvc-a:benchmark", root
+        )
         contents = (
             snapshot
             + contents
@@ -102,7 +108,11 @@ def _as_prepared_batch(control, kinds=("io", "io")):
         rows.append(f"execution\t{group_id}\t{group_id}\t{_sha256(definition)}\n")
         outputs.append(relative)
     (control / "env_used.sh").write_text(
-        common.replace("[benchmark]=1", "[z-io]=1 [a-metadata]=1"), encoding="utf-8"
+        common.replace(
+            "[pvc-a:benchmark]=1",
+            " ".join(sorted({f"[test-ns/{root}]=1" for root in roots})),
+        ),
+        encoding="utf-8",
     )
     (control / "run-metadata.tsv").write_text(
         "attempt_id\t1234abcd\noutput_basename\tfilesystem-batch-20260923Z010203\n"
@@ -137,7 +147,8 @@ def _write_bundle(tmp_path, execution_count=2):
     )
     (control / "env_used.sh").write_text(
         textwrap.dedent("""\
-            declare -gA TEST_DIRS=([benchmark]=1)
+            KUBECTL_NAMESPACE=test-ns
+            declare -gA TEST_DIRS=([pvc-a:benchmark]=1)
             ELBENCHO_SCALE_READ_WRITE_DURATION=1s
             ELBENCHO_LIVE_CSV_EXTENDED=0
             ELBENCHO_LIVEINT=1000
@@ -172,8 +183,8 @@ def _write_bundle(tmp_path, execution_count=2):
                 export dio_or_bio=dio
                 export use_random=0
                 export run_to_completion=0
-                export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=benchmark/target-{number}
-                export ELBENCHO_RUN_GENERATED_TEST_ROOT=benchmark
+                export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=pvc-a:benchmark/target-{number}
+                export ELBENCHO_RUN_GENERATED_TEST_ROOT=pvc-a:benchmark
                 export ELBENCHO_RUN_TEST_DIR_SUFFIX=-test-e{number:04d}
                 export ELBENCHO_SWEEP_WRITE_ONLY=1
                 export ELBENCHO_SWEEP_WRITE_NO_READ=0
@@ -207,7 +218,8 @@ def _write_bundle(tmp_path, execution_count=2):
 def _run_coordinator(control, state_dir, scratch, fake, **extra_env):
     environment = os.environ.copy()
     pvc_root = control.parent.parent / "pvc"
-    pvc_root.mkdir(exist_ok=True)
+    for claim in _CLAIMS:
+        (pvc_root / claim).mkdir(parents=True, exist_ok=True)
     environment.update(
         {
             "STORAGE_SCALE_TEST_INTEGRATION": "1",
@@ -245,8 +257,8 @@ def test_coordinator_preserves_multiple_generated_targets_as_csv(tmp_path):
     definition = control / "executions" / "0001.sh"
     definition.write_text(
         definition.read_text(encoding="utf-8").replace(
-            "benchmark/target-1\n",
-            "benchmark/target-1,benchmark/target-2\n",
+            "pvc-a:benchmark/target-1\n",
+            "pvc-a:benchmark/target-1,pvc-a:benchmark/target-2\n",
         ),
         encoding="utf-8",
     )
@@ -255,7 +267,7 @@ def test_coordinator_preserves_multiple_generated_targets_as_csv(tmp_path):
     assert result.returncode == 0, result.stderr
     pvc = tmp_path / "pvc"
     assert (control.parent / "fake-record").read_text(encoding="utf-8").strip() == (
-        f"0001|1||{pvc}/benchmark/target-1,{pvc}/benchmark/target-2"
+        f"0001|1||{pvc}/pvc-a/benchmark/target-1,{pvc}/pvc-a/benchmark/target-2"
     )
 
 
@@ -289,7 +301,8 @@ def _assert_collectable_failure(control, state_dir):
 def _run_recovery(control, state_dir, scratch):
     environment = os.environ.copy()
     pvc_root = control.parent.parent / "pvc"
-    pvc_root.mkdir(exist_ok=True)
+    for claim in _CLAIMS:
+        (pvc_root / claim).mkdir(parents=True, exist_ok=True)
     environment.update(
         {
             "STORAGE_SCALE_TEST_INTEGRATION": "1",
@@ -334,7 +347,7 @@ def test_coordinator_dispatches_mixed_io_and_mdtest_cells(
             export MDTEST_SINGLE_DIR_TARGET_FILES=''
             export MDTEST_SINGLE_DIR_FILES_PER_WORKER=''
             export ELBENCHO_RUN_TEST_DIR_SUFFIX=-20260923Z010203-e0002
-            export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=benchmark/mdtest-elbencho-target-1-20260923Z010203-e0002
+            export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=pvc-a:benchmark/mdtest-elbencho-target-1-20260923Z010203-e0002
             export ELBENCHO_RUN_GENERATED_TEST_ROOT=''
             """),
         encoding="utf-8",
@@ -384,7 +397,7 @@ def test_coordinator_dispatches_mixed_io_and_mdtest_cells(
     assert "0002|mdtest|10.10.0.1,10.10.0.2|" in record
     basename = "mdtest-elbencho" if prepared_batch else "elbencho"
     assert f"|0002|{scratch / '0002' / f'{basename}-20260923Z010203'}" in record
-    root = "a-metadata" if prepared_batch else "benchmark"
+    root = "pvc-b/a-metadata" if prepared_batch else "pvc-a/benchmark"
     assert f"/{root}/mdtest-elbencho-target-1-20260923Z010203-e0002" in record
     if prepared_batch:
         publication = (state_dir / "publication-manifest.tsv").read_text(
@@ -485,8 +498,8 @@ def test_coordinator_uses_verified_bundle_context_and_manifest_last(tmp_path):
     assert (control.parent / "fake-record").read_text(
         encoding="utf-8"
     ).splitlines() == [
-        f"0001|1||{pvc_root}/benchmark/target-1",
-        f"0002|1||{pvc_root}/benchmark/target-2",
+        f"0001|1||{pvc_root}/pvc-a/benchmark/target-1",
+        f"0002|1||{pvc_root}/pvc-a/benchmark/target-2",
     ]
 
 
@@ -520,7 +533,7 @@ def test_multinode_cell_persists_worker_selection_before_fake_elbencho(tmp_path)
     ]
     pvc_root = control.parent.parent / "pvc"
     assert (control.parent / "fake-record").read_text(encoding="utf-8").strip() == (
-        f"0001|0|10.10.0.1,10.10.0.2|{pvc_root}/benchmark/target-1"
+        f"0001|0|10.10.0.1,10.10.0.2|{pvc_root}/pvc-a/benchmark/target-1"
     )
 
 
@@ -612,11 +625,11 @@ def test_generated_target_symlink_cannot_escape_pvc(tmp_path):
     pvc_root = tmp_path / "pvc"
     outside = tmp_path / "outside"
     outside.mkdir()
-    pvc_root.mkdir()
-    (pvc_root / "benchmark").symlink_to(outside, target_is_directory=True)
+    (pvc_root / "pvc-a").mkdir(parents=True)
+    (pvc_root / "pvc-a" / "benchmark").symlink_to(outside, target_is_directory=True)
     result = _run_coordinator(control, state_dir, scratch, fake)
     assert result.returncode != 0
-    assert "workload path escapes the mounted PVC" in result.stderr
+    assert "workload path escapes its mounted claim" in result.stderr
     assert list(outside.iterdir()) == []
 
 
@@ -1021,47 +1034,68 @@ def test_batch_preflight_includes_every_generated_target_and_group_read_path(tmp
     previous_digest = _sha256(definition)
     definition.write_text(
         definition.read_text()
-        + "\nexport ELBENCHO_SWEEP_READ_FROM=a-metadata/retained\n"
+        + "\nexport ELBENCHO_SWEEP_READ_FROM=pvc-b:a-metadata/retained\n"
     )
     manifest = control / "batch-manifest.tsv"
     manifest.write_text(
         manifest.read_text().replace(previous_digest, _sha256(definition))
     )
     (control / "batch-sealed.sha256").write_text(_sha256(manifest) + "\n")
+    plan = tmp_path / "plan"
+    plan.mkdir()
     command = textwrap.dedent(f"""\
         source '{_REPOSITORY_ROOT / 'lib/_batch_functions.sh'}'
         source '{_KUBECTL_FUNCTIONS}'
-        _kubectl_batch_workload_paths '{control}'
+        kubectl_plan_segments '{control}' '{plan}'
         """)
     result = subprocess.run(
         [_BASH, "-c", command], text=True, capture_output=True, check=False
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [
-        "/mnt/storage-scale-test/z-io/target-1",
-        "/mnt/storage-scale-test/a-metadata/target-2",
-        "/mnt/storage-scale-test/a-metadata/retained",
+    assert (plan / "segments.tsv").read_text() == (
+        "0\ttest-ns\ttest-ns/pvc-a:z-io\tpvc-a,pvc-b\n"
+    )
+    assert (plan / "segment-0.roots").read_text().splitlines() == [
+        "/mnt/storage-scale-test/pvc-a/z-io",
+        "/mnt/storage-scale-test/pvc-b/a-metadata",
     ]
+    assert (plan / "segment-0.paths").read_text().splitlines() == [
+        "/mnt/storage-scale-test/pvc-a/z-io",
+        "/mnt/storage-scale-test/pvc-a/z-io/target-1",
+        "/mnt/storage-scale-test/pvc-b/a-metadata",
+        "/mnt/storage-scale-test/pvc-b/a-metadata/retained",
+        "/mnt/storage-scale-test/pvc-b/a-metadata/target-2",
+    ]
+    assert (plan / "segment-0.ids").read_text().splitlines() == ["0001", "0002"]
 
 
 @pytest.mark.parametrize("sealed", [False, True])
 def test_batch_preflight_checks_canonical_control_layout_before_discovery(
     tmp_path, sealed
 ):
-    """Static path failures must be found before a draft is sealed or Pods created."""
+    """Static path failures must be found before a draft is sealed or Pods created.
+
+    kubectl_batch_preflight, which _elbencho_batch_preflight calls, refuses a
+    sealed batch whose canonical control root moved, and a read path that
+    scans the control root, before any node discovery.
+    """
     control, _, _, _ = _write_bundle(tmp_path)
     _as_prepared_batch(control)
     if not sealed:
-        definition = control / "executions/0002.sh"
+        definition = control / "executions/0001.sh"
         previous_digest = _sha256(definition)
         definition.write_text(
-            definition.read_text() + "\nexport ELBENCHO_SWEEP_READ_FROM=a-metadata\n"
+            definition.read_text() + "\nexport ELBENCHO_SWEEP_READ_FROM=pvc-a:z-io\n"
         )
         manifest = control / "batch-manifest.tsv"
         manifest.write_text(
             manifest.read_text().replace(previous_digest, _sha256(definition))
         )
         (control / "batch-sealed.sha256").unlink()
+    saved = "test-ns/pvc-b:a-metadata" if sealed else "test-ns/pvc-a:z-io"
+    saved_root = "/mnt/storage-scale-test/" + (
+        "pvc-b/a-metadata" if sealed else "pvc-a/z-io"
+    )
     command = textwrap.dedent(f"""\
         source '{_REPOSITORY_ROOT / 'lib/_batch_functions.sh'}'
         source '{control / 'env_used.sh'}'
@@ -1077,9 +1111,9 @@ def test_batch_preflight_checks_canonical_control_layout_before_discovery(
                 kubectl_discover_candidate_nodes() {{ echo discovery-was-reached >&2; return 1; }}
             fi
         }}
-        KUBECTL_CONTROL_LOGICAL_ROOT=z-io
-        KUBECTL_CONTROL_TEST_ROOT=/mnt/storage-scale-test/z-io
-        KUBECTL_CONTROL_ROOT=/mnt/storage-scale-test/z-io/.storage-scale-test
+        KUBECTL_CONTROL_LOGICAL_ROOT={saved}
+        KUBECTL_CONTROL_TEST_ROOT={saved_root}
+        KUBECTL_CONTROL_ROOT={saved_root}/.storage-scale-test
         _elbencho_batch_preflight '{control}'
         """)
     result = subprocess.run(
@@ -1115,6 +1149,25 @@ def test_batch_collection_imports_exact_group_paths_and_rejects_reassignment(tmp
     shutil.copytree(control, results)
     prior_artifact = results / outputs[0] / "result-0001.txt"
     prior_artifact.write_text("old-artifact\n")
+    # The predecessor attempt has a (single-segment) identity of its own.
+    identity = subprocess.run(
+        [
+            _BASH,
+            "-c",
+            f"""
+            source '{_KUBECTL_FUNCTIONS}'
+            root='{results / "kubernetes"}'
+            kubectl_local_lock_acquire "$root" fd
+            kubectl_attempt_create_identity "$root" "$fd" aaaabbbb \\
+                0123456789abcdef0123456789abcdef test-ns namespace-uid \\
+                test-pv pv-uid pvc-a pvc-uid
+            """,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert identity.returncode == 0, identity.stderr
     prior_manifest = (
         results
         / "kubernetes/attempts/aaaabbbb/collected-state/publication-manifest.tsv"
@@ -1209,8 +1262,8 @@ def test_prebenchmark_mapping_failure_marks_the_cell_failed_and_committed(tmp_pa
     definition = control / "executions" / "0001.sh"
     definition.write_text(
         definition.read_text(encoding="utf-8").replace(
-            "ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=benchmark/target-1",
-            "ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=.storage-scale-test/unsafe",
+            "ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=pvc-a:benchmark/target-1",
+            "ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=pvc-a:.storage-scale-test/unsafe",
         ),
         encoding="utf-8",
     )
@@ -1381,7 +1434,8 @@ def test_signal_publishes_terminal_failure_without_erasing_scratch_evidence(
     )
     environment = os.environ.copy()
     pvc_root = tmp_path / "pvc"
-    pvc_root.mkdir()
+    for claim in _CLAIMS:
+        (pvc_root / claim).mkdir(parents=True)
     environment.update(
         {
             "STORAGE_SCALE_TEST_INTEGRATION": "1",
@@ -1568,3 +1622,294 @@ def test_child_loss_after_success_preserves_checkpoint_and_collectable_attempt(
     _assert_collectable_failure(control, state_dir)
     recovered = _run_recovery(control, state_dir, scratch)
     assert recovered.returncode == 0, recovered.stderr
+
+
+_SEGMENT_NAMESPACES = ("ns-a", "ns-b")
+
+
+def _as_two_target_segment(
+    control,
+    keep,
+    segment_index,
+    kinds=("io", "io"),
+    roots=("pvc-a:z-io", "pvc-b:a-metadata"),
+):
+    """Turn a two-group batch bundle into one segment of a two-namespace attempt.
+
+    Group N's roots are in namespace N-1 (its snapshot's KUBECTL_NAMESPACE).
+    The bundle keeps only execution KEEP and names SEGMENT_INDEX's namespace
+    in segment.tsv.
+    """
+    outputs = _as_prepared_batch(control, kinds, roots)
+    manifest = control / "batch-manifest.tsv"
+    rows = manifest.read_text(encoding="utf-8").splitlines(keepends=True)
+    for number, (output, namespace) in enumerate(zip(outputs, _SEGMENT_NAMESPACES), 1):
+        # Like a real group snapshot (and the definitions that embed it),
+        # each names its resolved namespace.
+        snapshot = control / output / "env_used.sh"
+        old_text = snapshot.read_text(encoding="utf-8")
+        new_text = old_text + f"export KUBECTL_NAMESPACE={namespace}\n"
+        snapshot.write_text(new_text, encoding="utf-8")
+        definition = control / "executions" / f"{number:04d}.sh"
+        definition.write_text(
+            definition.read_text(encoding="utf-8").replace(old_text, new_text, 1),
+            encoding="utf-8",
+        )
+        for index, row in enumerate(rows):
+            fields = row.rstrip("\n").split("\t")
+            if fields[:2] == ["group", f"{number:04d}"]:
+                fields[4] = _sha256(snapshot)
+            elif fields[:2] == ["execution", f"{number:04d}"]:
+                fields[3] = _sha256(definition)
+            else:
+                continue
+            rows[index] = "\t".join(fields) + "\n"
+    manifest.write_text("".join(rows), encoding="utf-8")
+    (control / "batch-sealed.sha256").write_text(_sha256(manifest) + "\n")
+    union = control / "env_used.sh"
+    union_roots = " ".join(
+        f"[{namespace}/{root}]=1" for namespace, root in zip(_SEGMENT_NAMESPACES, roots)
+    )
+    union_text = union.read_text(encoding="utf-8")
+    union.write_text(
+        union_text.replace(
+            " ".join(sorted({f"[test-ns/{root}]=1" for root in roots})), union_roots
+        )
+    )
+    for number in (1, 2):
+        if number != keep:
+            (control / "executions" / f"{number:04d}.sh").unlink()
+    (control / "segment.tsv").write_text(
+        f"{segment_index}\t{_SEGMENT_NAMESPACES[segment_index]}\n", encoding="utf-8"
+    )
+    _refresh_bundle_manifest(control)
+    return outputs
+
+
+@pytest.mark.parametrize("keep,segment_index", [(1, 0), (2, 1)])
+def test_segment_bundle_runs_only_its_targets_executions(tmp_path, keep, segment_index):
+    """A segment is a subset of the batch whose groups' roots are in its namespace."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    _as_two_target_segment(control, keep, segment_index)
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode == 0, result.stderr
+    statuses = sorted(path.name for path in (state_dir / "executions").glob("*.status"))
+    assert statuses == [f"{keep:04d}.status"]
+    assert (state_dir / "run.status").read_text().strip() == "SUCCESS"
+
+
+def test_segment_rejects_a_definition_of_another_target(tmp_path):
+    """A definition whose roots are in another namespace fails at startup."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    _as_two_target_segment(control, keep=2, segment_index=0)
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode != 0
+    assert not state_dir.exists()
+    assert (
+        "execution 0002 uses namespace ns-b, but this segment runs namespace ns-a"
+    ) in result.stderr
+
+
+def test_segment_requires_a_valid_segment_row(tmp_path):
+    """segment.tsv is one INDEX NAMESPACE row inside a batch bundle."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    _as_two_target_segment(control, keep=1, segment_index=0)
+    (control / "segment.tsv").write_text("0\tns-a\tpvc-a\n", encoding="utf-8")
+    _refresh_bundle_manifest(control)
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode != 0
+    assert "invalid segment.tsv" in result.stderr
+    assert not state_dir.exists()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_coordinator_exit_status_matches_the_published_outcome(tmp_path, fail):
+    """The sequencer starts the next target only on Complete: exit 0 iff SUCCESS."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    extra = {"FAKE_ELBENCHO_FAIL_ID": "0002"} if fail else {}
+    result = _run_coordinator(control, state_dir, scratch, fake, **extra)
+    outcome = (state_dir / "run.status").read_text(encoding="utf-8").strip()
+    assert outcome == ("FAILED" if fail else "SUCCESS")
+    assert (result.returncode == 0) is (outcome == "SUCCESS"), result.stderr
+
+
+_MDTEST_DEFINITION = """\
+export ELBENCHO_EXECUTION_KIND=mdtest
+export nodes=2
+export tasks_per_node=3
+export MDTEST_LAYOUT=standard
+export MDTEST_BRANCH_FACTOR=1
+export MDTEST_ITEMS_PER_DIR=1
+export MDTEST_ITERATIONS=1
+export MDTEST_SINGLE_DIR_TARGET_FILES=''
+export MDTEST_SINGLE_DIR_FILES_PER_WORKER=''
+export ELBENCHO_RUN_TEST_DIR_SUFFIX=-20260923Z010203-e{id}
+export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=pvc-a:benchmark/mdtest-elbencho-target-1-20260923Z010203-e{id}
+export ELBENCHO_RUN_GENERATED_TEST_ROOT=''
+"""
+
+_MDTEST_FAKE = """\
+#!/usr/bin/env bash
+set -eu
+id=$1 scratch=$2
+printf '%s|%s\\n' "$id" "$ELBENCHO_RUN_TEST_DIRS_CSV" >> "$FAKE_ELBENCHO_RECORD"
+stem="$scratch/mdtest-elbencho-c_002-t_003_20260923Z010203_iter1"
+printf 'result\\n' > "$stem.out"
+printf 'csv\\n' > "$stem.csv"
+mkdir -p "$scratch/executions"
+printf 'COMPLETE\\n' > "$scratch/executions/$id.mdtest.complete"
+"""
+
+
+def _rewrite_definition(control, number, transform):
+    """Rewrite execution NUMBER's definition and rebind its sealed digests."""
+    definition = control / "executions" / f"{number:04d}.sh"
+    old_digest = _sha256(definition)
+    definition.write_text(
+        transform(definition.read_text(encoding="utf-8")), encoding="utf-8"
+    )
+    manifest = control / "batch-manifest.tsv"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(old_digest, _sha256(definition)),
+        encoding="utf-8",
+    )
+    (control / "batch-sealed.sha256").write_text(_sha256(manifest) + "\n")
+    _refresh_bundle_manifest(control)
+
+
+def _without_restated_roots(text):
+    """A definition that leaves TEST_DIRS and KUBECTL_NAMESPACE to the bundle."""
+    return "\n".join(
+        line
+        for line in text.splitlines()
+        if "TEST_DIRS=(" not in line and "KUBECTL_NAMESPACE=" not in line
+    )
+
+
+@pytest.mark.parametrize("restated", [True, False])
+@pytest.mark.parametrize("keep,segment_index", [(1, 0), (2, 1)])
+def test_mdtest_cell_checks_targets_against_its_own_namespace_roots(
+    tmp_path, keep, segment_index, restated
+):
+    """[S-29] Two namespaces may use the same claim:path; an mdtest cell's generated
+    target must belong to exactly one root of its own namespace, even though
+    the union TEST_DIRS also holds the other namespace's same-named root. The
+    cell's roots come from its group snapshot whether or not its definition
+    restates them."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    for number in (1, 2):
+        (control / "executions" / f"{number:04d}.sh").write_text(
+            _MDTEST_DEFINITION.format(id=f"{number:04d}"), encoding="utf-8"
+        )
+    _make_executable(fake, _MDTEST_FAKE)
+    _refresh_bundle_manifest(control)
+    _as_two_target_segment(
+        control,
+        keep,
+        segment_index,
+        kinds=("mdtest", "mdtest"),
+        roots=("pvc-a:bench", "pvc-a:bench"),
+    )
+    union = (control / "env_used.sh").read_text(encoding="utf-8")
+    assert "[ns-a/pvc-a:bench]=1 [ns-b/pvc-a:bench]=1" in union
+    if not restated:
+        _rewrite_definition(control, keep, _without_restated_roots)
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode == 0, result.stderr
+    status = state_dir / "executions" / f"{keep:04d}.status"
+    assert status.read_text(encoding="utf-8").strip() == "SUCCESS"
+    record = (control.parent / "fake-record").read_text(encoding="utf-8")
+    target = f"/pvc-a/bench/mdtest-elbencho-target-1-20260923Z010203-e{keep:04d}"
+    assert target in record
+
+
+def test_segment_control_root_is_chosen_from_its_own_namespace(tmp_path):
+    """[S-29] A later segment's control root is the first root of its own namespace,
+    not the union's lexically first root in another namespace: reading from
+    it is refused as reading the control root."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    _as_two_target_segment(control, 2, 1, roots=("pvc-a:a-first", "pvc-b:z-second"))
+    _rewrite_definition(
+        control,
+        2,
+        lambda text: text.replace(
+            "ELBENCHO_SWEEP_READ_FROM=''", "ELBENCHO_SWEEP_READ_FROM=pvc-b:z-second"
+        ),
+    )
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode != 0
+    assert "read-from may not scan the Kubernetes control-root" in result.stderr
+    status = state_dir / "executions" / "0002.status"
+    assert status.read_text(encoding="utf-8").strip() == "FAILED"
+
+
+def test_bundle_without_segment_row_refuses_roots_spanning_namespaces(tmp_path):
+    """[S-29] Without segment.tsv no namespace is chosen for the run tree, so union
+    roots in two namespaces (sharing a claim:path) fail before any state."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    _as_two_target_segment(control, 1, 0, roots=("pvc-a:bench", "pvc-a:bench"))
+    (control / "segment.tsv").unlink()
+    _refresh_bundle_manifest(control)
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode != 0
+    assert "the roots span namespaces, but the bundle names no segment" in (
+        result.stderr
+    )
+    assert not (state_dir / "run.status").exists()
+
+
+@pytest.mark.parametrize("restated", [True, False])
+def test_read_from_is_checked_against_its_own_groups_roots(tmp_path, restated):
+    """[S-29] A read-from path below a group's root that is nested in another group's
+    root belongs to exactly one root of its own group, as planning checked;
+    the batch's union (both roots) must not make it ambiguous at run time."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    _as_prepared_batch(control, roots=("pvc-a:bench", "pvc-a:bench/sub"))
+    union = (control / "env_used.sh").read_text(encoding="utf-8")
+    assert "[test-ns/pvc-a:bench]=1" in union
+    assert "[test-ns/pvc-a:bench/sub]=1" in union
+
+    def read_from(text):
+        text = text.replace(
+            "ELBENCHO_SWEEP_READ_FROM=''",
+            "ELBENCHO_SWEEP_READ_FROM=pvc-a:bench/sub/data",
+        )
+        return text if restated else _without_restated_roots(text)
+
+    _rewrite_definition(control, 2, read_from)
+    (tmp_path / "pvc" / "pvc-a" / "bench" / "sub" / "data").mkdir(parents=True)
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode == 0, result.stderr
+    for number in (1, 2):
+        status = state_dir / "executions" / f"{number:04d}.status"
+        assert status.read_text(encoding="utf-8").strip() == "SUCCESS"
+
+
+def test_mdtest_cell_rejects_a_target_on_another_namespaces_root(tmp_path):
+    """[S-29] A generated target naming the other namespace's same-named root fails
+    the cell before any benchmark runs."""
+    control, state_dir, scratch, fake = _write_bundle(tmp_path)
+    (control / "executions" / "0002.sh").write_text(
+        _MDTEST_DEFINITION.format(id="0002"), encoding="utf-8"
+    )
+    _make_executable(fake, _MDTEST_FAKE)
+    _refresh_bundle_manifest(control)
+    _as_two_target_segment(
+        control,
+        2,
+        1,
+        kinds=("mdtest", "mdtest"),
+        roots=("pvc-a:bench", "pvc-a:bench"),
+    )
+    _rewrite_definition(
+        control,
+        2,
+        lambda text: text.replace(
+            "CSV=pvc-a:bench/mdtest", "CSV=ns-a/pvc-a:bench/mdtest"
+        ),
+    )
+    result = _run_coordinator(control, state_dir, scratch, fake)
+    assert result.returncode != 0
+    status = state_dir / "executions" / "0002.status"
+    assert status.read_text(encoding="utf-8").strip() == "FAILED"
+    assert not (control.parent / "fake-record").exists()

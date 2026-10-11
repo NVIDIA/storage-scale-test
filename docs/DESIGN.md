@@ -17,7 +17,7 @@ limitations under the License.
 
 # NVIDIA Storage Scale Test — Design Document
 
-**Last Updated**: 2026-10-08\
+**Last Updated**: 2026-10-11\
 **Status**: Documents the design and architecture of the existing implementation.
 
 ---
@@ -161,8 +161,8 @@ template has a clearly-marked editable section bounded by:
 followed by `source lib/env_base.sh` which applies defaults and backward
 compatibility. This design means:
 
-- The user edits one file; filesystem launchers can layer a workload-only
-  `--env-override` file (§3.5).
+- The user edits one file; filesystem launchers can layer `--target` files
+  (what to test) and `--env-override` files (how to test) on top (§3.5).
 - Defaults are set once in `env_base.sh`, not scattered across scripts.
 - Every orchestrator script sources `env.sh` as its first action, giving it the
   full configuration.
@@ -173,7 +173,7 @@ compatibility. This design means:
 |----------|--------------|---------|
 | Output | `RESULTS_DIR`, `LOGS_DIR` | Where results and logs are written |
 | Execution | `EXECUTION_SUBSTRATE`, `SSH_HOST_LIST`, Slurm account/partition/reservation | Explicitly selects SSH, Slurm, or kubectl mode |
-| Filesystem | `TEST_DIRS` (associative array with weights) | Mount paths and load-balancing weights |
+| Filesystem | `TEST_DIRS` (associative array with weights) | One storage target: its roots (mount paths on SSH/Slurm, `[namespace/]claim:path` on Kubernetes) and load-balancing weights |
 | Object storage | `OBJ_BUCKET`, `OBJ_HOST`, `OBJ_AUTH_FILE` | S3-compatible endpoint and credentials |
 | Elbencho IO | `ELBENCHO_SCALE_IO_SIZES`, `ELBENCHO_SCALE_THREAD_LIST`, `ELBENCHO_IODEPTH_LIST`, `ELBENCHO_SCALE_READ_WRITE_DURATION` | Filesystem IO sweep parameters |
 | Elbencho file layout | `ELBENCHO_FILE_LAYOUT`, `ELBENCHO_FILES_PER_NODE`, `ELBENCHO_FILE_SIZE` | Legacy worker-directory or completion-based shared-directory workload |
@@ -182,7 +182,7 @@ compatibility. This design means:
 | Warp | `WARP_THREAD_LIST`, `WARP_OBJ_SIZES`, PUT/GET durations | Object storage sweep parameters |
 | Netbench | `NETBENCH_THREADS`, `NETBENCH_HOST_NIC_GBPS`, `NETBENCH_TARGET_RUNTIME` | Network test parameters |
 | Slurm extras | `SLURM_JOB_NAME_PREFIX`, `SLURM_EXTRA_ARGS`, `SLURM_EXCLUSIVE_USER`, `SLURM_NODE_IGNORES`, `SLURM_NODE_INCLUDES`, `SLURM_JOB_POLL_INTERVAL_SECONDS` | Slurm job customization |
-| Kubernetes | `KUBECTL_NAMESPACE`, `KUBECTL_PV`, `KUBECTL_PVC`, `KUBECTL_NODE_SELECTOR`, `KUBECTL_ELBENCHO_IMAGE`, `KUBECTL_RUN_AS_USER`, `KUBECTL_RUN_AS_GROUP` | Existing namespace, RWX storage, eligible nodes, image, and workload identity for kubectl mode |
+| Kubernetes | `KUBECTL_NAMESPACE`, `KUBECTL_NODE_SELECTOR`, `KUBECTL_ELBENCHO_IMAGE`, `KUBECTL_RUN_AS_USER`, `KUBECTL_RUN_AS_GROUP`, `KUBECTL_SEQUENCER_IMAGE` | Default namespace for `TEST_DIRS` claims (optional when every key names its namespace), eligible nodes, image, workload identity, and an optional digest-pinned override (for a mirror) of the default sequencer image that batches spanning namespaces run |
 
 ### 3.3 Defaults and Compatibility
 
@@ -216,7 +216,7 @@ edit-validate loop:
    | Binary architecture match | `file` on binary vs. `uname -m` on remote |
    | Filesystem paths use storage distinct from `/` | Compare `stat -c %d` device IDs on compute nodes (via Slurm/SSH) |
    | Filesystem paths are writable | Touch test on compute nodes |
-   | Kubernetes prerequisites | API access and Lease permission, namespace/PV/PVC identity, Ready nodes matching `KUBECTL_NODE_SELECTOR`, and a short-lived Job that checks the image, UID/GID, required tools, and PVC read/write |
+   | Kubernetes prerequisites | Claim-qualified `TEST_DIRS` keys; API access and Lease permission in the namespace of `env.sh`'s `TEST_DIRS`; per-claim identity (Bound, RWX, Filesystem volume mode; bound PV recorded); Ready nodes matching `KUBECTL_NODE_SELECTOR`; one short-lived Job that mounts all of its claims and checks the image, UID/GID, required tools, and read/write per root; sequencer version, RBAC, and image pull as warnings, and with `--sequencer` the full probe as errors (one namespace needs none of them) |
    | Existing toolset Kubernetes objects | Read-only listing of objects labeled `app.kubernetes.io/name=storage-scale-test`; informational (may warn), never fails validation |
    | S3 credentials and bucket access | `s3test` binary |
    | S3 bucket emptiness | Object count check (warning if non-empty) |
@@ -230,12 +230,37 @@ discovered after a 2-hour run wastes the user's time and Slurm allocation.
 Front-loading all validation into a fast, comprehensive check is the single
 most effective ergonomic investment.
 
-### 3.5 Workload Override Files
+### 3.5 Target and Workload Override Files
 
-Filesystem launchers accept repeatable `--env-override <file>` flags per new
-submission, `--batch`, or `--append`; see
-[Workload override files](FILESYSTEM_TESTING.md#workload-override-files) for
-usage. After `env.sh`, `filesystem_env_override_declarations`
+Filesystem launchers split the override-allowed settings in two, on every
+substrate: **what to test comes from `env.sh` or `--target`; how to test comes
+from `env.sh` or `--env-override`.** Target settings are `TEST_DIRS`,
+`STORAGE_TARGET_NAME`, `FS_MAX_AGG_THROUGHPUT`, `FS_MAX_NODE_THROUGHPUT_GBPS`,
+and `FS_MAX_NODE_IOPS` (`filesystem_target_setting_names`); every other name in
+`filesystem_env_override_names` is a workload setting. See
+[Testing several filesystems](FILESYSTEM_TESTING.md#testing-several-filesystems)
+for usage.
+
+- **`--target FILE`** is repeatable on new submissions, `--batch`, and
+  `--append`; N flags publish N groups in command-line order (§4.5). For each
+  group the launcher clears `STORAGE_TARGET_NAME`, loads the target file
+  (which must set `TEST_DIRS` and may set only target settings; `TEST_DIRS` is
+  replaced whole, unset `FS_MAX_*` values keep `env.sh`'s), and then applies
+  the override files. A plain run with more than one `--target` is rejected
+  and the error prints the equivalent `--batch` and `--start` commands;
+  lifecycle operations reject `--target`, and `--delete-only` accepts at most
+  one, only to resolve `TEST_DIRS`.
+- **`--env-override FILE`** may set only workload settings, and applies to
+  every target of the submission. A workload setting in a target file, or a
+  target setting in an override file, is an error naming the file, the
+  variable, and the flag to use instead.
+
+**Rationale:** Letting override files also set target settings gave two
+overlapping ways to say what to test, with precedence rules to learn; disjoint
+allowlists make each file's role obvious from the flag that passes it.
+
+Override files are loaded as follows; target files use the same loader with
+the target allowlist. After `env.sh`, `filesystem_env_override_declarations`
 (`lib/env_functions.sh`) sources the file in an isolated child shell seeded
 with the current allowed values and the exported environment, so relative edits
 such as `LIST+=(x)` work. Only names listed by `filesystem_env_override_names`
@@ -247,20 +272,22 @@ declarations before running the next file's loader, so later files build on
 earlier ones; `resolve_env_override_chain` resolves the paths and rejects the
 same file given twice.
 
-- **Allowlist equals the snapshot.** The names are exactly the workload
-  settings that `env_used.sh` records. Slurm coordinators re-source `env.sh`
-  and then only `env_used.sh`, so overriding anything else would silently
-  revert.
+- **Allowlists equal the snapshot.** Together, the target and workload names
+  are exactly the settings that `env_used.sh` records. Slurm coordinators
+  re-source `env.sh` and then only `env_used.sh`, so overriding anything else
+  would silently revert.
 - **`env_base.sh` is not re-sourced.** It is not idempotent (modules, `PATH`,
   Slurm queries); only the workload defaults are re-applied.
-- **Evaluated once per group.** Batch preparation stages each file as
+- **Evaluated once per group.** Batch preparation stages each override file as
   `.env-override-<n>.sh` (the operator's paths go in `.env-override-origins`)
   and reuses the launcher's concatenated, validated declarations instead of
-  re-sourcing the files.
+  re-sourcing the files. Target files are staged the same way with their own
+  provenance.
 - **Provenance.** `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILES,SHA256S,FILE_VARIABLES}`
-  arrays record each file's path, SHA-256, and changed names in application
-  order. The scalars `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}`
-  keep the last file and the union of names (§8.1).
+  arrays record each override file's path, SHA-256, and changed names in
+  application order. The scalars
+  `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}` keep the last file and the union of names. The target file is recorded
+  separately as `STORAGE_SCALE_TEST_TARGET_FILE{,_SHA256,_VARIABLES}` (§8.1).
 
 ---
 
@@ -273,9 +300,9 @@ point. `EXECUTION_SUBSTRATE` is required; there is no implicit default:
 
 - `ssh` selects passwordless SSH and requires `SSH_HOST_LIST`.
 - `slurm` submits through the configured scheduler.
-- `kubectl` requires an already authorized `kubectl` context, an existing
-  namespace, and pre-existing bound RWX storage named by `KUBECTL_PV` and
-  `KUBECTL_PVC`.
+- `kubectl` requires an already authorized `kubectl` context, existing
+  namespaces, and pre-existing Bound RWX claims named by the
+  `[namespace/]claim:path` keys of `TEST_DIRS` (§4.3).
 
 The Kubernetes substrate does not provision storage or require host-networked
 Pods. It selects Ready nodes with `KUBECTL_NODE_SELECTOR`, uses ordinary Pod
@@ -298,7 +325,8 @@ top-level orchestrator (storage-tests/*/nv-*.sh)
     │               └── transmit a checked-in or generated scriptlet to a head host
     │                       └── source copied libraries and run benchmark phases
     │
-    └── kubectl: reserve an attempt on the configured PVC and create owned
+    └── kubectl: reserve an attempt on the TEST_DIRS claims and create, per
+                 namespace, owned
                     │
                     └── worker DaemonSet + coordinator Job; query or collect
                         the durable asynchronous sweep later
@@ -328,41 +356,71 @@ and network benchmarks do not use the Kubernetes substrate.
 
 ### 4.3 Kubernetes Asynchronous Filesystem IO
 
-The exact attempt, PVC-run, and per-cell state machines; invariants;
+The exact attempt, claim-run, and per-cell state machines; invariants;
 linearization points; supported fault boundaries; and unsupported situations
 are normative in
 [KUBERNETES_ELBENCHO_LIFECYCLE.md](KUBERNETES_ELBENCHO_LIFECYCLE.md).
 
-Kubernetes submission is asynchronous at the sweep level. The submitting host
-acquires a deterministic Kubernetes Lease for the namespace/PV/PVC identity,
-creates attempt-scoped ownership metadata, and stages the control bundle and
-ledger on the PVC. It then starts one elbencho worker per selected Ready node
-in an owned DaemonSet and a single coordinator Job. The coordinator has no
-Kubernetes API credentials: it runs the copied control bundle from the PVC,
-uses frozen Pod IPv4 endpoints, and writes active benchmark output to Job-local
-scratch.
+**Claim-qualified roots.** On Kubernetes every `TEST_DIRS` key is
+`[namespace/]claim:path`, split at the first `:` (namespace and claim names
+cannot contain `:`). The namespace defaults to `KUBECTL_NAMESPACE`, and `path`
+is relative to the claim. All roots of one map must share a namespace, because
+a Pod can mount claims only from its own namespace; a map spanning namespaces
+is rejected with a pointer to separate targets (§4.5). Weights and modes keep
+their meaning on every substrate: several roots form one aggregate target
+with load split by weight and force completion mode, and the single-root
+modes still need exactly one root. Each claim must be Bound, RWX, and in
+Filesystem volume mode; there is no PV setting, and the claim's bound PV name
+and the namespace, PV, and PVC UIDs are recorded in the attempt identity and
+checked for drift. Unqualified keys, and the removed single-claim settings of
+v1.x, fail before anything runs and print a replacement `TEST_DIRS` line, with
+the real claim name when `KUBECTL_PVC` is still set (see
+[Upgrading from v1.8.0](FILESYSTEM_TESTING.md#upgrading-from-v180)).
 
-Logical `TEST_DIRS` paths are mapped below `/mnt/storage-scale-test`. Each root
-must be writable by the workload identity, but the PVC mount root need not be.
-The lexically first normalized root contains a reserved `.storage-scale-test`
-subtree for control state, locks, completed-cell publications, and recovery
-metadata; no workload path may overlap it.
-After each cell reaches a terminal state, its result artifacts are copied from
-scratch to the PVC and an atomic publication manifest records the completed
-cell. This bounds result loss if the submitting `kubectl` credentials expire
-or the coordinator Pod is replaced.
+**Mount layout.** Every Pod (workers, coordinator, helpers, validation) mounts
+each claim its namespace's groups use at `/mnt/storage-scale-test/<claim>`, and
+`claim:path` maps to `/mnt/storage-scale-test/<claim>/<path>`; the
+coordinator's path checks validate each root against its own claim's mount
+root. Each root must be an existing directory writable by the workload identity, but a claim's mount
+root need not be. The lexically first (bytewise) normalized root (`namespace/claim:path`)
+of the namespace holds a reserved `.storage-scale-test` subtree for control
+state, locks, completed-cell publications, and recovery metadata; no workload
+path may overlap it.
 
-The local lifecycle commands operate on the saved attempt identity rather than
-today's `env.sh`: `--status` reads durable state, `--cancel` stops the exact
-owned Job and publishes cancellation, and `--collect` validates and retrieves
-the published artifacts into the local result directory before releasing the
-PVC Lease and deleting owned Kubernetes resources. `--resume` for a
-Kubernetes attempt is collection-gated: collect first imports partial results,
-then a new sweep can resume the failed cells from the local execution ledger.
-Coordinator loss, endpoint replacement, cancellation, and retry-safe
-collection are treated as recoverable lifecycle events; ownership labels,
-annotations, resource UIDs, and an attempt nonce prevent adopting unrelated
-objects.
+**Submission.** The submitting host acquires one deterministic Lease per
+claim, keyed by the claim's UIDs, in sorted (namespace, claim) order, and
+releases them in reverse order. It creates attempt-scoped ownership metadata
+and, per namespace, stages the control bundle and ledger on the control root
+and starts one elbencho worker per selected Ready node in an owned DaemonSet
+and a single coordinator Job. The coordinator has no Kubernetes API
+credentials: it runs the copied control bundle, uses frozen Pod IPv4
+endpoints, and writes active benchmark output to Job-local scratch. After each
+cell reaches a terminal state, its result artifacts are copied from scratch to
+the control root and an atomic publication manifest records the completed
+cell. This bounds result loss if the submitting `kubectl` credentials expire or
+the coordinator Pod is replaced.
+
+The local lifecycle commands operate on the saved attempt identity (schema 4,
+which lists the claims of each namespace segment) rather than today's
+`env.sh`: `--status` reads durable state, `--cancel` stops the exact owned Job
+and publishes cancellation, and `--collect` validates and retrieves the
+published artifacts into the local result directory before releasing the
+Leases and deleting owned Kubernetes resources. `--resume` for a Kubernetes
+attempt is collection-gated: collect first imports partial results, then a new
+sweep can resume the failed cells from the local execution ledger. Coordinator
+loss, endpoint replacement, cancellation, and retry-safe collection are
+treated as recoverable lifecycle events; ownership labels, annotations,
+resource UIDs, and an attempt nonce prevent adopting unrelated objects.
+Attempts started by v1.x use an older identity schema and are not collected by
+v2.0.0; collect them with v1.8.0 before upgrading.
+
+A batch whose groups use several namespaces runs one such segment per
+namespace (§4.5).
+
+**Rationale:** Naming the claim in every root makes an aggregate across
+filesystems just several claims in one map, and makes "several roots but one
+claim" impossible to misread. The v1.x model (one unqualified claim setting,
+keys relative to it) could not span claims and was ambiguous for aggregates.
 
 ### 4.4 Filesystem IO Reification and Resume
 
@@ -403,18 +461,96 @@ is not executable. The existing dispatch-lock ownership checks protect append
 and seal operations.
 
 The common execution environment and host/scheduler-list contents are frozen at
-creation. Group workload settings may differ, through `env.sh` edits or a
-per-group `--env-override` file (§3.5). Start performs non-mutating preflight,
-checks that the manifest revision is unchanged, and permanently seals it before
-external mutation. Submission failure never reopens preparation.
-Every cell restores its own saved configuration in an isolated context. Ordinary
+creation. Group target and workload settings may differ, through `env.sh`
+edits, a `--target` file, or `--env-override` files (§3.5). Start performs
+non-mutating preflight, checks that the manifest revision is unchanged, and
+permanently seals it before external mutation. Submission failure never
+reopens preparation. Every cell restores its own saved configuration in an isolated context. Ordinary
 non-batch layouts and dispatch remain unchanged.
+
+**Storage targets.** A target is one `TEST_DIRS` map, and separate targets
+are separate groups on every substrate. `--target FILE` (§3.5) is the way to
+submit several: N flags publish N groups in command-line order, and
+`_elbencho_batch_publish_groups` commits all of a submission's groups under
+one dispatch lock with one atomic manifest rename, so a crash never leaves a
+partial target set. Each group's snapshot records a storage target name
+(`STORAGE_TARGET_NAME`, else the sorted `TEST_DIRS` roots joined with `,`,
+normalized to `namespace/claim:path` on Kubernetes; a snapshot written before
+v2.0.0 that records `KUBECTL_PVC` and no name defaults to `<namespace>/<pvc>`).
+`lib/storage_target.py` and `lib/env_functions.sh` share this identity rule,
+and it is metadata only. `--status` reports each group's name as
+`GROUP_<NNNN>_TARGET`. The extractors refuse inputs that name different known
+targets unless `--allow-mixed-targets` is given, and batch reports are per
+group and so per target. See
+[Testing several filesystems](FILESYSTEM_TESTING.md#testing-several-filesystems).
+
+**Kubernetes segments.** On Kubernetes, `KUBECTL_NAMESPACE` (the default
+namespace for keys), the selector, image, pull policy, UID/GID, and
+sequencer image (as resolved at preparation) are frozen common settings;
+claims vary per group.
+Batch preflight checks every claim. An attempt has one **segment** per
+namespace, in the order each namespace first appears in the batch ledger;
+cells run in ledger order within a segment, so execution is namespace-major
+(groups A, B, A, B with A and B in different namespaces run A, A, B, B). A
+segment owns its claims' Leases, one worker DaemonSet and one coordinator Job
+that mount all of the namespace's claims, its NetworkPolicies, and its control
+root; each cell uses its own group's roots, so every workload mode is
+unchanged.
+
+- **One namespace** (the common case, including several targets in that
+  namespace): one segment, a plain coordinator Job, and no sequencer,
+  ServiceAccount, or RBAC.
+- **Several namespaces:** submission creates every segment's Leases, run tree
+  and workers, then each coordinator Job suspended, before any cell runs, so a
+  claim that cannot mount fails the submission and rolls back every namespace. A sequencer Job (Kubernetes 1.24 or
+  newer; a pinned default image or a digest-pinned `KUBECTL_SEQUENCER_IMAGE`) unsuspends each Job after
+  its predecessor completes and stops at the first failure. It runs, with its
+  ServiceAccount, in the first segment's namespace; its token is the only
+  Pod-held API credential, scoped by a Role per namespace (`resourceNames`)
+  and a UID precondition to `get` and `patch` on that attempt's Jobs. The sequencer re-derives progress from Job states, and
+  `--status` performs the same idempotent advance with the user's
+  credentials if the sequencer is lost. `--status` adds `SEGMENT_COUNT`,
+  `SEGMENT_CURRENT`, `SEGMENT_<i>_NAMESPACE`, and `SEGMENT_<i>_STATE`.
+  Worker drift in any unfinished segment fails the whole attempt at once and
+  marks later segments never started; cancellation stops the sequence,
+  acting on the next segment when the running one already succeeded, and
+  never overwrites a finished segment. Collection is refused until the attempt is terminal and
+  publishes an aggregate `run.status` and `run-summary.tsv` at the results
+  root beside per-namespace `run-<namespace>.status`,
+  `run-summary-<namespace>.tsv`, `startup-error-<namespace>.txt`, and
+  `coordinator-loss-<namespace>.tsv`.
+  `validate_env.sh` warns when the image does not pull and provide its tools
+  (a short-lived Job, no API call) or the RBAC is missing; `--sequencer` proves
+  the image, token, and RBAC in its namespace by running the real sequencer in
+  a probe Job against absent Jobs, reporting failures as errors.
+
+The attempt identity lists only segments that own executions, so a resume
+whose remaining cells use one namespace runs without a sequencer. The
+lifecycle contract is normative for names, keys, and faults.
+
+**Rationale:** Alternatives considered and rejected:
+
+- *A Kubernetes-only list of claims expanded into one group each*: it could
+  not express per-target sizing or layouts and duplicated what batch groups
+  and `--target` already do on every substrate.
+- *One segment per claim, chained in one Pod by init containers when the
+  claims share a namespace*: unnecessary once one coordinator mounts every
+  claim of its namespace, and it added a second execution mode with its own
+  recovery rules.
+- *Unqualified keys plus a single claim setting*: ambiguous for aggregates and
+  unable to span claims (§4.3).
+- *`--env-override` setting target settings*: two overlapping ways to say what
+  to test (§3.5).
+
+The sequencer remains only where Kubernetes forces it, because one Pod cannot
+mount claims from two namespaces; keeping a batch in one namespace, or one
+batch per namespace, avoids it and its RBAC.
 
 SSH stays host-driven; Slurm acquires one maximum-sized allocation, and
 Kubernetes selects enough workers for all pending cells in one attempt.
 Kubernetes retains its existing attempt ownership, Lease, publication, and
-collection/resume gates; its canonical control root comes from the sealed union
-of test roots. Control bundles retain the full
+collection/resume gates; each segment's control root comes from the sealed
+union of its namespace's test roots. Control bundles retain the full
 batch manifest and group provenance, including on partial resume.
 
 `utils/extract-filesystem.py` delegates to the existing reporters independently
@@ -560,7 +696,7 @@ times `ELBENCHO_FILE_SIZE_MULTIPLIER` (default 1024). The CLI modes are:
 - `--read-from <directory>`: scan or reuse a saved treefile for an existing
   dataset and run only the read phase.
 - `--delete-only <directory>`: validate that the path is a strict descendant of
-  the configured test root, then remove it on one compute node.
+  the configured test root (`TEST_DIRS` from `env.sh` or one `--target`), then remove it on one compute node.
 
 For directory `--read-from`, a successful initial scan can publish
 `.storage-scale-test-elbencho-treefile.txt` in the dataset. Later sweeps reuse it;
@@ -746,14 +882,21 @@ invocations. `env_used.yaml` is the human/tool-readable configuration snapshot;
 directory is the execution ledger and may also contain exit codes, Slurm job IDs,
 exact-completion JSON, workload TSV records, core files, and treefile-cache usage
 records. Metadata sweeps write `env_used.yaml` and a sourceable `env_used.sh`
-snapshot and use the same typed execution ledger. Filesystem `env_used.sh`
+snapshot and use the same typed execution ledger. Both snapshot kinds record the
+effective `STORAGE_TARGET_NAME` (§4.5), which the extractors read back. Filesystem `env_used.sh`
 always records `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}` and
 the arrays `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILES,SHA256S,FILE_VARIABLES}`
 (empty without an override, so sourcing one group's snapshot after another's
 cannot inherit provenance; snapshots with only the scalars are normalized to
 one-entry arrays); `env_used.yaml` carries an `env_override` mapping (`file`,
 `sha256`, `variables` for the last file and the union, plus `files`, a list of
-`{file, sha256, variables}` in application order) or `null` (§3.5). Separately, staged
+`{file, sha256, variables}` in application order) or `null` (§3.5). The
+`--target` file is recorded separately, always present and empty without one:
+`STORAGE_SCALE_TEST_TARGET_FILE{,_SHA256,_VARIABLES}` in `env_used.sh` and
+`target_file` (`null` or `{file, sha256, variables}`, with the operator's
+original path for a batch) in `env_used.yaml`. Kubernetes snapshots record
+the resolved `KUBECTL_NAMESPACE` and the Pod paths as
+`KUBECTL_MAPPED_TEST_DIRS`; bound PVs and UIDs live in the attempt identity. Separately, staged
 directory reads can persist their reusable treefile cache in the dataset,
 outside the result directory.
 
@@ -934,9 +1077,9 @@ does not make compliance determinations for deployments.
 
 ### 11.2 Trusted Inputs and Persistent State
 
-`env.sh`, the object-auth file, and `--env-override` files are sourced as
-Bash. They are trusted operator inputs and can execute arbitrary commands with
-the invoking user's privileges.
+`env.sh`, the object-auth file, and `--target` and `--env-override` files are
+sourced as Bash. They are trusted operator inputs and can execute arbitrary
+commands with the invoking user's privileges.
 Filesystem IO resume also sources the generated `env_used.sh` snapshot and each
 reified `executions/NNNN.sh` definition. Result directories used with `--resume`
 must therefore remain writable only by trusted users. Paths passed to

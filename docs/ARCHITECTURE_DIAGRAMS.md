@@ -21,10 +21,10 @@ limitations under the License.
 
 NVIDIA Storage Scale Test is a benchmark orchestration tool packaged by the user as a single tarball for transfer into a test environment. This repository does not distribute pre-built benchmark binaries; users are responsible for obtaining, building, validating, and complying with license/security requirements for the binaries they include. The architecture has four components:
 
-1. **Orchestration layer.** Shell scripts on an executing host (login node or workstation) drive benchmark execution. `env.sh` parameterizes all behavior; filesystem launchers may layer a workload override file. The orchestration layer supports three explicitly selected dispatch mechanisms:
+1. **Orchestration layer.** Shell scripts on an executing host (login node or workstation) drive benchmark execution. `env.sh` parameterizes all behavior; filesystem launchers may layer target files and workload override files. The orchestration layer supports three explicitly selected dispatch mechanisms:
    - **Slurm:** Jobs are submitted via `sbatch` to a Slurm controller, which allocates compute nodes and executes benchmark workloads within job allocations.
    - **SSH:** Benchmark code is transmitted as self-contained scriptlets to remote nodes over passwordless SSH. Results are streamed back through SSH, normally as tar archives.
-   - **kubectl:** Filesystem sweeps create an attempt-scoped worker DaemonSet and coordinator Job in an existing Kubernetes namespace. The submitter returns after dispatch; later lifecycle commands query status, cancel, or collect the durable attempt.
+   - **kubectl:** Filesystem sweeps create, in each existing Kubernetes namespace their claims live in, an attempt-scoped worker DaemonSet and coordinator Job that mount every claim of that namespace. The submitter returns after dispatch; later lifecycle commands query status, cancel, or collect the durable attempt.
 
 2. **Benchmark clients.** One or more nodes run required benchmark and connectivity binaries (for example elbencho, Warp, and s3test) that were supplied by the user or produced by helper build scripts before the tarball was taken into the test environment. These nodes issue IO against the systems under test and write result files to local or shared storage.
 
@@ -43,7 +43,7 @@ result data, configuration snapshots, and reified filesystem-sweep executions
 with their status sentinels. Kubernetes attempts additionally persist their
 control bundle, ownership identity, endpoint evidence, execution ledger, and
 completed-cell publications under `.storage-scale-test` in the canonical
-`TEST_DIRS` root on the configured PVC.
+(lexically first) `TEST_DIRS` root of each namespace, on that root's claim.
 Optional treefile caches are stored alongside staged datasets. Together these
 artifacts support report regeneration, asynchronous collection, dataset reuse,
 and `nv-elbencho-sweep.sh --resume` after an interrupted run.
@@ -180,65 +180,73 @@ flowchart TB
   RES --> ANA
 ```
 
-## Kubernetes Mode (kubectl + Existing RWX PVC)
+## Kubernetes Mode (kubectl + Existing RWX Claims)
 
 Kubernetes mode is currently implemented for filesystem Elbencho sweeps. It
-requires an already authorized `kubectl` context, an existing namespace, and a
-bound RWX PVC. The PVC must be visible from the selected nodes; this tool does
-not provision the PV or PVC.
+requires an already authorized `kubectl` context, existing namespaces, and
+Bound RWX claims in Filesystem volume mode, named by `TEST_DIRS` keys of the
+form `[namespace/]claim:path`. The claims must be visible from the selected
+nodes; this tool does not provision PVs or claims.
+
+Each namespace an attempt uses is one **segment**. Its Pods mount every claim
+the segment uses, one subdirectory per claim, and `claim:path` maps to
+`/mnt/storage-scale-test/<claim>/<path>`. With one namespace (the usual case,
+even for several targets) there is one segment and no sequencer. With several
+namespaces, the segments' coordinator Jobs are created suspended and a
+sequencer Job, in the first namespace, starts them one at a time.
 
 ```mermaid
 %%{init: {"flowchart": {"curve": "linear"}}}%%
 flowchart LR
   %% Kubernetes mode: submit quickly, then observe or collect asynchronously.
+  %% One segment per namespace; the sequencer exists only across namespaces.
 
   subgraph HOST["Executing Host"]
-    ENV["env.sh<br/>EXECUTION_SUBSTRATE=kubectl"]
+    ENV["env.sh + --target files<br/>EXECUTION_SUBSTRATE=kubectl<br/>TEST_DIRS keys [namespace/]claim:path"]
     CLI["nv-elbencho-sweep.sh<br/>submit / status / cancel / collect"]
     RESULTS["Local results directory<br/>ledger + collected cell artifacts"]
   end
 
-  subgraph API["Kubernetes API"]
-    NS["Existing namespace"]
-    LEASE["PVC-wide Lease<br/>namespace/PV/PVC UID key"]
+  subgraph SEG["Namespace segment (one per namespace)"]
+    LEASE["One Lease per claim<br/>UID-keyed, acquired in sorted order"]
     DS["Owned worker DaemonSet<br/>one Elbencho service per selected node"]
     JOB["Owned coordinator Job<br/>finite-lived, no API credentials"]
     HELP["Short-lived owned helper Pods<br/>staging, status, collection"]
+    subgraph PODS["Pods (Pod network)"]
+      W["Elbencho worker Pods<br/>frozen Pod IPv4 endpoints"]
+      C["Coordinator Pod<br/>Pod-to-Pod port 1611"]
+    end
+    subgraph CLAIMS["Bound RWX claims of this namespace"]
+      CA["claim-a at /mnt/storage-scale-test/claim-a<br/>first root: .storage-scale-test/<br/>control bundle, locks, ledger, publications"]
+      CB["claim-b at /mnt/storage-scale-test/claim-b<br/>mapped workload paths (TEST_DIRS)"]
+    end
   end
 
-  subgraph PVC["Configured RWX PVC"]
-    CONTROL["canonical TEST_DIR/.storage-scale-test/<br/>control bundle + locks + ledger"]
-    PUBLISHED["completed-cell publications<br/>result artifacts + manifest"]
-    DATA["Mapped workload paths<br/>/mnt/storage-scale-test/...<br/>(TEST_DIRS) "]
-  end
-
-  subgraph NET["Pod Network"]
-    W["Elbencho worker Pods<br/>frozen Pod IPv4 endpoints"]
-    C["Coordinator Pod<br/>Pod-to-Pod port 1611"]
-  end
+  SEQ["Sequencer Job (first namespace; several namespaces only)<br/>unsuspends each segment's Job in turn"]
 
   ENV --> CLI
-  CLI -- "create/query/cancel/collect" --> NS
+  CLI -- "create/query/cancel/collect" --> SEG
   CLI --> LEASE
   CLI --> HELP
-  NS --> DS --> W
-  NS --> JOB --> C
-  NS --> HELP
-  DS --> DATA
-  JOB --> CONTROL
+  DS --> W
+  JOB --> C
   C --> W
-  C --> DATA
-  C --> PUBLISHED
-  HELP --> CONTROL
-  HELP --> PUBLISHED
-  PUBLISHED --> CLI --> RESULTS
+  W --> CA
+  W --> CB
+  C --> CA
+  C --> CB
+  HELP --> CA
+  SEQ -. "unsuspend" .-> JOB
+  CA -- "published cells" --> CLI --> RESULTS
 ```
 
-The attempt identity, ownership nonce, Kubernetes resource UIDs, node
-selection, and worker endpoint evidence are persisted locally and on the PVC.
-Each resource is labeled and annotated for exact ownership. The coordinator
-publishes each completed cell before continuing, so a lost Pod or expired
-kubectl session does not discard already completed results. Collection verifies
-the publication manifest, copies results back to the executing host, removes
-attempt state and exact owned resources, and releases the UID-journaled PVC
-Lease last.
+The attempt identity (namespace, claim, bound PV, and UIDs per claim), the
+ownership nonce, Kubernetes resource UIDs, node selection, and worker endpoint
+evidence are persisted locally and on the control root. Each resource is
+labeled and annotated for exact ownership. The coordinator publishes each
+completed cell before continuing, so a lost Pod or expired kubectl session does
+not discard already completed results. Collection verifies the publication
+manifest, copies results back to the executing host, removes attempt state and
+exact owned resources, and releases the UID-journaled Leases last, in reverse
+acquisition order. Details are normative in
+[KUBERNETES_ELBENCHO_LIFECYCLE.md](KUBERNETES_ELBENCHO_LIFECYCLE.md).

@@ -19,6 +19,14 @@
 # Manifest rows, never directory enumeration, define committed membership.
 # Cell preparation/validation intentionally restore globals only in their own
 # subshells; later adapters restore their own context rather than those values.
+# Batch preflight validates Kubernetes claims; the coordinator bundle ships this
+# library without that helper and never needs it.
+if ! declare -F kubectl_validate_test_dirs >/dev/null \
+        && [[ -f "$(dirname "${BASH_SOURCE[0]}")/_kubectl_claims.sh" ]]; then
+    # shellcheck source=lib/_kubectl_claims.sh
+    source "$(dirname "${BASH_SOURCE[0]}")/_kubectl_claims.sh"
+fi
+
 elbencho_batch_is_batch() {
     local marker
     # Exact batch markers keep a damaged batch on the validating lifecycle path;
@@ -38,6 +46,40 @@ _elbencho_batch_sha256() {
 }
 
 _elbencho_batch_error() { printf 'Error: filesystem batch: %s\n' "$*" >&2; return 1; }
+
+# _elbencho_quote_argument ARGUMENT: print ARGUMENT as one copy-paste-safe shell
+# word. Plain words (including commas, so "--nodes 1,8" stays readable) are
+# left bare; anything else is quoted with ${argument@Q}.
+_elbencho_quote_argument() {
+    if [[ "$1" =~ ^[A-Za-z0-9_./,:=@+-]+$ ]]; then
+        printf '%s' "$1"
+    else
+        printf '%s' "${1@Q}"
+    fi
+}
+
+# elbencho_reject_multi_target_run COUNT LAUNCHER [ARG...]: explain why a plain
+# run cannot take several --target files, and print the equivalent batch
+# commands with the operator's own arguments (LAUNCHER and ARGs are the original
+# invocation). Always fails.
+elbencho_reject_multi_target_run() {
+    local count="$1" launcher="$2" argument quoted_launcher quoted_arguments=""
+    shift 2
+    quoted_launcher=$(_elbencho_quote_argument "$launcher")
+    for argument in "$@"; do
+        quoted_arguments+=" $(_elbencho_quote_argument "$argument")"
+    done
+    {
+        printf 'Error: %s --target files were given, but a plain run tests exactly one target.\n' \
+            "$count"
+        printf 'Prepare a batch instead; it creates one group per --target, in command-line order:\n'
+        printf '  %s --batch%s\n' "$quoted_launcher" "$quoted_arguments"
+        printf '  %s --start <directory printed as STORAGE_SCALE_TEST_BATCH_RESULTS>\n' \
+            "$quoted_launcher"
+        printf 'To run a single target directly, pass only one --target.\n'
+    } >&2
+    return 1
+}
 
 elbencho_batch_execution_output_dir() {
     local root="$1" id="$2" relative
@@ -191,9 +233,14 @@ _elbencho_batch_common_names() {
         ssh) printf '%s\n' SSH_USER SSH_HOMEDIR_SHARED SSH_OPTIONS SSH_OPTS ;;
         slurm) printf '%s\n' account reservation partition run_time MODULES \
             SLURM_EXTRA_ARGS SLURM_EXCLUSIVE_USER SLURM_JOB_NAME_PREFIX ;;
-        kubectl) printf '%s\n' KUBECTL_NAMESPACE KUBECTL_PV KUBECTL_PVC \
-            KUBECTL_NODE_SELECTOR KUBECTL_ELBENCHO_IMAGE KUBECTL_IMAGE_PULL_POLICY \
-            KUBECTL_RUN_AS_USER KUBECTL_RUN_AS_GROUP ;;
+        # Each group's snapshot records its own roots (and so its claims and
+        # namespace); the batch freezes only what is shared. The sequencer image
+        # is frozen as the image it resolves to at prepare time (the default
+        # when env.sh sets none), so neither a later env.sh edit nor a newer
+        # default changes how a prepared batch chains its namespaces.
+        kubectl) printf '%s\n' KUBECTL_NAMESPACE KUBECTL_NODE_SELECTOR \
+            KUBECTL_ELBENCHO_IMAGE KUBECTL_IMAGE_PULL_POLICY KUBECTL_RUN_AS_USER \
+            KUBECTL_RUN_AS_GROUP KUBECTL_SEQUENCER_IMAGE ;;
     esac
 }
 
@@ -299,6 +346,25 @@ _elbencho_batch_compare_profile() {
     return "$rc"
 }
 
+# _elbencho_batch_normalize_kubectl_root KEY HELPERS OUT_VAR: set OUT_VAR to the
+# union form of a Kubernetes TEST_DIRS key. A claim-qualified key becomes
+# "namespace/claim:path" (kubectl_parse_test_dir_key), so groups that spell the
+# same root differently share one union entry; HELPERS is the Kubernetes helper
+# library, loaded only when the claim parser is unavailable and the key is a
+# plain path.
+_elbencho_batch_normalize_kubectl_root() {
+    local key="$1" helpers="$2" namespace claim relative parsed
+    local -n result_ref="$3"
+    if declare -F kubectl_parse_test_dir_key >/dev/null; then
+        parsed=$(kubectl_parse_test_dir_key "$key") || return 1
+        IFS=$'\t' read -r namespace claim relative <<< "$parsed"
+        result_ref="$namespace/$claim:$relative"
+        return 0
+    fi
+    declare -F kubectl_normalize_logical_path >/dev/null || source "$helpers" || return 1
+    kubectl_normalize_logical_path "$key" result_ref
+}
+
 _elbencho_batch_refresh_union() (
     local root="$1" row id kind relative unused
     local kube_helpers
@@ -311,10 +377,7 @@ _elbencho_batch_refresh_union() (
         local path
         for path in "${!TEST_DIRS[@]}"; do
             if [[ "$EXECUTION_SUBSTRATE" == kubectl ]]; then
-                declare -F kubectl_normalize_logical_path >/dev/null || source "$kube_helpers" || exit 1
-                local normalized_root
-                kubectl_normalize_logical_path "$path" normalized_root || exit 1
-                path="$normalized_root"
+                _elbencho_batch_normalize_kubectl_root "$path" "$kube_helpers" path || exit 1
             fi
             union["$path"]=1
         done
@@ -351,32 +414,27 @@ _elbencho_batch_reidentify_execution() (
     printf 'export ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV=%q\n' "$batch_paths_csv"
 )
 
+# _elbencho_batch_publish_group ROOT STAGE KIND DS: publish one staged group.
 _elbencho_batch_publish_group() {
-    local root="$1" stage="$2" kind="$3" ds="$4"
-    local count gid revision offset old_id id relative target definition temp_manifest
-    offset=$(awk -F '\t' '$1=="execution" {n++} END {print n+0}' "$root/batch-manifest.tsv")
-    count=$(list_elbencho_execution_ids "$stage/executions" | wc -l)
-    (( count > 0 && offset + count <= 9999 )) || {
-        _elbencho_batch_error 'append exceeds the 9999-execution limit'; return 1;
-    }
-    gid=$(awk -F '\t' '$1=="group" {n++} END {printf "%04d",n+1}' "$root/batch-manifest.tsv")
-    revision=$(awk -F '\t' '$1=="revision" {print $2+1}' "$root/batch-manifest.tsv")
-    relative="groups/$gid/elbencho-$ds"
-    [[ "$kind" != mdtest ]] || relative="groups/$gid/mdtest-elbencho-$ds"
+    _elbencho_batch_publish_groups "$1" "$3" "$4" "$2"
+}
+
+# Append one staged group's rows to the uncommitted manifest TEMP_MANIFEST and
+# write its snapshots and execution definitions. OFFSET_VAR names the caller's
+# count of execution IDs already used; it is advanced past this group.
+_elbencho_batch_stage_group_rows() {
+    local root="$1" stage="$2" kind="$3" ds="$4" gid="$5" temp_manifest="$6"
+    local -n offset_ref="$7"
+    local relative target old_id id definition
+    relative=$(_elbencho_batch_group_relative "$gid" "$kind" "$ds")
     target="$root/$relative"
-    # Uncommitted debris is never enumerated. A retry may replace only the next
-    # uncommitted group while holding the mutation lock.
-    [[ ! -e "$root/groups/$gid" ]] || rm -r "$root/groups/$gid" || return 1
     mkdir -p "$target" || return 1
     cp "$stage/env_used.sh" "$stage/env_used.yaml" "$target/" || return 1
-    temp_manifest="$root/.batch-manifest.new"
-    awk -F '\t' -v rev="$revision" 'BEGIN {OFS="\t"} $1=="revision" {$2=rev} {print}' \
-        "$root/batch-manifest.tsv" > "$temp_manifest" || return 1
     printf 'group\t%s\t%s\t%s\t%s\t%s\n' "$gid" "$kind" "$relative" \
         "$(_elbencho_batch_sha256 "$target/env_used.sh")" \
         "$(_elbencho_batch_sha256 "$target/env_used.yaml")" >> "$temp_manifest" || return 1
     while IFS= read -r old_id; do
-        offset=$((offset + 1)); printf -v id '%04d' "$offset"
+        offset_ref=$((offset_ref + 1)); printf -v id '%04d' "$offset_ref"
         definition="$root/executions/$id.sh"
         {
             cat "$target/env_used.sh"
@@ -388,22 +446,174 @@ _elbencho_batch_publish_group() {
         printf 'execution\t%s\t%s\t%s\n' "$id" "$gid" \
             "$(_elbencho_batch_sha256 "$definition")" >> "$temp_manifest" || return 1
     done < <(list_elbencho_execution_ids "$stage/executions")
-    mv "$temp_manifest" "$root/batch-manifest.tsv" || return 1
-    _elbencho_batch_refresh_union "$root" || return 1
-    printf 'STORAGE_SCALE_TEST_BATCH_RESULTS=%s\nSTORAGE_SCALE_TEST_BATCH_GROUP=%s\n' "$root" "$gid"
-    printf 'STORAGE_SCALE_TEST_BATCH_GROUP_TARGET=%q\n' \
-        "$(_elbencho_batch_group_target "$target")"
-    printf 'STORAGE_SCALE_TEST_BATCH_EXECUTIONS=%04d-%s\n' "$((offset-count+1))" "$id"
 }
+
+_elbencho_batch_group_relative() {
+    local gid="$1" kind="$2" ds="$3" basename=elbencho
+    [[ "$kind" != mdtest ]] || basename=mdtest-elbencho
+    printf 'groups/%s/%s-%s\n' "$gid" "$basename" "$ds"
+}
+
+# Print the publication keys. Every published group gets
+# "GROUP_<gid>_TARGET=<effective target name>" (mirroring the GROUP_<NNNN>_TARGET
+# status keys). Exactly one group also keeps the historical
+# "GROUP_TARGET=<effective target name>" line. Several groups (one per --target
+# file) add GROUPS; GROUP names the first group and EXECUTIONS spans all of them.
+_elbencho_batch_print_publication() {
+    local root="$1" ds="$2" kind="$3" first="$4" last="$5" gid target prefix=STORAGE_SCALE_TEST_BATCH
+    shift 5
+    printf '%s_RESULTS=%s\n%s_GROUP=%s\n' "$prefix" "$root" "$prefix" "$1"
+    [[ $# -eq 1 ]] || printf '%s_GROUPS=%s\n' "$prefix" "$(IFS=,; printf '%s' "$*")"
+    for gid in "$@"; do
+        target=$(_elbencho_batch_group_target "$root/$(_elbencho_batch_group_relative "$gid" "$kind" "$ds")")
+        [[ $# -ne 1 ]] || printf '%s_GROUP_TARGET=%q\n' "$prefix" "$target"
+        printf '%s_GROUP_%s_TARGET=%q\n' "$prefix" "$gid" "$target"
+    done
+    printf '%s_EXECUTIONS=%04d-%04d\n' "$prefix" "$first" "$last"
+}
+
+# _elbencho_batch_publish_groups ROOT KIND DS STAGE...: publish one staged
+# group per STAGE, in order, with a single manifest commit (revision += the
+# group count), so an interruption never leaves part of a target set. The
+# caller holds the dispatch lock.
+_elbencho_batch_publish_groups() {
+    local root="$1" kind="$2" ds="$3"
+    shift 3
+    local -a stages=("$@") gids=()
+    local manifest="$root/batch-manifest.tsv" temp_manifest="$root/.batch-manifest.new"
+    local stage count total=0 offset groups revision gid index first
+    offset=$(awk -F '\t' '$1=="execution" {n++} END {print n+0}' "$manifest")
+    for stage in "${stages[@]}"; do
+        count=$(list_elbencho_execution_ids "$stage/executions" | wc -l)
+        (( count > 0 )) || { _elbencho_batch_error 'staged group has no executions'; return 1; }
+        total=$((total + count))
+    done
+    (( offset + total <= 9999 )) || {
+        _elbencho_batch_error 'append exceeds the 9999-execution limit'; return 1;
+    }
+    groups=$(awk -F '\t' '$1=="group" {n++} END {print n+0}' "$manifest")
+    revision=$(awk -F '\t' -v added="${#stages[@]}" '$1=="revision" {print $2+added}' "$manifest")
+    # Uncommitted debris is never enumerated. A retry may replace only the next
+    # uncommitted groups while holding the mutation lock.
+    for index in "${!stages[@]}"; do
+        printf -v gid '%04d' "$((groups + index + 1))"
+        gids+=("$gid")
+        [[ ! -e "$root/groups/$gid" ]] || rm -r "$root/groups/$gid" || return 1
+    done
+    awk -F '\t' -v rev="$revision" 'BEGIN {OFS="\t"} $1=="revision" {$2=rev} {print}' \
+        "$manifest" > "$temp_manifest" || return 1
+    first=$((offset + 1))
+    for index in "${!stages[@]}"; do
+        _elbencho_batch_stage_group_rows "$root" "${stages[index]}" "$kind" "$ds" \
+            "${gids[index]}" "$temp_manifest" offset || return 1
+    done
+    mv "$temp_manifest" "$manifest" || return 1
+    # The manifest rename is the commit. From here the groups are published, so
+    # a failed union refresh must not hide their identifiers: the operator
+    # would retry --append and duplicate every group. --status and --start
+    # rebuild the union from the manifest.
+    if ! _elbencho_batch_refresh_union "$root"; then
+        printf 'Warning: group(s) %s were committed to %s but its combined environment (env_used.sh) could not be refreshed; do not re-run --append for them. Run --status or --start on the batch to repair it.\n' \
+            "$(IFS=,; printf '%s' "${gids[*]}")" "$root" >&2
+    fi
+    _elbencho_batch_print_publication "$root" "$ds" "$kind" "$first" "$offset" "${gids[@]}"
+}
+
+# Move every "--target FILE" pair out of the launcher arguments (ARGS_VAR) and
+# set TARGETS_VAR to the resolved files in command-line order; each becomes one
+# group. The same file twice is an error: it would publish two identical groups.
+_elbencho_batch_extract_targets() {
+    # shellcheck disable=SC2178  # Namerefs to the caller's arrays.
+    local -n args_ref="$1" targets_ref="$2"
+    local -a remaining=()
+    local index=0 resolved other
+    targets_ref=()
+    while (( index < ${#args_ref[@]} )); do
+        if [[ "${args_ref[index]}" != --target ]]; then
+            remaining+=("${args_ref[index]}")
+            index=$((index + 1))
+            continue
+        fi
+        resolved=$(resolve_target_file "${args_ref[index + 1]:-}") || return 1
+        for other in "${targets_ref[@]}"; do
+            [[ ! "$resolved" -ef "$other" ]] || {
+                _elbencho_batch_error "--target given more than once for the same file: $resolved"
+                return 1
+            }
+        done
+        targets_ref+=("$resolved")
+        index=$((index + 2))
+    done
+    args_ref=("${remaining[@]}")
+}
+
+# Copy a target file into a group's staging directory (.target-file.sh) and
+# record the operator's path beside it (.target-file-origin, NUL-terminated)
+# for provenance, as the override files are staged.
+_elbencho_batch_stage_target_file() {
+    local stage="$1" origin="$2"
+    cp -- "$origin" "$stage/.target-file.sh" || return 1
+    printf '%s\0' "$origin" > "$stage/.target-file-origin"
+}
+
+# _elbencho_batch_stage_groups WORK DS LAUNCHER TARGETS_VAR STAGES_VAR ARGS_VAR:
+# run the launcher once per target file, each into its own staging directory,
+# and set STAGES_VAR to those directories in target order. Each launcher run
+# applies exactly that group's target file and then the override files. With at
+# most one target (or none: the target comes from env.sh) the launcher stages
+# into WORK itself, as it always has. Override files staged once in WORK serve
+# every group.
+_elbencho_batch_stage_groups() {
+    local work="$1" ds="$2" launcher="$3" index stage count
+    # shellcheck disable=SC2178  # Namerefs to the caller's arrays.
+    local -n targets_ref="$4" stages_ref="$5" launch_args_ref="$6"
+    local -a group_args
+    count=${#targets_ref[@]}
+    stages_ref=()
+    for ((index = 0; index < (count > 0 ? count : 1); index++)); do
+        stage="$work"
+        if (( count > 1 )); then
+            stage="$work/target-$index"
+            mkdir "$stage" || return 1
+            if [[ -f "$work/.env-override-origins" ]]; then
+                cp "$work/.env-override-origins" "$stage/" || return 1
+            fi
+        fi
+        group_args=("${launch_args_ref[@]}")
+        if (( count > 0 )); then
+            _elbencho_batch_stage_target_file "$stage" "${targets_ref[index]}" || return 1
+            group_args+=(--target "$stage/.target-file.sh")
+        fi
+        ELBENCHO_BATCH_PREPARE_DIR="$stage" ELBENCHO_BATCH_DATESTAMP="$ds" \
+            "$BASH" "$launcher" "${group_args[@]}" || return 1
+        stages_ref+=("$stage")
+    done
+}
+
+# Write STAGE's complete group snapshot with that group's own settings in
+# effect: the launcher saved the declarations that applied its target file and
+# overrides (.env-override-declarations.sh), and a subshell replays them so one
+# group's settings never reach another's snapshot.
+_elbencho_batch_complete_staged_group() (
+    local stage="$1"
+    if [[ -f "$stage/.env-override-declarations.sh" ]]; then
+        # Reuse the launcher's evaluated values; sourcing the original files
+        # here would repeat relative edits and any other evaluation side effects.
+        # shellcheck disable=SC1091
+        source "$stage/.env-override-declarations.sh" || exit 1
+    fi
+    _elbencho_batch_complete_group_snapshot "$stage"
+)
 
 _elbencho_batch_prepare() (
     local kind="$1" operation="$2" directory="$3" launcher="$4"
     shift 4
     # RESULTS_DIR is initialized by env.sh, not by this helper's caller.
     # shellcheck disable=SC2153
-    local base="${SCRIPT_DIR}/../.." root stage ds token="" rc=0
+    local base="${SCRIPT_DIR}/../.." root work stage ds token="" rc=0 index
     source "$base/env.sh" || exit 1
     source "$base/lib/_elbencho_functions.sh" || exit 1
+    local -a targets=() stages=()
     if [[ "$operation" == batch ]]; then
         ds=$(date -u +%Y%m%dZ%H%M%S)
         root="$RESULTS_DIR/filesystem-batch-$ds"
@@ -413,23 +623,23 @@ _elbencho_batch_prepare() (
         elbencho_batch_verify_manifest "$root" || exit 1
         ds=$(awk -F '\t' '$1=="datestamp" {print $2}' "$root/batch-manifest.tsv")
     fi
-    stage=$(mktemp -d "$RESULTS_DIR/.group-staging.XXXXXX") || exit 1
-    trap 'rm -r "$stage"' EXIT
+    work=$(mktemp -d "$RESULTS_DIR/.group-staging.XXXXXX") || exit 1
+    trap 'rm -r "$work"' EXIT
     local -a launcher_args=("$@")
     reset_env_override_provenance
-    _elbencho_batch_stage_env_override "$stage" launcher_args || exit 1
-    ELBENCHO_BATCH_PREPARE_DIR="$stage" ELBENCHO_BATCH_DATESTAMP="$ds" \
-        "$BASH" "$launcher" "${launcher_args[@]}" || exit 1
-    if [[ "${ELBENCHO_BATCH_ENV_OVERRIDE_COUNT:-0}" -gt 0 ]]; then
-        # Reuse the launcher's evaluated values (every override, in order);
-        # sourcing the original files here would repeat relative edits and any
-        # other evaluation side effects.
-        # shellcheck disable=SC1091
-        source "$stage/.env-override-declarations.sh" || exit 1
+    _elbencho_batch_extract_targets launcher_args targets || exit 1
+    _elbencho_batch_stage_env_override "$work" launcher_args || exit 1
+    _elbencho_batch_stage_groups "$work" "$ds" "$launcher" targets stages \
+        launcher_args || exit 1
+    for index in "${!stages[@]}"; do
+        stage="${stages[index]}"
+        _elbencho_batch_validate_candidate "$stage" || exit 1
+        _elbencho_batch_complete_staged_group "$stage" || exit 1
+    done
+    if [[ "$EXECUTION_SUBSTRATE" == kubectl ]]; then
+        kubectl_resolve_sequencer_image || exit 1
     fi
-    _elbencho_batch_validate_candidate "$stage" || exit 1
-    _elbencho_batch_complete_group_snapshot "$stage" || exit 1
-    _elbencho_batch_write_profile "$stage/common-fields.tsv" || exit 1
+    _elbencho_batch_write_profile "$work/common-fields.tsv" || exit 1
     if [[ "$operation" == batch ]]; then
         mkdir "$root" || { _elbencho_batch_error "results directory already exists: $root"; exit 1; }
         mkdir "$root/executions" || exit 1
@@ -442,8 +652,8 @@ _elbencho_batch_prepare() (
     if [[ -e "$root/batch-sealed.sha256" ]]; then
         _elbencho_batch_error "sealed batch is immutable: $root; create a new --batch"
         rc=1
-    elif ! _elbencho_batch_compare_profile "$root" "$stage/common-fields.tsv"; then rc=1
-    else _elbencho_batch_publish_group "$root" "$stage" "$kind" "$ds" || rc=$?
+    elif ! _elbencho_batch_compare_profile "$root" "$work/common-fields.tsv"; then rc=1
+    else _elbencho_batch_publish_groups "$root" "$kind" "$ds" "${stages[@]}" || rc=$?
     fi
     _elbencho_release_dispatch_lock "$root/executions" "$token" || rc=1
     exit "$rc"
@@ -456,13 +666,11 @@ _elbencho_batch_prepare() (
 # snapshot. The operator's absolute paths are recorded NUL-separated in
 # .env-override-origins for provenance. The same file given twice is rejected
 # here, while the originals are still comparable.
-# Exports ELBENCHO_BATCH_ENV_OVERRIDE_COUNT (0 when the group has none).
 _elbencho_batch_stage_env_override() {
     local stage="$1" position index
     # shellcheck disable=SC2178  # Nameref to the caller's argument array.
     local -n args_ref="$2"
     local -a positions=() origins=() labels=()
-    export ELBENCHO_BATCH_ENV_OVERRIDE_COUNT=0
     for position in "${!args_ref[@]}"; do
         [[ "${args_ref[$position]}" == --env-override ]] || continue
         positions+=("$position")
@@ -476,7 +684,6 @@ _elbencho_batch_stage_env_override() {
         args_ref[positions[index] + 1]="$stage/.env-override-$((index + 1)).sh"
         printf '%s\0' "${origins[index]}" >> "$stage/.env-override-origins" || return 1
     done
-    export ELBENCHO_BATCH_ENV_OVERRIDE_COUNT="${#positions[@]}"
 }
 
 _elbencho_batch_validate_candidate() {
@@ -586,28 +793,13 @@ _elbencho_batch_preflight() {
             } ;;
         kubectl)
             source "$SCALE_TEST_BASE/storage-tests/fs/kubectl/_nv-elbencho-kubectl-functions.sh" || return 1
-            kubectl_validate_runtime_configuration || return 1
-            kubectl_validate_cluster_identity >/dev/null || return 1
-            local batch_logical_root batch_test_root
-            kubectl_select_control_root batch_logical_root batch_test_root || return 1
-            if [[ -e "$root/batch-sealed.sha256" ]]; then
-                kubectl_validate_saved_control_layout || return 1
-                [[ "$batch_logical_root" == "$KUBECTL_CONTROL_LOGICAL_ROOT" \
-                    && "$batch_test_root" == "$KUBECTL_CONTROL_TEST_ROOT" ]] || {
-                    _elbencho_batch_error 'canonical control root differs from its saved union'; return 1;
-                }
-            fi
-            kubectl_set_control_layout "$batch_logical_root" "$batch_test_root" || return 1
-            _kubectl_batch_workload_paths "$root" >/dev/null || return 1
-            local discovery rc=0
-            discovery=$(mktemp -d "$root/.preflight.XXXXXX") || return 1
-            kubectl_discover_candidate_nodes "$KUBECTL_NODE_SELECTOR" "$discovery/nodes.tsv" || rc=1
-            if [[ "$rc" == 0 ]] && (( $(wc -l < "$discovery/nodes.tsv") < maximum )); then
-                _elbencho_batch_error "worker selector cannot satisfy $maximum nodes"
-                rc=1
-            fi
-            rm -r "$discovery" || rc=1
-            return "$rc" ;;
+            declare -F kubectl_batch_preflight >/dev/null || {
+                _elbencho_batch_error 'Kubernetes batch preflight (kubectl_batch_preflight) is unavailable'
+                return 1
+            }
+            # Claim identity, runtime settings, control root, workload paths
+            # and node discovery for the saved batch.
+            kubectl_batch_preflight "$root" || return 1 ;;
         *) _elbencho_batch_error 'invalid saved execution substrate'; return 1 ;;
     esac
     _elbencho_batch_validate_executable "$root"

@@ -39,9 +39,12 @@ def _bash(body: str) -> subprocess.CompletedProcess[str]:
             "-c",
             textwrap.dedent(f"""\
                 source {_FUNCTIONS!s}
-                KUBECTL_CONTROL_LOGICAL_ROOT=benchmark
-                KUBECTL_CONTROL_TEST_ROOT="$KUBECTL_SWEEP_MOUNT_ROOT/benchmark"
+                KUBECTL_CONTROL_LOGICAL_ROOT=test-ns/test-pvc:benchmark
+                KUBECTL_CONTROL_TEST_ROOT="$KUBECTL_SWEEP_MOUNT_ROOT/test-pvc/benchmark"
                 KUBECTL_CONTROL_ROOT="$KUBECTL_CONTROL_TEST_ROOT/.storage-scale-test"
+                _test_configuration() {{
+                    printf 'declare -ga KUBECTL_SEGMENT_CONTROL_ROOTS=( test-ns/test-pvc:benchmark )\n' > "$1"
+                }}
                 {body}
                 """),
         ],
@@ -190,7 +193,8 @@ def test_runtime_validation_does_not_require_a_results_directory() -> None:
     result = _bash("""
         set -u
         unset results_dir
-        declare -gA TEST_DIRS=([benchmark]=1)
+        declare -gA TEST_DIRS=([test-pvc:benchmark]=1)
+        KUBECTL_NAMESPACE=test-ns
         KUBECTL_NODE_SELECTOR=benchmark=true
         kubectl_validate_cluster_identity() { return 0; }
         kubectl_discover_candidate_nodes() { printf 'reached-discovery\\n'; return 1; }
@@ -300,21 +304,28 @@ def test_attempt_configuration_freezes_the_canonical_control_root(
 ) -> None:
     """Lifecycle retries use saved placement rather than a changed env.sh."""
     result = _bash(_identity(tmp_path / "state") + """
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        set -e
+        export KUBECTL_NAMESPACE=test-ns
         export KUBECTL_NODE_SELECTOR=storage-test=true
         export KUBECTL_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never
         export KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
-        declare -A mapped=([/mnt/storage-scale-test/zeta]=1 \
-          [/mnt/storage-scale-test/alpha]=1)
         kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
-        kubectl_attempt_write_configuration "$root" "$fd" 1234abcd mapped '' \
-          alpha /mnt/storage-scale-test/alpha
+        # The control root must lie on one of the segment's own claims.
+        ! kubectl_attempt_write_configuration "$root" "$fd" 1234abcd '' \
+          test-ns/other-pvc:alpha
+        ! kubectl_attempt_write_configuration "$root" "$fd" 1234abcd '' \
+          other-ns/test-pvc:alpha
+        kubectl_attempt_write_configuration "$root" "$fd" 1234abcd '' \
+          test-ns/test-pvc:alpha
+        unset KUBECTL_SEGMENT_CONTROL_ROOTS
         source "$root/attempts/1234abcd/configuration.sh"
         kubectl_validate_saved_control_layout
         [[ "$KUBECTL_CONTROL_ROOT" == \
-          /mnt/storage-scale-test/alpha/.storage-scale-test ]]
-        KUBECTL_CONTROL_ROOT=/mnt/storage-scale-test/zeta/.storage-scale-test
+          /mnt/storage-scale-test/test-pvc/alpha/.storage-scale-test ]]
+        [[ "${KUBECTL_SEGMENT_CONTROL_ROOTS[*]}" == test-ns/test-pvc:alpha ]]
+        ! grep -E '^KUBECTL_(NAMESPACE|PV|PVC)=' "$root/attempts/1234abcd/configuration.sh"
+        KUBECTL_CONTROL_ROOT=/mnt/storage-scale-test/test-pvc/zeta/.storage-scale-test
         ! kubectl_validate_saved_control_layout
         kubectl_local_lock_release "$fd"
     """)
@@ -356,15 +367,31 @@ def test_attempt_templates_are_yaml_and_restrict_security_surface() -> None:
     result = _bash("""
         selector=$(kubectl_render_node_selector 'storage-test=true,role=client')
         nodes=$(kubectl_render_node_affinity_values node-a node-b)
+        _kubectl_claim_volume_arguments claims workload lustre-a lustre-b
         kubectl_render_attempt_template storage-tests/fs/kubectl/templates/worker-daemonset.yaml.tmpl \\
           NAMESPACE=test-ns RESOURCE_NAME=sst-elb-1234abcd-workers ATTEMPT_ID=1234abcd \\
           OWNERSHIP_NONCE=0123456789abcdef0123456789abcdef IMAGE=breuner/elbencho:v3.2-1 \\
-          IMAGE_PULL_POLICY=Never RUN_AS_USER=2000 RUN_AS_GROUP=2000 PVC_NAME=test-pvc \\
-          "NODE_SELECTOR_BLOCK=$selector" "NODE_AFFINITY_VALUES=$nodes"
+          IMAGE_PULL_POLICY=Never RUN_AS_USER=2000 RUN_AS_GROUP=2000 "${claims[@]}" \\
+          "NODE_SELECTOR_BLOCK=$selector" "NODE_AFFINITY_VALUES=$nodes" SEGMENT_INDEX=0
         """)
     assert result.returncode == 0, result.stderr
     daemonset = yaml.safe_load(result.stdout)
+    target_label = {"storage-scale-test.nvidia.com/segment": "0"}
+    assert target_label.items() <= daemonset["spec"]["selector"]["matchLabels"].items()
+    assert (
+        target_label.items()
+        <= daemonset["spec"]["template"]["metadata"]["labels"].items()
+    )
     pod_spec = daemonset["spec"]["template"]["spec"]
+    # Every claim of the segment is mounted at its own subdirectory.
+    assert pod_spec["volumes"] == [
+        {"name": "claim-0", "persistentVolumeClaim": {"claimName": "lustre-a"}},
+        {"name": "claim-1", "persistentVolumeClaim": {"claimName": "lustre-b"}},
+    ]
+    assert pod_spec["containers"][0]["volumeMounts"] == [
+        {"name": "claim-0", "mountPath": "/mnt/storage-scale-test/lustre-a"},
+        {"name": "claim-1", "mountPath": "/mnt/storage-scale-test/lustre-b"},
+    ]
     assert pod_spec["automountServiceAccountToken"] is False
     assert "hostNetwork" not in pod_spec
     assert pod_spec["nodeSelector"] == {"storage-test": "true", "role": "client"}
@@ -393,15 +420,17 @@ def test_attempt_templates_are_yaml_and_restrict_security_surface() -> None:
 def test_sweep_job_exposes_coordinator_identity_with_downward_api() -> None:
     """The phase-six coordinator gets its exact Pod identity without API access."""
     result = _bash("""
+        _kubectl_claim_volume_arguments claims workload test-pvc
         kubectl_render_attempt_template storage-tests/fs/kubectl/templates/sweep-job.yaml.tmpl \\
           NAMESPACE=test-ns RESOURCE_NAME=sst-elb-1234abcd-sweep ATTEMPT_ID=1234abcd \\
           OWNERSHIP_NONCE=0123456789abcdef0123456789abcdef IMAGE=breuner/elbencho:v3.2-1 \\
-          IMAGE_PULL_POLICY=Never RUN_AS_USER=2000 RUN_AS_GROUP=2000 PVC_NAME=test-pvc \\
-          COORDINATOR_NODE=node-a \
-          REMOTE_RUN_DIRECTORY=/mnt/storage-scale-test/benchmark/.storage-scale-test/runs/1234abcd
+          IMAGE_PULL_POLICY=Never RUN_AS_USER=2000 RUN_AS_GROUP=2000 "${claims[@]}" \\
+          COORDINATOR_NODE=node-a SEGMENT_INDEX=0 JOB_SUSPEND=false \
+          REMOTE_RUN_DIRECTORY=/mnt/storage-scale-test/test-pvc/benchmark/.storage-scale-test/runs/1234abcd
         """)
     assert result.returncode == 0, result.stderr
     job = yaml.safe_load(result.stdout)
+    assert job["spec"]["suspend"] is False
     assert job["spec"]["template"]["spec"]["securityContext"]["seccompProfile"] == {
         "type": "Unconfined"
     }
@@ -853,6 +882,16 @@ def test_resume_replaces_only_digest_verified_non_success_artifacts(
     (executions / "0002.status").write_text("FAILED\n", encoding="utf-8")
     (executions / "0002.exitcode").write_text("97\n", encoding="utf-8")
     (results / "run.status").write_text("FAILED\n", encoding="utf-8")
+    # The earlier attempt's identity tells which results-root names it used.
+    created = _bash(f"""
+        root={str(results / 'kubernetes')!r}
+        kubectl_local_lock_acquire "$root" fd
+        kubectl_attempt_create_identity "$root" "$fd" 11111111 \\
+          0123456789abcdef0123456789abcdef test-ns namespace-uid \\
+          test-pv pv-uid test-pvc pvc-uid
+        kubectl_local_lock_release "$fd"
+        """)
+    assert created.returncode == 0, created.stderr
     previous = results / "kubernetes/attempts/11111111/collected-state"
     previous.mkdir(parents=True)
 
@@ -942,6 +981,67 @@ def test_fake_kubectl_discovers_only_ready_nonterminating_workers(
         grep -F $'node-b\\tuid-b\\tpod-new\\tpoduid-new\\t10.0.0.3' {str(output)!r}
         """)
     assert result.returncode == 0, result.stderr
+
+
+def _v1_identity(root: Path, schema: str) -> str:
+    """Shell that publishes the scalar header of a v1.x (schema 2 or 3) identity."""
+    return f"""
+        root={str(root)!r}
+        metadata="$root/attempts/1234abcd"
+        mkdir -p "$metadata"
+        {{
+          printf '# Trusted storage-scale-test Kubernetes attempt metadata.\\n'
+          printf 'KUBECTL_ATTEMPT_SCHEMA={schema}\\nKUBECTL_ATTEMPT_ID=1234abcd\\n'
+          printf 'KUBECTL_OWNERSHIP_NONCE=0123456789abcdef0123456789abcdef\\n'
+          printf 'KUBECTL_NAMESPACE=test-ns\\nKUBECTL_NAMESPACE_UID=namespace-uid\\n'
+          printf 'KUBECTL_PV=test-pv\\nKUBECTL_PV_UID=pv-uid\\n'
+          printf 'KUBECTL_PVC=test-pvc\\nKUBECTL_PVC_UID=pvc-uid\\n'
+        }} > "$metadata/identity.sh"
+        printf 'schema: {schema}\\nattempt_id: "1234abcd"\\n' > "$metadata/identity.yaml"
+    """
+
+
+@pytest.mark.parametrize("schema", ["2", "3"])
+def test_v1_attempt_identity_is_refused_with_the_collect_with_v1_message(
+    tmp_path: Path, schema: str
+) -> None:
+    """An attempt started by v1.x is not loaded; the error says to use v1.x."""
+    result = _bash(_v1_identity(tmp_path / "state", schema) + """
+        ! kubectl_attempt_load_identity "$root/attempts/1234abcd"
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "started by storage-scale-test v1.x" in result.stderr
+    assert f"attempt identity schema {schema}" in result.stderr
+    assert "Collect this attempt with storage-scale-test v1.x" in result.stderr
+
+
+def test_worker_discovery_selects_the_active_segment(tmp_path: Path) -> None:
+    """Worker Pods are found by run, component and the active segment label."""
+    nodes = tmp_path / "nodes.tsv"
+    nodes.write_text("node-a\tuid-a\tamd64\n", encoding="utf-8")
+    output = tmp_path / "workers.tsv"
+    state = tmp_path / "state"
+    setup = _identity(state) + 'kubectl_local_lock_release "$fd"\n'
+    result = _bash(setup + f"""
+        kubectl_attempt_load_identity "$root/attempts/1234abcd"
+        [[ "$KUBECTL_ATTEMPT_SCHEMA" == 4 && "$KUBECTL_SEGMENT_COUNT" == 1 ]]
+        [[ "${{KUBECTL_CLAIM_PVCS[0]}}" == test-pvc && "$KUBECTL_ACTIVE_SEGMENT" == 0 ]]
+        kubectl_run_bounded() {{
+          if [[ "$*" == *"get nodes"* ]]; then
+            printf 'node-a\\tuid-a\\tamd64\\tTrue\\t\\n'
+          else
+            printf 'selector=%s\\n' "${{@: -3:1}}" >&2
+            printf 'node-a\\tpod-a\\tpoduid-a\\t10.0.0.1\\tTrue\\tsha256:one\\t\\n'
+          fi
+        }}
+        kubectl_discover_worker_endpoints test-ns 1234abcd {str(nodes)!r} {str(output)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    expected = (
+        "storage-scale-test.nvidia.com/run=1234abcd,app.kubernetes.io/component=workers"
+        ",storage-scale-test.nvidia.com/segment=0"
+    )
+    assert f"selector={expected}\n" in result.stderr
 
 
 def test_terminal_job_evidence_preserves_empty_active_field() -> None:
@@ -1865,10 +1965,13 @@ def test_worker_discovery_rejects_each_malformed_endpoint_field(
     assert not output.exists()
 
 
-def test_helper_template_is_rendered_and_removed_when_readiness_fails() -> None:
+def test_helper_template_is_rendered_and_removed_when_readiness_fails(
+    tmp_path: Path,
+) -> None:
     """[R-02] An unready collector helper is removed with diagnosis."""
-    result = _bash("""
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+    result = _bash(_identity(tmp_path / "state") + """
+        kubectl_attempt_load_identity "$root/attempts/1234abcd"
+        export KUBECTL_NAMESPACE=test-ns
         export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
         captured=$(mktemp)
@@ -1880,17 +1983,23 @@ def test_helper_template_is_rendered_and_removed_when_readiness_fails() -> None:
         [[ $(cat "$captured") != *@@* ]]
         grep -q 'storage-scale-test.nvidia.com/operation: 1234' "$captured"
         grep -q 'KUBECTL_REMOTE_RUN_DIRECTORY' "$captured"
-        grep -q '/mnt/storage-scale-test/benchmark/.storage-scale-test/runs/1234abcd' "$captured"
+        grep -q '/mnt/storage-scale-test/test-pvc/benchmark/.storage-scale-test/runs/1234abcd' "$captured"
         grep -q 'automountServiceAccountToken: false' "$captured"
+        # The helper mounts every claim of its segment at its own path.
+        grep -q 'claimName: test-pvc' "$captured"
+        grep -q 'mountPath: /mnt/storage-scale-test/test-pvc$' "$captured"
         """)
     assert result.returncode == 0, result.stderr
     assert "deleted" in result.stdout
 
 
-def test_helper_creation_returns_uid_to_common_caller_variable_names() -> None:
+def test_helper_creation_returns_uid_to_common_caller_variable_names(
+    tmp_path: Path,
+) -> None:
     """Nested Bash output variables must not be shadowed by helper locals."""
-    result = _bash("""
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+    result = _bash(_identity(tmp_path / "state") + """
+        kubectl_attempt_load_identity "$root/attempts/1234abcd"
+        export KUBECTL_NAMESPACE=test-ns
         export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
         kubectl_run_bounded() { :; }
@@ -1911,8 +2020,6 @@ def test_helper_creation_returns_uid_to_common_caller_variable_names() -> None:
     ("variable", "invalid"),
     (
         ("KUBECTL_NAMESPACE", "Bad_Name"),
-        ("KUBECTL_PV", "bad/pv"),
-        ("KUBECTL_PVC", "bad/pvc"),
         ("KUBECTL_NODE_SELECTOR", "bad selector"),
         ("KUBECTL_ELBENCHO_IMAGE", "bad image"),
         ("KUBECTL_IMAGE_PULL_POLICY", "Sometimes"),
@@ -1925,11 +2032,10 @@ def test_runtime_configuration_rejects_every_invalid_field(
 ) -> None:
     """[S-01] Every independent runtime configuration field is validated."""
     result = _bash(f"""
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV='bad/pv' KUBECTL_PVC=test-pvc
+        export KUBECTL_NAMESPACE=test-ns
         export KUBECTL_NODE_SELECTOR=storage-test=true
         export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
-        export KUBECTL_PV=test-pv
         export {variable}={invalid!r}
         ! kubectl_validate_runtime_configuration
         """)
@@ -1939,11 +2045,12 @@ def test_runtime_configuration_rejects_every_invalid_field(
 
 
 def test_runtime_configuration_reports_every_missing_field() -> None:
-    """[S-01] One validation run identifies every missing Kubernetes setting."""
+    """[S-01] One validation run identifies every missing Kubernetes setting.
+
+    Storage comes from claim-qualified TEST_DIRS keys, and KUBECTL_NAMESPACE
+    (the namespace of keys that name none) is optional.
+    """
     variables = (
-        "KUBECTL_NAMESPACE",
-        "KUBECTL_PV",
-        "KUBECTL_PVC",
         "KUBECTL_NODE_SELECTOR",
         "KUBECTL_ELBENCHO_IMAGE",
         "KUBECTL_IMAGE_PULL_POLICY",
@@ -1959,16 +2066,19 @@ def test_runtime_configuration_reports_every_missing_field() -> None:
     assert result.returncode == 0, result.stderr
     for variable in variables:
         assert f"Error: {variable} is required" in result.stderr
+    for removed in ("KUBECTL_NAMESPACE", "KUBECTL_PV", "KUBECTL_PVC"):
+        assert f"Error: {removed} is required" not in result.stderr
 
 
 def test_cluster_storage_contract_reports_expected_and_observed_values() -> None:
     """Storage validation identifies the mismatched PVC attribute and values."""
     result = _bash("""
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NAMESPACE=test-ns
         export KUBECTL_NODE_SELECTOR=storage-test=true
         export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never
         export KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
+        declare -A TEST_DIRS=([test-pvc:benchmark]=1 [good-pvc:other]=1)
         kubectl() { :; }
         kubectl_run_observational() {
             case "$*" in
@@ -1977,30 +2087,34 @@ def test_cluster_storage_contract_reports_expected_and_observed_values() -> None
                     printf 'yes' ;;
                 'get namespace test-ns -o jsonpath={.metadata.uid}')
                     printf 'namespace-uid' ;;
-                'get pv test-pv -o jsonpath={.metadata.uid}') printf 'pv-uid' ;;
-                '-n test-ns get pvc test-pvc -o jsonpath={.metadata.uid}')
-                    printf 'pvc-uid' ;;
+                'get pv good-pv -o jsonpath={.metadata.uid}') printf 'pv-uid' ;;
+                '-n test-ns get pvc good-pvc -o jsonpath='*)
+                    printf 'good-uid\tgood-pv\tBound\tFilesystem\tReadWriteMany' ;;
                 '-n test-ns get pvc test-pvc -o jsonpath='*)
-                    printf 'another-pv\tPending\tBlock\tReadWriteOnce' ;;
+                    printf 'pvc-uid\tanother-pv\tPending\tBlock\tReadWriteOnce' ;;
                 *) printf 'unexpected command: %s\n' "$*" >&2; return 90 ;;
             esac
         }
         ! kubectl_validate_cluster_identity
+        rows=$(kubectl_validate_cluster_identity test-ns good-pvc)
+        [[ "$rows" == $'test-ns\tnamespace-uid\tgood-pv\tpv-uid\tgood-pvc\tgood-uid' ]]
         """)
     assert result.returncode == 0, result.stderr
     assert "PVC test-ns/test-pvc does not satisfy" in result.stderr
-    assert "expected: volumeName=test-pv" in result.stderr
+    assert "expected: phase=Bound volumeMode=Filesystem" in result.stderr
     assert "observed: volumeName=another-pv phase=Pending" in result.stderr
+    assert "good-pvc does not satisfy" not in result.stderr
 
 
 def test_cluster_identity_reports_denied_lease_permission() -> None:
     """[S-01] An authoritative RBAC denial names the missing permission."""
     result = _bash(r"""
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NAMESPACE=test-ns
         export KUBECTL_NODE_SELECTOR=storage-test=true
         export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never
         export KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
+        declare -A TEST_DIRS=([test-pvc:benchmark]=1)
         kubectl() { :; }
         kubectl_run_observational() {
           case "$*" in
@@ -2029,7 +2143,7 @@ def test_prepare_failure_classification_preserves_local_capacity_and_path_causes
           'required=2 eligible=1'
         [[ "$reason" == INSUFFICIENT_CAPACITY ]]
         kubectl_classify_prepare_failure reason pvc-paths 1 \
-          'path escapes PVC mount through a symlink'
+          'path escapes its claim mount through a symlink'
         [[ "$reason" == PATH_REJECTED ]]
         [[ $(_kubectl_observation_safe_action PATH_REJECTED) == \
           *'correct the configured PVC path'* ]]
@@ -2037,6 +2151,17 @@ def test_prepare_failure_classification_preserves_local_capacity_and_path_causes
           *'add eligible worker capacity'* ]]
         """)
     assert result.returncode == 0, result.stderr
+
+
+def _single_segment_plan(plan: Path, root: str = "benchmark") -> str:
+    """Shell that writes a one-segment plan for claim test-pvc in test-ns."""
+    return f"""
+        plan={str(plan)!r}
+        mkdir -p "$plan"
+        printf '0\\ttest-ns\\ttest-ns/test-pvc:{root}\\ttest-pvc\\n' > "$plan/segments.tsv"
+        printf '/mnt/storage-scale-test/test-pvc/{root}\\n' > "$plan/segment-0.roots"
+        cp "$plan/segment-0.roots" "$plan/segment-0.paths"
+    """
 
 
 @pytest.mark.parametrize(
@@ -2050,16 +2175,15 @@ def test_prepare_reports_specific_capacity_and_path_failures(
     tmp_path: Path, mode: str, required: int, phase: str, reason: str
 ) -> None:
     """Preparation preserves actionable phase and cause through rollback."""
-    result = _bash(f"""
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+    result = _bash(_single_segment_plan(tmp_path / "plan") + f"""
+        export KUBECTL_NAMESPACE=test-ns
         export KUBECTL_NODE_SELECTOR=storage-test=true
         export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000
         export KUBECTL_RUN_AS_GROUP=2000
-        declare -A mapped=([/mnt/storage-scale-test/bench]=1)
         mode={mode!r}
         kubectl_validate_cluster_identity() {{
-            printf 'namespace-uid\tpv-uid\tpvc-uid\n'
+            printf 'test-ns\tnamespace-uid\ttest-pv\tpv-uid\ttest-pvc\tpvc-uid\n'
         }}
         kubectl_discover_candidate_nodes() {{
             printf 'node-a\tuid-a\tamd64\n' > "$2"
@@ -2068,7 +2192,7 @@ def test_prepare_reports_specific_capacity_and_path_failures(
         kubectl_create_helper_pod() {{ printf -v "$1" uid-transfer; }}
         kubectl_validate_pvc_paths() {{
             [[ "$mode" != path ]] || {{
-                printf 'path escapes PVC mount through a symlink\n' >&2
+                printf 'path escapes its claim mount through a symlink\n' >&2
                 return 1
             }}
         }}
@@ -2077,39 +2201,61 @@ def test_prepare_reports_specific_capacity_and_path_failures(
         kubectl_preserve_attempt_diagnostics() {{ :; }}
         kubectl_cleanup_journaled_resources() {{ :; }}
         ! kubectl_prepare_attempt_lifecycle attempt {str(tmp_path)!r} \
-          {required} mapped '' benchmark "$KUBECTL_CONTROL_TEST_ROOT"
+          {required} "$plan" ''
     """)
     assert result.returncode == 0, result.stderr
     assert f"STORAGE_SCALE_TEST_DIAGNOSTIC_PHASE={phase}" in result.stderr
     assert f"STORAGE_SCALE_TEST_DIAGNOSTIC_REASON={reason}" in result.stderr
 
 
-def test_r20_cluster_uid_mismatch_emits_structured_diagnosis() -> None:
+def test_r20_cluster_uid_mismatch_emits_structured_diagnosis(tmp_path: Path) -> None:
     """[R-20] A replacement cluster is refused with exact UID evidence."""
-    result = _bash("""
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_NAMESPACE_UID=namespace-old
-        export KUBECTL_PV=test-pv KUBECTL_PV_UID=pv-old
-        export KUBECTL_PVC=test-pvc KUBECTL_PVC_UID=pvc-old
+    result = _bash(_identity(tmp_path / "state") + """
+        kubectl_attempt_load_identity "$root/attempts/1234abcd"
         export KUBECTL_LIFECYCLE_STATE=SUBMITTED
         kubectl_validate_cluster_identity() {
-            printf 'namespace-new\tpv-old\tpvc-old\n'
+            [[ "$*" == 'test-ns test-pvc' ]] || return 9
+            printf 'test-ns\tnamespace-new\ttest-pv\tpv-uid\ttest-pvc\tpvc-uid\n'
         }
         ! _kubectl_verify_saved_cluster_identity /tmp/kubernetes 1234abcd
         """)
     assert result.returncode == 0, result.stderr
     assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=IDENTITY_MISMATCH" in result.stderr
     assert "STORAGE_SCALE_TEST_DIAGNOSTIC_RESOURCE_KIND=Namespace" in result.stderr
-    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_EXPECTED_UID=namespace-old" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_EXPECTED_UID=namespace-uid" in result.stderr
     assert "STORAGE_SCALE_TEST_DIAGNOSTIC_OBSERVED_UID=namespace-new" in result.stderr
     assert "do\\ not\\ adopt" in result.stderr
 
 
-def test_c15_permanent_pvc_loss_is_detected_without_adoption() -> None:
+@pytest.mark.parametrize(
+    ("observed", "kind", "expected"),
+    (
+        ("test-pv\tpv-new\ttest-pvc\tpvc-uid", "PersistentVolume", "pv-uid"),
+        ("other-pv\tpv-uid\ttest-pvc\tpvc-uid", "PersistentVolume", "pv-uid"),
+        ("test-pv\tpv-uid\ttest-pvc\tpvc-new", "PersistentVolumeClaim", "pvc-uid"),
+    ),
+)
+def test_claim_rebinding_or_replacement_is_identity_drift(
+    tmp_path: Path, observed: str, kind: str, expected: str
+) -> None:
+    """[R-20] A claim bound to another PV, or a replaced PV or claim, is drift."""
+    result = _bash(_identity(tmp_path / "state") + f"""
+        kubectl_attempt_load_identity "$root/attempts/1234abcd"
+        kubectl_validate_cluster_identity() {{
+            printf 'test-ns\\tnamespace-uid\\t%b\\n' {observed!r}
+        }}
+        ! _kubectl_verify_saved_cluster_identity /tmp/kubernetes 1234abcd
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=IDENTITY_MISMATCH" in result.stderr
+    assert f"STORAGE_SCALE_TEST_DIAGNOSTIC_RESOURCE_KIND={kind}" in result.stderr
+    assert f"STORAGE_SCALE_TEST_DIAGNOSTIC_EXPECTED_UID={expected}" in result.stderr
+
+
+def test_c15_permanent_pvc_loss_is_detected_without_adoption(tmp_path: Path) -> None:
     """[C-15] Missing durable storage fails closed with identity diagnosis."""
-    result = _bash("""
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_NAMESPACE_UID=namespace-old
-        export KUBECTL_PV=test-pv KUBECTL_PV_UID=pv-old
-        export KUBECTL_PVC=test-pvc KUBECTL_PVC_UID=pvc-old
+    result = _bash(_identity(tmp_path / "state") + """
+        kubectl_attempt_load_identity "$root/attempts/1234abcd"
         export KUBECTL_LIFECYCLE_STATE=SUBMITTED
         kubectl_validate_cluster_identity() {
             printf 'persistentvolumeclaim "test-pvc" not found\n' >&2
@@ -2123,13 +2269,13 @@ def test_c15_permanent_pvc_loss_is_detected_without_adoption() -> None:
         "STORAGE_SCALE_TEST_DIAGNOSTIC_RESOURCE_KIND=PersistentVolumeClaim"
         in result.stderr
     )
-    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_EXPECTED_UID=pvc-old" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_EXPECTED_UID=pvc-uid" in result.stderr
 
 
 def test_always_pull_policy_requires_an_immutable_image_reference() -> None:
     """A coordinator repull cannot diverge from the frozen worker image."""
     result = _bash("""
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NAMESPACE=test-ns
         export KUBECTL_NODE_SELECTOR=storage-test=true
         export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Always KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
@@ -2222,16 +2368,95 @@ def test_runtime_preflight_covers_complete_coordinator_command_contract() -> Non
         assert command in body, command
 
 
+_POD_ROOT = "/mnt/storage-scale-test/test-pvc/scale-test"
+
+
+def _validation_root_checks(mount_root: Path) -> str:
+    """The rendered validation Job's per-root checks for the root
+    test-pvc:scale-test, with the Pod mount root moved to MOUNT_ROOT here."""
+    result = _bash(f"""
+        roots=$(kubectl_render_test_root_arguments {_POD_ROOT})
+        _kubectl_claim_volume_arguments claims workload test-pvc
+        kubectl_render_attempt_template storage-tests/fs/kubectl/templates/validation-job.yaml.tmpl \
+          NAMESPACE=test-ns RESOURCE_NAME=sst-elb-1234abcd-validation ATTEMPT_ID=1234abcd \
+          OWNERSHIP_NONCE=0123456789abcdef0123456789abcdef IMAGE=breuner/elbencho:v3.2-1 \
+          IMAGE_PULL_POLICY=Never RUN_AS_USER=2000 RUN_AS_GROUP=2000 "${{claims[@]}}" \
+          NODE_NAME=node-a MOUNT_ROOT=/mnt/storage-scale-test "TEST_ROOT_ARGUMENTS=$roots"
+        """)
+    assert result.returncode == 0, result.stderr
+    body = yaml.safe_load(result.stdout)["spec"]["template"]["spec"]["containers"][0][
+        "args"
+    ][0]
+    checks = body[body.index("test_roots=(") :]
+    assert _POD_ROOT in checks
+    return checks.replace("/mnt/storage-scale-test", str(mount_root))
+
+
+@pytest.mark.parametrize(
+    ("setup", "message"),
+    [
+        (
+            "missing",
+            "does not exist: create scale-test on claim test-pvc, readable and "
+            "writable by UID:GID",
+        ),
+        ("unsearchable", "is unreachable: UID:GID"),
+        ("file", "is not a directory on claim test-pvc"),
+        ("unreadable", "cannot read TEST_DIRS root"),
+        ("ok", None),
+    ],
+)
+def test_validation_job_says_why_a_root_is_unusable(
+    tmp_path: Path, setup: str, message: str | None
+) -> None:
+    """A missing root is not reported as unreadable, and each cause is named."""
+    if os.geteuid() == 0 and setup in {"unsearchable", "unreadable"}:
+        pytest.skip("root bypasses permission bits")
+    parent = tmp_path / "mnt" / "test-pvc"
+    parent.mkdir(parents=True)
+    root = parent / "scale-test"
+    if setup == "file":
+        root.write_text("", encoding="utf-8")
+    elif setup != "missing":
+        root.mkdir()
+    if setup == "unreadable":
+        root.chmod(0o300)
+    if setup == "unsearchable":
+        parent.chmod(0o600)
+    try:
+        result = subprocess.run(
+            [_BASH, "-ceu", "--", _validation_root_checks(tmp_path / "mnt")],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+    finally:
+        parent.chmod(0o755)
+        if root.is_dir():
+            root.chmod(0o755)
+    if message is None:
+        assert result.returncode == 0, result.stderr
+        assert "PHASE=complete" in result.stdout
+    else:
+        assert result.returncode == 1
+        assert result.stderr.startswith("Error: ") and message in result.stderr
+        # Named as env.sh names it, never by its Pod path.
+        assert "test-pvc:scale-test" in result.stderr
+        assert str(tmp_path) not in result.stderr
+
+
 def test_runtime_preflight_job_is_bounded_and_self_cleaning() -> None:
     """Interrupted validation cannot leave an unbounded sleeping helper."""
     result = _bash("""
         roots=$(kubectl_render_test_root_arguments \
-          /mnt/storage-scale-test/alpha /mnt/storage-scale-test/benchmark)
+          /mnt/storage-scale-test/other/alpha /mnt/storage-scale-test/test-pvc/benchmark)
+        _kubectl_claim_volume_arguments claims workload other test-pvc
         kubectl_render_attempt_template storage-tests/fs/kubectl/templates/validation-job.yaml.tmpl \
           NAMESPACE=test-ns RESOURCE_NAME=sst-elb-1234abcd-validation ATTEMPT_ID=1234abcd \
           OWNERSHIP_NONCE=0123456789abcdef0123456789abcdef IMAGE=breuner/elbencho:v3.2-1 \
-          IMAGE_PULL_POLICY=Never RUN_AS_USER=2000 RUN_AS_GROUP=2000 PVC_NAME=test-pvc \
-          NODE_NAME=node-a "TEST_ROOT_ARGUMENTS=$roots"
+          IMAGE_PULL_POLICY=Never RUN_AS_USER=2000 RUN_AS_GROUP=2000 "${claims[@]}" \
+          NODE_NAME=node-a MOUNT_ROOT=/mnt/storage-scale-test "TEST_ROOT_ARGUMENTS=$roots"
         """)
     assert result.returncode == 0, result.stderr
     job = yaml.safe_load(result.stdout)
@@ -2250,8 +2475,14 @@ def test_runtime_preflight_job_is_bounded_and_self_cleaning() -> None:
     assert "missing required command" in body
     assert "cannot write TEST_DIRS root" in body
     assert "could not read back its PVC probe" in body
-    assert "/mnt/storage-scale-test/alpha" in body
-    assert "/mnt/storage-scale-test/benchmark" in body
+    assert "/mnt/storage-scale-test/other/alpha" in body
+    assert "/mnt/storage-scale-test/test-pvc/benchmark" in body
+    assert [
+        volume["persistentVolumeClaim"]["claimName"] for volume in pod["volumes"]
+    ] == [
+        "other",
+        "test-pvc",
+    ]
     for phase in (
         "identity",
         "seccomp",
@@ -2309,6 +2540,167 @@ def test_runtime_validation_diagnostics_resolve_symlinked_tmpdir(
     assert "may not traverse a symbolic link" not in result.stderr
 
 
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (
+            "'' 0 n1 TIMEOUT 'cannot start the image: ErrImagePull: nope'",
+            "the runtime validation Pod on node n1 cannot start the image: "
+            "ErrImagePull: nope",
+        ),
+        ("FAILED 0 n1 TIMEOUT ''", "the runtime validation Job failed on node n1"),
+        ("'' 1 n1 TIMEOUT ''", "the runtime validation Job could not be observed"),
+        (
+            "'' 0 n1 PVC_MOUNT ''",
+            "the runtime validation Job did not finish within 180 seconds on node "
+            "n1 (a claim's volume could not be mounted there)",
+        ),
+        (
+            "'' 0 n1 TIMEOUT ''",
+            "the runtime validation Job did not finish within 180 seconds on node n1",
+        ),
+    ],
+)
+def test_runtime_validation_failure_headline(arguments: str, expected: str) -> None:
+    """One Error line names the node and why the Job did not complete."""
+    result = _bash(f"_kubectl_print_runtime_validation_failure {arguments}")
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == f"Error: {expected}\n"
+
+
+_POD = "sst-elb-1234abcd-validation-x"
+_FAILED_MOUNT = (
+    f"{_POD}\tMountVolume.MountDevice failed for "
+    'volume "pv" : mount failed: exit status 5\nIs the MGS running?'
+)
+_BLOCKED = "cannot mount a claim's volume (FailedMount)\n"
+
+
+@pytest.mark.parametrize(
+    ("pods", "events", "expected"),
+    [
+        (f"{_POD}\tPending\tContainerCreating,", _FAILED_MOUNT, _BLOCKED),
+        (f"{_POD}\tPending\t", _FAILED_MOUNT, _BLOCKED),
+        (
+            f"{_POD}\tPending\tContainerCreating,",
+            f"{_POD}\tUnable to attach or mount volumes: "
+            "timed out waiting for the condition",
+            "",
+        ),
+        (
+            f"{_POD}\tPending\tContainerCreating,",
+            "other-pod\tMountVolume.SetUp failed: mount failed: exit status 32",
+            "",
+        ),
+        # The mount recovered: the Pod started, or even finished, after the event.
+        (f"{_POD}\tRunning\t,", _FAILED_MOUNT, ""),
+        (f"{_POD}\tSucceeded\t,", _FAILED_MOUNT, ""),
+        ("", _FAILED_MOUNT, ""),
+        # No FailedMount event at all: one empty row, never looked up.
+        (f"{_POD}\tPending\tContainerCreating,", "", ""),
+    ],
+)
+def test_only_a_pod_still_mounting_after_a_failed_mount_command_is_blocked(
+    pods: str, events: str, expected: str
+) -> None:
+    """A failed mount command ends the wait only while the Pod has not started;
+    a mount timeout, another Pod's event, or a recovered Pod never does."""
+    result = _bash(f"""
+        _kubectl_pod_fatal_waiting_reason() {{ return 1; }}
+        kubectl_run_observational() {{
+            case " $* " in
+                *' get pods '*) printf '%b\\n' {pods!r} ;;
+                *' get events '*) printf '%b\\n' {events!r} ;;
+                *) return 1 ;;
+            esac
+        }}
+        _kubectl_validation_pod_blocked test-ns 1234abcd sst-elb-1234abcd-validation
+        printf 'rc=%s\\n' "$?"
+        """)
+    assert result.stdout == expected + f"rc={0 if expected else 1}\n", result.stderr
+    assert result.stderr == ""
+
+
+def test_a_fatal_image_reason_blocks_the_validation_pod() -> None:
+    """A Pod that cannot start its image is blocked without an event lookup."""
+    result = _bash("""
+        _kubectl_pod_fatal_waiting_reason() { echo 'ErrImagePull: nope'; }
+        kubectl_run_observational() { echo CALLED >&2; return 1; }
+        _kubectl_validation_pod_blocked test-ns 1234abcd sst-elb-1234abcd-validation
+        """)
+    assert result.returncode == 0
+    assert result.stdout == "cannot start the image: ErrImagePull: nope\n"
+    assert "CALLED" not in result.stderr
+
+
+def test_validation_pod_cause_precedes_the_dump(tmp_path: Path) -> None:
+    """The container's Error lines and the Pods' full Warning events come first."""
+    result = _bash(f"""
+        kubectl_run_observational() {{
+            case "$*" in
+                *' get pods '*) printf 'pod/sst-elb-1234abcd-validation-x\n' ;;
+                *'involvedObject.name=sst-elb-1234abcd-validation-x,type=Warning'*)
+                    printf 'Pod event FailedMount: mount failed\nIs the MGS running?\n' ;;
+                *) return 1 ;;
+            esac
+        }}
+        kubectl_capture_resource_diagnostics() {{
+            local bundle="$1/diagnostics/runtime-validation"
+            mkdir -p -- "$bundle"
+            printf 'PHASE=pvc-create\nError: cannot create a file in /x\n' > "$bundle/pods.log"
+            printf '[pod/p/validation] Error: prefixed by kubectl logs\n' >> "$bundle/pods.log"
+            printf 'described\n' > "$bundle/resource.describe"
+            printf '%s\n' "$bundle"
+        }}
+        TMPDIR={str(tmp_path)!r}
+        _kubectl_print_runtime_validation_diagnostics \
+          test-ns sst-elb-1234abcd-validation 1234abcd
+        """)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    assert lines[:5] == [
+        "Pod log: Error: cannot create a file in /x",
+        "Pod log: Error: prefixed by kubectl logs",
+        "Pod event FailedMount: mount failed",
+        "Is the MGS running?",
+        "",
+    ]
+    assert lines[5] == "===== Kubernetes validation diagnostic: resource.describe ====="
+
+
+def test_runtime_validation_ends_at_once_when_the_image_cannot_start() -> None:
+    """A fatal waiting reason ends the wait instead of the 180-second deadline."""
+    result = _bash("""
+        kubectl_validate_cluster_identity() { :; }
+        kubectl_select_control_root() { :; }
+        kubectl_set_control_layout() { :; }
+        kubectl_test_dirs_segment() { printf -v "$1" test-ns; }
+        _kubectl_claim_volume_arguments() { :; }
+        kubectl_map_test_dirs() { :; }
+        kubectl_render_test_root_arguments() { :; }
+        kubectl_discover_candidate_nodes() { : > "$2"; }
+        kubectl_choose_coordinator_node() { echo n1; }
+        kubectl_render_attempt_template() { echo manifest; }
+        kubectl_create_owned_object() { printf -v "$1" uid; }
+        kubectl_job_terminal_state() { return 2; }
+        sleep() { :; }
+        _kubectl_pod_fatal_waiting_reason() { echo 'ErrImagePull: nope'; }
+        kubectl_classify_readiness_failure() { printf -v "$1" IMAGE_PULL; }
+        _kubectl_print_runtime_validation_diagnostics() { :; }
+        kubectl_report_lifecycle_error() { :; }
+        kubectl_delete_owned_object() { echo DELETED; }
+        start=$SECONDS
+        if kubectl_validate_runtime_pod; then exit 1; fi
+        (( SECONDS - start < 10 )) || exit 2
+        """)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "DELETED" in result.stdout
+    assert result.stderr == (
+        "Error: the runtime validation Pod on node n1 cannot start the image: "
+        "ErrImagePull: nope\n"
+    )
+
+
 def test_control_bundle_stages_phase_six_contract_once(tmp_path: Path) -> None:
     """The trusted helper, coordinator, and frozen run metadata stay together."""
     coordinator = tmp_path / "coordinator-source.sh"
@@ -2362,11 +2754,11 @@ def test_sweep_bundle_stages_failure_overlay_only_for_first_attempt(
         encoding="utf-8",
     )
     result = _bash(f"""
-        kubectl_attempt_remote_root() {{ printf %s /mnt/storage-scale-test/benchmark/.storage-scale-test/runs/1234abcd; }}
+        kubectl_attempt_remote_root() {{ printf %s /mnt/storage-scale-test/test-pvc/benchmark/.storage-scale-test/runs/1234abcd; }}
         kubectl_populate_sweep_control_bundle {str(bundle)!r} {str(results)!r} \\
             {str(endpoints)!r}
         test -x {str(bundle / 'failure-overlay.sh')!r}
-        grep -F '/mnt/storage-scale-test/benchmark/.storage-scale-test/runs/1234abcd/control/failure-overlay.sh' \\
+        grep -F '/mnt/storage-scale-test/test-pvc/benchmark/.storage-scale-test/runs/1234abcd/control/failure-overlay.sh' \\
             {str(bundle / 'env_used.sh')!r}
         printf 0001\\n > {str(tmp_path / 'selection')!r}
         kubectl_populate_sweep_control_bundle {str(resume_bundle)!r} {str(results)!r} \\
@@ -2751,9 +3143,9 @@ def test_remote_release_executes_guards_before_owner_read_and_deletion(
     mount = tmp_path / "mount"
     result = _bash(f"""
         mount={str(mount)!r}
-        test_root="$mount/benchmark"
+        test_root="$mount/test-pvc/benchmark"
         control_root="$test_root/.storage-scale-test"
-        KUBECTL_CONTROL_TEST_ROOT=/mnt/storage-scale-test/benchmark
+        KUBECTL_CONTROL_TEST_ROOT=/mnt/storage-scale-test/test-pvc/benchmark
         KUBECTL_CONTROL_ROOT="$KUBECTL_CONTROL_TEST_ROOT/.storage-scale-test"
         run="$control_root/runs/1234abcd"
         nonce=0123456789abcdef0123456789abcdef
@@ -2825,8 +3217,10 @@ def test_collection_recovery_retries_every_cleanup_stage(
     """[R-12] [R-13] Durable import survives each cleanup interruption."""
     results = tmp_path / "results"
     metadata = results / "kubernetes" / "attempts" / "1234abcd"
-    (metadata / "collected-state").mkdir(parents=True)
-    result = _bash(f"""
+    result = _bash(_identity(results / "kubernetes") + f"""
+        kubectl_local_lock_release "$fd"
+        mkdir -p {str(metadata / 'collected-state')!r}
+        kubectl_attempt_load_identity "$root/attempts/1234abcd"
         export KUBECTL_NAMESPACE=test-ns
         events={str(tmp_path / 'events')!r}
         failed={failed_stage!r}
@@ -2876,13 +3270,16 @@ def test_fake_pre_job_lifecycle_orders_identity_reservation_and_workers(
 ) -> None:
     """The pre-Job dispatcher is a testable sequence, not disconnected helpers."""
     result = _bash(f"""
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NAMESPACE=test-ns
         export KUBECTL_NODE_SELECTOR=storage-test=true
         export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
-        declare -A mapped=([/mnt/storage-scale-test/bench]=1)
+        plan=$(mktemp -d)
+        printf '0\\ttest-ns\\ttest-ns/test-pvc:bench\\ttest-pvc\\n' > "$plan/segments.tsv"
+        printf '/mnt/storage-scale-test/test-pvc/bench\\n' > "$plan/segment-0.roots"
+        cp "$plan/segment-0.roots" "$plan/segment-0.paths"
         events={str(tmp_path / 'events')!r}
-        kubectl_validate_cluster_identity() {{ printf 'namespace-uid\\tpv-uid\\tpvc-uid\\n'; }}
+        kubectl_validate_cluster_identity() {{ printf 'test-ns\\tnamespace-uid\\ttest-pv\\tpv-uid\\ttest-pvc\\tpvc-uid\\n'; }}
         kubectl_discover_candidate_nodes() {{
             test -s {str(tmp_path)!r}/kubernetes/current-attempt
             printf current >> "$events"
@@ -2902,8 +3299,7 @@ def test_fake_pre_job_lifecycle_orders_identity_reservation_and_workers(
         kubectl_create_worker_daemonset() {{ printf workers >> "$events"; }}
         kubectl_wait_worker_endpoints() {{ printf endpoints >> "$events"; : > "$4"; }}
         attempt=
-        kubectl_prepare_attempt_lifecycle attempt {str(tmp_path)!r} 2 mapped \
-          '' benchmark "$KUBECTL_CONTROL_TEST_ROOT"
+        kubectl_prepare_attempt_lifecycle attempt {str(tmp_path)!r} 2 "$plan" ''
         [[ "$attempt" =~ ^[0-9a-f]{{8}}$ ]]
         test -f {str(tmp_path)!r}/kubernetes/attempts/"$attempt"/identity.sh
         test -f {str(tmp_path)!r}/kubernetes/attempts/"$attempt"/configuration.sh
@@ -2917,13 +3313,16 @@ def test_prepare_failure_terminalizes_only_after_successful_rollback(
 ) -> None:
     """[S-03] [S-14] Failed handoff terminalizes after exact cleanup."""
     result = _bash(f"""
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NAMESPACE=test-ns
         export KUBECTL_NODE_SELECTOR=storage-test=true
         export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
-        declare -A mapped=([/mnt/storage-scale-test/bench]=1)
+        plan=$(mktemp -d)
+        printf '0\\ttest-ns\\ttest-ns/test-pvc:bench\\ttest-pvc\\n' > "$plan/segments.tsv"
+        printf '/mnt/storage-scale-test/test-pvc/bench\\n' > "$plan/segment-0.roots"
+        cp "$plan/segment-0.roots" "$plan/segment-0.paths"
         events={str(tmp_path / 'events')!r}
-        kubectl_validate_cluster_identity() {{ printf 'namespace-uid\\tpv-uid\\tpvc-uid\\n'; }}
+        kubectl_validate_cluster_identity() {{ printf 'test-ns\\tnamespace-uid\\ttest-pv\\tpv-uid\\ttest-pvc\\tpvc-uid\\n'; }}
         kubectl_discover_candidate_nodes() {{ printf 'node-a\\tuid-a\\tamd64\\n' > "$2"; }}
         kubectl_choose_coordinator_node() {{ printf node-a; }}
         kubectl_create_helper_pod() {{ printf -v "$1" uid-transfer; }}
@@ -2939,8 +3338,7 @@ def test_prepare_failure_terminalizes_only_after_successful_rollback(
         kubectl_cleanup_journaled_resources() {{ printf cleanup >> "$events"; }}
         kubectl_release_pvc_lease() {{ printf lease-release >> "$events"; }}
         attempt=
-        ! kubectl_prepare_attempt_lifecycle attempt {str(tmp_path)!r} 1 mapped \
-          '' benchmark "$KUBECTL_CONTROL_TEST_ROOT"
+        ! kubectl_prepare_attempt_lifecycle attempt {str(tmp_path)!r} 1 "$plan" ''
         attempt=$(cat {str(tmp_path)!r}/kubernetes/current-attempt)
         kubectl_attempt_load_metadata {str(tmp_path)!r}/kubernetes/attempts/"$attempt"
         [[ "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED ]]
@@ -2963,13 +3361,16 @@ def test_prepare_rollback_failure_keeps_prepared_attempt_recoverable(
 ) -> None:
     """A failed release leaves the durable PREPARED pointer for retry."""
     result = _bash(f"""
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NAMESPACE=test-ns
         export KUBECTL_NODE_SELECTOR=storage-test=true
         export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
-        declare -A mapped=([/mnt/storage-scale-test/bench]=1)
+        plan=$(mktemp -d)
+        printf '0\\ttest-ns\\ttest-ns/test-pvc:bench\\ttest-pvc\\n' > "$plan/segments.tsv"
+        printf '/mnt/storage-scale-test/test-pvc/bench\\n' > "$plan/segment-0.roots"
+        cp "$plan/segment-0.roots" "$plan/segment-0.paths"
         events={str(tmp_path / 'events')!r}
-        kubectl_validate_cluster_identity() {{ printf 'namespace-uid\\tpv-uid\\tpvc-uid\\n'; }}
+        kubectl_validate_cluster_identity() {{ printf 'test-ns\\tnamespace-uid\\ttest-pv\\tpv-uid\\ttest-pvc\\tpvc-uid\\n'; }}
         kubectl_discover_candidate_nodes() {{ printf 'node-a\\tuid-a\\tamd64\\n' > "$2"; }}
         kubectl_choose_coordinator_node() {{ printf node-a; }}
         kubectl_create_helper_pod() {{ printf -v "$1" uid-transfer; }}
@@ -2984,8 +3385,7 @@ def test_prepare_rollback_failure_keeps_prepared_attempt_recoverable(
         kubectl_release_journaled_remote_attempt() {{ printf release >> "$events"; return 1; }}
         kubectl_cleanup_journaled_resources() {{ printf cleanup >> "$events"; }}
         attempt=
-        ! kubectl_prepare_attempt_lifecycle attempt {str(tmp_path)!r} 1 mapped \
-          '' benchmark "$KUBECTL_CONTROL_TEST_ROOT"
+        ! kubectl_prepare_attempt_lifecycle attempt {str(tmp_path)!r} 1 "$plan" ''
         attempt=$(cat {str(tmp_path)!r}/kubernetes/current-attempt)
         kubectl_attempt_load_metadata {str(tmp_path)!r}/kubernetes/attempts/"$attempt"
         [[ "$KUBECTL_LIFECYCLE_STATE" == PREPARED ]]
@@ -3006,7 +3406,7 @@ def test_submission_failure_terminalizes_only_after_successful_rollback(
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
         kubectl_local_lock_release "$fd"
         events={str(tmp_path / 'events')!r}
-        declare -A TEST_DIRS=([benchmark]=1)
+        declare -A TEST_DIRS=([test-pvc:benchmark]=1)
         kubectl_validate_runtime_configuration() {{ :; }}
         kubectl_map_test_dirs() {{ :; }}
         kubectl_prepare_attempt_lifecycle() {{ printf -v "$1" 1234abcd; }}
@@ -3032,7 +3432,7 @@ def test_submission_rollback_failure_keeps_prepared_attempt_recoverable(
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
         kubectl_local_lock_release "$fd"
         events={str(tmp_path / 'events')!r}
-        declare -A TEST_DIRS=([benchmark]=1)
+        declare -A TEST_DIRS=([test-pvc:benchmark]=1)
         kubectl_validate_runtime_configuration() {{ :; }}
         kubectl_map_test_dirs() {{ :; }}
         kubectl_prepare_attempt_lifecycle() {{ printf -v "$1" 1234abcd; }}
@@ -3058,11 +3458,11 @@ def test_interrupted_bundle_upload_never_starts_job_and_rolls_back(
     result = _bash(_identity(state) + f"""
         kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
-        : > "$root/attempts/1234abcd/configuration.sh"
+        _test_configuration "$root/attempts/1234abcd/configuration.sh"
         : > "$root/attempts/1234abcd/remote-reservation.sh"
         kubectl_local_lock_release "$fd"
         events={str(tmp_path / 'events')!r}
-        declare -A TEST_DIRS=([benchmark]=1)
+        declare -A TEST_DIRS=([test-pvc:benchmark]=1)
         kubectl_validate_runtime_configuration() {{ :; }}
         kubectl_map_test_dirs() {{ :; }}
         kubectl_prepare_attempt_lifecycle() {{ printf -v "$1" 1234abcd; }}
@@ -3165,14 +3565,17 @@ def test_clean_failed_resume_restores_collected_predecessor_pointer(
         kubectl_attempt_transition "$root" "$fd" 1234abcd COLLECTED
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
         kubectl_local_lock_release "$fd"
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NAMESPACE=test-ns
         export KUBECTL_NODE_SELECTOR=storage-test=true
         export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
-        declare -A mapped=([/mnt/storage-scale-test/bench]=1)
+        plan=$(mktemp -d)
+        printf '0\\ttest-ns\\ttest-ns/test-pvc:bench\\ttest-pvc\\n' > "$plan/segments.tsv"
+        printf '/mnt/storage-scale-test/test-pvc/bench\\n' > "$plan/segment-0.roots"
+        cp "$plan/segment-0.roots" "$plan/segment-0.paths"
         kubectl_generate_attempt_id() {{ printf aaaabbbb; }}
         kubectl_generate_ownership_nonce() {{ printf 11111111111111111111111111111111; }}
-        kubectl_validate_cluster_identity() {{ printf 'namespace-uid\\tpv-uid\\tpvc-uid\\n'; }}
+        kubectl_validate_cluster_identity() {{ printf 'test-ns\\tnamespace-uid\\ttest-pv\\tpv-uid\\ttest-pvc\\tpvc-uid\\n'; }}
         kubectl_discover_candidate_nodes() {{ printf 'node-a\\tuid-a\\tamd64\\n' > "$2"; }}
         kubectl_choose_coordinator_node() {{ printf node-a; }}
         kubectl_create_helper_pod() {{ printf -v "$1" uid-transfer; }}
@@ -3186,8 +3589,7 @@ def test_clean_failed_resume_restores_collected_predecessor_pointer(
         kubectl_cleanup_journaled_resources() {{ :; }}
         kubectl_release_pvc_lease() {{ :; }}
         first=
-        ! kubectl_prepare_attempt_lifecycle first {str(results)!r} 1 mapped \
-          '' benchmark "$KUBECTL_CONTROL_TEST_ROOT" 1234abcd
+        ! kubectl_prepare_attempt_lifecycle first {str(results)!r} 1 "$plan" '' 1234abcd
         [[ $(kubectl_attempt_current_id "$root") == 1234abcd ]]
         kubectl_attempt_load_metadata "$root/attempts/aaaabbbb"
         [[ "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED ]]
@@ -3209,14 +3611,17 @@ def test_deferred_prepared_recovery_restores_collected_predecessor_pointer(
         kubectl_attempt_transition "$root" "$fd" 1234abcd COLLECTED
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
         kubectl_local_lock_release "$fd"
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NAMESPACE=test-ns
         export KUBECTL_NODE_SELECTOR=storage-test=true
         export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000 KUBECTL_RUN_AS_GROUP=2000
-        declare -A mapped=([/mnt/storage-scale-test/bench]=1)
+        plan=$(mktemp -d)
+        printf '0\\ttest-ns\\ttest-ns/test-pvc:bench\\ttest-pvc\\n' > "$plan/segments.tsv"
+        printf '/mnt/storage-scale-test/test-pvc/bench\\n' > "$plan/segment-0.roots"
+        cp "$plan/segment-0.roots" "$plan/segment-0.paths"
         kubectl_generate_attempt_id() {{ printf aaaabbbb; }}
         kubectl_generate_ownership_nonce() {{ printf 11111111111111111111111111111111; }}
-        kubectl_validate_cluster_identity() {{ printf 'namespace-uid\\tpv-uid\\tpvc-uid\\n'; }}
+        kubectl_validate_cluster_identity() {{ printf 'test-ns\\tnamespace-uid\\ttest-pv\\tpv-uid\\ttest-pvc\\tpvc-uid\\n'; }}
         kubectl_discover_candidate_nodes() {{ printf 'node-a\\tuid-a\\tamd64\\n' > "$2"; }}
         kubectl_choose_coordinator_node() {{ printf node-a; }}
         kubectl_create_helper_pod() {{ printf -v "$1" uid-transfer; }}
@@ -3232,8 +3637,7 @@ def test_deferred_prepared_recovery_restores_collected_predecessor_pointer(
         kubectl_cleanup_journaled_resources() {{ :; }}
         kubectl_release_pvc_lease() {{ :; }}
         first=
-        ! kubectl_prepare_attempt_lifecycle first {str(results)!r} 1 mapped \
-          '' benchmark "$KUBECTL_CONTROL_TEST_ROOT" 1234abcd
+        ! kubectl_prepare_attempt_lifecycle first {str(results)!r} 1 "$plan" '' 1234abcd
         [[ $(kubectl_attempt_current_id "$root") == aaaabbbb ]]
         kubectl_local_lock_acquire "$root" fd2
         kubectl_recover_prepared_attempt "$root" "$fd2" aaaabbbb
@@ -3264,7 +3668,7 @@ def test_submission_failed_status_retries_predecessor_restore(tmp_path: Path) ->
         kubectl_attempt_write_state "$root" "$fd2" aaaabbbb PREPARED
         kubectl_attempt_transition "$root" "$fd2" aaaabbbb SUBMISSION_FAILED
         printf '1234abcd\\n' > "$root/attempts/aaaabbbb/predecessor-attempt"
-        : > "$root/attempts/aaaabbbb/configuration.sh"
+        _test_configuration "$root/attempts/aaaabbbb/configuration.sh"
         kubectl_attempt_write_current "$root" "$fd2" aaaabbbb
         kubectl_local_lock_release "$fd2"
         # Even if cluster identity validation is unavailable, local recovery
@@ -3639,16 +4043,20 @@ def test_cancel_retries_after_job_delete_was_already_journaled(
     tmp_path: Path,
 ) -> None:
     """[T-08] Cancellation resumes after exact Job deletion was journaled."""
-    result = _bash(_identity(tmp_path / "state") + """
+    ledger = tmp_path / "ledger"
+    ledger.write_text("RUNNING", encoding="utf-8")
+    result = _bash(_identity(tmp_path / "state") + f"""
+        set -e
         kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
         kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
         kubectl_attempt_transition "$root" "$fd" 1234abcd CANCEL_REQUESTED
         kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
           Job sweep test-ns job-uid 0123456789abcdef0123456789abcdef
         kubectl_attempt_journal_step "$root" "$fd" 1234abcd delete-sweep
-        kubectl_read_remote_status() { printf RUNNING; }
-        kubectl_delete_owned_object() { :; }
-        kubectl_finalize_cancelled_attempt() { :; }
+        kubectl_read_remote_status() {{ cat {str(ledger)!r}; }}
+        kubectl_delete_owned_object() {{ echo unexpected-delete >&2; return 1; }}
+        kubectl_observe_segment_job() {{ echo unexpected-observe >&2; return 1; }}
+        kubectl_finalize_cancelled_attempt() {{ printf CANCELLED > {str(ledger)!r}; }}
         [[ $(kubectl_cancel_journaled_attempt "$root" "$fd" test-ns helper \
           1234abcd 0123456789abcdef0123456789abcdef) == CANCELLED ]]
         kubectl_attempt_load_metadata "$root/attempts/1234abcd"
@@ -3656,6 +4064,7 @@ def test_cancel_retries_after_job_delete_was_already_journaled(
         kubectl_local_lock_release "$fd"
         """)
     assert result.returncode == 0, result.stderr
+    assert "unexpected" not in result.stderr
 
 
 def test_cancel_rejects_missing_exact_job_journal(tmp_path: Path) -> None:
@@ -3755,12 +4164,15 @@ def test_stale_resume_contender_cannot_replace_successful_attempt(
         kubectl_attempt_transition "$root" "$fd" 1234abcd COLLECTED
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
         kubectl_local_lock_release "$fd"
-        export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc
+        export KUBECTL_NAMESPACE=test-ns
         export KUBECTL_NODE_SELECTOR=storage-test=true
-        declare -A mapped=([/mnt/storage-scale-test/bench]=1)
+        plan=$(mktemp -d)
+        printf '0\\ttest-ns\\ttest-ns/test-pvc:bench\\ttest-pvc\\n' > "$plan/segments.tsv"
+        printf '/mnt/storage-scale-test/test-pvc/bench\\n' > "$plan/segment-0.roots"
+        cp "$plan/segment-0.roots" "$plan/segment-0.paths"
         kubectl_generate_attempt_id() {{ printf aaaabbbb; }}
         kubectl_generate_ownership_nonce() {{ printf 11111111111111111111111111111111; }}
-        kubectl_validate_cluster_identity() {{ printf 'namespace-uid\tpv-uid\tpvc-uid\n'; }}
+        kubectl_validate_cluster_identity() {{ printf 'test-ns\tnamespace-uid\ttest-pv\tpv-uid\ttest-pvc\tpvc-uid\n'; }}
         kubectl_attempt_write_configuration() {{ : > "$1/attempts/$3/configuration.sh"; }}
         kubectl_discover_candidate_nodes() {{ printf 'node-a\tuid-a\tamd64\n' > "$2"; }}
         kubectl_choose_coordinator_node() {{ printf node-a; }}
@@ -3777,12 +4189,10 @@ def test_stale_resume_contender_cannot_replace_successful_attempt(
         kubectl_create_worker_daemonset() {{ :; }}
         kubectl_wait_worker_endpoints() {{ : > "$4"; }}
         first=
-        kubectl_prepare_attempt_lifecycle first {str(results)!r} 1 mapped \
-          '' benchmark "$KUBECTL_CONTROL_TEST_ROOT" 1234abcd
+        kubectl_prepare_attempt_lifecycle first {str(results)!r} 1 "$plan" '' 1234abcd
         test "$first" = aaaabbbb
         second=
-        ! kubectl_prepare_attempt_lifecycle second {str(results)!r} 1 mapped \
-          '' benchmark "$KUBECTL_CONTROL_TEST_ROOT" 1234abcd
+        ! kubectl_prepare_attempt_lifecycle second {str(results)!r} 1 "$plan" '' 1234abcd
         test "$(kubectl_attempt_current_id "$root")" = aaaabbbb
         """)
     assert result.returncode == 0, result.stderr
@@ -3814,7 +4224,7 @@ def test_collected_terminal_status_is_a_successful_query(
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
         mkdir -p "$root/attempts/1234abcd/collected-state" \
           "$root/attempts/1234abcd/control-bundle/executions"
-        : > "$root/attempts/1234abcd/configuration.sh"
+        _test_configuration "$root/attempts/1234abcd/configuration.sh"
         kubectl_local_lock_release "$fd"
         kubectl_cleanup_ephemeral_helpers() {{ :; }}
         _kubectl_validate_collected_publication() {{
@@ -3842,7 +4252,7 @@ def test_repeated_collect_preserves_failed_benchmark_exit_semantics(
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
         mkdir -p "$root/attempts/1234abcd/collected-state" \
           "$root/attempts/1234abcd/control-bundle/executions"
-        : > "$root/attempts/1234abcd/configuration.sh"
+        _test_configuration "$root/attempts/1234abcd/configuration.sh"
         kubectl_local_lock_release "$fd"
         kubectl_cleanup_ephemeral_helpers() {{ :; }}
         _kubectl_validate_collected_publication() {{
@@ -3869,7 +4279,7 @@ def test_status_projects_published_collection_after_remote_cleanup(
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
         mkdir -p "$root/attempts/1234abcd/collected-state" \
           "$root/attempts/1234abcd/control-bundle/executions"
-        : > "$root/attempts/1234abcd/configuration.sh"
+        _test_configuration "$root/attempts/1234abcd/configuration.sh"
         kubectl_local_lock_release "$fd"
         kubectl_cleanup_ephemeral_helpers() {{ :; }}
         _kubectl_validate_collected_publication() {{
@@ -3926,7 +4336,7 @@ def test_resume_before_collection_prints_exact_collect_command(tmp_path: Path) -
         kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
         kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
-        : > "$root/attempts/1234abcd/configuration.sh"
+        _test_configuration "$root/attempts/1234abcd/configuration.sh"
         kubectl_local_lock_release "$fd"
         ! kubectl_resume_collected_sweep {str(results)!r}
         """)
@@ -3948,7 +4358,7 @@ def test_prepared_attempt_recovery_releases_intended_reservation(
     result = _bash(_identity(state) + f"""
         kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
-        : > "$root/attempts/1234abcd/configuration.sh"
+        _test_configuration "$root/attempts/1234abcd/configuration.sh"
         kubectl_attempt_journal_remote_reservation "$root" "$fd" 1234abcd \
           0123456789abcdef0123456789abcdef
         kubectl_local_lock_release "$fd"
@@ -3985,10 +4395,7 @@ def test_public_status_recovers_coordinator_loss_before_running(
         kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
         kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
-        cat > "$root/attempts/1234abcd/configuration.sh" <<'EOF'
-export KUBECTL_NAMESPACE=test-ns
-export KUBECTL_PVC=test-pvc
-EOF
+        _test_configuration "$root/attempts/1234abcd/configuration.sh"
         kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
           Job sweep test-ns job-uid 0123456789abcdef0123456789abcdef
         kubectl_local_lock_release "$fd"
@@ -4046,7 +4453,7 @@ def test_public_status_reads_progress_before_removing_inspector(
         kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
         kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
-        printf 'export KUBECTL_NAMESPACE=test-ns\n' > "$root/attempts/1234abcd/configuration.sh"
+        _test_configuration "$root/attempts/1234abcd/configuration.sh"
         kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
           Job sweep test-ns job-uid 0123456789abcdef0123456789abcdef
         kubectl_local_lock_release "$fd"
@@ -4188,9 +4595,7 @@ def test_status_reports_incomplete_cancellation_as_retryable_failure(
         kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
           Job sweep test-ns job-uid 0123456789abcdef0123456789abcdef
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
-        cat > "$root/attempts/1234abcd/configuration.sh" <<'EOF'
-export KUBECTL_NAMESPACE=test-ns
-EOF
+        _test_configuration "$root/attempts/1234abcd/configuration.sh"
         kubectl_local_lock_release "$fd"
         kubectl_cleanup_ephemeral_helpers() {{ :; }}
         _kubectl_verify_saved_cluster_identity() {{ :; }}
@@ -4218,9 +4623,7 @@ def test_status_rejects_cancellation_without_exact_job_journal(
         kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
         kubectl_attempt_transition "$root" "$fd" 1234abcd CANCEL_REQUESTED
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
-        cat > "$root/attempts/1234abcd/configuration.sh" <<'EOF'
-export KUBECTL_NAMESPACE=test-ns
-EOF
+        _test_configuration "$root/attempts/1234abcd/configuration.sh"
         kubectl_local_lock_release "$fd"
         kubectl_cleanup_ephemeral_helpers() {{ :; }}
         _kubectl_verify_saved_cluster_identity() {{ :; }}
@@ -4244,9 +4647,7 @@ def test_completed_job_with_nonterminal_ledger_is_diagnosed(
         kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
         kubectl_attempt_transition "$root" "$fd" 1234abcd SUBMITTED
         kubectl_attempt_write_current "$root" "$fd" 1234abcd
-        cat > "$root/attempts/1234abcd/configuration.sh" <<'EOF'
-export KUBECTL_NAMESPACE=test-ns
-EOF
+        _test_configuration "$root/attempts/1234abcd/configuration.sh"
         kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \
           Job sweep test-ns job-uid 0123456789abcdef0123456789abcdef
         kubectl_local_lock_release "$fd"

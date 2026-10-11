@@ -56,8 +56,8 @@ def _digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _stage(base, batch, nodes="1"):
-    stage = base / "candidate"
+def _stage(base, batch, nodes="1", name="candidate"):
+    stage = base / name
     stage.mkdir()
     datestamp = batch.name.removeprefix("filesystem-batch-")
     source = (
@@ -148,7 +148,16 @@ def test_publication_interruption_has_one_manifest_commit_boundary(
         f"fault_batch={shlex.quote(str(batch))}; {injection}"
         f'_elbencho_batch_publish_group "$fault_batch" {shlex.quote(str(stage))} io {datestamp}',
     )
-    assert result.returncode != 0
+    # A failure before the manifest commit publishes nothing and fails. After
+    # the commit the group is published: the identifiers must still be printed
+    # (a retry of --append would duplicate it), so refresh failure only warns.
+    assert (result.returncode == 0) is (boundary == "after"), result.stderr
+    if boundary == "after":
+        assert "STORAGE_SCALE_TEST_BATCH_GROUP=" in result.stdout
+        assert "STORAGE_SCALE_TEST_BATCH_EXECUTIONS=" in result.stdout
+        assert "do not re-run --append" in result.stderr
+    else:
+        assert "STORAGE_SCALE_TEST_BATCH_GROUP=" not in result.stdout
     expected_count = (0 if initial else 1) + (boundary == "after")
     assert _membership(batch) == tuple(
         f"{number:04d}" for number in range(1, expected_count + 1)
@@ -172,6 +181,89 @@ def test_publication_interruption_has_one_manifest_commit_boundary(
         assert (batch / "env_used.sh").is_file()
         assert len(read_batch_manifest(batch).executions) == expected_count
     assert not (batch / SEAL).exists()
+
+
+def _two_candidates(base, batch):
+    first, datestamp = _stage(base, batch, "1", "candidate-a")
+    second, _ = _stage(base, batch, "2", "candidate-b")
+    return first, second, datestamp
+
+
+def _publish_two(base, batch, stages, datestamp, injection=""):
+    arguments = " ".join(shlex.quote(str(stage)) for stage in stages)
+    return script(
+        base,
+        f"{injection}_elbencho_batch_publish_groups {shlex.quote(str(batch))} io "
+        f"{datestamp} {arguments}",
+    )
+
+
+FAIL_SECOND_GROUP = (
+    'eval "_real$(declare -f _elbencho_batch_stage_group_rows)"; calls=0; '
+    "_elbencho_batch_stage_group_rows() { _real_elbencho_batch_stage_group_rows "
+    '"$@" || return; calls=$((calls + 1)); [[ $calls -lt 2 ]] || return 91; }; '
+)
+
+
+def test_multi_group_failure_before_commit_leaves_debris_a_retry_replaces(
+    fault_checkout,
+):
+    base = fault_checkout
+    batch = create(base)
+    first, second, datestamp = _two_candidates(base, batch)
+    before = (batch / MANIFEST).read_bytes()
+    failed = _publish_two(base, batch, (first, second), datestamp, FAIL_SECOND_GROUP)
+    assert failed.returncode != 0
+    assert "STORAGE_SCALE_TEST_BATCH_" not in failed.stdout
+    # Nothing is committed, yet both groups left their (uncommitted) files.
+    assert (batch / MANIFEST).read_bytes() == before
+    assert _membership(batch) == ("0001",)
+    assert (batch / "groups/0002").is_dir() and (batch / "groups/0003").is_dir()
+    (batch / "groups/0003/debris").write_text("stale\n", encoding="utf-8")
+    retried = _publish_two(base, batch, (first, second), datestamp)
+    assert retried.returncode == 0, retried.stdout + retried.stderr
+    assert _membership(batch) == ("0001", "0002", "0003")
+    assert not (batch / "groups/0003/debris").exists()
+    assert "revision\t3\n" in (batch / MANIFEST).read_text(encoding="utf-8")
+    keys = dict(
+        line.split("=", 1)
+        for line in retried.stdout.splitlines()
+        if line.startswith("STORAGE_SCALE_TEST_BATCH_")
+    )
+    assert keys["STORAGE_SCALE_TEST_BATCH_GROUPS"] == "0002,0003"
+    assert keys["STORAGE_SCALE_TEST_BATCH_EXECUTIONS"] == "0002-0003"
+    assert "STORAGE_SCALE_TEST_BATCH_GROUP_TARGET" not in keys
+    assert {
+        "STORAGE_SCALE_TEST_BATCH_GROUP_0002_TARGET",
+        "STORAGE_SCALE_TEST_BATCH_GROUP_0003_TARGET",
+    } <= set(keys)
+
+
+def test_multi_group_failure_after_commit_reports_every_committed_group(
+    fault_checkout,
+):
+    base = fault_checkout
+    batch = create(base)
+    first, second, datestamp = _two_candidates(base, batch)
+    result = _publish_two(
+        base,
+        batch,
+        (first, second),
+        datestamp,
+        "_elbencho_batch_refresh_union() { return 91; }; ",
+    )
+    assert result.returncode == 0, result.stderr
+    assert _membership(batch) == ("0001", "0002", "0003")
+    assert "STORAGE_SCALE_TEST_BATCH_GROUPS=0002,0003\n" in result.stdout
+    assert "STORAGE_SCALE_TEST_BATCH_EXECUTIONS=0002-0003\n" in result.stdout
+    assert "group(s) 0002,0003 were committed" in result.stderr
+    assert "do not re-run --append" in result.stderr
+    # --status rebuilds the union from the manifest.
+    (batch / "env_used.sh").unlink()
+    repaired = launch(base, MD, "--status", batch)
+    assert repaired.returncode == 0, repaired.stdout + repaired.stderr
+    assert "EXECUTIONS_PENDING=3" in repaired.stdout
+    assert (batch / "env_used.sh").is_file()
 
 
 def test_execution_limit_rejection_does_not_publish_any_candidate_state(fault_checkout):

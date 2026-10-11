@@ -38,6 +38,9 @@ source "$SCRIPT_DIR/../../lib/project_version.sh" || exit 1
 project_version_option "$SCRIPT_DIR/../.." "$@"
 project_version_export "$SCRIPT_DIR/../.."
 readonly INVOKING_EXECUTION_SUBSTRATE="${EXECUTION_SUBSTRATE:-}"
+# The original arguments, quoted into the batch commands suggested when a
+# plain run is given more than one --target.
+readonly -a LAUNCHER_ARGUMENTS=("$@")
 
 # Prepared batches are routed before env.sh can redefine a saved workload.
 if [[ -f "$SCRIPT_DIR/../../lib/_batch_functions.sh" ]]; then
@@ -57,8 +60,8 @@ Usage: $0 [FLAGS] --nodes <node_spec>
    or: $0 --status <results_dir>
    or: $0 --cancel <results_dir>
    or: $0 --collect <results_dir>
-   or: $0 --batch [FLAGS] --nodes <node_spec>
-   or: $0 --append <batch_dir> [FLAGS] --nodes <node_spec>
+   or: $0 --batch [FLAGS] [--target <file>]... --nodes <node_spec>
+   or: $0 --append <batch_dir> [FLAGS] [--target <file>]... --nodes <node_spec>
    or: $0 --start <batch_dir>
 
 Prepared batches: --batch saves the first group without dispatching;
@@ -86,6 +89,7 @@ Sweep modes (--write-only, --write-no-read, default, or --read-from <path>):
 
 Delete-only (no sweep, no sbatch elbencho workers):
   --delete-only <path>  Remove a strict subdirectory under TEST_DIRS (not the test root).
+                        TEST_DIRS comes from env.sh or one --target <file>.
                         Requires **SLURM_ENABLED** or **SSH_ENABLED**: runs on one compute node
                         via **sbatch** or over **SSH** to one host. --nodes is not used (ignored if set).
 
@@ -119,11 +123,22 @@ Path modes (at most one; --write-only and --read-from require a single TEST_DIRS
 Flags:
   -h, --help          Show this help message and exit
   --version           Print the project version and exit
+  What to test comes from env.sh or --target; how to test comes from env.sh or --env-override.
+  --target <file>     Test the filesystem(s) <file> describes. A target file sets
+                      only target settings (TEST_DIRS, which it must set,
+                      STORAGE_TARGET_NAME and FS_MAX_*); its TEST_DIRS replaces
+                      env.sh's whole, and an FS_MAX_* it omits keeps env.sh's value.
+                      Repeat it with --batch/--append: each --target becomes one
+                      group, in command-line order, and every --env-override applies
+                      to every group. A plain run takes one --target. Accepted only
+                      when submitting, with --batch/--append, or (one file) with
+                      --delete-only. Saved in env_used.sh.
   --env-override <file>
-                      Source <file> after env.sh so its filesystem workload
-                      settings (TEST_DIRS, FS_MAX_*, MDTEST_*, STORAGE_TARGET_NAME,
-                      the ELBENCHO_* sweep lists and file controls) take
-                      precedence. May be repeated: files apply in command-line
+                      Source <file> after env.sh (and after --target) so its
+                      workload settings (MDTEST_*, the ELBENCHO_* sweep lists and
+                      file controls) take precedence. It may not set target
+                      settings; pass such a file with --target instead. May be
+                      repeated: files apply in command-line
                       order, each on top of the previous result (so a later
                       LIST+=(x) extends an earlier list), and the same file
                       twice is an error. Accepted only when submitting or with
@@ -148,7 +163,7 @@ Examples:
   $0 --read-from /mnt/fs/elbencho-sweep-foo/elbencho-bigfile --nodes 8
   $0 --delete-only /mnt/fs/elbencho-sweep-foo
   $0 --append <batch_dir> --env-override overrides/large-seq.env --nodes 1,8
-  $0 --batch --env-override targets/fs-a.env --env-override recipes/large-seq.env --nodes 1,8
+  $0 --batch --target targets/vendor-a.env --target targets/vendor-b.env --env-override recipes/large-seq.env --nodes 1,8
 
 EOF
 }
@@ -167,7 +182,9 @@ status_dir=""
 cancel_dir=""
 collect_dir=""
 env_override_files=()
+# shellcheck disable=SC2034  # Filled by resolve_env_override_chain, read by name.
 env_override_labels=()
+target_files=()
 
 # Parse flags
 while [[ $# -gt 0 ]]; do
@@ -249,6 +266,14 @@ while [[ $# -gt 0 ]]; do
             env_override_files+=("$2")
             shift 2
             ;;
+        --target)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "Error: --target requires a file argument" >&2
+                exit 1
+            fi
+            target_files+=("$2")
+            shift 2
+            ;;
         --delete-only)
             if [[ $# -lt 2 || -z "$2" ]]; then
                 echo "Error: --delete-only requires a path argument" >&2
@@ -328,7 +353,7 @@ _has_workload_options() {
         || "$run_to_completion_option" != 0 || -n "$nodes_spec" \
         || "$sweep_write_only" != 0 || "$sweep_write_no_read" != 0 \
         || -n "$sweep_read_from" || -n "$delete_only_path" \
-        || "${#env_override_files[@]}" -gt 0 ]]
+        || "${#env_override_files[@]}" -gt 0 || "${#target_files[@]}" -gt 0 ]]
 }
 
 # Validate that --resume is the only flag in play.
@@ -347,6 +372,17 @@ _select_operation() {
             || -n "$delete_only_path" ) ]]; then
         echo "Error: --env-override applies only to a new submission or --batch/--append;" \
             "existing results always use their saved env_used.sh" >&2
+        return 1
+    fi
+    if [[ "${#target_files[@]}" -gt 0 && -n "$resume_dir$status_dir$cancel_dir$collect_dir" ]]; then
+        echo "Error: --target applies only to a new submission, --delete-only, or" \
+            "--batch/--append; existing results always use their saved env_used.sh" >&2
+        return 1
+    fi
+    # --delete-only uses one target file only to locate TEST_DIRS.
+    if [[ "${#target_files[@]}" -gt 1 && -n "$delete_only_path" ]]; then
+        echo "Error: --delete-only takes at most one --target file" \
+            "(${#target_files[@]} given): it resolves one TEST_DIRS root to check the path against" >&2
         return 1
     fi
     [[ -n "$resume_dir" ]] && lifecycle_count=$((lifecycle_count + 1))
@@ -382,6 +418,12 @@ _select_operation() {
         SWEEP_OPERATION=submit
     fi
     readonly SWEEP_OPERATION
+    # A plain run (also a batch group being prepared) tests exactly one target.
+    if [[ "$SWEEP_OPERATION" == submit && "${#target_files[@]}" -gt 1 ]]; then
+        elbencho_reject_multi_target_run "${#target_files[@]}" "$0" \
+            "${LAUNCHER_ARGUMENTS[@]}"
+        return 1
+    fi
     return 0
 }
 
@@ -510,27 +552,38 @@ if [[ "$SWEEP_OPERATION" == resume ]]; then
     export EXECUTION_SUBSTRATE
 fi
 
-# A new submission layers its --env-override files over env.sh at top level,
-# in command-line order (each on top of the previous result), before any
-# validation or output, so every check and snapshot sees effective values.
-if [[ "$SWEEP_OPERATION" == submit ]]; then
+# A new submission layers its --target file and then its --env-override files
+# over env.sh at top level, in command-line order (each on top of the previous
+# result), before any validation or output, so every check and snapshot sees
+# effective values. What to test comes from env.sh or the target file; how to
+# test comes from env.sh or the overrides.
+if [[ "$SWEEP_OPERATION" == submit \
+        || ( "$SWEEP_OPERATION" == delete-only && "${#target_files[@]}" -gt 0 ) ]]; then
     reset_env_override_provenance
+    reset_target_file_provenance
+    target_file="" target_label=""
+    if [[ "${#target_files[@]}" -gt 0 ]]; then
+        target_file=$(resolve_target_file "${target_files[0]}") || exit 1
+        target_label=$(target_file_provenance_label "$target_file") || exit 1
+    fi
     if [[ "${#env_override_files[@]}" -gt 0 ]]; then
         resolve_env_override_chain env_override_files env_override_labels || exit 1
+    fi
+    if [[ -n "$target_file" || "${#env_override_files[@]}" -gt 0 ]]; then
         # Batch preparation passes staged copies and gets the operator's paths
         # as labels; it reuses the combined declarations rather than the files.
-        env_override_saved="reset_env_override_provenance"$'\n'
-        for env_override_index in "${!env_override_files[@]}"; do
-            env_override_declarations=$(filesystem_env_override_declarations \
-                "${env_override_files[env_override_index]}" \
-                "${env_override_labels[env_override_index]}") || exit 1
-            eval "$env_override_declarations"
-            env_override_saved+="$env_override_declarations"$'\n'
-        done
+        submission_declarations=$(filesystem_submission_declarations \
+            "$target_file" "$target_label" env_override_files env_override_labels) || exit 1
+        eval "$submission_declarations"
         if [[ -n "${ELBENCHO_BATCH_PREPARE_DIR:-}" ]]; then
-            printf '%s' "$env_override_saved" \
+            printf '%s\n' "$submission_declarations" \
                 > "$ELBENCHO_BATCH_PREPARE_DIR/.env-override-declarations.sh" || exit 1
         fi
+    fi
+    # Kubernetes roots name their claim; reject anything else before output.
+    if [[ "$SWEEP_OPERATION" == submit && "${EXECUTION_SUBSTRATE:-}" == kubectl ]] \
+            && declare -F kubectl_validate_test_dirs >/dev/null; then
+        kubectl_validate_test_dirs || exit 1
     fi
 fi
 
@@ -551,7 +604,7 @@ _validate_elbencho_sweep_environment() {
     test_dirs_declaration=$(declare -p TEST_DIRS 2>/dev/null || true)
     if [[ -z "$test_dirs_declaration" || ${#TEST_DIRS[@]} -eq 0 ]]; then
         echo "Error: Filesystem testing is not enabled (TEST_DIRS is empty)" >&2
-        echo "  Set TEST_DIRS in env.sh to enable filesystem testing" >&2
+        echo "  Set TEST_DIRS in env.sh or pass --target FILE" >&2
         return 1
     fi
     export FS_ENABLED=1
@@ -802,6 +855,7 @@ exec 1> >(tee -a "${out_log}")
 exec 2> >(tee -a "${out_log}" >&2)
 echo "storage-scale-test $STORAGE_SCALE_TEST_VERSION"
 
+print_target_file_summary
 print_env_override_summary
 print_storage_target_summary
 

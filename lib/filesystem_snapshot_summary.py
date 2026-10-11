@@ -28,7 +28,9 @@ NONE_RECORDED = "none recorded"
 FIELD_SEPARATOR = "; "
 READ_FROM_FIELD = "sweep_read_from"
 FILE_KEY = "file"
-OVERRIDE_LABEL = "Override"
+SETTING_FILES_LABEL = "Setting files"
+TARGET_PREFIX = "target "
+OVERRIDES_PREFIX = "overrides "
 LINE_LIMIT = 132
 ELLIPSIS = "\u2026"
 TARGETS_LABEL = "Targets"
@@ -83,7 +85,6 @@ def _runner(snapshot: dict) -> str:
             snapshot,
             (
                 ("KUBECTL_NAMESPACE", "namespace"),
-                ("KUBECTL_PVC", "PVC"),
                 ("KUBECTL_ELBENCHO_IMAGE", "image"),
             ),
         )
@@ -234,32 +235,35 @@ def _lifecycle(snapshot: dict) -> str:
 
 
 def _override_basenames(provenance: dict) -> list[str]:
-    """Quoted basenames of the applied override files, in application order."""
+    """Plain basenames of the applied override files, in application order."""
     files = provenance.get("files")
     if not isinstance(files, list):
         return []
     return [
-        _display(Path(str(entry[FILE_KEY])).name)
+        Path(str(entry[FILE_KEY])).name
         for entry in files
         if isinstance(entry, dict) and entry.get(FILE_KEY)
     ]
 
 
 def _fit_names(names: list[str], limit: int) -> str:
-    """Join names, ending with "(+K more)" so the text fits within limit.
+    """Quote and join names, ending with "(+K more)", within limit characters.
 
-    The first name is always shown, even when it alone exceeds the limit.
+    Whole names are dropped from the end first; if even the first name does
+    not fit with its count, that name is shortened with an ellipsis inside
+    its quotes.
     """
     for shown in range(len(names), 0, -1):
-        text = ", ".join(names[:shown])
-        if shown < len(names):
-            text += f" (+{len(names) - shown} more)"
-        if len(text) <= limit or shown == 1:
+        suffix = f" (+{len(names) - shown} more)" if shown < len(names) else ""
+        text = ", ".join(_display(name) for name in names[:shown]) + suffix
+        if len(text) <= limit:
             return text
-    return NONE_RECORDED
+    suffix = f" (+{len(names) - 1} more)" if len(names) > 1 else ""
+    return _display_fit(names[0], limit - len(suffix)) + suffix
 
 
-def _override(snapshot: dict) -> str:
+def _override(snapshot: dict, budget: int) -> str:
+    """The workload override files: whole names, "(+K more)" within budget."""
     provenance = snapshot.get("env_override")
     if "env_override" in snapshot and provenance is None:
         return NONE_RECORDED
@@ -267,21 +271,37 @@ def _override(snapshot: dict) -> str:
         return UNKNOWN
     names = _override_basenames(provenance)
     if names:
-        return _fit_names(names, LINE_LIMIT - len(f"{OVERRIDE_LABEL}: "))
+        return _fit_names(names, budget)
     filename = provenance.get(FILE_KEY)
     if filename is None:
         return UNKNOWN
-    return _display(Path(str(filename)).name) if filename else NONE_RECORDED
+    if not filename:
+        return NONE_RECORDED
+    return _fit_names([Path(str(filename)).name], budget)
+
+
+def _target_file(snapshot: dict) -> str:
+    """The quoted basename of the --target file, if one was used."""
+    provenance = snapshot.get("target_file")
+    if "target_file" in snapshot and provenance is None:
+        return NONE_RECORDED
+    if not isinstance(provenance, dict) or not provenance.get(FILE_KEY):
+        return UNKNOWN
+    return _display_fit(Path(str(provenance[FILE_KEY])).name, NAME_LIMIT)
+
+
+def _setting_files(snapshot: dict) -> str:
+    """The target file, then the override files, each by file name."""
+    target = TARGET_PREFIX + _target_file(snapshot)
+    budget = LINE_LIMIT - len(f"{SETTING_FILES_LABEL}: {target}{FIELD_SEPARATOR}")
+    budget -= len(OVERRIDES_PREFIX)
+    return target + FIELD_SEPARATOR + OVERRIDES_PREFIX + _override(snapshot, budget)
 
 
 def _row(label: str, value: str) -> str:
-    """One summary line, shortened with an ellipsis to the line limit.
-
-    The Override row is exempt: it already fits by listing whole file names
-    ("+K more") and always shows the first name in full.
-    """
+    """One summary line, shortened with an ellipsis to the line limit."""
     line = f"{label}: {value}"
-    if label != OVERRIDE_LABEL and len(line) > LINE_LIMIT:
+    if len(line) > LINE_LIMIT:
         line = line[: LINE_LIMIT - 1] + ELLIPSIS
     return line + "\n"
 
@@ -306,6 +326,6 @@ def format_io_snapshot_summary(snapshot: dict) -> str:
         ("Sweep", sweep),
         ("Files/sizing", _files(snapshot)),
         ("Lifecycle", _lifecycle(snapshot)),
-        (OVERRIDE_LABEL, _override(snapshot)),
+        (SETTING_FILES_LABEL, _setting_files(snapshot)),
     )
     return "".join(_row(label, value) for label, value in rows)

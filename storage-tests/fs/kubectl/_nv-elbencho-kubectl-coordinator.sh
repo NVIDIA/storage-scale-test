@@ -148,6 +148,19 @@ _coordinator_verify_bundle() {
     while IFS= read -r relative; do
         [[ "$relative" == bundle-manifest.tsv || -v seen["$relative"] ]] || return 1
     done <<< "$bundle_files"
+    # A segment of a multi-segment attempt runs a subset of the batch: only
+    # the executions whose roots are in the segment's namespace.
+    local segment_namespace=""
+    if [[ -v seen[segment.tsv] ]]; then
+        [[ -v seen[batch-manifest.tsv] ]] || {
+            _coordinator_error "a segment bundle must carry its batch manifest"
+            return 1
+        }
+        _coordinator_load_segment_namespace segment_namespace || {
+            _coordinator_error "invalid segment.tsv"
+            return 1
+        }
+    fi
     if [[ -v seen[batch-manifest.tsv] ]]; then
         [[ -v seen[_batch_functions.sh] && -v seen[batch-sealed.sha256] ]] || return 1
         # shellcheck disable=SC1090,SC1091  # The library digest was checked above.
@@ -164,14 +177,64 @@ _coordinator_verify_bundle() {
             expected_kind=$(awk -F '\t' -v id="$expected_group" '$1 == "group" && $2 == id {print $3}' "$CONTROL_DIR/batch-manifest.tsv") || return 1
             (
                 unset ELBENCHO_BATCH_GROUP_ID ELBENCHO_BATCH_OUTPUT_RELATIVE ELBENCHO_EXECUTION_KIND
+                unset KUBECTL_NAMESPACE TEST_DIRS
                 # shellcheck disable=SC1090  # The execution digest was checked above.
                 source "$CONTROL_DIR/$relative" || exit 1
                 [[ "${ELBENCHO_BATCH_GROUP_ID:-}" == "$expected_group" \
                     && "${ELBENCHO_BATCH_OUTPUT_RELATIVE:-}" == "$expected_output" \
-                    && "${ELBENCHO_EXECUTION_KIND:-}" == "$expected_kind" ]]
+                    && "${ELBENCHO_EXECUTION_KIND:-}" == "$expected_kind" ]] || exit 1
+                [[ -z "$segment_namespace" ]] && exit 0
+                # The group snapshot (digest-checked above) holds its roots.
+                # shellcheck disable=SC1090
+                source "$CONTROL_DIR/$expected_output/env_used.sh" >/dev/null || exit 1
+                local namespace
+                namespace=$(_coordinator_roots_namespace) || {
+                    _coordinator_error "execution $execution_id has no claim-qualified roots in one namespace"
+                    exit 1
+                }
+                if [[ "$namespace" != "$segment_namespace" ]]; then
+                    _coordinator_error "execution $execution_id uses namespace $namespace, but this segment runs namespace $segment_namespace"
+                    exit 1
+                fi
             ) || return 1
         done
     fi
+}
+
+# Read segment.tsv ("INDEX<TAB>NAMESPACE", one row) into the named variable
+# as NAMESPACE. Locals carry a prefix so they never shadow the caller's
+# output name.
+_coordinator_load_segment_namespace() {
+    local _clsn_output="$1" _clsn_line _clsn_index _clsn_namespace _clsn_extra
+    local _clsn_rows=0 _clsn_pattern='^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+    [[ "$_clsn_output" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    while IFS= read -r _clsn_line || [[ -n "$_clsn_line" ]]; do
+        IFS=$'\t' read -r _clsn_index _clsn_namespace _clsn_extra <<< "$_clsn_line"
+        [[ -z "${_clsn_extra:-}" && "$_clsn_index" =~ ^(0|[1-9][0-9]?)$ \
+            && "$_clsn_namespace" =~ $_clsn_pattern ]] || return 1
+        _clsn_rows=$((_clsn_rows + 1))
+    done < "$CONTROL_DIR/segment.tsv"
+    [[ "$_clsn_rows" -eq 1 ]] || return 1
+    printf -v "$_clsn_output" '%s' "$_clsn_namespace"
+}
+
+# Print the one namespace of the loaded TEST_DIRS keys ("[NAMESPACE/]CLAIM:
+# PATH", NAMESPACE defaulting to KUBECTL_NAMESPACE).
+_coordinator_roots_namespace() {
+    local key qualifier namespace first=""
+    declare -p TEST_DIRS >/dev/null 2>&1 && (( ${#TEST_DIRS[@]} > 0 )) || return 1
+    for key in "${!TEST_DIRS[@]}"; do
+        [[ "$key" == *:* ]] || return 1
+        qualifier="${key%%:*}"
+        if [[ "$qualifier" == */* ]]; then
+            namespace="${qualifier%%/*}"
+        else
+            namespace="${KUBECTL_NAMESPACE:-}"
+        fi
+        [[ -n "$namespace" && ( -z "$first" || "$namespace" == "$first" ) ]] || return 1
+        first="$namespace"
+    done
+    printf '%s\n' "$first"
 }
 
 _coordinator_load_run_metadata() {
@@ -250,7 +313,7 @@ _coordinator_validate_arguments() {
     if [[ "${STORAGE_SCALE_TEST_INTEGRATION:-}" != 1 ]]; then
         [[ "$run_root" == "$COORDINATOR_CONTROL_ROOT/runs/$ATTEMPT_ID" \
             && "$COORDINATOR_CONTROL_ROOT" == "$COORDINATOR_TEST_ROOT/.storage-scale-test" \
-            && "$COORDINATOR_TEST_ROOT" == "$coordinator_mount/"* \
+            && "$COORDINATOR_TEST_ROOT" == "$coordinator_mount/"*/* \
             && "$SCRATCH_DIR" == "/tmp/storage-scale-test/$ATTEMPT_ID" ]] || {
                 _coordinator_error "control or scratch path is outside the Kubernetes attempt layout"
                 return 1
@@ -267,16 +330,49 @@ _coordinator_validate_state_tree() {
     mkdir -p "$STATE_DIR/executions" "$STATE_DIR/results" || return 1
 }
 
+# The control root is the lexically first root of this segment's namespace
+# (segment.tsv names it; otherwise every root shares one namespace). Outside
+# integration fixtures it must be the root whose run tree this coordinator
+# was started in.
 _coordinator_set_control_layout() {
+    local namespace="" key normalized mapped logical=""
+    local -a roots=()
+    if [[ -f "$CONTROL_DIR/segment.tsv" ]]; then
+        _coordinator_load_segment_namespace namespace || return 1
+    else
+        # Without a segment row every root must share one namespace, so a
+        # same-named claim:path of another namespace can never be chosen.
+        namespace=$(_coordinator_roots_namespace) || {
+            _coordinator_error "the roots span namespaces, but the bundle names no segment"
+            return 1
+        }
+    fi
+    for key in "${!TEST_DIRS[@]}"; do
+        kubectl_normalize_logical_path "$key" normalized || return 1
+        [[ "$normalized" == "$namespace/"* ]] || continue
+        roots+=("$normalized")
+    done
+    [[ ${#roots[@]} -gt 0 ]] || return 1
+    mapfile -t roots < <(printf '%s\n' "${roots[@]}" | LC_ALL=C sort -u)
     if [[ "${STORAGE_SCALE_TEST_INTEGRATION:-}" == 1 ]]; then
-        local logical_root mapped_root
-        kubectl_select_control_root logical_root mapped_root || return 1
-        kubectl_set_control_layout "$logical_root" "$mapped_root"
+        mapped=$(kubectl_map_logical_path "${roots[0]}") || return 1
+        kubectl_set_control_layout "${roots[0]}" "$mapped"
         return
     fi
+    for normalized in "${roots[@]}"; do
+        mapped=$(kubectl_map_logical_path "$normalized") || return 1
+        if [[ "$mapped" == "$COORDINATOR_TEST_ROOT" ]]; then
+            logical="$normalized"
+            break
+        fi
+    done
+    [[ -n "$logical" ]] || {
+        _coordinator_error "the run tree is not below a root of this segment: $COORDINATOR_TEST_ROOT"
+        return 1
+    }
     KUBECTL_CONTROL_TEST_ROOT="$COORDINATOR_TEST_ROOT"
     KUBECTL_CONTROL_ROOT="$COORDINATOR_CONTROL_ROOT"
-    KUBECTL_CONTROL_LOGICAL_ROOT="${COORDINATOR_TEST_ROOT#"$KUBECTL_SWEEP_MOUNT_ROOT"/}"
+    KUBECTL_CONTROL_LOGICAL_ROOT="$logical"
     export KUBECTL_CONTROL_TEST_ROOT KUBECTL_CONTROL_ROOT \
         KUBECTL_CONTROL_LOGICAL_ROOT
     kubectl_validate_saved_control_layout
@@ -827,26 +923,70 @@ _coordinator_validate_mdtest_definition() {
     esac
 }
 
+# Each generated mdtest target (claim-qualified, as the definition records it)
+# must be a directory directly below exactly one of the cell's roots. Both
+# sides are compared as normalized NAMESPACE/CLAIM:PATH logical paths, so a
+# root of another namespace never matches, even on a claim:path of the same
+# name.
 _coordinator_validate_mdtest_targets() {
-    local id="$1" csv="$2" target root mapped_root basename index
+    local id="$1" csv="$2" target logical root normalized_root basename index
     local expected_suffix="${ELBENCHO_RUN_TEST_DIR_SUFFIX:-}"
     [[ "$expected_suffix" =~ ^-[0-9]{8}Z[0-9]{6}-e${id}$ ]] || return 1
     local -a targets=()
     IFS=, read -ra targets <<< "$csv"
     [[ ${#targets[@]} -gt 0 ]] || return 1
     for target in "${targets[@]}"; do
-        basename="${target##*/}"
+        kubectl_normalize_logical_path "$target" logical || return 1
+        basename="${logical##*/}"
         [[ "$basename" == mdtest-elbencho-target-*"$expected_suffix" ]] || return 1
         index="${basename#mdtest-elbencho-target-}"
         index="${index%"$expected_suffix"}"
         [[ "$index" =~ ^[1-9][0-9]*$ ]] || return 1
         local matches=0
         for root in "${!TEST_DIRS[@]}"; do
-            mapped_root=$(kubectl_map_logical_path "$root") || return 1
-            [[ "${target%/*}" == "$mapped_root" ]] && matches=$((matches + 1))
+            kubectl_normalize_logical_path "$root" normalized_root || return 1
+            [[ "${logical%/*}" == "$normalized_root" ]] && matches=$((matches + 1))
         done
         [[ "$matches" -eq 1 ]] || return 1
     done
+}
+
+# A batch cell's roots are its own group's, never the batch's union, which
+# can hold the same claim:path in another namespace. Replace TEST_DIRS with
+# the roots of the cell's digest-verified group snapshot, normalized to
+# NAMESPACE/CLAIM:PATH, and KUBECTL_NAMESPACE with their one namespace, which
+# must be this segment's. Outside a batch TEST_DIRS is the target's own.
+_coordinator_load_cell_roots() {
+    [[ -f "$CONTROL_DIR/batch-manifest.tsv" ]] || return 0
+    local relative="${ELBENCHO_BATCH_OUTPUT_RELATIVE:-}" rows logical weight
+    local namespace="" segment_namespace="" root_namespace
+    # shellcheck disable=SC2034  # Only the namespace part is needed here.
+    local claim path
+    _coordinator_regular_relative_path "$relative/env_used.sh" || return 1
+    rows=$(
+        unset TEST_DIRS KUBECTL_NAMESPACE
+        # shellcheck disable=SC1090  # Digest-verified group snapshot.
+        source "$CONTROL_DIR/$relative/env_used.sh" >/dev/null || exit 1
+        declare -p TEST_DIRS >/dev/null 2>&1 && (( ${#TEST_DIRS[@]} > 0 )) || exit 1
+        for key in "${!TEST_DIRS[@]}"; do
+            kubectl_normalize_logical_path "$key" logical || exit 1
+            printf '%s\t%s\n' "$logical" "${TEST_DIRS[$key]}"
+        done
+    ) || return 1
+    unset TEST_DIRS
+    declare -gA TEST_DIRS=()
+    while IFS=$'\t' read -r logical weight; do
+        _kubectl_logical_parts "$logical" root_namespace claim path
+        [[ -z "$namespace" || "$namespace" == "$root_namespace" ]] || return 1
+        namespace="$root_namespace"
+        TEST_DIRS["$logical"]="$weight"
+    done <<< "$rows"
+    if [[ -f "$CONTROL_DIR/segment.tsv" ]]; then
+        _coordinator_load_segment_namespace segment_namespace \
+            && [[ "$namespace" == "$segment_namespace" ]] || return 1
+    fi
+    KUBECTL_NAMESPACE="$namespace"
+    export KUBECTL_NAMESPACE TEST_DIRS
 }
 
 _coordinator_prepare_active_execution() {
@@ -903,6 +1043,11 @@ _coordinator_run_one() (
     unset MDTEST_BRANCH_FACTOR MDTEST_ITEMS_PER_DIR MDTEST_ITERATIONS
     # shellcheck disable=SC1090  # Digest-verified control bundle definition.
     source "$definition" || {
+        _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
+        return 1
+    }
+    _coordinator_load_cell_roots || {
+        _coordinator_error "execution $id: its group's roots are not in this segment's one namespace"
         _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
         return 1
     }
@@ -974,7 +1119,8 @@ _coordinator_run_one() (
         return 1
     }
     if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == mdtest ]] \
-            && ! _coordinator_validate_mdtest_targets "$id" "$test_dirs_csv"; then
+            && ! _coordinator_validate_mdtest_targets "$id" \
+                "$ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV"; then
         _coordinator_finish_prebenchmark_failure "$id" "$scratch" 1
         return 1
     fi
@@ -1073,19 +1219,23 @@ kubectl_map_generated_csv() {
     printf '%s' "${output[*]}"
 }
 
+# A workload path must stay inside the mount of its own claim
+# (KUBECTL_SWEEP_MOUNT_ROOT/<claim>) and outside the control tree.
 _coordinator_validate_pvc_path() {
-    local candidate="$1" root_real control_real resolved
-    [[ ( "$candidate" == "$KUBECTL_SWEEP_MOUNT_ROOT" \
-            || "$candidate" == "$KUBECTL_SWEEP_MOUNT_ROOT/"* ) \
-        && "$candidate" != *$'\n'* && "$candidate" != *$'\r'* \
-        && "$candidate" != *$'\t'* ]] || return 1
-    root_real=$(realpath -e -- "$KUBECTL_SWEEP_MOUNT_ROOT") || return 1
+    local candidate="$1" mount root_real control_real resolved
+    [[ "$candidate" != *$'\n'* && "$candidate" != *$'\r'* \
+        && "$candidate" != *$'\t'* ]] \
+        && kubectl_mapped_mount_root "$candidate" mount || return 1
+    root_real=$(realpath -e -- "$mount") || {
+        _coordinator_error "workload path is not on a mounted claim: $candidate"
+        return 1
+    }
     control_real=$(realpath -m -- "$KUBECTL_CONTROL_ROOT") || return 1
     resolved=$(realpath -m -- "$candidate") || return 1
-    [[ ( "$resolved" == "$root_real" || "$resolved" == "$root_real/"* ) \
+    [[ "$resolved" == "$root_real/"* \
         && "$resolved" != "$control_real" \
         && "$resolved" != "$control_real/"* ]] || {
-            _coordinator_error "workload path escapes the mounted PVC: $candidate"
+            _coordinator_error "workload path escapes its mounted claim: $candidate"
             return 1
         }
 }
@@ -1272,6 +1422,15 @@ _coordinator_recover_lost() {
     _coordinator_publish_manifest
 }
 
+# Whether the published FAILED outcome came from the coordinator's signal
+# handler (TERM: 143, INT: 130), which is how a deleted Job's coordinator ends.
+_coordinator_failed_by_signal() {
+    local summary="$STATE_DIR/run-summary.tsv" exit_code
+    [[ -f "$summary" && ! -L "$summary" ]] || return 1
+    exit_code=$(awk -F '\t' '$1 == "exit_code" {print $2}' "$summary") || return 1
+    [[ "$exit_code" == 143 || "$exit_code" == 130 ]]
+}
+
 _coordinator_finalize_cancelled() {
     _coordinator_validate_arguments "$@" || return 1
     _coordinator_verify_bundle || return 1
@@ -1288,6 +1447,23 @@ _coordinator_finalize_cancelled() {
     observed_run_status=$(cat "$STATE_DIR/run.status" 2>/dev/null || true)
     [[ "$observed_run_status" =~ ^(PREPARED|RUNNING|SUCCESS|FAILED|CANCELLED)$ ]] \
         && _coordinator_ensure_recovery_lock "$observed_run_status" || return 1
+    # A terminal outcome is immutable. The coordinator may have finished
+    # before its Job was deleted, so SUCCESS (and an earlier CANCELLED) only
+    # gets its bounded publication repaired. The one FAILED that cancellation
+    # replaces is the one the coordinator's own TERM/INT handler published
+    # while its Job was being deleted (run-summary exit code 143 or 130).
+    case "$observed_run_status" in
+        SUCCESS|CANCELLED)
+            _coordinator_repair_terminal_publication "$observed_run_status"
+            return
+            ;;
+        FAILED)
+            if ! _coordinator_failed_by_signal; then
+                _coordinator_repair_terminal_publication FAILED
+                return
+            fi
+            ;;
+    esac
     local status_file id status failed_id=""
     for status_file in "$STATE_DIR"/executions/[0-9][0-9][0-9][0-9].status; do
         [[ -f "$status_file" && ! -L "$status_file" ]] || continue
@@ -1417,6 +1593,12 @@ _coordinator_main() {
         COORDINATOR_ACTIVE_SCRATCH=""
     done < <(_coordinator_execution_ids "$CONTROL_DIR/executions" .sh)
     _coordinator_finalize_run "$rc" "$failed_id" || return 1
+    # The sequencer starts the next storage target only after this Job is
+    # Complete: exit 0 exactly when the published outcome is SUCCESS.
+    if [[ "$rc" -eq 0 && "$(cat "$STATE_DIR/run.status" 2>/dev/null)" != SUCCESS ]]; then
+        _coordinator_error "run outcome is not SUCCESS after a successful sweep"
+        return 1
+    fi
     return "$rc"
 }
 

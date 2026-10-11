@@ -706,7 +706,7 @@ def test_omnibus_report_preserves_tables_with_each_saved_environment(
             group_start = combined.index(contents[group.group_id])
             prefix = combined[previous_end:group_start]
             assert prefix.count("Runner:") == 1
-            assert prefix.count("Override:") == 1
+            assert prefix.count("Setting files:") == 1
             previous_end = group_start + len(contents[group.group_id])
         assert (report_root / "groups" / group.group_id / "report.txt").read_text(
             encoding="utf-8"
@@ -1115,7 +1115,7 @@ printer([metric, replace(metric, operation="READ")])
         summary = combined[previous_end:start]
         assert summary.count("Runner:") == 1
         assert summary.count("Files/sizing:") == 1
-        assert summary.count("Override:") == 1
+        assert summary.count("Setting files:") == 1
         assert "```yaml" not in summary
         assert (
             manifest.root / "reports/groups" / group.group_id / "report.txt"

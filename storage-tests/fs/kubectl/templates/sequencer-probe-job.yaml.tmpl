@@ -1,0 +1,111 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Validation only (validate_env.sh with several storage targets): run the
+# checked-in sequencer script once per argument triple under the sequencer's
+# RBAC shape. Each triple names a Job that does not exist, and its Role allows
+# get on exactly that name, so the sequencer must exit 3 (the API server
+# answered NotFound). That proves the image pulls, provides sh, kubectl, grep
+# and sleep, and reaches the API server with its own ServiceAccount token, in
+# target 0's namespace and, with a second namespace, through a cross-namespace
+# RoleBinding. Any other exit code fails the probe.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: "@@RESOURCE_NAME@@"
+  namespace: "@@NAMESPACE@@"
+  labels:
+    app.kubernetes.io/name: storage-scale-test
+    app.kubernetes.io/instance: sst-elb-@@ATTEMPT_ID@@
+    app.kubernetes.io/component: validation
+    app.kubernetes.io/managed-by: storage-scale-test
+    storage-scale-test.nvidia.com/benchmark: elbencho
+    storage-scale-test.nvidia.com/run: "@@ATTEMPT_ID@@"
+  annotations:
+    storage-scale-test.nvidia.com/ownership: "@@OWNERSHIP_NONCE@@"
+spec:
+  backoffLimit: 0
+  # The host stops waiting after the probe timeout; these bound an abandoned
+  # probe.
+  activeDeadlineSeconds: @@ACTIVE_DEADLINE_SECONDS@@
+  ttlSecondsAfterFinished: 60
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: storage-scale-test
+        app.kubernetes.io/instance: sst-elb-@@ATTEMPT_ID@@
+        app.kubernetes.io/component: validation
+        storage-scale-test.nvidia.com/run: "@@ATTEMPT_ID@@"
+    spec:
+      serviceAccountName: "@@SERVICE_ACCOUNT_NAME@@"
+      automountServiceAccountToken: true
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 1
+      nodeSelector:
+@@NODE_SELECTOR_BLOCK@@
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: @@RUN_AS_USER@@
+        runAsGroup: @@RUN_AS_GROUP@@
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sequencer-probe
+          image: "@@IMAGE@@"
+          imagePullPolicy: @@IMAGE_PULL_POLICY@@
+          command:
+            - /bin/sh
+            - -c
+            - |
+                script=$HOME/sequencer.sh
+                while IFS= read -r line || [ -n "$line" ]; do
+                    printf '%s\n' "$line"
+                done > "$script" <<'SST_SEQUENCER_SCRIPT_EOF'
+@@SEQUENCER_SCRIPT@@
+                SST_SEQUENCER_SCRIPT_EOF
+                if [ "$#" -eq 0 ] || [ $(($# % 3)) -ne 0 ]; then
+                    printf 'sequencer probe failed: expected NAMESPACE JOB_NAME JOB_UID triples\n' >&2
+                    exit 1
+                fi
+                while [ "$#" -gt 0 ]; do
+                    sh "$script" "$1" "$2" "$3"
+                    rc=$?
+                    if [ "$rc" -ne 3 ]; then
+                        printf 'sequencer probe failed: the sequencer exited %s for absent Job %s/%s; expected 3 (API NotFound)\n' \
+                            "$rc" "$1" "$2" >&2
+                        exit 1
+                    fi
+                    printf 'sequencer probe: the API server answered NotFound for Job %s/%s\n' "$1" "$2"
+                    shift 3
+                done
+            - storage-scale-test-sequencer-probe
+          args:
+@@SEQUENCER_ARGUMENTS@@
+          env:
+            - name: HOME
+              value: /tmp/storage-scale-test
+            - name: KUBECTL_SEQUENCER_POLL_SECONDS
+              value: "2"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: scratch
+              mountPath: /tmp/storage-scale-test
+      volumes:
+        - name: scratch
+          emptyDir: {}

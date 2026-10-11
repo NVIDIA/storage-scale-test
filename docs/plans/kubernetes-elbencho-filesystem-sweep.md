@@ -17,6 +17,8 @@ limitations under the License.
 
 # Kubernetes Elbencho Filesystem Sweep: Implemented Design Record
 
+> Superseded in v2.0.0: the single-claim model (`KUBECTL_PVC`/`KUBECTL_PV`) described here was replaced by claim-qualified `TEST_DIRS` keys; see [Testing several filesystems](../FILESYSTEM_TESTING.md#testing-several-filesystems).
+
 ## Status and authority
 
 The design described here is implemented. This document records the problem,

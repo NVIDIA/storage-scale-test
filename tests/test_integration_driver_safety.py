@@ -313,6 +313,7 @@ def _kubectl_fixture() -> object:
         kubectl_pv="storage-pv",
         kubectl_pvc="storage-test-rwx",
         kubectl_image="docker.io/example/elbencho@sha256:" + "a" * 64,
+        kubectl_sequencer_image="docker.io/example/kubectl@sha256:" + "b" * 64,
     )
 
 
@@ -586,10 +587,12 @@ def test_kubectl_renderer_uses_logical_roots_and_private_fixture_values():
         "kubectl", "/tmp/workspace", _kubectl_fixture(), timeout_seconds=120
     )
 
-    assert "declare -A TEST_DIRS=([primary]=1)" in overrides
+    assert "declare -A TEST_DIRS=([storage-test-rwx:primary]=1)" in overrides
     assert "KUBECTL_NAMESPACE=test-namespace" in overrides
-    assert "KUBECTL_PV=storage-pv" in overrides
-    assert "KUBECTL_PVC=storage-test-rwx" in overrides
+    assert "KUBECTL_SEQUENCER_IMAGE=docker.io/example/kubectl@sha256:" in overrides
+    # Roots name their claim, so the fixture never sets a PV or claim.
+    for removed in ("KUBECTL_PV", "KUBECTL_PVC", "KUBECTL_STORAGE_TARGETS"):
+        assert removed not in overrides
     assert "KUBECTL_NODE_SELECTOR=storage-scale-test/target=true" in overrides
     assert "KUBECTL_IMAGE_PULL_POLICY=Never" in overrides
     assert "unset SSH_HOST_LIST SSH_USER SSH_HOMEDIR_SHARED" in overrides
@@ -603,8 +606,8 @@ def test_kubectl_renderer_uses_logical_roots_and_private_fixture_values():
         logical_test_root="integration-regression/run-1-baseline-kubectl/primary",
     )
     assert (
-        "declare -A TEST_DIRS=([integration-regression/run-1-baseline-kubectl/primary]=1)"
-        in overrides
+        "declare -A TEST_DIRS=([storage-test-rwx:"
+        "integration-regression/run-1-baseline-kubectl/primary]=1)" in overrides
     )
 
 
@@ -648,8 +651,28 @@ def test_kubectl_utility_manifest_is_nonroot_tokenless_and_uses_private_image():
     assert spec["securityContext"]["runAsUser"] == 2000
     assert container["imagePullPolicy"] == "Never"
     assert container["image"] == _kubectl_fixture().kubectl_image
-    assert container["volumeMounts"][0]["mountPath"] == "/mnt/storage-scale-test"
+    # Each claim is mounted where the product mounts it: one directory per claim.
+    assert container["volumeMounts"][0]["mountPath"] == (
+        "/mnt/storage-scale-test/storage-test-rwx"
+    )
     assert spec["nodeSelector"] == {"storage-scale-test/login": "true"}
+
+    several = json.loads(
+        _kubectl_utility_manifest(
+            "utility-1234abcd",
+            _kubectl_fixture(),
+            claims=("storage-test-rwx", "storage-test-rwx-2"),
+        )
+    )["spec"]
+    assert [
+        item["claimName"]
+        for item in (volume["persistentVolumeClaim"] for volume in several["volumes"])
+    ] == ["storage-test-rwx", "storage-test-rwx-2"]
+    assert [item["mountPath"] for item in several["containers"][0]["volumeMounts"]] == [
+        "/mnt/storage-scale-test/storage-test-rwx",
+        "/mnt/storage-scale-test/storage-test-rwx-2",
+    ]
+    assert len({item["name"] for item in several["volumes"]}) == 2
 
     pinned = json.loads(
         _kubectl_utility_manifest("utility-1234abcd", _kubectl_fixture(), "worker-a")
@@ -912,7 +935,10 @@ def test_kubectl_generated_inputs_are_created_under_the_storage_mount(monkeypatc
     )
     fixture = SimpleNamespace(login_pod=None, login_container=None)
     _create_generated_inputs(object(), object(), fixture, runtime, step)
-    assert "/mnt/storage-scale-test/integration-regression/run/primary" in commands[0]
+    assert (
+        "/mnt/storage-scale-test/storage-test-rwx/integration-regression/run/primary"
+        in commands[0]
+    )
 
 
 @pytest.mark.parametrize(
@@ -1013,8 +1039,8 @@ def test_kubectl_storage_cleanup_targets_only_owned_root(tmp_path, monkeypatch):
 
     _cleanup_scenario_storage(object(), config, fixture, runtime)
     assert any(
-        "/mnt/storage-scale-test/integration-regression/run-1-baseline-kubectl"
-        in command
+        "/mnt/storage-scale-test/storage-test-rwx/"
+        "integration-regression/run-1-baseline-kubectl" in command
         for command in commands
     )
 
@@ -2298,7 +2324,7 @@ def test_sbx_shared_directories_allow_replacement_pod_cleanup(tmp_path, monkeypa
         ("acquire", _DRIVER.SBX_KIND_NODE_IMAGE),
         ("run", "docker"),
     ]
-    for name in ("storage-test", "ssh-home"):
+    for name in _DRIVER.SBX_SHARED_DIRECTORIES:
         mode = (config.sbx_shared_root / name).stat().st_mode & 0o7777
         assert mode == _DRIVER.SBX_SHARED_DIRECTORY_MODE == 0o777
 
@@ -2537,6 +2563,7 @@ def test_sbx_shared_teardown_migrates_legacy_marker(tmp_path, monkeypatch):
         json.dumps(legacy_marker), encoding="utf-8"
     )
     (config.sbx_shared_root / "storage-test").mkdir()
+    (config.sbx_shared_root / "storage-test-2").mkdir()
     (config.sbx_shared_root / "ssh-home").mkdir()
     monkeypatch.setattr(_DRIVER, "_repository_root", lambda: repository)
 

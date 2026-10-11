@@ -105,6 +105,9 @@ def test_default_plan_expands_substrates_and_batches_shared_home():
         ("work", "kubectl-cancel", "kubectl"),
         ("work", "kubectl-coordinator-loss", "kubectl"),
         ("work", "kubectl-endpoint-drift", "kubectl"),
+        ("work", "kubectl-multi-target", "kubectl"),
+        ("work", "kubectl-multi-target-unbound", "kubectl"),
+        ("work", "kubectl-same-namespace-targets", "kubectl"),
         ("work", "slurm-scheduling", "slurm"),
     )
     assert all(
@@ -155,6 +158,9 @@ def test_kubectl_selection_has_no_ssh_transition():
         "kubectl-cancel",
         "kubectl-coordinator-loss",
         "kubectl-endpoint-drift",
+        "kubectl-multi-target",
+        "kubectl-multi-target-unbound",
+        "kubectl-same-namespace-targets",
     ]
 
 

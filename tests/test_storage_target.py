@@ -49,12 +49,28 @@ KUBECTL_ENV = {
 }
 
 
+# A v2.0.0 snapshot: claim-qualified TEST_DIRS keys and no KUBECTL_PVC.
+QUALIFIED_ENV = {"EXECUTION_SUBSTRATE": "kubectl", "KUBECTL_NAMESPACE": "team-a"}
+
+
+def test_kubectl_default_normalizes_claim_qualified_roots():
+    """A key without a namespace takes KUBECTL_NAMESPACE; paths are normalized."""
+    env = {
+        **QUALIFIED_ENV,
+        "TEST_DIRS": {"lustre-b:scale/": 1, "team-b/lustre-a:/x//y": 2},
+    }
+    assert (
+        default_storage_target_name(env) == "team-a/lustre-b:scale,team-b/lustre-a:x/y"
+    )
+
+
 def test_explicit_name_wins_and_is_recorded():
     env = {**KUBECTL_ENV, "STORAGE_TARGET_NAME": "lustre-a", "TEST_DIRS": {"/x": 1}}
     assert storage_target_from_env(env) == StorageTarget("lustre-a", True)
 
 
 def test_kubectl_default_uses_namespace_and_claim():
+    """A snapshot written before v2.0.0 records KUBECTL_PVC; it still names it."""
     env = {**KUBECTL_ENV, "TEST_DIRS": {"/x": 1}, "STORAGE_TARGET_NAME": ""}
     assert storage_target_from_env(env) == StorageTarget("team-a/claim-1", False)
 
@@ -271,13 +287,25 @@ PARITY_CASES = {
     "slashes-only-and-real-root": ({}, ["//", "/mnt/a//"]),
     "backslashes": ({}, ["/mnt/a\\b", "/mnt/a\\", "/mnt/\\n/", "/mnt/a\\\\"]),
     "quotes-and-dollars": ({}, ['/mnt/"q"', "/mnt/$HOME", "/mnt/`id`", "/mnt/it's"]),
-    "kubectl": (
-        {**KUBECTL_ENV},
-        ["/mnt/ignored"],
-    ),
-    "kubectl-without-claim": (
-        {**KUBECTL_ENV, "KUBECTL_PVC": ""},
+    "kubectl-unqualified-keys": (
+        QUALIFIED_ENV,
         ["/mnt/b/", "/mnt/a"],
+    ),
+    "kubectl-claim-qualified": (
+        QUALIFIED_ENV,
+        ["lustre-b:scale/", "team-b/lustre-a:x//y", "lustre-a:/scale-test"],
+    ),
+    "kubectl-one-invalid-key": (
+        QUALIFIED_ENV,
+        ["Bad:x", "lustre-a:y"],
+    ),
+    "kubectl-reserved-component": (
+        QUALIFIED_ENV,
+        ["lustre-a:.storage-scale-test/x", "lustre-a:y"],
+    ),
+    "kubectl-no-default-namespace": (
+        {**QUALIFIED_ENV, "KUBECTL_NAMESPACE": ""},
+        ["lustre-a:y", "team-b/lustre-b:z"],
     ),
 }
 

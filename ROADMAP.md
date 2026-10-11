@@ -15,15 +15,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Roadmap Items (last updated 2026-10-08)
+# Roadmap Items (last updated 2026-10-11)
 
 ## Completed
 
 - Add kubectl as the filesystem Elbencho execution substrate. It uses an
-  existing authorized cluster, namespace, and bound RWX PVC; submits a
+  existing authorized cluster, namespace, and bound RWX PVCs; submits a
   durable asynchronous sweep, and supports status, cancel, collect, and
   collection-gated resume.
 - Add `--env-override` workload files to the filesystem launchers.
+- Add sweep across multiple storage targets
+  ([#16](https://github.com/NVIDIA/storage-scale-test/issues/16)): on
+  Kubernetes, claim-qualified `TEST_DIRS` roots (`[namespace/]claim:path`)
+  make one aggregate target across several claims in one namespace, with
+  weighted load as on SSH and Slurm; a repeatable `--target FILE` tests
+  several filesystems as separate batch groups on every substrate; storage
+  target names, a report mixing guard, and repeatable `--env-override`. A batch
+  that spans several Kubernetes namespaces runs them in order through an
+  in-cluster sequencer; one namespace needs none. See
+  [Testing several filesystems](docs/FILESYSTEM_TESTING.md#testing-several-filesystems).
 - Add prepared filesystem batches (`--batch`, `--append`, `--start`) that
   accumulate sweep executions and run them from one resumable batch.
 - Add completion-based (finite dataset) filesystem sweeps
@@ -36,7 +46,6 @@ limitations under the License.
 - Integrate with AI Cloud Validation
 (https://github.com/NVIDIA/ai-cloud-validation).
     - Exercise the implemented kubectl substrate in the validation suite.
-    - Add sweep across multiple storage targets.
     - Drive prepared batches (`--batch`/`--append`/`--start`) from the
       validation suite's orchestrator.
     - Watch out for (current) 10m AI Cloud Validation test timeout--figure

@@ -36,20 +36,22 @@ can run recipes without editing `env.sh`:
 
 Queue several with `--batch`/`--append`; each group keeps its own overrides.
 `--env-override` may repeat within one command: the files apply in order, each
-on top of the previous one, so a target file and a recipe stack. For example,
-a file that sets `STORAGE_TARGET_NAME` and `TEST_DIRS` for one filesystem
-combines with any recipe:
+on top of the previous one, so recipes stack. Override files hold workload
+settings only. The filesystem to test (`TEST_DIRS`, `STORAGE_TARGET_NAME`,
+`FS_MAX_*`) comes from `env.sh` or from a target file passed with `--target`:
 
 ```bash
 ./storage-tests/fs/nv-elbencho-sweep.sh \
-    --env-override targets/fs-a.env \
+    --target targets/vendor-a.env \
     --env-override overrides/r2-requirements.env --nodes 8,16
 ```
 
 Recipes that edit a list with `+=` build on the earlier file's list, so make
 each recipe set the lists it depends on outright when it must not depend on
 what came before. See
-[Workload override files](docs/FILESYSTEM_TESTING.md#workload-override-files).
+[Workload override files](docs/FILESYSTEM_TESTING.md#workload-override-files)
+and, for several filesystems,
+[section 10](#10-testing-several-filesystems).
 
 ---
 
@@ -64,6 +66,7 @@ what came before. See
 7. [Sequential IO Size Tuning](#7-sequential-io-size-tuning)
 8. [Choosing Node Counts](#8-choosing-node-counts)
 9. [Thread Count Sizing by CPU Count](#9-thread-count-sizing-by-cpu-count)
+10. [Testing Several Filesystems](#10-testing-several-filesystems)
 
 ---
 
@@ -396,7 +399,9 @@ export ELBENCHO_READ_AFTER_WRITE_PAUSE=0
 
 With `ELBENCHO_SINGLE_BIG_FILE=1`, `--read-from` must name the file itself,
 and its size comes from the file (so `ELBENCHO_SINGLE_BIG_FILE_SIZE` may be
-unset). For a directory, set `ELBENCHO_SINGLE_BIG_FILE=0`.
+unset). For a directory, set `ELBENCHO_SINGLE_BIG_FILE=0`. The `/mnt/fs` paths
+here are SSH/Slurm style; on Kubernetes, pass `--read-from` as
+`[namespace/]claim:path`.
 
 ### Phase 2: Partitioned vs Full-File Read
 
@@ -739,6 +744,83 @@ ceiling for random IO workloads.
 For multi-node sweeps, pare this down to the 1–2 values that saturated the
 single node's NIC. There's no need to re-sweep the full thread range at
 every node count.
+
+---
+
+## 10. Testing Several Filesystems
+
+What to test comes from `env.sh` or `--target`; how to test comes from
+`env.sh` or `--env-override`. A target file may set only `TEST_DIRS` (required),
+`STORAGE_TARGET_NAME` and the `FS_MAX_*` estimates; an override file may set
+only the
+[supported workload settings](docs/FILESYSTEM_TESTING.md#workload-override-files).
+Substrate, connection, and allocation settings stay in `env.sh`. The full
+explanation is in
+[Testing several filesystems](docs/FILESYSTEM_TESTING.md#testing-several-filesystems).
+
+### Spread Load Across Several Filesystems (One Aggregate Target)
+
+Several weighted roots in one `TEST_DIRS` form one target, and the load is split
+by weight. Here `lustre-a` gets twice the load of `lustre-b`. On SSH or Slurm
+the keys are paths that exist on every worker:
+
+```bash
+# env.sh or a target file
+TEST_DIRS=(["/mnt/lustre-a/scale-test"]=2 ["/mnt/lustre-b/scale-test"]=1)
+```
+
+On Kubernetes the keys are `[namespace/]claim:path`; the namespace defaults to
+`KUBECTL_NAMESPACE`, and every root of one target must share a namespace:
+
+```bash
+KUBECTL_NAMESPACE=validation   # in env.sh; a target file cannot set it
+TEST_DIRS=(["lustre-a:scale-test"]=2 ["lustre-b:scale-test"]=1)
+```
+
+Run any recipe as usual. More than one root always runs writes and reads to
+completion instead of for a fixed duration. Set `FS_MAX_AGG_THROUGHPUT`,
+`FS_MAX_NODE_THROUGHPUT_GBPS` and `FS_MAX_NODE_IOPS` for the filesystems
+combined; they size the generated dataset.
+
+### Compare Several Filesystems (Separate Targets)
+
+Give each filesystem its own target file and run one recipe against both as a
+batch. `--target` is repeatable and creates one group per file, in
+command-line order:
+
+```bash
+# targets/vendor-a.env (targets/vendor-b.env is the same for the second one)
+STORAGE_TARGET_NAME=vendor-a
+TEST_DIRS=(["/mnt/vendor-a/scale-test"]=1)   # Kubernetes: ["vendor-a:scale-test"]=1
+                                             # (namespace from env.sh's KUBECTL_NAMESPACE)
+```
+
+```bash
+IO=./storage-tests/fs/nv-elbencho-sweep.sh
+BATCH=$("$IO" --batch --target targets/vendor-a.env \
+    --target targets/vendor-b.env \
+    --env-override overrides/r2-requirements.env --nodes 8,16 \
+    | sed -n 's/^STORAGE_SCALE_TEST_BATCH_RESULTS=//p'); test -n "$BATCH"
+"$IO" --start "$BATCH"
+# Kubernetes only: wait for a terminal --status, then collect.
+"$IO" --status "$BATCH"
+"$IO" --collect "$BATCH"
+./utils/extract-filesystem.py "$BATCH"
+```
+
+You get group `0001` for `vendor-a` and `0002` for `vendor-b`, each reported
+separately. Notes:
+
+- The override applies to every target in the submission.
+- A failed target stops the batch, so later groups do not run. Use one batch per
+  target when the comparison must survive a failure.
+- The extractors refuse to mix targets in one report unless you pass
+  `--allow-mixed-targets`.
+- A plain run (without `--batch`) accepts only one `--target`; given more, it
+  is rejected with the equivalent `--batch` and `--start` commands.
+- On Kubernetes, targets in one namespace need nothing extra. Targets in several
+  namespaces need the in-cluster sequencer and its RBAC; check them with
+  `validate_env.sh --sequencer`.
 
 ---
 

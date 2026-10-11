@@ -58,3 +58,35 @@ spec:
   resources:
     requests:
       storage: @@SSH_HOME_CAPACITY@@
+---
+# A second namespace with a claim of the same name gets its own directory,
+# because the StorageClass subDir includes the claim's namespace. Multi-target
+# Kubernetes scenarios use it as their second storage target.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: storage-test-rwx
+  namespace: @@NAMESPACE_2@@
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: storage-scale-nfs-csi
+  resources:
+    requests:
+      storage: @@STORAGE_TEST_CAPACITY@@
+---
+# A third claim beside the primary one, for the same-namespace storage-target
+# scenario. The StorageClass subDir includes the claim name, so it gets its own
+# directory on the export.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: storage-test-rwx-2
+  namespace: @@NAMESPACE@@
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: storage-scale-nfs-csi
+  resources:
+    requests:
+      storage: @@STORAGE_TEST_CAPACITY@@

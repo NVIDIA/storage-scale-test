@@ -125,32 +125,40 @@ def provenance(path):
     return values[0] if values else ""
 
 
+def target_provenance(path):
+    """The (file, sha256, variables) recorded by a snapshot's target provenance."""
+    values = []
+    for name in ("FILE", "FILE_SHA256", "FILE_VARIABLES"):
+        match = re.search(
+            rf"^STORAGE_SCALE_TEST_TARGET_{name}=(.*)$", path.read_text(), re.M
+        )
+        assert match, f"{path} lacks target provenance {name}"
+        words = shlex.split(match.group(1))
+        values.append(words[0] if words else "")
+    return tuple(values)
+
+
 def test_relative_edits_types_and_scratch_variables_are_applied(checkout):
     override = write_override(
         checkout,
         "mixed.env",
         "ELBENCHO_SCALE_THREAD_LIST+=(2 4)\n"
         'ELBENCHO_SCALE_IO_SIZES=(1M "1M,4K")\n'
-        'TEST_DIRS=(["/data/two"]=1)\n'
         "for size in 64G; do ELBENCHO_FILE_SIZE=$size; done\n"
         "echo noisy output must not become a declaration\n",
     )
     result = apply_and_print(
         checkout,
         override,
-        ("ELBENCHO_SCALE_THREAD_LIST", "ELBENCHO_SCALE_IO_SIZES", "TEST_DIRS"),
+        ("ELBENCHO_SCALE_THREAD_LIST", "ELBENCHO_SCALE_IO_SIZES"),
     )
     assert result.returncode == 0, result.stderr
     assert '([0]="1" [1]="2" [2]="4")' in result.stdout
     assert '([0]="1M" [1]="1M,4K")' in result.stdout
-    test_dirs = next(
-        line for line in result.stdout.splitlines() if "TEST_DIRS=" in line
-    )
-    assert "/data/two" in test_dirs and "/data/one" not in test_dirs
     assert "noisy output" in result.stderr
     assert (
         "VARIABLES=ELBENCHO_FILE_SIZE ELBENCHO_SCALE_IO_SIZES "
-        "ELBENCHO_SCALE_THREAD_LIST TEST_DIRS"
+        "ELBENCHO_SCALE_THREAD_LIST"
     ) in result.stdout
     assert "size" not in result.stdout.split("VARIABLES=")[1]
 
@@ -180,7 +188,7 @@ def test_function_scope_eval_replaces_function_local_test_dirs(checkout):
             "bash",
             "-ceu",
             'prepare() { source "$1/env.sh"; '
-            'd=$(filesystem_env_override_declarations "$2"); eval "$d"; '
+            'd=$(filesystem_target_declarations "$2"); eval "$d"; '
             'echo "${!TEST_DIRS[*]} FS_ENABLED=$FS_ENABLED"; }; prepare "$1" "$2"',
             "override-test",
             str(checkout),
@@ -290,7 +298,6 @@ def test_override_read_context_intentionally_excludes_unexported_site_helpers(ch
         ("PATH=/nowhere\n", "unsupported variable(s): PATH"),
         ('ELBENCHO_SCALE_IO_SIZES="4K 1M"\n', "contains whitespace"),
         ("ELBENCHO_FILE_SIZE=(1G)\n", "ELBENCHO_FILE_SIZE must be a scalar"),
-        ("unset TEST_DIRS\ndeclare -a TEST_DIRS=(x)\n", "must be an associative"),
         ("MDTEST_ITERATIONS=2\nexit 0\n", "exited early"),
         ("false\n", "returned status 1"),
         ("ELBENCHO_LIVEINT=(\n", "returned status"),
@@ -311,22 +318,24 @@ def test_batch_groups_each_save_their_own_override(checkout, entry):
     io_override = write_override(
         checkout, "io.env", "ELBENCHO_SCALE_THREAD_LIST=(1 2)\nELBENCHO_LIVEINT=250\n"
     )
-    md_override = write_override(
-        checkout, "md.env", 'MDTEST_ITEMS_PER_DIR=500\nTEST_DIRS=(["/data/two"]=1)\n'
+    md_override = write_override(checkout, "md.env", "MDTEST_ITEMS_PER_DIR=500\n")
+    md_target = write_override(
+        checkout, "md-target.env", 'TEST_DIRS=(["/data/two"]=1)\n'
     )
     env_before = (checkout / "env.sh").read_text()
     io_args = ("--nodes", "1")
     md_args = ("--nodes", "1", "--tasks", "1")
     first, second = (IO, MD) if entry == IO else (MD, IO)
-    first_override, second_override = (
-        (io_override, md_override) if entry == IO else (md_override, io_override)
+    io_files = (OVERRIDE_FLAG, io_override)
+    md_files = ("--target", md_target, OVERRIDE_FLAG, md_override)
+    first_files, second_files = (
+        (io_files, md_files) if entry == IO else (md_files, io_files)
     )
     created = launch(
         checkout,
         first,
         "--batch",
-        OVERRIDE_FLAG,
-        first_override.relative_to(checkout),
+        *first_files,
         *(io_args if first == IO else md_args),
     )
     assert created.returncode == 0, created.stderr
@@ -336,8 +345,7 @@ def test_batch_groups_each_save_their_own_override(checkout, entry):
         second,
         "--append",
         batch,
-        OVERRIDE_FLAG,
-        second_override,
+        *second_files,
         *(io_args if second == IO else md_args),
     )
     assert appended.returncode == 0, appended.stderr
@@ -353,6 +361,17 @@ def test_batch_groups_each_save_their_own_override(checkout, entry):
         # The operator's file, not the staged copy, is the recorded provenance.
         assert saved["env_override"]["file"] == str(override)
         assert provenance(groups[kind] / "env_used.sh") == str(override)
+    # Only the metadata group has a target file; it too records the original.
+    assert (
+        yaml.safe_load((groups["io"] / "env_used.yaml").read_text())["target_file"]
+        is None
+    )
+    saved_target = yaml.safe_load((groups["mdtest"] / "env_used.yaml").read_text())[
+        "target_file"
+    ]
+    assert saved_target["file"] == str(md_target)
+    assert saved_target["sha256"] == sha256_of(md_target)
+    assert saved_target["variables"] == ["TEST_DIRS"]
     assert yaml.safe_load((groups["io"] / "env_used.yaml").read_text())[
         "ELBENCHO_SCALE_THREAD_LIST"
     ] == ["1", "2"]
@@ -361,6 +380,7 @@ def test_batch_groups_each_save_their_own_override(checkout, entry):
     (checkout / "env.sh").write_text(env_before + "\nexport ELBENCHO_LIVEINT=999\n")
     io_override.write_text("ELBENCHO_LIVEINT=777\n")
     md_override.write_text("MDTEST_ITEMS_PER_DIR=777\n")
+    md_target.write_text('TEST_DIRS=(["/data/changed"]=1)\n')
     result = shell(
         checkout,
         f'r={shlex.quote(str(batch))}; elbencho_batch_verify_manifest "$r"; '
@@ -421,6 +441,8 @@ def test_submission_without_override_records_none(checkout):
         yaml.safe_load((result / "env_used.yaml").read_text())["env_override"] is None
     )
     assert provenance(result / "env_used.sh") == ""
+    assert yaml.safe_load((result / "env_used.yaml").read_text())["target_file"] is None
+    assert target_provenance(result / "env_used.sh") == ("", "", "")
 
 
 @pytest.mark.parametrize(
@@ -558,7 +580,7 @@ def test_every_override_can_be_edited_relative_to_the_previous_result(checkout):
 def test_provenance_lists_every_file_and_keeps_the_legacy_scalars(
     checkout, entry, glob, setting
 ):
-    first = write_override(checkout, "a-target.env", "STORAGE_TARGET_NAME=fs-a\n")
+    first = write_override(checkout, "a-recipe.env", "ELBENCHO_LIVEINT=250\n")
     second = write_override(
         checkout,
         "b-recipe.env",
@@ -571,11 +593,10 @@ def test_provenance_lists_every_file_and_keeps_the_legacy_scalars(
         "Env override 1/2",
         "Env override 2/2",
     ]
-    assert f"{first} (sha256 {sha256_of(first)}): STORAGE_TARGET_NAME" in lines[0]
+    assert f"{first} (sha256 {sha256_of(first)}): ELBENCHO_LIVEINT" in lines[0]
     result = next((checkout / "results").glob(glob))
     union = sorted(
-        {"STORAGE_TARGET_NAME", "MDTEST_ITERATIONS"}
-        | {setting or "MDTEST_ITEMS_PER_DIR"}
+        {"ELBENCHO_LIVEINT", "MDTEST_ITERATIONS"} | {setting or "MDTEST_ITEMS_PER_DIR"}
     )
     saved = yaml.safe_load((result / "env_used.yaml").read_text())["env_override"]
     assert saved["file"] == str(second) and saved["sha256"] == sha256_of(second)
@@ -584,19 +605,19 @@ def test_provenance_lists_every_file_and_keeps_the_legacy_scalars(
         {
             "file": str(first),
             "sha256": sha256_of(first),
-            "variables": ["STORAGE_TARGET_NAME"],
+            "variables": ["ELBENCHO_LIVEINT"],
         },
         {
             "file": str(second),
             "sha256": sha256_of(second),
-            "variables": sorted(set(union) - {"STORAGE_TARGET_NAME"}),
+            "variables": sorted(set(union) - {"ELBENCHO_LIVEINT"}),
         },
     ]
     assert provenance(result / "env_used.sh") == str(second)
     files, digests, per_file = sourced_provenance(checkout, result / "env_used.sh")
     assert files == [str(first), str(second)]
     assert digests == [sha256_of(first), sha256_of(second)]
-    assert per_file[0] == "STORAGE_TARGET_NAME"
+    assert per_file[0] == "ELBENCHO_LIVEINT"
     assert (
         " " not in per_file[0] and per_file[1].split() == saved["files"][1]["variables"]
     )
@@ -622,7 +643,7 @@ def test_batch_and_append_record_each_groups_own_ordered_overrides(checkout, ent
     names = ("t1.env", "w1.env", "t2.env", "w2.env")
     t1, w1, t2, w2 = (
         write_override(
-            checkout, name, f"STORAGE_TARGET_NAME=fs-{name[1]}\nMDTEST_ITERATIONS={i}\n"
+            checkout, name, f"ELBENCHO_LIVEINT={i}00\nMDTEST_ITERATIONS={i}\n"
         )
         for i, name in enumerate(names, start=2)
     )
@@ -721,6 +742,64 @@ def test_old_scalar_only_snapshots_normalize_to_one_entry_files(
     assert f"{PREFIX}_FILES=(/ops/old.env)" in shell_text
 
 
+@pytest.mark.parametrize(
+    ("arrays", "survives"),
+    [
+        # The last entry matches the scalars but earlier entries add variables
+        # the scalar union does not list: stale, rebuilt from the scalars.
+        (
+            "FILES=(/stale.env /ops/old.env); SHA256S=(dead abc123); "
+            "FILE_VARIABLES=(STALE_ONE FS_MAX_NODE_IOPS)",
+            False,
+        ),
+        # Same file and union but another digest.
+        (
+            "FILES=(/ops/old.env); SHA256S=(dead); FILE_VARIABLES=(FS_MAX_NODE_IOPS)",
+            False,
+        ),
+        # Parallel arrays of different lengths cannot be consistent.
+        (
+            "FILES=(/ops/old.env); SHA256S=(); FILE_VARIABLES=(FS_MAX_NODE_IOPS)",
+            False,
+        ),
+        # A genuine two-file snapshot: every array agrees with the scalars.
+        (
+            "FILES=(/ops/first.env /ops/old.env); SHA256S=(beef abc123); "
+            "FILE_VARIABLES=(MDTEST_ITERATIONS FS_MAX_NODE_IOPS)",
+            True,
+        ),
+    ],
+)
+def test_provenance_arrays_must_agree_with_every_scalar_to_survive(
+    checkout, arrays, survives
+):
+    """Arrays left by an earlier snapshot never pass for this snapshot's."""
+    scalars = (
+        f"{PREFIX}_FILE=/ops/old.env; {PREFIX}_SHA256=abc123; "
+        f"{PREFIX}_VARIABLES='FS_MAX_NODE_IOPS'; "
+    )
+    if survives:
+        scalars = scalars.replace(
+            "'FS_MAX_NODE_IOPS'", "'FS_MAX_NODE_IOPS MDTEST_ITERATIONS'"
+        )
+    assignments = "; ".join(f"{PREFIX}_{part.strip()}" for part in arrays.split("; "))
+    result = shell(
+        checkout,
+        f"{assignments}; {scalars}normalize_env_override_provenance; "
+        f"printf '%s|' \"${{{PREFIX}_FILES[@]}}\"; echo; "
+        f"printf '%s|' \"${{{PREFIX}_FILE_VARIABLES[@]}}\"; echo",
+    )
+    assert result.returncode == 0, result.stderr
+    files, variables = result.stdout.splitlines()
+    if survives:
+        assert files == "/ops/first.env|/ops/old.env|"
+        assert variables == "MDTEST_ITERATIONS|FS_MAX_NODE_IOPS|"
+    else:
+        assert files == "/ops/old.env|"
+        assert variables == "FS_MAX_NODE_IOPS|"
+        assert "STALE" not in result.stdout
+
+
 def test_summary_of_old_snapshot_state_prints_one_unnumbered_line(checkout):
     result = shell(
         checkout,
@@ -745,24 +824,45 @@ def test_a_target_file_and_a_workload_file_both_apply(
     target = write_override(
         checkout,
         "target.env",
-        'STORAGE_TARGET_NAME=vendor-a:fs1\nTEST_DIRS=(["/data/two"]=1)\n',
+        'STORAGE_TARGET_NAME=vendor-a:fs1\nTEST_DIRS=(["/data/two"]=1)\n'
+        "FS_MAX_NODE_IOPS=777\n",
     )
     workload = write_override(
         checkout,
         "recipe.env",
         "ELBENCHO_SCALE_IO_SIZES=(1M)\nMDTEST_ITEMS_PER_DIR=7\n",
     )
-    submitted = launch(checkout, entry, *flags(target, workload), *ARGS_BY_ENTRY[entry])
+    submitted = launch(
+        checkout,
+        entry,
+        "--target",
+        target,
+        *flags(workload),
+        *ARGS_BY_ENTRY[entry],
+    )
     assert "Storage target: vendor-a:fs1\n" in submitted.stdout
+    assert f"Target file: {target} (sha256 {sha256_of(target)}): " in submitted.stdout
     result = next((checkout / "results").glob(glob))
     saved = yaml.safe_load((result / "env_used.yaml").read_text())
     assert saved["STORAGE_TARGET_NAME"] == "vendor-a:fs1"
     assert list(saved["TEST_DIRS"]) == ["/data/two"]
+    assert saved["FS_MAX_NODE_IOPS"] == 777
     assert saved[key] == expected
+    assert saved["target_file"] == {
+        "file": str(target),
+        "sha256": sha256_of(target),
+        "variables": ["FS_MAX_NODE_IOPS", "STORAGE_TARGET_NAME", "TEST_DIRS"],
+    }
+    # The target file is not an override: the list holds the workload file only.
+    assert [item["file"] for item in saved["env_override"]["files"]] == [str(workload)]
     assert [item["variables"] for item in saved["env_override"]["files"]] == [
-        ["STORAGE_TARGET_NAME", "TEST_DIRS"],
         ["ELBENCHO_SCALE_IO_SIZES", "MDTEST_ITEMS_PER_DIR"],
     ]
+    assert target_provenance(result / "env_used.sh") == (
+        str(target),
+        sha256_of(target),
+        "FS_MAX_NODE_IOPS STORAGE_TARGET_NAME TEST_DIRS",
+    )
 
 
 @pytest.mark.parametrize(
@@ -781,16 +881,19 @@ def test_override_path_must_be_a_readable_file(checkout, path, message):
         (MD, ("--nodes", "1", "--tasks", "1"), "mdtest-elbencho-*"),
     ],
 )
-def test_override_sets_the_storage_target_name(checkout, entry, args, glob):
-    override = write_override(
-        checkout, "name.env", "STORAGE_TARGET_NAME=vendor-a:fs1\n"
+def test_target_file_sets_the_storage_target_name(checkout, entry, args, glob):
+    target = write_override(
+        checkout,
+        "name.env",
+        'STORAGE_TARGET_NAME=vendor-a:fs1\nTEST_DIRS=(["/data/one"]=1)\n',
     )
-    submitted = launch(checkout, entry, OVERRIDE_FLAG, override, *args)
+    submitted = launch(checkout, entry, "--target", target, *args)
     assert "Storage target: vendor-a:fs1\n" in submitted.stdout
     result = next((checkout / "results").glob(glob))
     saved = yaml.safe_load((result / "env_used.yaml").read_text())
     assert saved["STORAGE_TARGET_NAME"] == "vendor-a:fs1"
-    assert saved["env_override"]["variables"] == ["STORAGE_TARGET_NAME"]
+    assert saved["target_file"]["variables"] == ["STORAGE_TARGET_NAME", "TEST_DIRS"]
+    assert saved["env_override"] is None
     reloaded = shell(
         checkout,
         f"source {shlex.quote(str(result))}/env_used.sh; "
@@ -809,9 +912,9 @@ def test_override_sets_the_storage_target_name(checkout, entry, args, glob):
 def test_unset_storage_target_name_is_derived_at_snapshot_time(
     checkout, entry, args, glob
 ):
-    """Never frozen at env load: an override's TEST_DIRS decides the default."""
-    override = write_override(checkout, "roots.env", 'TEST_DIRS=(["/data/two/"]=1)\n')
-    submitted = launch(checkout, entry, OVERRIDE_FLAG, override, *args)
+    """Never frozen at env load: a target file's TEST_DIRS decides the default."""
+    target = write_override(checkout, "roots.env", 'TEST_DIRS=(["/data/two/"]=1)\n')
+    submitted = launch(checkout, entry, "--target", target, *args)
     assert "Storage target: /data/two\n" in submitted.stdout
     result = next((checkout / "results").glob(glob))
     saved = yaml.safe_load((result / "env_used.yaml").read_text())
@@ -829,10 +932,12 @@ def test_unset_storage_target_name_is_derived_at_snapshot_time(
 def test_invalid_storage_target_name_is_rejected_before_any_output(
     checkout, entry, args, glob, name
 ):
-    override = write_override(
-        checkout, "bad-name.env", f"STORAGE_TARGET_NAME={shlex.quote(name)}\n"
+    target = write_override(
+        checkout,
+        "bad-name.env",
+        f'TEST_DIRS=(["/data/one"]=1)\nSTORAGE_TARGET_NAME={shlex.quote(name)}\n',
     )
-    result = launch(checkout, entry, OVERRIDE_FLAG, override, *args)
+    result = launch(checkout, entry, "--target", target, *args)
     assert result.returncode == 1
     assert "Error: STORAGE_TARGET_NAME" in result.stderr
     assert not (checkout / "results").exists() or not any(
@@ -847,7 +952,8 @@ def test_override_names_are_snapshotted_and_cover_every_default():
         [
             "bash",
             "-c",
-            'source "$1"; filesystem_env_override_names | cut -f1',
+            'source "$1"; filesystem_env_override_names | cut -f1; '
+            "filesystem_target_setting_names | cut -f1",
             "names",
             str(ROOT / "lib/env_functions.sh"),
         ],
@@ -913,3 +1019,100 @@ def test_mixed_batch_scenario_overrides_prepare_locally(checkout):
     assert "export MDTEST_ITERATIONS=2" in definitions[1]
     assert "export ELBENCHO_FILE_SIZE=8M" in definitions[2]
     assert "export ELBENCHO_FILE_SIZE=16M" not in definitions[2]
+
+
+def test_the_two_allowlists_split_target_from_workload_settings():
+    """What to test and how to test never overlap."""
+    listed = {}
+    for function in (
+        "filesystem_target_setting_names",
+        "filesystem_env_override_names",
+    ):
+        listed[function] = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'source "$1"; {function} | cut -f1',
+                "names",
+                str(ROOT / "lib/env_functions.sh"),
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.split()
+    target = listed["filesystem_target_setting_names"]
+    workload = listed["filesystem_env_override_names"]
+    assert sorted(target) == [
+        "FS_MAX_AGG_THROUGHPUT",
+        "FS_MAX_NODE_IOPS",
+        "FS_MAX_NODE_THROUGHPUT_GBPS",
+        "STORAGE_TARGET_NAME",
+        "TEST_DIRS",
+    ]
+    assert not set(target) & set(workload)
+    assert MDTEST_ITEMS_SETTING in workload and THREAD_LIST in workload
+
+
+@pytest.mark.parametrize("operation", [(), ("--batch",)])
+@pytest.mark.parametrize("entry", [IO, MD])
+@pytest.mark.parametrize(
+    "setting",
+    [
+        'TEST_DIRS=(["/data/two"]=1)',
+        "STORAGE_TARGET_NAME=vendor-a",
+        "FS_MAX_NODE_IOPS=777",
+    ],
+)
+def test_override_setting_a_target_setting_points_at_target(
+    checkout, operation, entry, setting
+):
+    """The v2.0.0 migration error names the file and variable and says --target."""
+    override = write_override(
+        checkout, "old-style.env", f"{setting}\nMDTEST_ITERATIONS=2\n"
+    )
+    result = launch(
+        checkout, entry, *operation, OVERRIDE_FLAG, override, *ARGS_BY_ENTRY[entry]
+    )
+    assert result.returncode == 1
+    variable = re.match(r"[A-Z_]+", setting).group(0)
+    assert (
+        f"Error: env override file {override} sets target setting(s): {variable}"
+    ) in result.stderr
+    assert "pass this file with --target instead of --env-override" in result.stderr
+    assert not (checkout / "results").exists() or not any(
+        (checkout / "results").glob("*-*")
+    )
+
+
+def test_override_changing_target_and_unsupported_settings_reports_both(checkout):
+    override = write_override(
+        checkout, "both.env", 'TEST_DIRS=(["/data/two"]=1)\nrun_time=1-00:00:00\n'
+    )
+    result = launch(checkout, IO, OVERRIDE_FLAG, override, "--nodes", "1")
+    assert result.returncode == 1
+    assert "sets target setting(s): TEST_DIRS" in result.stderr
+    assert "unsupported variable(s): run_time" in result.stderr
+
+
+def test_an_override_restating_an_unchanged_target_setting_is_a_noop(checkout):
+    """Detection is by change: restating env.sh's value is accepted, a new one is not."""
+    restated = write_override(
+        checkout,
+        "restated.env",
+        'TEST_DIRS=(["/data/one"]=1)\nMDTEST_ITERATIONS=3\n',
+    )
+    result = shell(
+        checkout,
+        f"d=$(filesystem_env_override_declarations {shlex.quote(str(restated))}) "
+        '|| exit 1; eval "$d"; echo "${!TEST_DIRS[*]} $MDTEST_ITERATIONS"; '
+        'echo "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES[0]}"',
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["/data/one 3", "MDTEST_ITERATIONS"]
+    changed = write_override(checkout, "changed.env", 'TEST_DIRS=(["/data/one"]=2)\n')
+    result = shell(
+        checkout,
+        f"filesystem_env_override_declarations {shlex.quote(str(changed))}",
+    )
+    assert result.returncode == 1
+    assert "sets target setting(s): TEST_DIRS" in result.stderr

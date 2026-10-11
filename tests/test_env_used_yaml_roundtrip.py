@@ -259,22 +259,26 @@ class TestEnvUsedYamlRoundTrip(unittest.TestCase):
         self.assertEqual(metric.configured_file_size, "128M")
 
     def test_kubernetes_snapshot_preserves_runtime_identity_and_mapped_paths(self):
-        """Resume snapshots retain Kubernetes identity, not only env.sh defaults."""
+        """Resume snapshots record the target's namespace and claim Pod paths.
+
+        The namespace is the one the claim-qualified roots resolve to (here
+        named by the keys, not KUBECTL_NAMESPACE); bound PVs live in the
+        attempt identity, so no KUBECTL_PV or KUBECTL_PVC is recorded.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             script = _bash_script_with_repo("""export EXECUTION_SUBSTRATE=kubectl
-export KUBECTL_NAMESPACE=test-ns
-export KUBECTL_PV=test-pv
-export KUBECTL_PVC=test-pvc
+export KUBECTL_NAMESPACE=default-ns
+unset TEST_DIRS
+declare -A TEST_DIRS=(
+  [team-a/lustre-a:bench/primary]=2
+  [team-a/lustre-b:/bench//secondary/]=1
+)
 export KUBECTL_NODE_SELECTOR=storage-test=true
 export KUBECTL_ELBENCHO_IMAGE=example.invalid/elbencho@sha256:abc
 export KUBECTL_IMAGE_PULL_POLICY=Never
 export KUBECTL_RUN_AS_USER=2000
 export KUBECTL_RUN_AS_GROUP=2000
-export KUBECTL_MAPPED_READ_FROM=/mnt/storage-scale-test/bench/input
-declare -A KUBECTL_MAPPED_TEST_DIRS=(
-  [/mnt/storage-scale-test/bench/primary]=2
-  [/mnt/storage-scale-test/bench/secondary]=1
-)
+export KUBECTL_MAPPED_READ_FROM=/mnt/storage-scale-test/lustre-a/bench/input
 export ELBENCHO_SCALE_THREAD_LIST=("1")
 export ELBENCHO_SCALE_IO_SIZES=("4K")
 export ELBENCHO_IODEPTH_LIST=("1")
@@ -293,18 +297,24 @@ export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=0
 """ + f'write_elbencho_env_used "{tmp}/env_used.yaml" dio 0 0 0 0 "" 1\n')
             _run_bash_write(tmp, script)
             loaded = load_env_used_yaml(tmp)
-            self.assertEqual(loaded["KUBECTL_NAMESPACE"], "test-ns")
-            self.assertEqual(loaded["KUBECTL_PV"], "test-pv")
-            self.assertEqual(loaded["KUBECTL_PVC"], "test-pvc")
+            self.assertEqual(loaded["KUBECTL_NAMESPACE"], "team-a")
+            self.assertNotIn("KUBECTL_PV", loaded)
+            self.assertNotIn("KUBECTL_PVC", loaded)
             self.assertEqual(
-                loaded["KUBECTL_MAPPED_TEST_DIRS"][
-                    "/mnt/storage-scale-test/bench/primary"
-                ],
-                2,
+                loaded["KUBECTL_MAPPED_TEST_DIRS"],
+                {
+                    "/mnt/storage-scale-test/lustre-a/bench/primary": 2,
+                    "/mnt/storage-scale-test/lustre-b/bench/secondary": 1,
+                },
+            )
+            self.assertEqual(
+                loaded["STORAGE_TARGET_NAME"],
+                "team-a/lustre-a:bench/primary,team-a/lustre-b:bench/secondary",
             )
             shell_snapshot = (Path(tmp) / "env_used.sh").read_text(encoding="utf-8")
-            self.assertIn("export KUBECTL_NAMESPACE=test-ns", shell_snapshot)
+            self.assertIn("export KUBECTL_NAMESPACE=team-a", shell_snapshot)
             self.assertIn("KUBECTL_MAPPED_TEST_DIRS", shell_snapshot)
+            self.assertNotIn("KUBECTL_PV", shell_snapshot)
 
     def test_mdtest_elbencho_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -362,8 +372,8 @@ export MDTEST_ITERATIONS=3
 """
 _KUBECTL_ENV = """export EXECUTION_SUBSTRATE=kubectl
 export KUBECTL_NAMESPACE=vendor-ns
-export KUBECTL_PV=vendor-pv
-export KUBECTL_PVC=vendor-pvc
+unset TEST_DIRS
+declare -A TEST_DIRS=([vendor-pvc:fs1]=2 ['vendor-pvc:/foo/']=1)
 export KUBECTL_NODE_SELECTOR=storage-test=true
 export KUBECTL_ELBENCHO_IMAGE=example.invalid/elbencho@sha256:abc
 export KUBECTL_IMAGE_PULL_POLICY=Never
@@ -434,17 +444,18 @@ class TestStorageTargetNameSnapshots(unittest.TestCase):
                 self.assertEqual(loaded["STORAGE_TARGET_NAME"], "vendor-a:fs1")
                 self.assertIn(_SH_NAME_PREFIX + "vendor-a:fs1\n", sh_text)
 
-    def test_kubectl_default_is_namespace_slash_claim(self):
+    def test_kubectl_default_is_the_sorted_qualified_roots(self):
+        """The default name is every root as namespace/claim:path, sorted."""
         preamble = _KUBECTL_ENV.replace("slurm", "kubectl")
+        expected = "vendor-ns/vendor-pvc:foo,vendor-ns/vendor-pvc:fs1"
         for label, writer in self.writers:
             with self.subTest(writer=label), tempfile.TemporaryDirectory() as tmp:
                 loaded, sh_text = _write_snapshot(tmp, preamble, writer)
-                self.assertEqual(loaded["STORAGE_TARGET_NAME"], "vendor-ns/vendor-pvc")
-                self.assertIn(_SH_NAME_PREFIX + "vendor-ns/vendor-pvc\n", sh_text)
+                self.assertEqual(loaded["STORAGE_TARGET_NAME"], expected)
+                self.assertEqual(_sourced_name(tmp), expected)
                 self.assertEqual(loaded["KUBECTL_NAMESPACE"], "vendor-ns")
-                self.assertEqual(loaded["KUBECTL_PV"], "vendor-pv")
-                self.assertEqual(loaded["KUBECTL_PVC"], "vendor-pvc")
-                self.assertIn("export KUBECTL_PVC=vendor-pvc\n", sh_text)
+                self.assertNotIn("KUBECTL_PV", loaded)
+                self.assertNotIn("KUBECTL_PVC", sh_text)
 
     def test_mdtest_snapshot_records_order_nodes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -482,6 +493,72 @@ class TestStorageTargetNameSnapshots(unittest.TestCase):
                 load_env_used_yaml(tmp)["STORAGE_TARGET_NAME"], _DERIVED_ROOTS
             )
             self.assertEqual(_sourced_name(tmp), _DERIVED_ROOTS)
+
+
+_TARGET_PROVENANCE = (
+    "STORAGE_SCALE_TEST_TARGET_FILE='/ops/targets/vendor a.env'\n"
+    "STORAGE_SCALE_TEST_TARGET_FILE_SHA256=" + "7" * 64 + "\n"
+    "STORAGE_SCALE_TEST_TARGET_FILE_VARIABLES='STORAGE_TARGET_NAME TEST_DIRS'\n"
+)
+
+
+class TestTargetFileProvenanceSnapshots(unittest.TestCase):
+    """Both writers record the --target file beside the override files."""
+
+    writers = (("io", _IO_WRITE), ("mdtest", _MD_WRITE))
+
+    def test_target_file_is_recorded_in_yaml_and_shell(self):
+        for label, writer in self.writers:
+            with self.subTest(writer=label), tempfile.TemporaryDirectory() as tmp:
+                loaded, sh_text = _write_snapshot(tmp, _TARGET_PROVENANCE, writer)
+                self.assertEqual(
+                    loaded["target_file"],
+                    {
+                        "file": "/ops/targets/vendor a.env",
+                        "sha256": "7" * 64,
+                        "variables": ["STORAGE_TARGET_NAME", "TEST_DIRS"],
+                    },
+                )
+                self.assertIsNone(loaded["env_override"])
+                self.assertIn(
+                    "STORAGE_SCALE_TEST_TARGET_FILE=/ops/targets/vendor\\ a.env\n",
+                    sh_text,
+                )
+                self.assertIn(
+                    "STORAGE_SCALE_TEST_TARGET_FILE_SHA256=" + "7" * 64, sh_text
+                )
+                self.assertIn(
+                    "STORAGE_SCALE_TEST_TARGET_FILE_VARIABLES="
+                    "STORAGE_TARGET_NAME\\ TEST_DIRS\n",
+                    sh_text,
+                )
+
+    def test_no_target_file_records_null_and_empty_scalars(self):
+        for label, writer in self.writers:
+            with self.subTest(writer=label), tempfile.TemporaryDirectory() as tmp:
+                loaded, sh_text = _write_snapshot(tmp, "", writer)
+                self.assertIn("target_file", loaded)
+                self.assertIsNone(loaded["target_file"])
+                for name in ("", "_SHA256", "_VARIABLES"):
+                    self.assertIn(f"STORAGE_SCALE_TEST_TARGET_FILE{name}=''\n", sh_text)
+
+    def test_regenerating_an_old_snapshot_does_not_inherit_a_target_file(self):
+        """A snapshot without provenance never takes the caller's target file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_snapshot(tmp, "", _IO_WRITE)
+            snapshot = Path(tmp) / "env_used.sh"
+            lines = snapshot.read_text(encoding="utf-8").splitlines(keepends=True)
+            snapshot.write_text(
+                "".join(x for x in lines if "STORAGE_SCALE_TEST_TARGET_FILE" not in x),
+                encoding="utf-8",
+            )
+            (Path(tmp) / "executions").mkdir()
+            script = _bash_script_with_repo(
+                "STORAGE_SCALE_TEST_TARGET_FILE=/leaked.env\n"
+                f'update_elbencho_env_used_treefile_cache_usage "{tmp}"\n'
+            )
+            _run_bash_write(tmp, script)
+            self.assertIsNone(load_env_used_yaml(tmp)["target_file"])
 
 
 if __name__ == "__main__":

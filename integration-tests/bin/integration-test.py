@@ -65,6 +65,13 @@ from fixture_capacity import (  # pylint: disable=wrong-import-position
 from fixture_images import (  # pylint: disable=wrong-import-position
     ELBENCHO_FIXTURE,
     ELBENCHO_FIXTURE_IMAGE,
+    kubectl_sequencer_fixture,
+)
+from fixture_storage import (  # pylint: disable=wrong-import-position
+    SAME_NAMESPACE_CLAIM,
+    SBX_SHARED_DIRECTORIES,
+    STORAGE_CLAIM,
+    second_namespace,
 )
 from scenario_planner import (  # pylint: disable=wrong-import-position
     SUBSTRATES,
@@ -1368,7 +1375,7 @@ def _prepare_sbx_shared(runner: Runner, config: Config) -> None:
             _write_text(marker, json.dumps(expected_marker, sort_keys=True) + "\n")
     else:
         _write_text(marker, json.dumps(expected_marker, sort_keys=True) + "\n")
-    for directory in (root / "storage-test", root / "ssh-home"):
+    for directory in (root / name for name in SBX_SHARED_DIRECTORIES):
         if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
             raise ProvisionError(f"refusing unsafe SBX shared child path: {directory}")
         directory.mkdir(exist_ok=True)
@@ -2749,7 +2756,7 @@ def _load_image_into_nodes(
 
 
 def _install_nfs_csi(runner: Runner, config: Config, gateway: str) -> None:
-    """Install NFS CSI and bind the two RWX claims."""
+    """Install NFS CSI and bind the fixture's RWX claims."""
     _prepare_csi_images(runner, config)
     chart = _ensure_nfs_csi_chart(runner, config)
     values = _resource_path("manifests/nfs-csi-values.yaml")
@@ -2773,11 +2780,13 @@ def _install_nfs_csi(runner: Runner, config: Config, gateway: str) -> None:
         timeout=420,
     )
     _ensure_namespace(runner, config)
+    _ensure_namespace(runner, config, second_namespace(config.namespace))
     storage = _render_resource(
         config,
         "manifests/nfs-storage.yaml.tmpl",
         {
             "NAMESPACE": config.namespace,
+            "NAMESPACE_2": second_namespace(config.namespace),
             "NFS_SERVER": gateway,
             "STORAGE_TEST_CAPACITY": STORAGE_TEST_CAPACITY,
             "SSH_HOME_CAPACITY": SSH_HOME_CAPACITY,
@@ -2793,20 +2802,24 @@ def _install_nfs_csi(runner: Runner, config: Config, gateway: str) -> None:
             "--for=jsonpath={.status.phase}=Bound",
             "pvc/storage-test-rwx",
             "pvc/ssh-home-rwx",
+            f"pvc/{SAME_NAMESPACE_CLAIM}",
             "--timeout=180s",
         ),
         timeout=210,
     )
+    _wait_for_second_storage_claim(runner, config, timeout=180)
 
 
 def _install_sbx_shared_storage(runner: Runner, config: Config) -> None:
     """Bind the shared kind-node paths to the fixture's stable RWX claims."""
     _ensure_namespace(runner, config)
+    _ensure_namespace(runner, config, second_namespace(config.namespace))
     storage = _render_resource(
         config,
         "manifests/sbx-storage.yaml.tmpl",
         {
             "NAMESPACE": config.namespace,
+            "NAMESPACE_2": second_namespace(config.namespace),
             "STORAGE_TEST_CAPACITY": STORAGE_TEST_CAPACITY,
             "SSH_HOME_CAPACITY": SSH_HOME_CAPACITY,
         },
@@ -2821,10 +2834,12 @@ def _install_sbx_shared_storage(runner: Runner, config: Config) -> None:
             "--for=jsonpath={.status.phase}=Bound",
             "pvc/storage-test-rwx",
             "pvc/ssh-home-rwx",
+            f"pvc/{SAME_NAMESPACE_CLAIM}",
             "--timeout=60s",
         ),
         timeout=90,
     )
+    _wait_for_second_storage_claim(runner, config, timeout=60)
 
 
 def _ensure_nfs_csi_chart(runner: Runner, config: Config) -> Path:
@@ -2856,13 +2871,32 @@ def _ensure_nfs_csi_chart(runner: Runner, config: Config) -> Path:
     return chart
 
 
-def _ensure_namespace(runner: Runner, config: Config) -> None:
-    """Create the integration namespace when absent."""
-    probe = runner.run(
-        _kubectl(config, "get", "namespace", config.namespace), check=False
+def _wait_for_second_storage_claim(
+    runner: Runner, config: Config, *, timeout: int
+) -> None:
+    """Wait for the second storage target's claim, which multi-target scenarios use."""
+    runner.run(
+        _kubectl(
+            config,
+            "-n",
+            second_namespace(config.namespace),
+            "wait",
+            "--for=jsonpath={.status.phase}=Bound",
+            f"pvc/{STORAGE_CLAIM}",
+            f"--timeout={timeout}s",
+        ),
+        timeout=timeout + 30,
     )
+
+
+def _ensure_namespace(
+    runner: Runner, config: Config, namespace: str | None = None
+) -> None:
+    """Create the integration namespace, or another named one, when absent."""
+    name = namespace or config.namespace
+    probe = runner.run(_kubectl(config, "get", "namespace", name), check=False)
     if probe.returncode:
-        runner.run(_kubectl(config, "create", "namespace", config.namespace))
+        runner.run(_kubectl(config, "create", "namespace", name))
 
 
 def _ensure_ssh_key(runner: Runner, config: Config) -> tuple[Path, Path]:
@@ -3520,6 +3554,17 @@ def _prepare_kubectl_prerequisite_image(runner: Runner, config: Config) -> None:
     _prepare_fixture_node_image(runner, config, ELBENCHO_FIXTURE)
 
 
+def _prepare_kubectl_sequencer_image(
+    runner: Runner, config: Config, backend: str
+) -> None:
+    """Load the profile's pinned kubectl+sh sequencer image onto every node.
+
+    Host Docker acquires and verifies it for both storage profiles, exactly as
+    for the Elbencho image, so kind nodes never pull it from a registry.
+    """
+    _prepare_fixture_node_image(runner, config, kubectl_sequencer_fixture(backend))
+
+
 def _ensure_calico_manifest(runner: Runner, config: Config) -> Path:
     """Return the checksum-verified Calico manifest cached in fixture state."""
     source = config.state_dir / "downloads" / f"calico-{CALICO_VERSION}.yaml"
@@ -4086,6 +4131,7 @@ def _validate_kubectl_prerequisites(
     """Prove the retained fixture can support the planned kubectl substrate."""
     cni_profile = _validate_network_policy_profile(runner, config, backend)
     _prepare_kubectl_prerequisite_image(runner, config)
+    _prepare_kubectl_sequencer_image(runner, config, backend)
     token = secrets.token_hex(16)
     workload_manifest = _render_resource(
         config,
@@ -4716,6 +4762,8 @@ def _write_state_summary(
         "cni_version": CALICO_VERSION if backend == "sbx-shared" else None,
         "cni_image": None if backend == "sbx-shared" else KINDNET_IMAGE,
         "kubectl_probe_image": ELBENCHO_FIXTURE_IMAGE,
+        "kubectl_sequencer_image": kubectl_sequencer_fixture(backend).fixture,
+        "second_storage_namespace": second_namespace(config.namespace),
     }
     _write_text(config.state_dir / "state.json", json.dumps(state, indent=2) + "\n")
 
@@ -5072,7 +5120,7 @@ def _validate_sbx_teardown_ownership(
             )
         if marker.is_file() and document == legacy_marker:
             _write_text(marker, json.dumps(expected_marker, sort_keys=True) + "\n")
-        allowed = {EXPORT_MARKER, "storage-test", "ssh-home"}
+        allowed = {EXPORT_MARKER, *SBX_SHARED_DIRECTORIES}
         unexpected = sorted(
             path.name for path in root.iterdir() if path.name not in allowed
         )

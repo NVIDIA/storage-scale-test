@@ -54,6 +54,24 @@ shared homes, successful SSH and Slurm sweeps); they differ in environmental
 fidelity, not feature coverage. NFS and CSI provisioning themselves are out of
 this repository's test scope.
 
+Both backends also provide a second storage target for multi-target Kubernetes
+scenarios: a namespace named `<namespace>-target-2` holding its own
+`storage-test-rwx` claim. On NFS the StorageClass `subDir`
+(`<namespace>/<claim>`) gives it a distinct directory; on SBX a second static PV
+(`storage-scale-sbx-data-2`) binds it to its own `storage-test-2` directory.
+A third claim, `storage-test-rwx-2`, sits beside the primary one in the primary
+namespace for the aggregate scenario (on SBX it is bound to
+`storage-scale-sbx-data-3` and its own `storage-test-3` directory). Scenario
+roots name their claim (`storage-test-rwx:<root>`, or
+`<namespace>/storage-test-rwx:<root>` for the second namespace), and every Pod
+the product creates mounts each claim at `/mnt/storage-scale-test/<claim>`. The
+harness's own utility Pods mount claims the same way, so a path the product
+recorded is valid there unchanged.
+Teardown removes them with the kind cluster and the backend's data. The
+Kubernetes prerequisite probe stays in the primary namespace only: it checks
+cluster-wide CNI and policy behavior, the namespaces carry no Pod Security
+labels, and every attempt creates its own NetworkPolicies per target namespace.
+
 The default, `--storage-backend auto`, selects `nfs` when the host has the
 loop, mount, systemd, and kernel NFS facilities, and `sbx-shared` only when a
 recognized capability that NFS needs is absent. An explicit backend never falls
@@ -79,10 +97,12 @@ The SBX profile:
   host Docker;
 - installs Docker SBX's proxy CA, when exposed, in the disposable kind nodes;
 - keeps data under `tmp/integration-sbx-shared` (override with
-  `--sbx-shared-root`, which must stay below the repository's `tmp/`). Its two
-  marker-owned, disposable backing directories are deliberately non-sticky
-  `0777`, because SBX can map the host caller and UID 2000 workloads to
-  different owners and both must create and remove scenario data.
+  `--sbx-shared-root`, which must stay below the repository's `tmp/`). Its
+  four marker-owned, disposable backing directories (test data, the second
+  target's data, the primary namespace's second claim's data, and shared homes)
+  are deliberately non-sticky `0777`, because SBX can map the host caller and
+  UID 2000 workloads to different owners and both must create and remove
+  scenario data.
 
 ### NFS headroom and kernel isolation
 
@@ -105,8 +125,10 @@ reboots a shared host.
 
 ## Setup, identities, and state
 
-Setup preloads the pinned upstream Elbencho image under a fixture-private node
-reference and runs a temporary Kubernetes prerequisite probe: one non-root
+Setup preloads the pinned upstream Elbencho image, and the product's default
+sequencer image (`alpine/kubectl` 1.37.0 by index digest, on both profiles; the
+multi-target sequencer's `kubectl` and `sh`), under
+fixture-private node references and runs a temporary Kubernetes prerequisite probe: one non-root
 service Pod per worker, direct Pod-IPv4 access from a coordinator, denial from
 an unrelated Pod, and bidirectional PVC visibility. Elbencho service Pods
 request the workload's `Unconfined` seccomp profile; other probe Pods keep
@@ -158,8 +180,8 @@ Scenarios fall into common cases that run on all three substrates (baseline,
 direct I/O, failure/resume, mdtest sweep, mixed prepared batch, live capture)
 and focused cases for a subset (for example, retained data on SSH and Slurm,
 Slurm scheduling, SSH shared homes, and Kubernetes cancellation, coordinator
-loss, and endpoint drift). Workloads are deliberately small. Assertions check
-execution coordinates, state transitions, workload evidence, dataset totals,
+loss, endpoint drift, and multi-target runs). Workloads are deliberately small.
+Assertions check execution coordinates, state transitions, workload evidence, dataset totals,
 required native flags, scheduling evidence, and semantic report rows and plot
 families, never incidental output or performance values. Structure-only
 direct-I/O scenarios use 256 KiB files because synced direct I/O to the NFS
@@ -178,6 +200,80 @@ Pod networking with an attempt-scoped NetworkPolicy; no host networking, host
 ports, or Service) on its supported kind profile. An external cluster still
 needs its own acceptance run for CNI, Pod-to-Pod policy, storage behavior, and
 credential lifetime.
+
+The Kubernetes multi-target cases pass their targets as `--target` files, never
+as `--env-override` files: what to test comes from `env.sh` or `--target`, and
+how to test from `env.sh` or `--env-override`. Every scenario's `env.sh` names
+roots as `storage-test-rwx:<root>` (the claim, then the path inside it) with
+`KUBECTL_NAMESPACE` set to the primary namespace and `KUBECTL_SEQUENCER_IMAGE`
+set to the preloaded sequencer image's fixture-private digest alias (so
+`validate_env.sh`'s default image check passes under the `Never` pull policy);
+no scenario sets `KUBECTL_PVC`, `KUBECTL_PV`, or `KUBECTL_STORAGE_TARGETS`.
+
+The `kubectl-multi-target` case writes two target files, `a.env`
+(`<namespace-1>/storage-test-rwx:<root>`) and `b.env`
+(`<namespace-2>/storage-test-rwx:<root>`) and prepares a default time-limited IO
+`--batch --target a.env --target b.env` and an `--append`ed mdtest with the same
+two `--target` flags. That gives four groups: IO on `a` then `b`, then mdtest on
+`a` then `b`, each named `<namespace>/storage-test-rwx:<root>`. It runs
+`validate_env.sh --sequencer` once with that environment, the real sequencer
+probe included (`env.sh` names one namespace, so the probe runs there only). It
+then runs `validate_env.sh --sequencer` once more as a temporary ServiceAccount
+that may run Jobs and hold Leases but may not create or delete ServiceAccounts,
+Roles, or RoleBindings, and requires it to fail, naming each missing permission
+and the fallback (the temporary objects are always deleted). After
+`--start` it does not call `--status`, because `--status` itself starts the next
+suspended coordinator Job when the sequencer is lost: it waits with `kubectl`
+for the sequencer Job to be Complete and requires the sequencer Pod's log to
+show each segment (a namespace) starting and completing in order, then all
+segments complete (on failure the error carries the sequencer log and the Job
+and Pod states). Only then does it poll `--status` for `NEXT_ACTION=COLLECT` and
+collect. It asserts each submission's printed `_GROUPS` and
+`GROUP_<gid>_TARGET` keys (and no `_CLAIM` key); each group's recorded
+namespace, target name, target file, and Pod-mapped roots (and no PV or claim);
+the `GROUP_<NNNN>_KIND`, `GROUP_<NNNN>_TARGET`, and `SEGMENT_COUNT`,
+`SEGMENT_<i>_NAMESPACE` (`<i>` counts from 0), and `SEGMENT_<i>_STATE` status
+keys (and no `TARGET_<i>_*` keys); one Lease per claim
+and one coordinator Job per namespace; successful cells with result files; run
+trees on both claims before collection and none after; the report index's Target
+column; and no tool-owned Lease, Job, DaemonSet, NetworkPolicy, Pod,
+ServiceAccount, Role, or RoleBinding left in either namespace. The scenario sets
+`KUBECTL_SEQUENCER_POLL_SECONDS=2` so the sequencer hands off promptly.
+`kubectl-multi-target-unbound` renders `b.env` with a scenario-owned claim that
+can never bind and requires `--start` to fail while leaving no owned object or
+run tree behind.
+
+`kubectl-same-namespace-targets` tests an aggregate target beside a separate
+target, all in the primary namespace and with no sequencer image. `agg.env`
+weights `storage-test-rwx:<root-a>` 2 and `storage-test-rwx-2:<root-b>` 1;
+`single.env` holds `storage-test-rwx-2:<root-c>`. `env.sh` carries the aggregate
+map too, so `validate_env.sh` checks both claims. The case prepares one small 4K
+cell per group with
+`--batch --target agg.env --target single.env --run-to-completion --nodes 1`,
+starts it, and requires one attempt with exactly one plain coordinator Job (no
+init containers) and one worker DaemonSet, each mounting both claims at
+`/mnt/storage-scale-test/<claim>`, and no sequencer Job, ServiceAccount, Role, or
+RoleBinding. With no sequencer to prove, it polls `--status` until
+`NEXT_ACTION=COLLECT` and requires no `SEGMENT_*` keys, since segments are
+reported for several namespaces only. After collection it requires every cell to
+succeed and, from the aggregate group's recorded
+`ELBENCHO_RUN_GENERATED_TEST_DIRS_CSV` (no cluster call), a 2:1 split of generated
+directories between the two claims. It also requires the run tree to have been on
+the control root's claim (the claim of the lexically first root, here
+`storage-test-rwx-2`) and gone after collection, and every generated directory
+and tool-owned object on both claims to be gone.
+
+`mixed-batch` also exercises storage-target provenance on every substrate: its
+appended metadata group passes a `--target` file (an explicit
+`STORAGE_TARGET_NAME` and a distinct `TEST_DIRS` root, claim-qualified on
+Kubernetes) and a workload-only `--env-override` recipe. The test requires each
+submission to print `GROUP_<gid>_TARGET` and the legacy `GROUP_TARGET` (and no
+`_GROUPS` list or `_CLAIM` key), the prepared batch's `--status` to print
+`GROUP_<NNNN>_KIND` and `GROUP_<NNNN>_TARGET` for every group (the other two
+groups carry the derived name), each group's `env_used.yaml` to record its name,
+its `target_file` (path, SHA-256 of the file, and the variables it set; `null`
+for groups without one) and the workload override files in order, and the report
+index's Target column to name each group's target.
 
 Tests run a real deployment archive: the harness snapshots the tracked source
 once, builds it with the zero-argument `utils/build_tarball.sh`, and caches the
