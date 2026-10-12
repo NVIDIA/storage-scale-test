@@ -120,6 +120,20 @@ def test_catalog_defines_every_planned_real_scenario():
     validate_scenario_specs()
 
 
+def test_validate_env_runs_once_per_validated_configuration():
+    """Exactly the pinned steps validate, and every substrate validates its
+    single-root and its two-root worker-directory configurations."""
+    marked = {
+        (spec.name, step.name)
+        for spec in _SCENARIOS.SCENARIO_SPECS
+        for step in spec.steps
+        if step.validate_env
+    }
+    assert marked == _SCENARIOS.VALIDATED_CONFIGURATIONS
+    for name in ("baseline", "default-dio"):
+        assert _scenario(name).substrates >= {"ssh", "slurm", "kubectl"}
+
+
 def test_each_step_is_bounded_and_has_semantic_expectations():
     """Real workloads remain bounded without freezing incidental artifacts."""
     for scenario in _SCENARIOS.SCENARIO_SPECS:

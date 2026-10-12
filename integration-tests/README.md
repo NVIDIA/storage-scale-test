@@ -174,7 +174,9 @@ repeatable. `--list-scenarios` prints each scenario's name, substrates, and
 purpose, and needs no setup state or privileges. Real tests refuse root,
 require the saved non-root identity, validate the live topology, generate
 environments from the packaged `env.sh.template`, and run `validate_env.sh`
-before each sweep.
+once per configuration it treats differently (one root; two worker-directory
+roots; per substrate, the multi-claim, single-big-file, weighted-root,
+shared-home, and allocation-option cases), not before every sweep.
 
 Scenarios fall into common cases that run on all three substrates (baseline,
 direct I/O, failure/resume, mdtest sweep, mixed prepared batch, live capture)
@@ -387,10 +389,12 @@ It runs six concurrent jobs, one per architecture (amd64, arm64) and substrate
 (SSH, Slurm, Kubernetes), each on its own runner and NFS fixture; scenarios
 within a job run one at a time. Three fixtures per architecture cost more
 runner time than one but cut wall time. Each job installs
-`requirements.txt` in an isolated venv, smoke-tests driver startup, runs setup
-twice, stops and restarts the fixture, proves root lifecycle execution is
-rejected, runs `test --substrate <substrate>` as the ordinary runner account,
-and tears down twice. Run the same lifecycle locally with:
+`requirements.txt` in an isolated venv, smoke-tests driver startup, runs setup,
+proves root lifecycle execution is rejected, runs `test --substrate
+<substrate>` as the ordinary runner account, and tears down twice. The fixture
+lifecycle does not depend on the substrate, so only the Slurm jobs (and an
+unsharded `all` run) also repeat setup and stop and restart the fixture before
+testing. Run the same lifecycle locally with:
 
 ```bash
 integration-tests/bin/ci-integration.sh <amd64|arm64> [nfs|sbx-shared] [all|ssh|slurm|kubectl]

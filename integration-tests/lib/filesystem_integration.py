@@ -2781,9 +2781,13 @@ def _validate_step_environment(
 ) -> str:
     """Run the repository's validator for a rendered scenario environment.
 
-    With *sequencer* (Kubernetes only) it also checks the sequencer. Returns
-    the validator's output.
+    Only a step marked ``validate_env`` (one per configuration the validator
+    treats differently) runs it; for any other step this returns "". With
+    *sequencer* (Kubernetes only) it also checks the sequencer. Returns the
+    validator's output.
     """
+    if not step.validate_env:
+        return ""
     if runtime.selector == "kubectl":
         result = _run_kubectl_validate_env(
             runner, runtime, config.kubeconfig, sequencer=sequencer

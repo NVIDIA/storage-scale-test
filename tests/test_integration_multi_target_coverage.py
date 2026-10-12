@@ -681,7 +681,7 @@ def test_step_validation_returns_the_validator_output(tmp_path):
         workspace=str(tmp_path),
         scenario=SimpleNamespace(name="s"),
     )
-    step = SimpleNamespace(name="prepare-io")
+    step = SimpleNamespace(name="prepare-io", validate_env=True)
     output = _FILESYSTEM._validate_step_environment(  # pylint: disable=protected-access
         _ValidateRunner(0, text), _CONFIG, None, runtime, step, tmp_path
     )
@@ -697,6 +697,21 @@ def test_step_validation_returns_the_validator_output(tmp_path):
         _FILESYSTEM._validate_step_environment(  # pylint: disable=protected-access
             _ValidateRunner(1, text), _CONFIG, None, runtime, step, tmp_path
         )
+
+
+def test_an_unmarked_step_skips_validation(tmp_path):
+    """Only a step marked validate_env runs validate_env.sh."""
+    runtime = SimpleNamespace(
+        selector="kubectl", workspace=str(tmp_path), scenario=SimpleNamespace(name="s")
+    )
+    runner = _ValidateRunner(1, "")
+    step = SimpleNamespace(name="resume", validate_env=False)
+    output = _FILESYSTEM._validate_step_environment(  # pylint: disable=protected-access
+        runner, _CONFIG, None, runtime, step, tmp_path, sequencer=True
+    )
+    assert output == ""
+    assert not runner.commands
+    assert not list(tmp_path.iterdir())
 
 
 class _Prepare:

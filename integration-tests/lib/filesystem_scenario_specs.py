@@ -153,6 +153,11 @@ class ScenarioStep:
     failure_injection: FailureInjection = FailureInjection.NONE
     preserve_failure_staging: bool = False
     workload_kind: str = "filesystem"
+    # Run validate_env.sh on this step's environment first. Only one step per
+    # configuration validate_env.sh treats differently does (see
+    # VALIDATED_CONFIGURATIONS); repeating it elsewhere re-checks the same
+    # cluster facts and the workload settings the launchers check anyway.
+    validate_env: bool = False
 
     def render_arguments(self, values: Mapping[str, str]) -> tuple[str, ...]:
         """Render driver-controlled placeholders in command arguments."""
@@ -344,6 +349,7 @@ def _step(
     preserve_failure_staging: bool = False,
     workload_kind: str = "filesystem",
     support_files: tuple[SupportFile, ...] = (),
+    validate_env: bool = False,
 ) -> ScenarioStep:
     """Build a sweep step with bounded defaults."""
     return ScenarioStep(
@@ -362,6 +368,7 @@ def _step(
         failure_injection=failure_injection,
         preserve_failure_staging=preserve_failure_staging,
         workload_kind=workload_kind,
+        validate_env=validate_env,
     )
 
 
@@ -376,6 +383,7 @@ def _baseline() -> FilesystemScenarioSpec:
                 _SHARED_ENV,
                 _coordinates((1, 2), ("4K",), (1,), (1,)),
                 _NORMAL_PHASES,
+                validate_env=True,
             ),
         ),
     )
@@ -449,6 +457,7 @@ def _default_dio() -> FilesystemScenarioSpec:
                 _WORKER_ENV,
                 _coordinates((1, 2), ("4K",), (1,), (1,)),
                 _NORMAL_PHASES,
+                validate_env=True,
             ),
             _step(
                 "explicit-completion-based",
@@ -695,6 +704,7 @@ def _kubectl_multi_target() -> FilesystemScenarioSpec:
         timeout_seconds=600,
         exports=("batch_results_dir",),
         support_files=NAMESPACE_TARGET_FILES,
+        validate_env=True,
     )
     metadata = _step(
         "append-metadata",
@@ -780,6 +790,7 @@ def _kubectl_same_namespace_targets() -> FilesystemScenarioSpec:
         timeout_seconds=600,
         exports=("batch_results_dir",),
         support_files=AGGREGATE_TARGET_FILES,
+        validate_env=True,
     )
     return FilesystemScenarioSpec(
         "kubectl-same-namespace-targets",
@@ -1038,6 +1049,7 @@ def _ssh_single_big_file() -> FilesystemScenarioSpec:
         env_lines,
         _coordinates((1, 2), ("4K",), (1,), (1,)),
         (WorkloadPhase.WRITE, WorkloadPhase.READ, WorkloadPhase.REMOVE_FILES),
+        validate_env=True,
     )
     read_env = _override_env(
         env_lines,
@@ -1110,6 +1122,7 @@ def _ssh_weighted_roots() -> FilesystemScenarioSpec:
                 env_lines,
                 _coordinates((1,), ("4K",), (1,), (1,)),
                 _NORMAL_PHASES,
+                validate_env=True,
             ),
         ),
     )
@@ -1126,6 +1139,7 @@ def _ssh_shared_home() -> FilesystemScenarioSpec:
                 _SHARED_ENV + ("export SSH_HOMEDIR_SHARED=1",),
                 _coordinates((1, 2), ("4K",), (1,), (1,)),
                 _NORMAL_PHASES,
+                validate_env=True,
             ),
         ),
     )
@@ -1156,9 +1170,29 @@ def _slurm_scheduling() -> FilesystemScenarioSpec:
         executions=_coordinates((1,), ("4K",), (1,), (1,)),
         required_phases=_NORMAL_PHASES,
         dataset=DatasetExpectation.CLEANED,
+        validate_env=True,
     )
     return FilesystemScenarioSpec("slurm-scheduling", _SLURM_ONLY, (step,))
 
+
+# The (scenario, step) pairs that run validate_env.sh, one per configuration it
+# treats differently: one root with a shared directory; two roots with worker
+# directories and automatic sizing; then, per substrate, two namespaces with
+# --sequencer and an aggregate over two claims (kubectl), a single big file,
+# weighted roots, and a shared home directory (SSH), and allocation options
+# (Slurm). Tests pin this set.
+VALIDATED_CONFIGURATIONS = frozenset(
+    {
+        ("baseline", "buffered-sweep"),
+        ("default-dio", "direct-worker-directories"),
+        ("kubectl-multi-target", "prepare-io"),
+        ("kubectl-same-namespace-targets", "prepare-io"),
+        ("ssh-single-big-file", "cooperative-readwrite"),
+        ("ssh-weighted-roots", "completion-based-automatic-sizing"),
+        ("ssh-shared-home", "shared-home-smoke"),
+        ("slurm-scheduling", "allocation-options"),
+    }
+)
 
 SCENARIO_SPECS = (
     _baseline(),

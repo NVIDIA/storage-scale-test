@@ -26,6 +26,7 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
 import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -249,8 +250,9 @@ def _run_wrapper(environment, *arguments):
     )
 
 
-def test_substrate_shard_keeps_the_full_lifecycle_and_writes_a_manifest(tmp_path):
-    """A shard runs every lifecycle call and tests only its substrate."""
+def test_substrate_shard_sets_up_once_and_writes_a_manifest(tmp_path):
+    """A non-Slurm shard sets up once (no repeat, stop or start) and tests only
+    its substrate."""
     environment, calls = _fixture(tmp_path)
     planned = subprocess.run(
         [sys.executable, _REPO_ROOT / "integration-tests/lib/shard_manifest.py"]
@@ -268,9 +270,6 @@ def test_substrate_shard_keeps_the_full_lifecycle_and_writes_a_manifest(tmp_path
     assert actions == [
         ["setup"],
         ["setup"],
-        ["stop"],
-        ["start"],
-        ["setup"],
         ["test"],
         ["test", "--substrate", "kubectl"],
         ["teardown"],
@@ -287,14 +286,31 @@ def test_substrate_shard_keeps_the_full_lifecycle_and_writes_a_manifest(tmp_path
     assert manifest["completed"] == planned.split()
     assert [timing["step"] for timing in manifest["timings"]] == [
         "setup-1",
-        "setup-2",
-        "stop",
-        "start",
         "root-setup",
         "root-test",
         "test",
         "teardown-1",
         "teardown-2",
+    ]
+
+
+@pytest.mark.parametrize("substrate", ("slurm", None))
+def test_slurm_and_unsharded_runs_prove_the_full_lifecycle(tmp_path, substrate):
+    """Only Slurm (and all substrates) repeat setup, then stop and start."""
+    environment, calls = _fixture(tmp_path)
+    if substrate is None:
+        result = _run_wrapper(environment)
+    else:
+        result = _run_wrapper(environment, substrate)
+    assert result.returncode == 0, result.stderr
+    actions = [line.split()[:-1] for line in calls.read_text().splitlines()]
+    assert actions[:6] == [
+        ["setup"],
+        ["setup"],
+        ["stop"],
+        ["start"],
+        ["setup"],
+        ["test"],
     ]
 
 
