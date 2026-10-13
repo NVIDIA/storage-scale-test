@@ -177,9 +177,10 @@ trap 'exit 130' INT
 cd -- "$repo_root"
 timed setup-1 driver_action setup
 # The fixture lifecycle (a repeated, idempotent setup, then stop and start)
-# does not depend on the substrate under test, so only the Slurm shard (and an
-# unsharded run) proves it; the other shards set up once and test.
-if [[ "$test_substrate" == slurm || "$test_substrate" == all ]]; then
+# does not depend on the substrate under test, so only the SSH shard (and an
+# unsharded run) proves it; the SSH jobs are the shortest, so they absorb the
+# extra time best. The other shards set up once and test.
+if [[ "$test_substrate" == ssh || "$test_substrate" == all ]]; then
     timed setup-2 driver_action setup
     timed stop driver_action stop
     timed start driver_action start

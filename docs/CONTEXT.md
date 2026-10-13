@@ -222,9 +222,10 @@ Important configuration relationships:
   expanded list before dispatch.
 - `TEST_DIRS` is an associative array of filesystem test roots and weights;
   one map is one storage target. On SSH and Slurm, `validate_env.sh` compares
-  each path's `stat -c %d` device number with `/` through both dispatch
-  interfaces; this establishes distinct backing storage, not that the
-  configured path is itself the exact mountpoint. Kubernetes keys are
+  each path's `stat -c %d` device number with `/` in one probe per transport
+  (an sbatch job and an srun step on Slurm, one session on SSH); this
+  establishes distinct backing storage on that node, not that the configured
+  path is itself the exact mountpoint. Kubernetes keys are
   `[namespace/]claim:path` ([below](#storage-targets-and-claims)).
   Object tests use a dedicated `OBJ_BUCKET`, endpoint settings, and credentials
   sourced from `OBJ_AUTH_FILE`.

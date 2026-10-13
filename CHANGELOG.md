@@ -71,12 +71,9 @@ See [Upgrading from v1.8.0](docs/FILESYSTEM_TESTING.md#upgrading-from-v180).
   snapshots still load.
 - CSV exports gain a `storage_target_name` column; older CSVs still load, but
   older checkouts cannot read the new column.
-- `validate_env.sh` on Kubernetes runs its independent checks concurrently,
-  roughly halving its run time; it prints a short summary unless `--verbose`.
-  A failed Kubernetes check names the node and cause (such as a claim that
-  cannot mount) and saves the full Pod/Job diagnostics under `LOGS_DIR`. The
-  runtime check stops waiting once its Pod cannot start its image or a
-  claim's mount command fails, and polls less often.
+- `validate_env.sh` is faster, especially on busy Slurm clusters, and prints a
+  short summary unless `--verbose`. Errors name the node and the likely cause
+  (such as a filesystem that cannot mount or is not writable).
 
 ## [1.8.0] - 2026-10-09
 

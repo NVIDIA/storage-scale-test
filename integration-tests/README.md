@@ -392,9 +392,10 @@ runner time than one but cut wall time. Each job installs
 `requirements.txt` in an isolated venv, smoke-tests driver startup, runs setup,
 proves root lifecycle execution is rejected, runs `test --substrate
 <substrate>` as the ordinary runner account, and tears down twice. The fixture
-lifecycle does not depend on the substrate, so only the Slurm jobs (and an
-unsharded `all` run) also repeat setup and stop and restart the fixture before
-testing. Run the same lifecycle locally with:
+lifecycle does not depend on the substrate, so only the SSH jobs (the
+shortest, so they absorb the extra time best) and an unsharded `all` run also
+repeat setup and stop and restart the fixture before testing. Run the same
+lifecycle locally with:
 
 ```bash
 integration-tests/bin/ci-integration.sh <amd64|arm64> [nfs|sbx-shared] [all|ssh|slurm|kubectl]

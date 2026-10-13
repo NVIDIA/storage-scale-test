@@ -250,20 +250,21 @@ def _run_wrapper(environment, *arguments):
     )
 
 
-def test_substrate_shard_sets_up_once_and_writes_a_manifest(tmp_path):
-    """A non-Slurm shard sets up once (no repeat, stop or start) and tests only
-    its substrate."""
+@pytest.mark.parametrize("substrate", ("kubectl", "slurm"))
+def test_substrate_shard_sets_up_once_and_writes_a_manifest(tmp_path, substrate):
+    """A shard other than SSH sets up once (no repeat, stop or start) and tests
+    only its substrate."""
     environment, calls = _fixture(tmp_path)
     planned = subprocess.run(
         [sys.executable, _REPO_ROOT / "integration-tests/lib/shard_manifest.py"]
-        + ["plan", "kubectl"],
+        + ["plan", substrate],
         check=True,
         capture_output=True,
         text=True,
     ).stdout
     (tmp_path / "planned").write_text(planned, encoding="utf-8")
 
-    result = _run_wrapper(environment, "kubectl")
+    result = _run_wrapper(environment, substrate)
 
     assert result.returncode == 0, result.stderr
     actions = [line.split()[:-1] for line in calls.read_text().splitlines()]
@@ -271,16 +272,16 @@ def test_substrate_shard_sets_up_once_and_writes_a_manifest(tmp_path):
         ["setup"],
         ["setup"],
         ["test"],
-        ["test", "--substrate", "kubectl"],
+        ["test", "--substrate", substrate],
         ["teardown"],
         ["teardown"],
     ]
     manifest = json.loads(
-        (tmp_path / "manifests" / f"{_architecture()}-kubectl.json").read_text()
+        (tmp_path / "manifests" / f"{_architecture()}-{substrate}.json").read_text()
     )
     assert manifest["architecture"] == _architecture()
     assert manifest["backend"] == "sbx-shared"
-    assert manifest["substrate"] == "kubectl"
+    assert manifest["substrate"] == substrate
     assert manifest["exit_code"] == 0
     assert manifest["planned"] == planned.split()
     assert manifest["completed"] == planned.split()
@@ -294,9 +295,9 @@ def test_substrate_shard_sets_up_once_and_writes_a_manifest(tmp_path):
     ]
 
 
-@pytest.mark.parametrize("substrate", ("slurm", None))
-def test_slurm_and_unsharded_runs_prove_the_full_lifecycle(tmp_path, substrate):
-    """Only Slurm (and all substrates) repeat setup, then stop and start."""
+@pytest.mark.parametrize("substrate", ("ssh", None))
+def test_ssh_and_unsharded_runs_prove_the_full_lifecycle(tmp_path, substrate):
+    """Only SSH (and all substrates) repeat setup, then stop and start."""
     environment, calls = _fixture(tmp_path)
     if substrate is None:
         result = _run_wrapper(environment)

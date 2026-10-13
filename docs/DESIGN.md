@@ -211,11 +211,11 @@ edit-validate loop:
    | Check | Method |
    |-------|--------|
    | Output directories exist | `test -d` |
-   | Slurm connectivity | `sinfo`, `sbatch` a test job, wait for completion |
-   | SSH connectivity | `ssh` command execution + scriptlet execution on each host |
-   | Binary architecture match | `file` on binary vs. `uname -m` on remote |
-   | Filesystem paths use storage distinct from `/` | Compare `stat -c %d` device IDs on compute nodes (via Slurm/SSH) |
-   | Filesystem paths are writable | Touch test on compute nodes |
+   | Slurm connectivity | `sinfo`, then one probe as an `sbatch` job (production options, waited on) and one as an `srun` step (minimal options) |
+   | SSH connectivity | `ssh` command, string-scriptlet and file-scriptlet execution on one host |
+   | Binary architecture match | `file` on binary vs. the probe's `uname -m` (srun's on Slurm, one SSH session's otherwise) |
+   | Filesystem paths use storage distinct from `/` | The same probe compares `stat -c %d` device IDs for every root on one node per probe |
+   | Filesystem paths are writable | `test -w` in the same probe |
    | Kubernetes prerequisites | Claim-qualified `TEST_DIRS` keys; API access and Lease permission in the namespace of `env.sh`'s `TEST_DIRS`; per-claim identity (Bound, RWX, Filesystem volume mode; bound PV recorded); Ready nodes matching `KUBECTL_NODE_SELECTOR`; one short-lived Job that mounts all of its claims and checks the image, UID/GID, required tools, and read/write per root; sequencer version, RBAC, and image pull as warnings, and with `--sequencer` the full probe as errors (one namespace needs none of them) |
    | Existing toolset Kubernetes objects | Read-only listing of objects labeled `app.kubernetes.io/name=storage-scale-test`; informational (may warn), never fails validation |
    | S3 credentials and bucket access | `s3test` binary |

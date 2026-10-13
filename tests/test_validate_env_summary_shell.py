@@ -44,6 +44,7 @@ _SSH_FAKES = textwrap.dedent("""\
     spawn_N_ssh() {
         local dir="$1" scriptlet="$3"
         shift 3
+        echo ssh >> "${CALLS_LOG:-/dev/null}"
         if [[ -z "$scriptlet" ]]; then
             bash -c "$1" > "$dir/stdout" 2>&1
         elif [[ "$scriptlet" == @* ]]; then
@@ -133,6 +134,8 @@ def _install_commands(bindir: Path) -> None:
         bindir / "sbatch",
         textwrap.dedent("""\
             #!/bin/bash
+            echo sbatch >> "${CALLS_LOG:-/dev/null}"
+            [[ -z "${FAKE_SBATCH_FAIL:-}" ]] || exit 1
             while [[ "${1:-}" == -* ]]; do shift; done
             script="$1"
             shift
@@ -140,7 +143,10 @@ def _install_commands(bindir: Path) -> None:
             echo "Submitted batch job 7"
             """),
     )
-    _write_executable(bindir / "srun", '#!/bin/sh\nshift\nexec "$@"\n')
+    _write_executable(
+        bindir / "srun",
+        '#!/bin/sh\necho srun >> "${CALLS_LOG:-/dev/null}"\nshift\nexec "$@"\n',
+    )
 
 
 def _deployment(tmp_path: Path, env_text: str) -> Path:
@@ -256,6 +262,56 @@ def test_slurm_success_prints_only_a_short_summary(tmp_path):
         "Object storage: bucket bkt reachable and empty: OK",
         _SUCCESS,
     ]
+
+
+def _slurm_roots_env(tmp_path: Path, count: int) -> str:
+    binary = _write_executable(tmp_path / "elbencho", "#!/bin/sh\n")
+    roots = []
+    for index in range(count):
+        root = tmp_path / "mnt" / f"root {index}"
+        root.mkdir(parents=True)
+        roots.append(f"[{str(root)!r}]=1")
+    return (
+        f"{_SLURM_FAKES}FS_ENABLED=1\nELBENCHO={str(binary)!r}\n"
+        f"declare -A TEST_DIRS=({' '.join(roots)})\n"
+    )
+
+
+@pytest.mark.skipif(
+    platform.system() == "Darwin", reason="macOS may launch only SSH or kubectl"
+)
+@pytest.mark.parametrize("count", (1, 2, 5))
+def test_slurm_uses_one_sbatch_and_one_srun_for_any_number_of_roots(tmp_path, count):
+    """The probe checks the echo, the architecture and every root per allocation."""
+    deployment = _deployment(tmp_path, _slurm_roots_env(tmp_path, count))
+    calls = tmp_path / "calls.log"
+    result = _run(tmp_path, deployment, CALLS_LOG=str(calls))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert calls.read_text(encoding="utf-8").splitlines() == ["sbatch", "srun"]
+    assert result.stdout.splitlines()[-2].startswith("Filesystem roots (")
+
+
+@pytest.mark.skipif(
+    platform.system() == "Darwin", reason="macOS may launch only SSH or kubectl"
+)
+def test_a_failed_sbatch_probe_runs_no_srun(tmp_path):
+    """sbatch failing still stops the Slurm checks before srun."""
+    deployment = _deployment(tmp_path, _slurm_roots_env(tmp_path, 1))
+    calls = tmp_path / "calls.log"
+    result = _run(tmp_path, deployment, CALLS_LOG=str(calls), FAKE_SBATCH_FAIL="1")
+    assert result.returncode == 1
+    assert "Failed to execute sbatch test" in result.stdout
+    assert calls.read_text(encoding="utf-8").splitlines() == ["sbatch"]
+
+
+def test_ssh_uses_one_session_for_the_architecture_and_every_root(tmp_path):
+    """Three transport self-tests, then one probe session for arch and roots."""
+    calls = tmp_path / "calls.log"
+    result = _run(
+        tmp_path, _deployment(tmp_path, _ssh_env(tmp_path)), CALLS_LOG=str(calls)
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert calls.read_text(encoding="utf-8").splitlines() == ["ssh"] * 4
 
 
 def test_a_skipped_check_is_not_a_summary_line(tmp_path):

@@ -966,12 +966,22 @@ check_arch_and_binaries() {
     # host and the target compute host are the same architecture.  So here, we have to
     # probe the architecture of one compute node.
 
-    if [ -n "$SLURM_ENABLED" ]; then
-        # For slurm, we can use the Slurm node architecture.
-        remote_arch=$(check_srun_with "uname -m")
+    # The probes (validate_probe_scriptlet) already reported each node's
+    # architecture: srun's on Slurm (as before), one SSH session's otherwise.
+    local probe_label=srun
+    if [[ "${slurm_rc:-1}" -eq 0 ]]; then
+        remote_arch=$PROBE_srun_ARCH
+        if [[ -n "$PROBE_sbatch_ARCH" && "$PROBE_sbatch_ARCH" != "$remote_arch" ]]; then
+            register_warning "sbatch and srun nodes report different architectures (${PROBE_sbatch_ARCH} and ${remote_arch:-none})"
+        fi
     else
-        # For SSH, we need to probe the architecture of one compute node.
-        remote_arch=$(check_ssh_with "uname -m")
+        probe_label=ssh
+        run_ssh_validation_probe
+        remote_arch=$PROBE_ssh_ARCH
+    fi
+    if [[ -z "$remote_arch" ]]; then
+        register_error "${probe_label}: the validation probe reported no architecture"
+        return
     fi
 
     if [[ "$remote_arch" != "${client_arch:?}" ]]; then
@@ -1046,6 +1056,151 @@ check_arch_and_binaries() {
     done
 }
 
+# The roots the probes check: every nonempty TEST_DIRS key when filesystem
+# tests are enabled (not on kubectl), in C-locale order. Results come back by
+# 1-based index into this list, never by path.
+validate_probe_roots() {
+    VALIDATE_PROBE_ROOTS=()
+    [[ -n "${FS_ENABLED:-}" && -z "${KUBECTL_ENABLED:-}" ]] || return 0
+    local root
+    for root in "${!TEST_DIRS[@]}"; do
+        [[ -z "$root" ]] || VALIDATE_PROBE_ROOTS+=("$root")
+    done
+    [[ ${#VALIDATE_PROBE_ROOTS[@]} -eq 0 ]] \
+        || mapfile -t VALIDATE_PROBE_ROOTS < <(printf '%s\n' "${VALIDATE_PROBE_ROOTS[@]}" | LC_ALL=C sort)
+}
+
+# The probe: one POSIX sh scriptlet run once per transport (an sbatch job with
+# the production options, an srun step with the minimal ones, or one SSH
+# session) instead of one allocation or session per check. Arguments: $1 is
+# the protocol version (1), $2... the roots. Every result line starts with
+# "VE1<TAB>", so the parser ignores prolog and module noise; a root's result
+# is keyed by its index. Each remote file operation is bounded by `timeout 30`
+# where available, so a hung mount marks that root "timeout". It always ends
+# with an "end" line and exits 0.
+validate_probe_scriptlet() {
+    cat <<'EOF'
+emit() { printf 'VE1'; for field in "$@"; do printf '\t%s' "$field"; done; printf '\n'; }
+if command -v timeout >/dev/null 2>&1; then
+    bounded() { timeout 30 "$@"; }
+else
+    bounded() { "$@"; }
+fi
+probe_root() {
+    bounded test -d "$1"; rc=$?
+    [ "$rc" -ne 124 ] || { echo timeout; return; }
+    [ "$rc" -eq 0 ] || { echo notdir; return; }
+    device=$(bounded stat -c %d -- "$1"); rc=$?
+    [ "$rc" -ne 124 ] || { echo timeout; return; }
+    [ "$rc" -eq 0 ] && [ -n "$root_device" ] || { echo statfail; return; }
+    [ "$device" != "$root_device" ] || { echo samedev; return; }
+    bounded test -w "$1"; rc=$?
+    [ "$rc" -ne 124 ] || { echo timeout; return; }
+    [ "$rc" -eq 0 ] || { echo nowrite; return; }
+    echo ok
+}
+emit begin "$(hostname -s 2>/dev/null || hostname)"
+emit echo ABCDEF
+emit arch "$(uname -m)"
+shift
+root_device=$(bounded stat -c %d -- /) || root_device=
+index=0
+for dir in "$@"; do
+    index=$((index + 1))
+    emit fs "$index" "$(probe_root "$dir")"
+done
+emit end 0
+exit 0
+EOF
+}
+
+# parse_validate_probe LABEL TEXT: set PROBE_<LABEL>_{HOST,ECHO,ARCH,END} and
+# the array PROBE_<LABEL>_FS (indexed from 1) from a probe's output. Lines
+# without the VE1 prefix are ignored; the first value of each field wins.
+parse_validate_probe() {
+    local label="$1" prefix tag first second _
+    declare -g "PROBE_${label}_HOST=" "PROBE_${label}_ECHO=" \
+        "PROBE_${label}_ARCH=" "PROBE_${label}_END="
+    declare -ga "PROBE_${label}_FS=()"
+    local -n probe_host="PROBE_${label}_HOST" probe_echo="PROBE_${label}_ECHO"
+    local -n probe_arch="PROBE_${label}_ARCH" probe_end="PROBE_${label}_END"
+    local -n probe_fs="PROBE_${label}_FS"
+    while IFS=$'\t' read -r prefix tag first second _; do
+        [[ "$prefix" == VE1 ]] || continue
+        case "$tag" in
+            begin) [[ -n "$probe_host" ]] || probe_host=$first ;;
+            echo) [[ -n "$probe_echo" ]] || probe_echo=$first ;;
+            arch) [[ -n "$probe_arch" ]] || probe_arch=$first ;;
+            end) probe_end=1 ;;
+            fs)
+                [[ "$first" =~ ^[1-9][0-9]*$ && -z "${probe_fs[first]:-}" ]] \
+                    && probe_fs[first]=$second
+                ;;
+        esac
+    done <<< "$2"
+}
+
+# _validate_probe_missing_roots LABEL: the roots the probe gave no result for.
+_validate_probe_missing_roots() {
+    # shellcheck disable=SC2178  # A nameref to the array, not a string.
+    local -n probe_fs="PROBE_${1}_FS"
+    local index missing=()
+    for index in "${!VALIDATE_PROBE_ROOTS[@]}"; do
+        [[ -n "${probe_fs[index + 1]:-}" ]] || missing+=("${VALIDATE_PROBE_ROOTS[index]}")
+    done
+    _validate_join_list ${missing[@]+"${missing[@]}"}
+}
+
+# _validate_probe_complete LABEL: register an error when the probe's output
+# has no end marker (its job or step ended early), naming the roots it never
+# reported; return 1 then.
+_validate_probe_complete() {
+    local -n probe_end="PROBE_${1}_END"
+    [[ -z "$probe_end" ]] || return 0
+    local missing
+    missing=$(_validate_probe_missing_roots "$1")
+    register_error "${1}: probe output incomplete (no end marker)${missing:+; results missing for roots: $missing}"
+    return 1
+}
+
+# check_fs_probe_result LABEL ROOT: register the error, if any, for ROOT's
+# result in the LABEL probe. A root with no result was reported as missing by
+# _validate_probe_complete.
+check_fs_probe_result() {
+    local label="$1" root="$2" index status host
+    local -n probe_fs="PROBE_${label}_FS" probe_host="PROBE_${label}_HOST"
+    for index in "${!VALIDATE_PROBE_ROOTS[@]}"; do
+        [[ "${VALIDATE_PROBE_ROOTS[index]}" != "$root" ]] || break
+    done
+    [[ "${VALIDATE_PROBE_ROOTS[index]:-}" == "$root" ]] || return 0
+    status=${probe_fs[index + 1]:-}
+    host=${probe_host:-unknown}
+    case "$status" in
+        ok|'') ;;
+        samedev) register_error "${label}: ${root} is not on a filesystem distinct from / on compute node ${host}" ;;
+        notdir) register_error "${label}: ${root} is not on a filesystem distinct from / on compute node ${host} (it is not a directory)" ;;
+        statfail) register_error "${label}: ${root} is not on a filesystem distinct from / on compute node ${host} (stat failed)" ;;
+        nowrite) register_error "${label}: ${root} is not writable on compute node ${host}" ;;
+        timeout) register_error "${label}: ${root} did not respond within 30 s on compute node ${host}" ;;
+        *) register_error "${label}: ${root}: unexpected probe result '${status}' on compute node ${host}" ;;
+    esac
+}
+
+# Run the probe once over SSH (one session on one host): the architecture and
+# every root. The SSH transport self-tests (check_ssh) stay separate.
+run_ssh_validation_probe() {
+    [[ -z "${_VALIDATE_SSH_PROBE_DONE:-}" ]] || return "$_VALIDATE_SSH_PROBE_RC"
+    _VALIDATE_SSH_PROBE_DONE=1
+    local output
+    output=$(check_ssh_with "$(validate_probe_scriptlet)" 1 ${VALIDATE_PROBE_ROOTS[@]+"${VALIDATE_PROBE_ROOTS[@]}"})
+    _VALIDATE_SSH_PROBE_RC=$?
+    parse_validate_probe ssh "$output"
+    if [[ "$_VALIDATE_SSH_PROBE_RC" -eq 0 ]]; then
+        _validate_probe_complete ssh || _VALIDATE_SSH_PROBE_RC=1
+    fi
+    return "$_VALIDATE_SSH_PROBE_RC"
+}
+
 check_sbatch_with() {
     local scriptlet="$1"
     shift
@@ -1081,6 +1236,13 @@ check_sbatch_with() {
             if grep -q "ExitCode=0:0" <(scontrol show job "$job_id"); then
                 return_val=0
             fi
+            # The poll ends at COMPLETING too, before the output may be
+            # complete; wait briefly for the probe's end marker.
+            local _
+            for _ in 1 2 3 4 5; do
+                ! grep -q $'^VE1\tend' "slurm-${job_id}.out" 2>/dev/null || break
+                sleep 1
+            done
             cat "slurm-${job_id}.out"
             rm -f "slurm-${job_id}.out"
         fi
@@ -1375,22 +1537,31 @@ EOF
         return 1
     fi
 
-    # First just basic check that sbatch runs.
-    sbatch_output=$(check_sbatch_with "echo ABCDEF")
+    # Two allocations in all: one probe (validate_probe_scriptlet) as an
+    # sbatch job with the production options, one as an srun step with the
+    # minimal options. Each reports the architecture and every root, which
+    # check_arch_and_binaries and check_fs_slurm then read.
+    local scriptlet
+    scriptlet=$(validate_probe_scriptlet)
+    sbatch_output=$(check_sbatch_with "$scriptlet" 1 ${VALIDATE_PROBE_ROOTS[@]+"${VALIDATE_PROBE_ROOTS[@]}"})
     sbatch_rc=$?
-    if [ "$sbatch_rc" != "0" ] || ! echo "$sbatch_output" | grep -q "ABCDEF"; then
+    parse_validate_probe sbatch "$sbatch_output"
+    if [ "$sbatch_rc" != "0" ] || [[ "$PROBE_sbatch_ECHO" != ABCDEF ]]; then
         register_error "sbatch: failed (rc=$sbatch_rc): $sbatch_output"
         # None of the rest of the checks will be useful, so exit here
         return 1
     fi
+    _validate_probe_complete sbatch || true
 
-    srun_output=$(check_srun_with "echo ABCDEF")
+    srun_output=$(check_srun_with "$scriptlet" _ 1 ${VALIDATE_PROBE_ROOTS[@]+"${VALIDATE_PROBE_ROOTS[@]}"})
     srun_rc=$?
-    if [ "$srun_rc" != "0" ] || ! echo "$srun_output" | grep -q "ABCDEF"; then
+    parse_validate_probe srun "$srun_output"
+    if [ "$srun_rc" != "0" ] || [[ "$PROBE_srun_ECHO" != ABCDEF ]]; then
         register_error "srun: failed (rc=$srun_rc): $srun_output"
         # None of the rest of the checks will be useful, so exit here
         return 1
     fi
+    _validate_probe_complete srun || true
 
     return 0
 }
@@ -1399,25 +1570,13 @@ check_fs() {
     local slurm_rc="$1"  # 0 if we can run slurm
     local fs_path="$2"   # filesystem path to test
 
-    # This scriptlet verifies that the test path is a directory on a different
-    # filesystem device than /. It does not prove that the path itself is the
-    # exact mountpoint. It is used for both Slurm and SSH-based testing.
-    local scriptlet
-    scriptlet=$(cat << 'EOF'
-TEST_DIR="$1"
-fs_device_failure() { echo "failed_$(hostname -s)"; exit 1; }
-test -d "$TEST_DIR" || fs_device_failure
-test_dir_device=$(stat -c %d -- "$TEST_DIR") || fs_device_failure
-root_device=$(stat -c %d -- "/") || fs_device_failure
-[ "$test_dir_device" != "$root_device" ] || fs_device_failure
-test -w "$TEST_DIR" || (echo "nowrite_$(hostname -s)" && exit 1)
-EOF
-)
-
+    # The probes (validate_probe_scriptlet) checked that the path is a
+    # directory on a different filesystem device than / and is writable. That
+    # does not prove the path itself is the exact mountpoint.
     if [[ "$slurm_rc" == "0" ]]; then
-        check_fs_slurm "$fs_path" "$scriptlet"
+        check_fs_slurm "$fs_path"
     elif [[ -n "${SSH_ENABLED:-}" ]]; then
-        check_fs_ssh "$fs_path" "$scriptlet"
+        check_fs_ssh "$fs_path"
     else
         register_warning "$(cat <<EOF
 Filesystem check skipped for:
@@ -1432,53 +1591,19 @@ EOF
 
 check_fs_ssh() {
     local fs_path="$1"   # filesystem path to test
-    local scriptlet="$2" # scriptlet to test
-
-    ssh_output=$(check_ssh_with "$scriptlet" "$fs_path")
-    ssh_rc=$?
-    if [[ "$ssh_output" =~ failed_([[:alnum:]_-]+) ]]; then
-        nodename="${BASH_REMATCH[1]}"
-        register_error "ssh: ${fs_path} is not on a filesystem distinct from / on compute node ${nodename}"
-    elif [[ "$ssh_output" =~ nowrite_([[:alnum:]_-]+) ]]; then
-        nodename="${BASH_REMATCH[1]}"
-        register_error "ssh: ${fs_path} is not writable on compute node ${nodename}"
-    elif [[ $ssh_rc != 0 ]]; then
-        register_error "ssh: $fs_path is not on a filesystem distinct from / on some node"
-        register_error "ssh: output: $ssh_output"
+    if ! run_ssh_validation_probe && [[ -z "$PROBE_ssh_END" ]]; then
+        # The session failed before reporting; check_ssh_with said why.
+        register_error "ssh: ${fs_path} was not checked: the validation probe failed"
+        return
     fi
-
-    local fs_path_quoted
-    printf -v fs_path_quoted '%q' "$fs_path"
-    # shellcheck disable=SC2016
-    local fs_check_cmd='TEST_DIR='"$fs_path_quoted"'; test -d "$TEST_DIR" && test_dir_device=$(stat -c %d -- "$TEST_DIR") && root_device=$(stat -c %d -- /) && [ "$test_dir_device" != "$root_device" ] || echo "failed_$(hostname -s)"'
-    ssh_output=$(check_ssh_with "" "$fs_check_cmd")
-
-    # Check for filesystem-device failure regardless of ssh exit status
-    if [[ "$ssh_output" =~ failed_([[:alnum:]_-]+) ]]; then
-        nodename="${BASH_REMATCH[1]}"
-        register_error "ssh: ${fs_path} is not on a filesystem distinct from / on compute node ${nodename}"
-    fi
+    check_fs_probe_result ssh "$fs_path"
 }
 
+# The sbatch and srun probes in check_slurm already checked every root.
 check_fs_slurm() {
     local fs_path="$1"   # filesystem path to test
-    local scriptlet="$2" # scriptlet to test
-
-    sbatch_output=$(check_sbatch_with "$scriptlet" "$fs_path")
-    sbatch_rc=$?
-    if [[ $sbatch_rc != 0 ]]; then
-        register_error "sbatch: $fs_path is not on a filesystem distinct from / on some node"
-        register_error "sbatch: output: $sbatch_output"
-    fi
-
-    # shellcheck disable=SC2016
-    srun_output=$(check_srun_with 'TEST_DIR="$1"; h=$(hostname -s); test -d "$TEST_DIR" && test_dir_device=$(stat -c %d -- "$TEST_DIR") && root_device=$(stat -c %d -- /) && [ "$test_dir_device" != "$root_device" ] || echo "failed_${h}"' _ "$fs_path")
-
-    # Check for filesystem-device failure regardless of srun exit status
-    if [[ "$srun_output" =~ failed_([[:alnum:]_-]+) ]]; then
-        nodename="${BASH_REMATCH[1]}"
-        register_error "srun: ${fs_path} is not on a filesystem distinct from / on compute node ${nodename}"
-    fi
+    check_fs_probe_result sbatch "$fs_path"
+    check_fs_probe_result srun "$fs_path"
 }
 
 check_obj() {
@@ -1611,6 +1736,10 @@ _validate_summarize_if_clean() {
     register_summary "$2"
 }
 
+# Filled by validate_probe_roots and parse_validate_probe.
+VALIDATE_PROBE_ROOTS=()
+PROBE_sbatch_ECHO="" PROBE_sbatch_ARCH="" PROBE_srun_ECHO="" PROBE_srun_ARCH=""
+PROBE_ssh_ARCH="" PROBE_ssh_END=""
 check_dirs
 launcher_prerequisites_rc=0
 check_macos_launcher_prerequisites || launcher_prerequisites_rc=$?
@@ -1628,6 +1757,7 @@ if [[ -n "${KUBECTL_ENABLED:-}" ]]; then
 elif [ -n "$SLURM_ENABLED" ]; then
     if [[ "$launcher_prerequisites_rc" -eq 0 ]]; then
         errors_before=$(_validate_record_count "$ERROR_FILE")
+        validate_probe_roots
         check_slurm
         slurm_rc=$?
         [[ "$slurm_rc" -ne 0 ]] || _validate_summarize_if_clean "$errors_before" \
@@ -1640,6 +1770,7 @@ else
 fi
 
 if [ -n "$SSH_ENABLED" ]; then
+    validate_probe_roots
     if [[ "$launcher_prerequisites_rc" -eq 0 ]]; then
         errors_before=$(_validate_record_count "$ERROR_FILE")
         check_ssh
