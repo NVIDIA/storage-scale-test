@@ -70,7 +70,9 @@ grep of the score. Report any failure you cannot fix.
 ```
 
 After changing `.github/`, parse every `.yml`/`.yaml` beneath it with a YAML
-parser.
+parser. After changing shell traps or signals, also run pytest as non-root
+under CI's bash 5.2 (e.g. an `ubuntu:24.04` container); trap semantics differ
+across bash versions.
 
 Install any missing check tool into the repo's local environment and rerun;
 never skip required tooling.
