@@ -429,7 +429,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             script = f"""
             source "{_ENV_FUNCTIONS}"
             RECORD={record!s}
-            trap 'printf "owner\\n" >> "$RECORD"' EXIT
+            trap 'printf "owner %s\\n" "$?" >> "$RECORD"' EXIT
             scancel() {{ printf 'cancel\\n' >> "$RECORD"; }}
             squeue() {{ return 0; }}
             _slurm_arm_dispatch_cleanup 4242
@@ -437,9 +437,10 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             """
             result = _run_bash(textwrap.dedent(script))
             self.assertEqual(result.returncode, 9, result.stderr)
+            # Bash < 5.1 skips EXIT traps in subshells forked from an EXIT trap.
             self.assertEqual(
                 record.read_text(encoding="utf-8").splitlines(),
-                ["cancel", "owner"],
+                ["cancel", "owner 9"],
             )
 
     def test_reified_execution_records_stable_test_dirs(self) -> None:
@@ -1448,6 +1449,8 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 export ELBENCHO_SWEEP_READ_FROM=
                 EOF
                 printf 'RUNNING\\n' > "$status_file"
+                OWNER={str(Path(tmp) / "owner")!r}
+                trap 'printf "%s\\n" "$?" > "$OWNER"' EXIT
                 _ssh_finalize_remote_generated_shared_failure() {{
                     printf cleanup > {str(Path(tmp) / "cleanup")!r}
                 }}
@@ -1458,9 +1461,11 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 result = _run_bash(textwrap.dedent(script))
                 status = (Path(tmp) / "0001.status").read_text(encoding="utf-8")
                 cleanup_exists = (Path(tmp) / "cleanup").is_file()
+                owner = (Path(tmp) / "owner").read_text(encoding="utf-8")
             self.assertEqual(result.returncode, expected_rc, result.stderr)
             self.assertEqual(status, "FAILED\n")
             self.assertTrue(cleanup_exists)
+            self.assertEqual(owner, f"{expected_rc}\n")
 
     def test_ssh_shared_success_disarms_without_finalization(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

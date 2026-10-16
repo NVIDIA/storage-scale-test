@@ -29,7 +29,7 @@ fi
 readonly KUBECTL_SWEEP_RESERVED_ROOT=.storage-scale-test
 # Identity schema 4: one segment per namespace, each with the claims its
 # Pods mount (one Lease per claim). Attempts written by storage-scale-test
-# v1.x (schemas 2 and 3) are not loaded: collect them with v1.x first.
+# v1.x (schemas 2 and 3) are not loaded: collect them with a v1.x checkout.
 readonly KUBECTL_ATTEMPT_SCHEMA_VERSION=4
 readonly KUBECTL_MAX_SEGMENTS=16
 readonly KUBECTL_MAX_CLAIMS=32
@@ -313,6 +313,32 @@ kubectl_map_read_from_path() {
         return 1
     fi
     printf '%s/%s/%s\n' "$KUBECTL_SWEEP_MOUNT_ROOT" "$read_claim" "$read_relative"
+}
+
+# kubectl_read_from_logical_path VALUE OUT: set OUT to VALUE, or, when VALUE is
+# a Pod path KUBECTL_SWEEP_MOUNT_ROOT/CLAIM[/PATH] (as --write-only prints it),
+# to NAMESPACE/CLAIM:PATH, where NAMESPACE is that of the TEST_DIRS roots on
+# CLAIM. A claim no root (or roots in several namespaces) uses is an error.
+kubectl_read_from_logical_path() {
+    local value="$1" output="$2" rest claim key namespace key_claim path
+    local -A namespaces=()
+    [[ "$output" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    printf -v "$output" '%s' "$value"
+    [[ "$value" == "$KUBECTL_SWEEP_MOUNT_ROOT/"* ]] || return 0
+    rest="${value#"$KUBECTL_SWEEP_MOUNT_ROOT/"}"
+    claim="${rest%%/*}"
+    for key in "${!TEST_DIRS[@]}"; do
+        kubectl_split_test_dir_key "$key" namespace key_claim path || return 1
+        [[ "$key_claim" != "$claim" ]] || namespaces["$namespace"]=1
+    done
+    if [[ ${#namespaces[@]} -ne 1 ]]; then
+        printf 'Error: --read-from %s is not on a claim of this submission'\''s TEST_DIRS; pass it as [namespace/]claim:path\n' \
+            "$value" >&2
+        return 1
+    fi
+    path=""
+    [[ "$rest" != */* ]] || path="${rest#*/}"
+    printf -v "$output" '%s/%s:%s' "${!namespaces[@]}" "$claim" "$path"
 }
 
 kubectl_validate_dns_subdomain() {
@@ -911,13 +937,14 @@ kubectl_attempt_write_state() {
 }
 
 # An identity written by storage-scale-test v1.x (schema 2 or 3) belongs to an
-# attempt that only v1.x can still inspect, cancel or collect.
+# attempt that only v1.x can still inspect, cancel or collect. The loaders
+# return 2 for it so lifecycle callers can skip their generic diagnostics.
 _kubectl_reject_v1_identity() {
     local identity_file="$1" schema
     schema=$(sed -n 's/^KUBECTL_ATTEMPT_SCHEMA=\([0-9]*\)$/\1/p' "$identity_file" \
         2>/dev/null) || schema=""
     [[ "$schema" == 2 || "$schema" == 3 ]] || return 1
-    printf 'Error: Kubernetes attempt %s was started by storage-scale-test v1.x (attempt identity schema %s), which this version does not inspect, cancel, collect or resume. Collect this attempt with storage-scale-test v1.x (for example v1.8.0) before upgrading.\n' \
+    printf 'Error: Kubernetes attempt %s was started by storage-scale-test v1.x (attempt identity schema %s), which this version does not inspect, cancel, collect or resume. Collect this attempt with a separate storage-scale-test v1.x checkout (for example v1.8.0).\n' \
         "${identity_file%/identity.sh}" "$schema" >&2
 }
 
@@ -931,7 +958,7 @@ kubectl_attempt_load_identity() {
     [[ -f "$identity_file" && ! -L "$identity_file" \
         && -f "$yaml_file" && ! -L "$yaml_file" ]] || return 1
     if _kubectl_reject_v1_identity "$identity_file"; then
-        return 1
+        return 2
     fi
     unset KUBECTL_ATTEMPT_SCHEMA KUBECTL_ATTEMPT_ID KUBECTL_OWNERSHIP_NONCE
     unset KUBECTL_NAMESPACE_UID KUBECTL_PV KUBECTL_PV_UID
@@ -1420,7 +1447,7 @@ _kubectl_resource_key_segment() {
 kubectl_attempt_load_metadata() {
     local metadata_dir="$1"
     local state_file="$metadata_dir/state.sh"
-    kubectl_attempt_load_identity "$metadata_dir" || return 1
+    kubectl_attempt_load_identity "$metadata_dir" || return
     [[ -f "$state_file" && ! -L "$state_file" ]] || return 1
     unset KUBECTL_LIFECYCLE_STATE
     # The state sidecar has no identity fields. Preserve the already loaded
@@ -1454,6 +1481,16 @@ kubectl_emit_state() {
     printf 'STATE=%s\n' "$state"
 }
 
+# A failed submission collects nothing: a batch resumes (retrying it), and a
+# plain run needs its cause fixed and a new submission.
+_kubectl_emit_submission_failed() {
+    local operation="$1" results_dir="$2" next=INSPECT
+    kubectl_emit_state SUBMISSION_FAILED
+    [[ "$operation" == status ]] || return 0
+    [[ ! -f "$results_dir/batch-manifest.tsv" ]] || next=RESUME
+    printf 'NEXT_ACTION=%s\n' "$next"
+}
+
 # Presentation only: durable lifecycle states and collection gates are unchanged.
 kubectl_emit_status_view() {
     local results="$1" attempt="$2" outcome="$3" source="$4" collection="$5"
@@ -1470,11 +1507,6 @@ kubectl_emit_status_view() {
     display="$outcome" next=WAIT
     case "$outcome" in
         PREPARED|SUBMITTED) display=PREPARING ;;
-        RUNNING)
-            if (( running == 0 )); then
-                display=BETWEEN_EXECUTIONS
-                (( pending > 0 )) || display=AWAITING_COMPLETION
-            fi ;;
         SUCCESS|FAILED|CANCELLED)
             next=COLLECT
             if [[ "$collection" == COMPLETE ]]; then
@@ -3458,7 +3490,8 @@ kubectl_validate_runtime_configuration() {
     if [[ "${KUBECTL_IMAGE_PULL_POLICY:-}" == Always \
             && -n "${KUBECTL_ELBENCHO_IMAGE:-}" \
             && ! "$KUBECTL_ELBENCHO_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]]; then
-        echo "Error: KUBECTL_IMAGE_PULL_POLICY=Always requires a digest-qualified KUBECTL_ELBENCHO_IMAGE" >&2
+        printf 'Error: KUBECTL_IMAGE_PULL_POLICY=Always requires a digest-qualified KUBECTL_ELBENCHO_IMAGE (name@sha256:<digest>); current: %s\n' \
+            "$KUBECTL_ELBENCHO_IMAGE" >&2
         rc=1
     fi
     kubectl_validate_sequencer_configuration 1 || rc=1
@@ -6782,7 +6815,7 @@ _kubectl_load_saved_attempt() {
     _kubectl_validate_local_directory_path "$kubernetes_dir" || return 1
     loaded_attempt_id=$(kubectl_attempt_current_id "$kubernetes_dir") || return 1
     metadata_dir="$kubernetes_dir/attempts/$loaded_attempt_id"
-    kubectl_attempt_load_metadata "$metadata_dir" || return 1
+    kubectl_attempt_load_metadata "$metadata_dir" || return
     [[ -f "$metadata_dir/configuration.sh" && ! -L "$metadata_dir/configuration.sh" ]] || return 1
     unset KUBECTL_SEGMENT_CONTROL_ROOTS
     # shellcheck disable=SC1090,SC1091  # Trusted, result-directory-local immutable metadata.
@@ -8330,14 +8363,45 @@ _kubectl_collect_multi_segment_teardown() {
     return "$rc"
 }
 
+# Report why a results directory has no loadable attempt. Load status 2 means
+# the v1.x rejection has already explained it.
+_kubectl_no_current_attempt_error() {
+    local results_dir="$1" load_rc="$2" actions="$3"
+    [[ "$load_rc" -ne 2 ]] || return 0
+    echo "Error: result directory has no valid current Kubernetes attempt: $results_dir" >&2
+    echo "A submission that failed before publishing attempt identity cannot be $actions." >&2
+}
+
+# Reject a missing directory or one without Kubernetes state before taking the
+# lifecycle lock, which would otherwise create kubernetes/ inside it.
+_kubectl_require_lifecycle_results_dir() {
+    local operation="$1" results_dir="$2" substrate
+    if [[ ! -d "$results_dir" ]]; then
+        echo "Error: results directory not found: $results_dir" >&2
+        return 1
+    fi
+    [[ ! -d "$results_dir/kubernetes" ]] || return 0
+    substrate=$(sed -n 's/^export EXECUTION_SUBSTRATE=//p' "$results_dir/env_used.sh" \
+        2>/dev/null | tail -n 1)
+    case "$substrate" in
+        ssh|slurm)
+            echo "Error: --$operation applies to Kubernetes sweeps and prepared batches; $results_dir is an EXECUTION_SUBSTRATE=$substrate sweep (use --resume to continue it)" >&2
+            ;;
+        *) _kubectl_no_current_attempt_error "$results_dir" 1 "inspected, collected, or cancelled" ;;
+    esac
+    return 1
+}
+
 kubectl_lifecycle_operation() {
     local operation="$1" results_dir="$2" kubernetes_dir attempt_id lock_fd inspector inspector_uid remote_state rc=0
-    [[ "$operation" =~ ^(status|cancel|collect)$ && -d "$results_dir" ]] || return 1
+    [[ "$operation" =~ ^(status|cancel|collect)$ ]] || return 1
+    _kubectl_require_lifecycle_results_dir "$operation" "$results_dir" || return 1
     kubernetes_dir="$results_dir/kubernetes"
     kubectl_local_lock_acquire "$kubernetes_dir" lock_fd || return 1
-    if ! _kubectl_load_saved_attempt "$results_dir" attempt_id; then
-        echo "Error: result directory has no valid current Kubernetes attempt: $results_dir" >&2
-        echo "A submission that failed before publishing attempt identity cannot be inspected, collected, or cancelled." >&2
+    _kubectl_load_saved_attempt "$results_dir" attempt_id || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        _kubectl_no_current_attempt_error "$results_dir" "$rc" \
+            "inspected, collected, or cancelled"
         rc=1
     fi
     [[ "$rc" -ne 0 ]] || kubectl_cleanup_ephemeral_helpers "$kubernetes_dir" "$lock_fd" \
@@ -8432,11 +8496,11 @@ kubectl_lifecycle_operation() {
         kubectl_recover_prepared_attempt "$kubernetes_dir" "$lock_fd" \
             "$attempt_id" || rc=1
         if [[ "$rc" -eq 0 ]]; then
-            kubectl_emit_state SUBMISSION_FAILED
+            _kubectl_emit_submission_failed "$operation" "$results_dir"
             [[ "$operation" != collect ]] || rc=1
         fi
     elif [[ "$rc" -eq 0 && "$KUBECTL_LIFECYCLE_STATE" == SUBMISSION_FAILED ]]; then
-        kubectl_emit_state SUBMISSION_FAILED
+        _kubectl_emit_submission_failed "$operation" "$results_dir"
         [[ "$operation" != collect ]] || rc=1
     elif [[ "$rc" -eq 0 && "$operation" == status \
             && "$KUBECTL_LIFECYCLE_STATE" == CANCEL_REQUESTED ]]; then
@@ -8454,7 +8518,7 @@ kubectl_lifecycle_operation() {
             cancel_namespace="$KUBECTL_RESOURCE_NAMESPACE"
             cancel_uid="$KUBECTL_RESOURCE_UID"
         else
-            kubectl_emit_state CANCEL_REQUESTED
+            printf 'STATE=CANCEL_REQUESTED\nNEXT_ACTION=INSPECT\n'
             KUBECTL_ATTEMPT_ID="$attempt_id" \
                 KUBECTL_DIAGNOSTIC_LOCAL_STATE_PATH="$kubernetes_dir/attempts/$attempt_id/state.sh" \
                 KUBECTL_DIAGNOSTIC_REMOTE_STATE_PATH="$(kubectl_attempt_remote_root "$attempt_id")/state/run.status" \
@@ -8465,7 +8529,7 @@ kubectl_lifecycle_operation() {
             rc=1
         fi
         if [[ "$rc" -eq 0 ]]; then
-            kubectl_emit_state CANCEL_REQUESTED
+            printf 'STATE=CANCEL_REQUESTED\nNEXT_ACTION=INSPECT\n'
             if [[ "${KUBECTL_SEGMENT_COUNT:-1}" -gt 1 ]]; then
                 printf 'SEGMENT_CURRENT=%s\nSEGMENT_%s_NAMESPACE=%s\n' "$cancel_target" \
                     "$cancel_target" "${KUBECTL_SEGMENT_NAMESPACES[cancel_target]}"
@@ -9568,9 +9632,9 @@ kubectl_resume_collected_sweep() {
     local kubernetes_dir="$results_dir/kubernetes"
     kubectl_local_lock_acquire "$kubernetes_dir" lock_fd || return 1
     local rc=0
-    if ! _kubectl_load_saved_attempt "$results_dir" attempt_id; then
-        echo "Error: result directory has no valid current Kubernetes attempt: $results_dir" >&2
-        echo "A submission that failed before publishing attempt identity cannot be resumed." >&2
+    _kubectl_load_saved_attempt "$results_dir" attempt_id || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        _kubectl_no_current_attempt_error "$results_dir" "$rc" resumed
         rc=1
     fi
     [[ "$rc" -ne 0 ]] || kubectl_attempt_load_metadata "$kubernetes_dir/attempts/$attempt_id" || rc=1

@@ -29,10 +29,9 @@ def snapshot_fixture():
         "EXECUTION_SUBSTRATE": "kubectl",
         "ORDER_NODES": "0",
         "KUBECTL_NAMESPACE": "dgxc-system",
-        "KUBECTL_PVC": "grtmk04-local-pvc",
         "KUBECTL_NODE_SELECTOR": "nodeGroup=customer-cpu",
         "KUBECTL_ELBENCHO_IMAGE": "docker.io/breuner/elbencho:v3.1-11",
-        "TEST_DIRS": {"scale-test": 1},
+        "TEST_DIRS": {"grtmk04-local-pvc:scale-test": 1},
         "nodes_spec": "1",
         "dio_or_bio": "dio",
         "rand_option": 0,
@@ -82,10 +81,12 @@ def test_representative_summary_is_six_readable_lines_with_units(snapshot):
         "Lifecycle",
         "Setting files",
     ]
-    assert 'name="dgxc-system/grtmk04-local-pvc" (derived); roots=' in lines[1]
+    assert (
+        'name="dgxc-system/grtmk04-local-pvc:scale-test" (derived); roots=' in lines[1]
+    )
     for value in ("kubectl", "dgxc-system", "grtmk04-local-pvc", "scale-test", "1G"):
         assert value in summary
-    assert "nodeGroup=customer-cpu" in summary
+    assert 'selector="' in summary  # shortened to fit the line
     for unit_value in ("50 GB/s", "40 Gbps", "10000 IOPS", "60 s"):
         assert unit_value in summary
     assert (
@@ -217,6 +218,7 @@ def test_non_kubernetes_runner_does_not_display_inherited_pod_settings(
     snapshot, substrate
 ):
     snapshot["EXECUTION_SUBSTRATE"] = substrate
+    snapshot["TEST_DIRS"] = {"/mnt/fs/scale-test": 1}
     summary = format_io_snapshot_summary(snapshot)
     assert substrate in summary
     for inherited in ("dgxc-system", "grtmk04-local-pvc", "docker.io/breuner/elbencho"):
@@ -261,7 +263,8 @@ def test_shared_layout_count_weighted_targets_and_compound_sizes_are_unambiguous
     targets = summary.splitlines()[1]
     assert len(targets) <= 132
     # The name and both path lists cannot fit one line: lists shrink, then clip.
-    assert "/data/one" in targets and "/data/two" not in targets
+    assert '"/data/one" (weight=1)' in targets
+    assert '"/data/two" (weight=3)' not in targets
     assert "(+1 more)" in targets and targets.endswith(ELLIPSIS)
     assert "weight=1" in targets
 
@@ -359,7 +362,7 @@ def test_a_long_target_file_name_is_shortened_and_the_row_stays_on_one_line(
         ({"STORAGE_TARGET_NAME": "lustre-a"}, 'name="lustre-a"; roots='),
         (
             {"STORAGE_TARGET_NAME": ""},
-            'name="dgxc-system/grtmk04-local-pvc" (derived); ',
+            'name="dgxc-system/grtmk04-local-pvc:scale-test" (derived); ',
         ),
         (
             {"EXECUTION_SUBSTRATE": "ssh", "TEST_DIRS": {"/mnt/b/": 1, "/mnt/a": 1}},

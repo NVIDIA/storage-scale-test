@@ -86,7 +86,7 @@ _kubectl_claims_replacement() {
         if [[ "$key" != *:* ]]; then
             path="$key"
             while [[ "$path" == /* ]]; do path="${path#/}"; done
-            new_key="$claim:${path:-data}"
+            new_key="$claim:${path:-<path>}"
         fi
         line+="${sep}[$(_kubectl_claims_quote "$new_key")]=${TEST_DIRS[$key]}"
         sep=" "
@@ -152,7 +152,7 @@ kubectl_validate_test_dirs() {
     done
     _kubectl_check_attempt_claim_count TEST_DIRS "${#claims[@]}" || rc=1
     if (( ${#namespaces[@]} > 1 )); then
-        printf 'Error: TEST_DIRS roots span Kubernetes namespaces (%s), but the roots of one target must share a namespace: a Pod mounts claims of its own namespace only. Test each namespace as its own target: put its roots in a target file and pass each file with --target.\n' \
+        printf 'Error: TEST_DIRS roots span Kubernetes namespaces (%s), but the roots of one target must share a namespace: a Pod mounts claims of its own namespace only. Test each namespace as its own target: put its roots in a target file and pass each file to --batch with --target.\n' \
             "$(printf '%s\n' "${!namespaces[@]}" | LC_ALL=C sort | paste -sd, -)" >&2
         rc=1
     fi

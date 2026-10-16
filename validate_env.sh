@@ -19,8 +19,8 @@
 set -u
 
 if (( BASH_VERSINFO[0] < 4 \
-        || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
-    printf 'Bash 4.3 or newer is required; on macOS run: brew install bash\n' >&2
+        || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+    printf 'Bash 4.4 or newer is required; on macOS run: brew install bash\n' >&2
     exit 1
 fi
 
@@ -235,6 +235,10 @@ _validate_record_count() {
 init_error_tracking
 
 # Source env.sh, capturing any output
+if [[ ! -f "${SCALE_TEST_BASE}/env.sh" ]]; then
+    echo "Error: env.sh not found; copy env.sh.template to env.sh and edit it" >&2
+    exit 1
+fi
 if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
         "${SCALE_TEST_BASE}/env.sh" 2>&1); then
     printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
@@ -463,12 +467,13 @@ _kubectl_sequencer_permission_problem() {
 
 # Fill the array named by $1 with one line per sequencer prerequisite that
 # NAMESPACE ($2) lacks: the server version and, in every namespace of a batch
-# spanning namespaces, permission to create and delete the sequencer's
-# ServiceAccount (first namespace), Roles and RoleBindings, and to create,
-# unsuspend and delete the coordinator Jobs. The checks are independent API
-# reads, so each runs concurrently in a background subshell that writes its
-# problem line (if any) to a numbered file; the files are read in the fixed
-# order of the checks, so the result never depends on completion order.
+# spanning namespaces, permission to create, get (ownership read-back) and
+# delete the sequencer's ServiceAccount (first namespace), Roles and
+# RoleBindings, and to create, unsuspend and delete the coordinator Jobs.
+# The checks are independent API reads, so each runs concurrently in a
+# background subshell that writes its problem line (if any) to a numbered
+# file; the files are read in the fixed order of the checks, so the result
+# never depends on completion order.
 _kubectl_sequencer_prerequisite_problems() {
     local -n found_problems="$1"
     local namespace="$2" answers_dir permission index=0 pid
@@ -480,10 +485,13 @@ _kubectl_sequencer_prerequisite_problems() {
     fi
     _kubectl_sequencer_version_problem > "$answers_dir/0" &
     pids+=("$!")
-    for permission in "create serviceaccounts" "delete serviceaccounts" \
+    for permission in "create serviceaccounts" "get serviceaccounts" \
+            "delete serviceaccounts" \
             "create roles.rbac.authorization.k8s.io" \
+            "get roles.rbac.authorization.k8s.io" \
             "delete roles.rbac.authorization.k8s.io" \
             "create rolebindings.rbac.authorization.k8s.io" \
+            "get rolebindings.rbac.authorization.k8s.io" \
             "delete rolebindings.rbac.authorization.k8s.io" \
             "patch jobs.batch" "create jobs.batch" "delete jobs.batch"; do
         index=$((index + 1))
@@ -822,8 +830,8 @@ _check_kubectl_sequencer_branch() {
     check_kubectl_sequencer_prerequisites "$2"
 }
 
-# Branch B of the concurrent checks: the inventory, the worker nodes, then the
-# runtime validation Job, which needs the nodes to be valid.
+# Branch B of the concurrent checks: the worker nodes, then the runtime
+# validation Job, which needs the nodes to be valid.
 _check_kubectl_cluster_branch() {
     local namespace="$2"
     _kubectl_validate_branch_setup "$1"

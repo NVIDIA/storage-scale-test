@@ -33,22 +33,18 @@ Kubernetes users should also read the
 
 SSH and Slurm require an elbencho binary for each client architecture under
 `utils/` and filesystems mounted at the same paths on every client. Kubernetes
-uses the configured image and claim-qualified test roots instead; see
-[Kubernetes setup](#kubernetes-setup). For SSH or Slurm, configure weighted
-roots:
+uses an elbencho image (default `docker.io/breuner/elbencho:v3.2-1`) and
+claim-qualified test roots instead; see [Kubernetes setup](#kubernetes-setup).
+For SSH or Slurm, configure one test root:
 
 ```bash
-declare -A TEST_DIRS=(
-    ["/mnt/fs1/scaletest"]=4
-    ["/mnt/fs2/scaletest"]=1
-)
+declare -A TEST_DIRS=(["/mnt/fs1/scaletest"]=1)
 ```
 
-Weights distribute load between unequal roots of one target; to measure
-filesystems separately, see
-[testing several filesystems](#testing-several-filesystems). Tune `FS_MAX_AGG_THROUGHPUT`,
-`FS_MAX_NODE_THROUGHPUT_GBPS`, and `FS_MAX_NODE_IOPS` when using multiple
-roots because they determine generated file counts and bounded write time.
+To spread load across several roots or compare filesystems, see
+[testing several filesystems](#testing-several-filesystems). Tune
+`FS_MAX_AGG_THROUGHPUT`, `FS_MAX_NODE_THROUGHPUT_GBPS`, and `FS_MAX_NODE_IOPS`
+for your filesystem; they determine generated file counts.
 
 ## First IO sweep
 
@@ -178,9 +174,11 @@ prints commands to query, cancel, and collect it:
 The metadata launcher offers the same lifecycle commands. The Job runs without
 your credentials, but lifecycle commands need current `kubectl` access.
 
-- `--status` exits 0 whenever the query succeeds, whatever the benchmark
-  outcome.
-- `--cancel "$RUN"` stops an active attempt; collect it afterward.
+- `--status` exits 0 whatever the benchmark outcome.
+- `--cancel "$RUN"` stops an active attempt; collect it afterward. On
+  `STATE=CANCEL_REQUESTED`, retry `--cancel`.
+- On `STATE=SUBMISSION_FAILED` (rolled back), fix the cause, then `--resume`
+  a batch or submit a plain run again.
 - `--collect` is required after every terminal attempt: it copies results and
   diagnostics locally and cleans up. For a failed or cancelled attempt it
   publishes partial results, then exits nonzero.
@@ -214,21 +212,24 @@ directory, so use only a trusted, unmodified result directory.
 Use `--write-only`, `--read-from`, and `--delete-only` to create a dataset once,
 run repeated read sweeps, and remove it without rewriting it for each read.
 
-1. Configure one value in each sweep dimension and run `--write-only`. Each
-   successful cell retains a unique target and prints its
-   `ELBENCHO_WRITE_ONLY_DATA_DIR`.
-2. Run `--read-from <path> --nodes <spec>` as needed. A many-file read caches
-   its scan in `<path>/.storage-scale-test-elbencho-treefile.txt`; remove that
-   file after changing the dataset.
-3. Run `--delete-only <path>` (SSH and Slurm only). The path must be a strict
-   descendant of the one `TEST_DIRS` root, from `env.sh` or one `--target FILE`.
+1. Configure one value in each sweep dimension (each cell retains its own
+   dataset) and run `--write-only`. Each successful cell prints its directory,
+   `ELBENCHO_WRITE_ONLY_DATA_DIR=<root>/elbencho-sweep-target-1-<DS>-e<NNNN>`;
+   on Kubernetes this is a Pod path below `/mnt/storage-scale-test/<claim>/`.
+2. Run `--read-from <dir> --nodes <spec>` with that printed value, as often as
+   needed; for a [single shared file](#single-shared-file), append the file
+   name (`elbencho-bigfile` by default). On Kubernetes,
+   `[namespace/]claim:path` also works. A many-file read caches its scan in
+   `<dir>/.storage-scale-test-elbencho-treefile.txt`; remove that file after
+   changing the dataset.
+3. Run `--delete-only <dir>` (SSH and Slurm only). The path must be below the
+   one `TEST_DIRS` root, from `env.sh` or one `--target FILE`. On Kubernetes,
+   delete the dataset from a Pod that mounts the claim.
 
-To build a mixed-size tree, move retained targets below one common directory
-under the configured test root, read that parent, then delete it once.
-In Kubernetes, pass `--read-from` as `[namespace/]claim:path` below its
-`TEST_DIRS` key (the namespace may be left out when it is
-`KUBECTL_NAMESPACE`), and do not read the canonical test root itself or a
-directory containing its reserved `.storage-scale-test` control subtree.
+To build a mixed-size tree, move retained directories below one common
+directory under the test root, read that parent, then delete it once. Do not
+read a test root itself or a directory containing its `.storage-scale-test`
+control directory.
 
 ## Shared-directory checkpoint files
 
@@ -361,23 +362,23 @@ remaining work. Initial start acquires capacity for the entire batch's maximum
 node requirement. `--batch` creates a new directory and takes no directory
 argument; only `--append` adds work to an existing draft.
 
-`--status` prints `KEY=value` lines. Wait for `NEXT_ACTION=COLLECT` before
-collecting; `STATE=UNKNOWN` is not success.
+`--status` prints `KEY=value` lines; on Kubernetes, wait for
+`NEXT_ACTION=COLLECT` before collecting.
 
 | Key | Meaning |
 | --- | --- |
 | `BATCH` | `DRAFT` until first start, then `SEALED` |
 | `ATTEMPT` | Kubernetes only: current attempt ID |
-| `STATE` | `BETWEEN_EXECUTIONS`: work pending, no cell running; `AWAITING_COMPLETION`: no cells left, outcome not yet committed; `UNKNOWN`: executor ownership unknown |
+| `STATE` | For people (`RUNNING`, `SUCCESS`, `FAILED`, ...; `UNKNOWN` is not success); scripts act on `NEXT_ACTION` |
 | `EXECUTION_SCOPE` | `BATCH`: full SSH/Slurm or draft ledger; `CURRENT_ATTEMPT`: current Kubernetes attempt, excluding cells completed before resume |
 | `PROGRESS_SOURCE` | Ledger read: `LOCAL` or `PVC` |
 | `EXECUTIONS_{TOTAL,PENDING,RUNNING,SUCCEEDED,FAILED}` | Cell counts within that scope |
 | `RESULT_COLLECTION` | `PENDING` (results remote), `CLEANUP_PENDING` (published, cleanup needed), `COMPLETE`; SSH/Slurm: `NOT_REQUIRED` |
 | `NEXT_ACTION` | `START`, `WAIT`, `COLLECT`, `RESUME`, `INSPECT`, or `NONE` |
-| `SEGMENT_COUNT` | Kubernetes, [several namespaces](#several-kubernetes-namespaces) only; one segment per namespace in the batch: the number of segments in this attempt. After a resume it can be smaller, because a namespace with nothing left to run is left out |
-| `SEGMENT_CURRENT` | Several namespaces only: the index `i` (from 0, in run order) of the namespace running now, or of the last one that ran. While a cancel is incomplete, the one being cancelled |
+| `SEGMENT_COUNT` | Kubernetes, [several namespaces](#appendix-one-batch-across-several-kubernetes-namespaces) only: namespaces in this attempt (a resume leaves out finished ones) |
+| `SEGMENT_CURRENT` | Several namespaces only: index `i` (from 0, in run order) of the running or last-run namespace |
 | `SEGMENT_<i>_NAMESPACE` | Several namespaces only: that namespace's name |
-| `SEGMENT_<i>_STATE` | Several namespaces only: `SUCCESS`, `FAILED`, `CANCELLED`, `RUNNING`, `PENDING` (prepared, its Job not yet started), or `NOT_STARTED` (waiting, or never run because an earlier one failed or was cancelled) |
+| `SEGMENT_<i>_STATE` | Several namespaces only: `SUCCESS`, `FAILED`, `CANCELLED`, `RUNNING`, `PENDING` (Job not yet started), or `NOT_STARTED` |
 | `GROUP_<NNNN>_KIND` | Batches only, one pair per committed group: `io` or `mdtest` |
 | `GROUP_<NNNN>_TARGET` | Batches only: the group's recorded storage target name, shell-quoted (`unknown` when none) |
 
@@ -389,13 +390,10 @@ collecting; `STATE=UNKNOWN` is not success.
 | `STORAGE_SCALE_TEST_BATCH_GROUP` | The new group's ID (the first new group's when there are several) |
 | `STORAGE_SCALE_TEST_BATCH_GROUPS` | Several new groups only (one per `--target`): every new group ID, comma-separated, in command-line order |
 | `STORAGE_SCALE_TEST_BATCH_GROUP_<gid>_TARGET` | Every new group: its storage target name, shell-quoted |
-| `STORAGE_SCALE_TEST_BATCH_GROUP_TARGET` | Legacy; only for a single-group submission (same value as its `_<gid>_TARGET`) |
 | `STORAGE_SCALE_TEST_BATCH_EXECUTIONS` | The new execution IDs, `<first>-<last>`, across every new group |
 
-The keys are printed once the groups are committed. If the refresh of the
-batch's combined environment fails after that, a warning goes to stderr and the
-command still exits 0 with all keys printed; do not repeat the `--append`.
-`--status` or `--start` repairs the batch.
+If these keys are printed, the groups were added, even if a warning follows;
+do not repeat the `--append`.
 
 Groups may differ in target, IO mode, sizes, durations, and metadata layout; to
 compare filesystems in one batch, see
@@ -403,9 +401,9 @@ compare filesystems in one batch, see
 about how the batch connects and allocates is frozen for the whole batch, and
 `--append` names mismatched fields: substrate, executable identity,
 architecture, ordering, host pool, and connection/allocation settings (on
-Kubernetes, `KUBECTL_NAMESPACE` (the default namespace), the worker settings,
-and the sequencer image, frozen as resolved at preparation). The claims and namespaces in each target's keys
-may still differ. Start and resume use saved settings, not the current
+Kubernetes, `KUBECTL_NAMESPACE`, `KUBECTL_NODE_SELECTOR`, the images, pull
+policy, and UID/GID). The claims and namespaces in each target's keys may
+still differ. Start and resume use saved settings, not the current
 `env.sh`; Kubernetes credentials remain the current client's. The durable
 control directory is chosen from the group test roots (on Kubernetes, the
 lexically first root of each namespace across its groups).
@@ -440,11 +438,12 @@ test -n "$BATCH"
 "$IO" --start "$BATCH"
 ```
 
-The flag may repeat. The first file builds on `env.sh`; each later file builds on
-the one before, so a later `ELBENCHO_SCALE_THREAD_LIST+=(4)` extends a list an
-earlier file set, and a later assignment to the same scalar wins. Each group's list is independent of
-the others. Giving the same file twice, even through a symlink or a different
-spelling of its path, is an error: it would repeat every relative edit.
+The flag may repeat. The first file builds on `env.sh`; each later file builds
+on the one before, so a later `ELBENCHO_SCALE_THREAD_LIST+=(4)` extends a list
+an earlier file set, and a later assignment to the same scalar wins. Each
+group's list is independent of the others. Giving the same file twice, even
+through a symlink or a different spelling of its path, is an error: it would
+repeat every relative edit.
 
 Each file is trusted Bash, sourced after `env.sh` in an isolated shell. It sees
 the exported environment and the current values of the allowed settings, so
@@ -474,34 +473,20 @@ wrong type is also an error. Either fails before a results directory is created
 or a group is appended. New lowercase variables, such as loop counters, are
 discarded.
 
-Each submission prints one line per file,
-`Env override: <path> (sha256 <hash>): <changed variables | no settings changed>`;
-with more than one file the prefix is `Env override <i>/<N>:`. The snapshots
-record the same, in application order. In `env_used.sh`, the arrays
-`STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILES,SHA256S,FILE_VARIABLES}` hold one entry
-per file (each `FILE_VARIABLES` entry is a space-separated list of names), and
-the scalars `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}` keep their
-single-file meaning: the last file applied, its hash, and the sorted union of
-changed names. In `env_used.yaml`, `env_override` is `null` without an override;
-otherwise `file`, `sha256`, and `variables` describe the last file and the
-union, and `files` lists `{file, sha256, variables}` for every file in order.
-Older snapshots with only the scalars read as a one-file list. Batch groups
-record the operator's paths, not the staged copies, and the snapshot summary
-shows the file basenames in order (`(+K more)` when the row would overflow),
-beside the [target file](#target-files). `--start`, `--resume`, `--status`,
-`--cancel`, `--collect`, and `--delete-only` reject the flag; lifecycle commands
-use the saved values, so later edits to the files have no effect.
+Each run records the override files it used (path and SHA-256) in its saved
+settings (`env_used.yaml`), and each submission prints them with the variables
+they changed. `--start`, `--resume`, `--status`, `--cancel`, `--collect`, and
+`--delete-only` reject the flag; lifecycle commands use the saved values, so
+later edits to the files have no effect.
 
 ## Testing several filesystems
 
 **What to test comes from `env.sh` or `--target`; how to test comes from
 `env.sh` or `--env-override`.**
 
-Terms: **root**: one `TEST_DIRS` key. **Target**: one `TEST_DIRS` map, the
-filesystems one group measures. **Target file**: sets one target; passed with
-`--target`. **Group**: one target's work in a batch. **Claim**: a Kubernetes
-PersistentVolumeClaim. **Cell**: one node count x thread count x IO size x IO
-depth combination. **Workload**: the settings from `env.sh` or `--env-override`.
+Terms: a **root** is one `TEST_DIRS` key; a **target** is one `TEST_DIRS` map;
+a **target file** sets one target and is passed with `--target`; a **group** is
+one target's work in a batch.
 
 | You want to | Configure | You get |
 |---|---|---|
@@ -556,19 +541,22 @@ IO=./storage-tests/fs/nv-elbencho-sweep.sh
 # Set BATCH to the printed STORAGE_SCALE_TEST_BATCH_RESULTS path.
 "$IO" --start "$BATCH"
 # Kubernetes only: repeat until it prints NEXT_ACTION=COLLECT, then collect.
-"$IO" --status "$BATCH"
-"$IO" --collect "$BATCH"
+# "$IO" --status "$BATCH"
+# "$IO" --collect "$BATCH"
 ./utils/extract-filesystem.py "$BATCH"
 ```
 
-You get:
+The `--batch` command prints, among its keys:
 
 ```text
-group 0001  target vendor-a  workload rand-4k
-group 0002  target vendor-b  workload rand-4k
-reports/groups/0001/report.txt, reports/groups/0002/report.txt,
-reports/index.md (with a Target column), and reports.txt
+STORAGE_SCALE_TEST_BATCH_GROUPS=0001,0002
+STORAGE_SCALE_TEST_BATCH_GROUP_0001_TARGET=vendor-a
+STORAGE_SCALE_TEST_BATCH_GROUP_0002_TARGET=vendor-b
 ```
+
+The report step writes `reports/groups/0001/report.txt` and
+`reports/groups/0002/report.txt`, `reports/index.md` (with a Target column),
+and the combined `reports.txt`, all under `$BATCH`.
 
 ### Rules
 
@@ -582,8 +570,9 @@ reports/index.md (with a Target column), and reports.txt
   roots, never `env.sh`.
 - Override files apply to every target in the submission. For a different
   workload per target, `--append` another submission.
-- Each target gets its own reports; the extractors refuse to mix targets
-  unless given `--allow-mixed-targets`.
+- Report the batch as usual with `./utils/extract-filesystem.py <batch-dir>`;
+  each target gets its own report (see
+  [Reporting per target](#reporting-per-target)).
 - Several `--target` flags need `--batch` or `--append`. Groups run one at a
   time in the order added (on Kubernetes,
   [grouped by namespace](#several-kubernetes-namespaces)), and a failure stops
@@ -595,11 +584,10 @@ reports/index.md (with a Target column), and reports.txt
 > - Roots are `[namespace/]claim:path`; the namespace defaults to
 >   `KUBECTL_NAMESPACE`. See [claims and test roots](#claims-and-test-roots).
 > - All roots of one target are in one namespace; claims in two namespaces are
->   two targets. Targets in one namespace need nothing extra.
-> - Targets in several namespaces in one batch need permission for the tool
->   to create an in-cluster sequencer and its RBAC objects; see
->   [several Kubernetes namespaces](#several-kubernetes-namespaces). To avoid
->   that, prepare one batch per namespace.
+>   two targets.
+> - Keep a batch's targets in one namespace, or prepare one batch per
+>   namespace; a batch spanning namespaces needs
+>   [extra setup](#several-kubernetes-namespaces).
 
 Reference: [target files](#target-files), [naming](#naming-a-target),
 [several namespaces](#several-kubernetes-namespaces),
@@ -612,9 +600,9 @@ Reference: [target files](#target-files), [naming](#naming-a-target),
 
 - **Settings.** `TEST_DIRS` (associative array, required),
   `STORAGE_TARGET_NAME`, `FS_MAX_AGG_THROUGHPUT`,
-  `FS_MAX_NODE_THROUGHPUT_GBPS`, and `FS_MAX_NODE_IOPS`. Changing any other
-  setting is an error that names the variable and says to use
-  `--env-override`. The file is trusted Bash, loaded like an
+  `FS_MAX_NODE_THROUGHPUT_GBPS`, and `FS_MAX_NODE_IOPS`. Setting a workload
+  variable is an error that says to use `--env-override`; any other variable
+  belongs in `env.sh`. The file is trusted Bash, loaded like an
   [override file](#workload-override-files).
 - **Order, per group.** `env.sh`'s `STORAGE_TARGET_NAME` is cleared, the target
   file is applied over `env.sh`, then the `--env-override` files apply in
@@ -626,33 +614,28 @@ Reference: [target files](#target-files), [naming](#naming-a-target),
   - `--batch` and `--append`: any number; N flags add N groups, one each, in
     command-line order, committed together. The same file twice is an error.
   - `--start`, `--resume`, `--status`, `--cancel`, and `--collect` reject it;
-    `--delete-only` takes at most one, to locate `TEST_DIRS`.
+    the IO launcher's `--delete-only` takes at most one, to locate `TEST_DIRS`.
   - Without `--target`, the one target comes from `env.sh`; keep a valid
     `TEST_DIRS` there for `validate_env.sh`.
 - **Mounts.** On SSH and Slurm, a batch uses one host pool, so every target's
   roots must be mounted on every client. On Kubernetes, each target's keys
   are checked when it is submitted and its claims when the batch starts.
-- **Provenance.** `env_used.sh` records `STORAGE_SCALE_TEST_TARGET_FILE`,
-  `STORAGE_SCALE_TEST_TARGET_FILE_SHA256`, and
-  `STORAGE_SCALE_TEST_TARGET_FILE_VARIABLES` (empty without a target file);
-  `env_used.yaml` records `target_file` as `null` or
-  `{file, sha256, variables}`. A batch records your original path, and the
-  snapshot summary shows the target file beside the override files.
+- **Provenance.** Each run records its target file (path and SHA-256) in
+  its saved settings (`env_used.yaml`), and each submission prints it.
 
 ### Naming a target
 
-Every saved run records the name of its storage target in `env_used.yaml` and
-`env_used.sh`. Set `STORAGE_TARGET_NAME` in `env.sh` or a target file to
-choose it. When it is empty, the name is derived when the sweep starts: the
-`TEST_DIRS` roots, sorted and joined with `,`.
+Each run saves the name of its storage target with its settings. Set
+`STORAGE_TARGET_NAME` in `env.sh` or a target file to choose it. When it is
+empty, the name is derived when the sweep starts: the `TEST_DIRS` roots,
+sorted and joined with `,`.
 
 | Substrate | Each root as |
 | --- | --- |
 | SSH, Slurm | The path, trailing `/` removed |
 | Kubernetes | `namespace/claim:path`, with the namespace filled in |
 
-Kubernetes results saved by v1.x keep their `<namespace>/<pvc>` name. An
-explicit name is 1-128 characters from letters, digits, and `._:@+/-`,
+An explicit name is 1-128 characters from letters, digits, and `._:@+/-`,
 starting with a letter or digit; `unknown` is reserved for results whose
 target cannot be identified. An invalid name is rejected before any results
 directory is created.
@@ -663,63 +646,19 @@ exports (see [reporting per target](#reporting-per-target)).
 
 ### Several Kubernetes namespaces
 
-Targets in one namespace share one set of workers and one coordinator that
-mount all of their claims, and their groups run in the order they were added.
-A batch whose targets are in more than one namespace runs one namespace at a
-time, in the order each namespace first appears in the batch, and each
-namespace's groups in the order they were added. For groups `0001` (ns-a),
-`0002` (ns-b), and `0003` (ns-a), the order is `0001`, `0003`, `0002`.
-
-- **How.** `--start` checks every claim, prepares every namespace's workers and
-  a suspended coordinator Job, and rolls everything back if a claim cannot
-  mount on a selected node. A **sequencer** Job in the first namespace then
-  starts each coordinator when the previous one finishes; its ServiceAccount
-  can only get and patch that attempt's coordinator Jobs, and its Pod is the
-  only one in a sweep that mounts an API token. If it is lost, `--status`
-  starts the next coordinator with your credentials.
-- **Prerequisites.** Kubernetes 1.24 or newer; the sequencer image, by default
-  a pinned `docker.io/alpine/kubectl` (set `KUBECTL_SEQUENCER_IMAGE` only to use
-  a mirror: any digest-pinned image providing `sh`, `kubectl`, `grep`, and
-  `sleep`); permission to create and delete a ServiceAccount in the first namespace,
-  and Roles, RoleBindings, and Jobs (and to patch Jobs) in every namespace;
-  and each namespace labeled `kubernetes.io/metadata.name` (automatic since
-  Kubernetes 1.21). An attempt spans at most 16 namespaces and
-  32 claims; `validate_env.sh` and `--start` reject more before creating
-  anything. `--resume` checks only the namespaces that still have cells.
-- **Validation.** `validate_env.sh` checks the RBAC, the server version, and
-  that the sequencer image pulls and provides its tools (a short-lived Job, no
-  API call) in `env.sh`'s one namespace; problems are warnings only, since a
-  batch in one namespace needs none of it. `validate_env.sh --sequencer` instead
-  runs the full probe of the real sequencer and treats problems as errors
-  (raise `KUBECTL_SEQUENCER_PROBE_TIMEOUT_SECONDS`, default 120, for a slow
-  pull). A set `KUBECTL_SEQUENCER_IMAGE` must be digest-pinned even when unused.
-- **Progress.** `--status` adds `SEGMENT_*` keys, one set per namespace (see
-  [prepared batches](#prepared-filesystem-batches)). `EXECUTIONS_*` counts
-  span every namespace.
-- **Failures.** A failed cell stops the batch: later namespaces show
-  `NOT_STARTED` and `NEXT_ACTION` becomes `COLLECT`. Worker drift fails the
-  attempt the same way. `--cancel` stops the sequencer and the running
-  namespace, and never overwrites a namespace that already finished.
-- **Results.** One `--collect` gathers every namespace and cleans up.
-  `run.status` and `run-summary.tsv` cover the whole attempt: `SUCCESS` only
-  when every namespace succeeded, otherwise the unsuccessful outcome (`FAILED`
-  after worker drift, not `CANCELLED`); `run-summary.tsv` adds `segments` and
-  `segment` rows, one per namespace. Each namespace also has its own
-  `run-<namespace>.status`, and `run-summary-`, `startup-error-`, and
-  `coordinator-loss-` files named the same way.
-- **Resume.** `--resume` skips successful cells. A namespace with nothing
-  left gets no workers, Job, or Lease, and with one namespace left no
-  sequencer is used.
-
-The [Kubernetes lifecycle contract](KUBERNETES_ELBENCHO_LIFECYCLE.md) has the
-details.
+Keep a batch's claims in one namespace, or run one batch per namespace; that
+needs no sequencer and no extra RBAC. One batch can span namespaces with extra
+setup; see the
+[appendix](#appendix-one-batch-across-several-kubernetes-namespaces).
 
 ### Reporting per target
 
-Reports are per target; there is no combined cross-target report.
+Report a multi-target batch like any other batch: run
+`./utils/extract-filesystem.py <batch-dir>` (after `--collect` on Kubernetes).
+Each group is one target and gets its own report; there is no combined
+cross-target report.
 
-- **Batches.** Each group has its own report, and groups are single-target, so
-  reports never mix targets. `reports/index.md` has a `Target` column, and the
+- **Batches.** Groups are single-target, so batch reports never mix targets. `reports/index.md` has a `Target` column, and the
   combined `reports.txt` heads every group `Group 0001 (io) target: "<name>"`.
   Current snapshots always record the effective name, so `(derived)` appears
   only beside results saved before this feature, which never recorded one.
@@ -727,20 +666,21 @@ Reports are per target; there is no combined cross-target report.
 - **Report headers.** IO and metadata reports print a `Storage target:` line
   after the version lines, and the IO settings summary leads its Targets row
   with `name=` (a long row is shortened with an ellipsis or `(+K more)`).
-- **Mixing guard.** The three extractors (`extract-elbencho.py`,
-  `extract-mdtest-elbencho.py`, `extract-filesystem.py`) exit 1 before writing
-  anything when their inputs record different target names, because IO tables
-  would merge and metadata results would be averaged. Derived names count:
-  different `TEST_DIRS` roots are different targets unless they share a
-  `STORAGE_TARGET_NAME`. `--allow-mixed-targets` overrides with a warning and a
-  `Storage target: mixed: "a", "b"` header, and aggregate tables still average
-  across targets. Unknown-target inputs (older results) beside a known one only
-  warn.
-- **Stitching.** `--to-csv` adds a `storage_target_name` column (empty, a name,
-  or `mixed: ...`), so per-target CSVs can be concatenated and filtered outside
-  the tool. Reloading a concatenated CSV with `--from-csv` is a mixed report and
-  needs `--allow-mixed-targets`. Older checkouts cannot read CSVs with the
-  column.
+- **Combining separate results.** One report given results from different
+  targets (several results directories on one command line, or a combined CSV
+  via `--from-csv`) exits 1 before writing anything, because IO tables would
+  merge and metadata results would be averaged. Sweeps of different `TEST_DIRS`
+  roots are different targets unless they share a `STORAGE_TARGET_NAME`; this
+  includes results saved before v2.0.0, whose name is derived from their roots.
+  Inputs without a saved `env_used.yaml` are unknown and only warn.
+  `--allow-mixed-targets` combines them anyway, with a warning and a
+  `Storage target: mixed: "a", "b"` header; aggregate tables then average
+  across targets.
+- **Stitching.** `--to-csv` adds a `storage_target_name` column (empty or a
+  name; metadata rows may also hold `mixed: ...`), so per-target CSVs can be
+  concatenated and filtered outside the tool. Reloading such a combined CSV
+  with `--from-csv` needs `--allow-mixed-targets`. v1.x checkouts cannot
+  reload the new IO CSVs.
 
 ## Filesystem reporting
 
@@ -803,7 +743,7 @@ Use `--help` for all options. Cached CSV input and single-file parsing require
 | Both | `--to-csv`, `--from-csv FILE` | Export/reload analyzed metrics |
 | Both | `--markdown` | Markdown on stdout; progress on stderr |
 | Both | `--test-parse FILE` | Inspect one raw result without reporting |
-| Both | `--allow-mixed-targets` | Report inputs from different [storage targets](#reporting-per-target) anyway |
+| Both | `--allow-mixed-targets` | Combine results from different [storage targets](#reporting-per-target) in one report (a batch never needs it) |
 | IO | `--only-sizes SIZE` | Repeat or separate with `;`; preserve compound-size commas |
 | IO | `--only-iodepths LIST` | Select depths with comma lists or ranges |
 | IO | `--no-dual-y-axis` | Separate throughput and latency axes |
@@ -905,6 +845,8 @@ TEST_DIRS=(["vendor-b/data:scale-test"]=1)       # claim data in vendor-b
 - Each claim exists in its namespace and is Bound, ReadWriteMany, and
   Filesystem mode. The tool records the PV it is bound to and fails if that
   changes during an attempt.
+- Each namespace carries the `kubernetes.io/metadata.name` label (automatic
+  since Kubernetes 1.21); `validate_env.sh` fails without it.
 - The selector matches enough Ready, schedulable nodes of the intended
   architecture for your largest node count. Inspect labels with
   `kubectl get nodes --show-labels`; comma-separated equality labels are ANDed,
@@ -919,51 +861,33 @@ TEST_DIRS=(["vendor-b/data:scale-test"]=1)       # claim data in vendor-b
   configured non-root UID/GID, disable privilege escalation, drop all
   capabilities, and mount no API token. Helper Pods keep more restrictive
   settings. The one exception is the sequencer Pod used across
-  [several namespaces](#several-kubernetes-namespaces).
+  [several namespaces](#appendix-one-batch-across-several-kubernetes-namespaces).
 - The submitting identity can:
-  - inspect nodes, the namespace, PV/PVC, workload resources, and events;
-  - create, get, and delete Jobs, Pods, DaemonSets, ConfigMaps,
-    NetworkPolicies, and namespaced Leases;
+  - get Nodes, PersistentVolumes, and Namespaces (cluster-scoped, so a
+    ClusterRole);
+  - get PVCs, workload resources, and events in the namespace;
+  - create, get, and delete Jobs, Pods, DaemonSets, NetworkPolicies, and
+    Leases;
   - read Pod logs and exec into Pods.
 
   The coordinator itself has no Kubernetes API credentials.
-- The image supports your nodes and is usable under the pull policy with any
-  required registry credentials. `Never` requires preloading; `Always`
-  requires a digest-pinned reference.
+- The elbencho image supports your nodes and is usable under the pull policy
+  with any required registry credentials. `KUBECTL_ELBENCHO_IMAGE` defaults to
+  `docker.io/breuner/elbencho:v3.2-1`; set it only for another image or a
+  mirror. `Never` requires preloading; `Always` requires a digest-pinned
+  image, so not the default tag.
 
 `validate_env.sh` then checks each claim and runs a temporary Job that mounts
 them all, to check the image, workload identity, write access to each root,
 and seccomp mode.
 
-### Upgrading from v1.8.0
-
-```bash
-# v1.8.0
-export KUBECTL_PVC=scale-test
-TEST_DIRS=(["data"]=1)
-# v2.0.0: the claim moves into the key; delete KUBECTL_PVC and KUBECTL_PV
-TEST_DIRS=(["scale-test:data"]=1)
-```
-
-- If `KUBECTL_PVC` or `KUBECTL_PV` is still set, or a key has no `claim:`,
-  `validate_env.sh` and the launchers stop with an error that prints the
-  replacement `TEST_DIRS` line: `KUBECTL_PVC` supplies the claim, otherwise a
-  `<claim>` placeholder stands in. Nothing is printed when only `KUBECTL_PV` is
-  set and the keys are qualified.
-- v2.0.0 cannot inspect, cancel, collect, or resume Kubernetes runs started
-  by v1.x. Before upgrading, wait for or `--cancel` each in-progress run and
-  `--collect` it with v1.x. Collected results still report.
-- On every substrate, an `--env-override` file that sets `TEST_DIRS`,
-  `STORAGE_TARGET_NAME`, or `FS_MAX_*` is now rejected: pass that file with
-  `--target` instead, and move any workload settings in it to an override
-  file. On Kubernetes, also qualify its keys as above.
-
 ## Kubernetes access and troubleshooting
 
 `validate_env.sh` also lists, informationally, any Jobs, DaemonSets, Pods,
 NetworkPolicies and Leases labeled `app.kubernetes.io/name=storage-scale-test`
-(all namespaces, falling back to `KUBECTL_NAMESPACE` if cluster-wide listing is
-forbidden), and prints nothing for this when there are none unless `--verbose`.
+(all namespaces, falling back to the namespace of the `TEST_DIRS` roots if
+cluster-wide listing is forbidden); with none, it prints nothing for this
+unless `--verbose`.
 Existing objects never fail validation, and the label does not prove
 ownership: they may belong to an active or uncollected attempt. Find the
 result directory whose `kubernetes/attempts/<run-id>/` matches the listed RUN
@@ -986,3 +910,62 @@ Keep the saved local state and remote resources while investigating. Do not
 bypass ownership checks by deleting the Lease or editing the ledger.
 The [Kubernetes lifecycle contract](KUBERNETES_ELBENCHO_LIFECYCLE.md)
 defines supported recovery, diagnostics, and remaining acceptance gates.
+
+## Upgrading from v1.8.0
+
+- Kubernetes `TEST_DIRS` keys are `[namespace/]claim:path`, and `KUBECTL_PVC`
+  and `KUBECTL_PV` are removed: `KUBECTL_PVC=scale-test` with
+  `TEST_DIRS=(["data"]=1)` becomes `TEST_DIRS=(["scale-test:data"]=1)`.
+  `validate_env.sh` and new submissions stop with a message showing the
+  replacement line.
+- On Kubernetes, `--read-from` takes `[namespace/]claim:path` or the Pod path
+  that `--write-only` printed.
+- An `--env-override` file can no longer set `TEST_DIRS` or `FS_MAX_*`; pass
+  that file with [`--target`](#target-files) instead.
+- One report no longer combines results from different storage targets, such
+  as v1.8.0 sweeps of different `TEST_DIRS` given together; add
+  `--allow-mixed-targets` to combine them. Batch reports are unaffected.
+
+## Appendix: one batch across several Kubernetes namespaces
+
+Targets in one namespace share one set of workers and one coordinator that
+mount all of their claims. A batch spanning namespaces runs one namespace at a
+time, in the order each first appears in the batch (on resume, among the
+remaining cells), and each namespace's groups in the order added: groups
+`0001` (ns-a), `0002` (ns-b), and `0003` (ns-a) run as `0001`, `0003`, `0002`.
+
+- **How.** `--start` checks every claim, prepares every namespace's workers and
+  a suspended coordinator Job, and rolls everything back if a claim cannot
+  mount on a selected node. A **sequencer** Job in the first namespace then
+  starts each coordinator when the previous one finishes. Its ServiceAccount
+  can only get and patch that attempt's coordinator Jobs, and its Pod is the
+  only one in a sweep that mounts an API token. If it is lost, `--status`
+  starts the next coordinator with your credentials.
+- **Prerequisites.** Kubernetes 1.24 or newer; permission to create, get, and
+  delete a ServiceAccount in the first namespace and Roles and RoleBindings in
+  every namespace, and to patch Jobs; and the sequencer image, by default a
+  pinned `docker.io/alpine/kubectl`. Set `KUBECTL_SEQUENCER_IMAGE` only for a
+  mirror: any digest-pinned image providing `sh`, `kubectl`, `grep`, `mkdir`,
+  and `sleep` (a private mirror needs node-level pull credentials). A set value
+  must be digest-pinned even when unused.
+- **Limits.** `--start` rejects an attempt spanning more than 16 namespaces or
+  32 claims before creating anything.
+- **Validation.** `validate_env.sh` checks the RBAC, the server version, and
+  that the sequencer image pulls and provides its tools, in the namespace of
+  `env.sh`'s `TEST_DIRS`, as warnings only. `validate_env.sh --sequencer` runs
+  the real sequencer and treats problems as errors (raise
+  `KUBECTL_SEQUENCER_PROBE_TIMEOUT_SECONDS`, default 120, for a slow pull).
+- **Progress.** `--status` adds `SEGMENT_*` keys per namespace (see
+  [prepared batches](#prepared-filesystem-batches)); `EXECUTIONS_*` counts
+  span every namespace.
+- **Failures.** A failed cell stops the batch: later namespaces show
+  `NOT_STARTED` and `NEXT_ACTION` becomes `COLLECT`. `--cancel` stops the
+  sequencer and the running namespace.
+- **Results.** One `--collect` gathers every namespace and cleans up.
+  `run.status` is `SUCCESS` only when every namespace succeeded; each
+  namespace also gets its own `run-<namespace>.status`.
+- **Resume.** `--resume` skips successful cells and uses only the namespaces
+  that still have cells (no sequencer when one is left).
+
+The [Kubernetes lifecycle contract](KUBERNETES_ELBENCHO_LIFECYCLE.md) has the
+details.

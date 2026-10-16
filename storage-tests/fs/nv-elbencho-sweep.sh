@@ -16,8 +16,8 @@
 # limitations under the License.
 
 if (( BASH_VERSINFO[0] < 4 \
-        || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
-    printf 'Bash 4.3 or newer is required; on macOS run: brew install bash\n' >&2
+        || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+    printf 'Bash 4.4 or newer is required; on macOS run: brew install bash\n' >&2
     exit 1
 fi
 
@@ -90,8 +90,8 @@ Sweep modes (--write-only, --write-no-read, default, or --read-from <path>):
 Delete-only (no sweep, no sbatch elbencho workers):
   --delete-only <path>  Remove a strict subdirectory under TEST_DIRS (not the test root).
                         TEST_DIRS comes from env.sh or one --target <file>.
-                        Requires **SLURM_ENABLED** or **SSH_ENABLED**: runs on one compute node
-                        via **sbatch** or over **SSH** to one host. --nodes is not used (ignored if set).
+                        Requires EXECUTION_SUBSTRATE=ssh or slurm: runs over SSH on one host
+                        or via sbatch on one compute node. --nodes is not used (ignored if set).
 
 Resume (continue an interrupted prior sweep run):
   --resume <results_dir>  Path to a prior \${RESULTS_DIR}/elbencho-<DS>/ directory. Sources
@@ -101,9 +101,9 @@ Resume (continue an interrupted prior sweep run):
                           A node that went bad after the original run is NOT rebound to remaining
                           executions: SLURM srun-steps pick fresh subsets of the live allocation;
                           SSH dispatch calls choose_N_ssh_hosts per execution. Mutually exclusive
-                          with all other flags.
+                          with all other flags. On Kubernetes, --collect the terminal attempt first.
 
-Kubernetes lifecycle (kubectl substrate only):
+Kubernetes lifecycle (kubectl sweeps; --status also reports a batch on any substrate):
   --status <results_dir>   Inspect an asynchronous sweep and perform bounded,
                           exact-identity reconciliation when recovery is required.
   --cancel <results_dir>   Stop the exact saved attempt and preserve results.
@@ -119,6 +119,8 @@ Path modes (at most one; --write-only and --read-from require a single TEST_DIRS
   --read-from <path>    Read-only from an existing path under TEST_DIRS. With ELBENCHO_SINGLE_BIG_FILE=0
                         (default), <path> is a directory (treescan). With ELBENCHO_SINGLE_BIG_FILE=1,
                         <path> must be a file passed through to elbencho read (error if <path> is a directory here).
+                        On Kubernetes, <path> is [namespace/]claim:path or the Pod path
+                        (/mnt/storage-scale-test/<claim>/<path>) that --write-only prints.
 
 Flags:
   -h, --help          Show this help message and exit
@@ -149,7 +151,7 @@ Flags:
   -r, --rand          Use random IO patterns (default: sequential IO; not with ELBENCHO_SINGLE_BIG_FILE=1)
   --run-to-completion Complete each requested write/read phase without
                       benchmark time limits or repetition; size the dataset
-                      with ELBENCHO_FILES_PER_NODE and ELBENCHO_FILE_SIZE
+                      with ELBENCHO_FILES_PER_NODE and ELBENCHO_FILE_SIZE.
                       Buffered IO and multiple TEST_DIRS roots imply this mode.
                       Otherwise, one-root direct IO is time-limited.
 
@@ -167,6 +169,11 @@ Examples:
 
 EOF
 }
+
+# Help wins over any operation, including the --batch forms routed above.
+for argument in "$@"; do
+    [[ "$argument" != -h && "$argument" != --help ]] || { print_usage; exit 0; }
+done
 
 # Initialize flags (if any)
 g_bio_or_dio="dio"
@@ -520,6 +527,10 @@ case "$SWEEP_OPERATION" in
         ;;
 esac
 
+if [[ ! -f "${SCRIPT_DIR}/../../env.sh" ]]; then
+    echo "Error: env.sh not found; copy env.sh.template to env.sh and edit it" >&2
+    exit 1
+fi
 if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
         "${SCRIPT_DIR}/../../env.sh" 2>&1); then
     printf "%s\n\nFailed to source env.sh; fix ^^^^^^^^^^\n" "$source_output"
@@ -585,7 +596,10 @@ if [[ "$SWEEP_OPERATION" == submit \
     # Kubernetes roots name their claim; reject anything else before output.
     if [[ "$SWEEP_OPERATION" == submit && "${EXECUTION_SUBSTRATE:-}" == kubectl ]] \
             && declare -F kubectl_validate_test_dirs >/dev/null; then
-        kubectl_validate_test_dirs || exit 1
+        kubectl_validate_test_dirs || {
+            [[ -z "$target_label" ]] || echo "Error: invalid target file: $target_label" >&2
+            exit 1
+        }
     fi
 fi
 
@@ -704,7 +718,7 @@ _run_delete_only_path() {
         tail_until_complete "$job_id" "${log_files[@]}"
         return $?
     fi
-    echo "Error: --delete-only requires SLURM_ENABLED or SSH_ENABLED (set in env.sh)." >&2
+    echo "Error: --delete-only supports EXECUTION_SUBSTRATE=ssh or slurm (current: ${EXECUTION_SUBSTRATE:-unset})" >&2
     return 1
 }
 
@@ -738,7 +752,7 @@ if [[ -n "$resume_dir" ]]; then
         dispatch_ssh_executions "$OUTPUT_DIR"
         exit $?
     fi
-    echo "Error: neither SLURM_ENABLED nor SSH_ENABLED is set; cannot dispatch" >&2
+    echo "Error: --resume supports EXECUTION_SUBSTRATE=ssh or slurm (current: ${EXECUTION_SUBSTRATE:-unset})" >&2
     exit 1
 fi
 
@@ -761,7 +775,7 @@ fi
 
 if [[ -n "$delete_only_path" ]]; then
     if [[ -z "${SLURM_ENABLED:-}" && -z "${SSH_ENABLED:-}" ]]; then
-        echo "Error: --delete-only requires SLURM_ENABLED or SSH_ENABLED (set in env.sh)." >&2
+        echo "Error: --delete-only supports EXECUTION_SUBSTRATE=ssh or slurm (current: ${EXECUTION_SUBSTRATE:-unset})" >&2
         exit 1
     fi
     if ! validate_elbencho_sweep_single_test_dirs_key; then
@@ -834,6 +848,11 @@ if [[ "$sweep_write_only" == "1" || -n "$sweep_read_from" ]]; then
     validate_elbencho_sweep_one_generated_target_dir || exit 1
 fi
 if [[ -n "$sweep_read_from" ]]; then
+    # Kubernetes also accepts the Pod path that --write-only prints.
+    if [[ "${EXECUTION_SUBSTRATE:-}" == kubectl ]]; then
+        _kubectl_claims_load_helpers \
+            && kubectl_read_from_logical_path "$sweep_read_from" sweep_read_from || exit 1
+    fi
     validate_elbencho_sweep_read_from_path "$sweep_read_from" || exit 1
     validate_elbencho_single_big_file_read_from_is_not_dir \
         "$sweep_read_from" || exit 1
