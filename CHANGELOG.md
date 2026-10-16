@@ -71,6 +71,7 @@ See [Upgrading from v1.8.0](docs/FILESYSTEM_TESTING.md#upgrading-from-v180).
   snapshots still load.
 - CSV exports gain a `storage_target_name` column; older CSVs still load, but
   older checkouts cannot read the new column.
+- `KUBECTL_ELBENCHO_IMAGE` defaults to the pinned elbencho image when unset.
 - `validate_env.sh` is faster, especially on busy Slurm clusters, and prints a
   short summary unless `--verbose`. Errors name the node and the likely cause
   (such as a filesystem that cannot mount or is not writable).

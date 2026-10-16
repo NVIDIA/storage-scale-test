@@ -71,6 +71,7 @@ case "${EXECUTION_SUBSTRATE:-}" in
         export SLURM_ENABLED=""
         export SSH_ENABLED=""
         export KUBECTL_ENABLED=1
+        apply_kubectl_defaults
         ;;
     "")
         echo "Error: EXECUTION_SUBSTRATE is required (slurm, ssh, or kubectl)" >&2

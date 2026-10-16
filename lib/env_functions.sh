@@ -1387,6 +1387,19 @@ filesystem_enabled_from_test_dirs() {
 # applied, so this is idempotent: env_base.sh calls it once after env.sh, and an
 # --env-override file is followed by a second call that restores the default
 # for anything the override unset (exactly as if it had been unset in env.sh).
+# The elbencho image Kubernetes sweeps run when KUBECTL_ELBENCHO_IMAGE is unset
+# or empty: the release utils/build_tarball.sh downloads (ELBENCHO_VERSION_TAG).
+KUBECTL_DEFAULT_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.2-1
+
+# apply_kubectl_defaults: on EXECUTION_SUBSTRATE=kubectl, default the settings
+# env.sh may leave out. env_base.sh calls it, and so does every entry point
+# right after sourcing env.sh, so settings appended after env_base.sh's
+# source line are covered too.
+apply_kubectl_defaults() {
+    [[ "${EXECUTION_SUBSTRATE:-}" == kubectl ]] || return 0
+    export KUBECTL_ELBENCHO_IMAGE="${KUBECTL_ELBENCHO_IMAGE:-$KUBECTL_DEFAULT_ELBENCHO_IMAGE}"
+}
+
 apply_filesystem_workload_defaults() {
     # Default values for FS_MAX_* estimates
     # If IOR_FS_MAX_AGG_THROUGHPUT is defined, use it as the default for FS_MAX_AGG_THROUGHPUT

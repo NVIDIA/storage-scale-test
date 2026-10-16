@@ -262,3 +262,39 @@ def test_legacy_resume_cannot_be_reinterpreted_as_kubectl(tmp_path):
         "legacy resume snapshots require inherited EXECUTION_SUBSTRATE=ssh or slurm"
         in result.stderr
     )
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    (
+        ("unset KUBECTL_ELBENCHO_IMAGE", "docker.io/breuner/elbencho:v3.2-1"),
+        ("KUBECTL_ELBENCHO_IMAGE=", "docker.io/breuner/elbencho:v3.2-1"),
+        (
+            "KUBECTL_ELBENCHO_IMAGE=registry.example/elbencho:x",
+            "registry.example/elbencho:x",
+        ),
+    ),
+)
+def test_kubectl_elbencho_image_defaults_to_the_pinned_release(
+    tmp_path, configured, expected
+):
+    """Deleting KUBECTL_ELBENCHO_IMAGE from env.sh uses the pinned image; a set
+    value is kept."""
+    result = _run_bash(
+        f"{configured}\n"
+        + _env_base_script(tmp_path, "kubectl")
+        + 'printf "%s\\n" "$KUBECTL_ELBENCHO_IMAGE"\n'
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == expected
+
+
+def test_the_default_elbencho_image_is_the_downloaded_release():
+    """The default image's tag is the elbencho release build_tarball.sh pins."""
+    builder = (_REPOSITORY_ROOT / "utils" / "build_tarball.sh").read_text(
+        encoding="utf-8"
+    )
+    tag = builder.split("ELBENCHO_VERSION_TAG='", 1)[1].split("'", 1)[0]
+    assert f"KUBECTL_DEFAULT_ELBENCHO_IMAGE=docker.io/breuner/elbencho:{tag}\n" in (
+        _REPOSITORY_ROOT / "lib" / "env_functions.sh"
+    ).read_text(encoding="utf-8")

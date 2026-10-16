@@ -243,6 +243,8 @@ fi
 
 # shellcheck disable=SC1091
 . "${SCALE_TEST_BASE}/env.sh"
+# env.sh normally loads lib/env_functions.sh (via env_base.sh), which defines it.
+! declare -F apply_kubectl_defaults >/dev/null || apply_kubectl_defaults
 
 # Check required directories
 check_dirs() {

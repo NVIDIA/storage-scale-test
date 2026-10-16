@@ -182,7 +182,7 @@ compatibility. This design means:
 | Warp | `WARP_THREAD_LIST`, `WARP_OBJ_SIZES`, PUT/GET durations | Object storage sweep parameters |
 | Netbench | `NETBENCH_THREADS`, `NETBENCH_HOST_NIC_GBPS`, `NETBENCH_TARGET_RUNTIME` | Network test parameters |
 | Slurm extras | `SLURM_JOB_NAME_PREFIX`, `SLURM_EXTRA_ARGS`, `SLURM_EXCLUSIVE_USER`, `SLURM_NODE_IGNORES`, `SLURM_NODE_INCLUDES`, `SLURM_JOB_POLL_INTERVAL_SECONDS` | Slurm job customization |
-| Kubernetes | `KUBECTL_NAMESPACE`, `KUBECTL_NODE_SELECTOR`, `KUBECTL_ELBENCHO_IMAGE`, `KUBECTL_RUN_AS_USER`, `KUBECTL_RUN_AS_GROUP`, `KUBECTL_SEQUENCER_IMAGE` | Default namespace for `TEST_DIRS` claims (optional when every key names its namespace), eligible nodes, image, workload identity, and an optional digest-pinned override (for a mirror) of the default sequencer image that batches spanning namespaces run |
+| Kubernetes | `KUBECTL_NAMESPACE`, `KUBECTL_NODE_SELECTOR`, `KUBECTL_ELBENCHO_IMAGE`, `KUBECTL_RUN_AS_USER`, `KUBECTL_RUN_AS_GROUP`, `KUBECTL_SEQUENCER_IMAGE` | Default namespace for `TEST_DIRS` claims (optional when every key names its namespace), eligible nodes, image (defaults to the pinned elbencho release), workload identity, and an optional digest-pinned override (for a mirror) of the default sequencer image that batches spanning namespaces run |
 
 ### 3.3 Defaults and Compatibility
 

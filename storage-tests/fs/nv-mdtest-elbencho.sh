@@ -217,6 +217,8 @@ if ! source_output=$("$BASH" -c 'source "$1"' env-loader \
 fi
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/../../env.sh" || exit 1
+# env.sh normally loads lib/env_functions.sh (via env_base.sh), which defines it.
+! declare -F apply_kubectl_defaults >/dev/null || apply_kubectl_defaults
 if [[ "$operation" == resume ]]; then
     [[ "${EXECUTION_SUBSTRATE:-}" == "$SAVED_EXECUTION_SUBSTRATE" ]] || {
         echo "Error: current env.sh substrate differs from saved substrate" >&2
