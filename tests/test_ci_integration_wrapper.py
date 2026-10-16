@@ -182,6 +182,13 @@ def test_teardown_failure_makes_successful_lifecycle_fail(tmp_path):
         )
         == 2
     )
+    manifest = json.loads(
+        (tmp_path / "manifests" / f"{architecture}-all.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["exit_code"] != 0
+    assert [t["exit_code"] for t in manifest["timings"] if t["step"] == "test"] == [0]
 
 
 def test_unwritable_diagnostics_do_not_prevent_teardown(tmp_path):

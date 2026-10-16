@@ -38,7 +38,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -195,8 +195,10 @@ SSH_STORAGE_VISIBILITY_TIMEOUT_SECONDS = 30
 IMAGE_PULL_ATTEMPTS = image_acquisition.IMAGE_PULL_ATTEMPTS
 IMAGE_PULL_TIMEOUT_SECONDS = image_acquisition.IMAGE_PULL_TIMEOUT_SECONDS
 IMAGE_PULL_DEADLINE_SECONDS = image_acquisition.IMAGE_PULL_DEADLINE_SECONDS
-TEMPORARY_UNMOUNT_ATTEMPTS = 10
-TEMPORARY_UNMOUNT_RETRY_SECONDS = 1
+# A busy mount (temporary or the fixture export) is retried this many times,
+# this many seconds apart, before cleanup fails.
+UNMOUNT_ATTEMPTS = 10
+UNMOUNT_RETRY_SECONDS = 1
 DEFAULT_STATE_DIR = Path(__file__).resolve().parents[2] / "tmp" / "integration-state"
 DEFAULT_EXPORT_DIR = Path("/srv/storage-scale-test-integration")
 DEFAULT_SBX_SHARED_ROOT = (
@@ -1857,10 +1859,23 @@ def _export_mount_type(runner: Runner, config: Config) -> str:
     )
 
 
-def _unmount_temporary_filesystem(runner: Runner, mountpoint: Path) -> None:
-    """Unmount a temporary filesystem and verify it is no longer mounted."""
+def _unmount_verified(
+    runner: Runner,
+    mountpoint: Path,
+    label: str,
+    on_busy: Callable[[], None] | None = None,
+) -> None:
+    """Unmount MOUNTPOINT and verify with findmnt that it is gone.
+
+    A mount still present after an attempt is retried, up to UNMOUNT_ATTEMPTS
+    times UNMOUNT_RETRY_SECONDS apart; a first attempt that succeeds never
+    waits. ON_BUSY runs after the first busy attempt and again when the
+    attempts run out, to record what holds the mount while it still does.
+    Exhaustion, or a findmnt that cannot tell, raises, so the caller never
+    goes on to detach or delete a mounted path.
+    """
     last_result: subprocess.CompletedProcess[str] | None = None
-    for attempt in range(1, TEMPORARY_UNMOUNT_ATTEMPTS + 1):
+    for attempt in range(1, UNMOUNT_ATTEMPTS + 1):
         last_result = runner.run([*_sudo_prefix(), "umount", mountpoint], check=False)
         mounted = runner.run(
             [
@@ -1875,25 +1890,32 @@ def _unmount_temporary_filesystem(runner: Runner, mountpoint: Path) -> None:
             return
         if mounted.returncode != 0:
             raise ProvisionError(
-                f"could not verify temporary mount was removed at {mountpoint}: "
+                f"could not verify {label} was removed at {mountpoint}: "
                 f"findmnt exited {mounted.returncode}"
             )
-        if attempt < TEMPORARY_UNMOUNT_ATTEMPTS:
+        if on_busy is not None and attempt in (1, UNMOUNT_ATTEMPTS):
+            on_busy()
+        if attempt < UNMOUNT_ATTEMPTS:
             LOG.warning(
-                "Temporary mount %s remains active after unmount attempt %d/%d; "
-                "retrying",
+                "%s %s remains active after unmount attempt %d/%d; retrying",
+                label[:1].upper() + label[1:],
                 mountpoint,
                 attempt,
-                TEMPORARY_UNMOUNT_ATTEMPTS,
+                UNMOUNT_ATTEMPTS,
             )
-            time.sleep(TEMPORARY_UNMOUNT_RETRY_SECONDS)
+            time.sleep(UNMOUNT_RETRY_SECONDS)
 
     detail = (last_result.stderr or last_result.stdout).strip() if last_result else ""
     suffix = f": {detail}" if detail else ""
     raise ProvisionError(
-        f"temporary mount remains active at {mountpoint} after "
-        f"{TEMPORARY_UNMOUNT_ATTEMPTS} unmount attempts{suffix}"
+        f"{label} remains active at {mountpoint} after "
+        f"{UNMOUNT_ATTEMPTS} unmount attempts{suffix}"
     )
+
+
+def _unmount_temporary_filesystem(runner: Runner, mountpoint: Path) -> None:
+    """Unmount a temporary filesystem and verify it is no longer mounted."""
+    _unmount_verified(runner, mountpoint, "temporary mount")
 
 
 def _loop_devices_for_file(runner: Runner, path: Path) -> list[str]:
@@ -5534,8 +5556,14 @@ def _remove_nfs_configuration(runner: Runner, config: Config) -> None:
 def _unmount_export_filesystem(runner: Runner, config: Config) -> None:
     """Unmount and detach only the verified fixture backing filesystem."""
     if _export_mount_type(runner, config):
+        # Ownership first: only the verified fixture loop mount is unmounted.
         _verified_export_loop(runner, config)
-        runner.run([*_sudo_prefix(), "umount", config.export_dir])
+        _unmount_verified(
+            runner,
+            config.export_dir,
+            "fixture export mount",
+            on_busy=lambda: _busy_export_diagnostics(runner, config),
+        )
     _validate_loop_associations(runner, config)
     for device in _associated_loop_devices(runner, config):
         runner.run([*_sudo_prefix(), "losetup", "--detach", device])
@@ -5543,6 +5571,30 @@ def _unmount_export_filesystem(runner: Runner, config: Config) -> None:
         raise ProvisionError(f"export remains mounted: {config.export_dir}")
     if _associated_loop_devices(runner, config):
         raise ProvisionError(f"loop devices remain attached to {config.nfs_image}")
+
+
+def _busy_export_diagnostics(runner: Runner, config: Config) -> None:
+    """Log what may hold the busy fixture export mount (never raises).
+
+    Each command is bounded and independent, so a missing or failing tool
+    neither hides the others nor replaces the unmount error.
+    """
+    LOG.error("Fixture export %s is busy; recording what holds it", config.export_dir)
+    sudo = _sudo_prefix()
+    for command in (
+        [
+            "findmnt",
+            "--output",
+            "TARGET,SOURCE,FSTYPE,PROPAGATION",
+            "--submounts",
+            "--mountpoint",
+            config.export_dir,
+        ],
+        [*sudo, "losetup", "--list", "--associated", config.nfs_image],
+        [*sudo, "fuser", "-vm", config.export_dir],
+        [*sudo, "exportfs", "-v"],
+    ):
+        _run_diagnostic(runner, command)
 
 
 def _remove_harness_images(runner: Runner, config: Config) -> None:
