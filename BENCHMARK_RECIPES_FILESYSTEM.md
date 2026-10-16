@@ -161,7 +161,7 @@ export ELBENCHO_READ_AFTER_WRITE_PAUSE=0
 ./storage-tests/fs/nv-elbencho-sweep.sh --nodes 1
 ```
 
-Review the single-node report (`utils/extract-elbencho.py`) and identify:
+Review the single-node report (`utils/extract-filesystem.py`) and identify:
 
 1. The **first thread count** that saturates (or nearly saturates) the
    node's storage-facing NIC line rate for sequential IO.
@@ -307,7 +307,7 @@ export ELBENCHO_READ_AFTER_WRITE_PAUSE=0
 ./storage-tests/fs/nv-elbencho-sweep.sh --nodes 8,16
 ```
 
-**What to compare:** Generate a report with `utils/extract-elbencho.py` and
+**What to compare:** Generate a report with `utils/extract-filesystem.py` and
 compare key metrics (sequential read/write GB/s, random 4K IOPS) against
 the baseline. A regression of more than ~10% warrants investigation.
 
@@ -391,17 +391,21 @@ export ELBENCHO_READ_AFTER_WRITE_PAUSE=0
 # Full pipeline: write then read (DirectIO, the default)
 ./storage-tests/fs/nv-elbencho-sweep.sh --nodes 4,8,16
 
-# Or staged: write-only, then read separately
+# Or staged: write-only (one thread value), then read separately
 ./storage-tests/fs/nv-elbencho-sweep.sh --write-only --nodes 8
-# (note the printed file path, e.g. /mnt/fs/elbencho-sweep-target-1-<DS>/elbencho-bigfile)
-./storage-tests/fs/nv-elbencho-sweep.sh --read-from /mnt/fs/elbencho-sweep-target-1-<DS>/elbencho-bigfile --nodes 8
+# Prints ELBENCHO_WRITE_ONLY_DATA_DIR=/mnt/fs/elbencho-sweep-target-1-<DS>-e0001
+./storage-tests/fs/nv-elbencho-sweep.sh \
+    --read-from /mnt/fs/elbencho-sweep-target-1-<DS>-e0001/elbencho-bigfile --nodes 8
 ```
 
-With `ELBENCHO_SINGLE_BIG_FILE=1`, `--read-from` must name the file itself,
-and its size comes from the file (so `ELBENCHO_SINGLE_BIG_FILE_SIZE` may be
-unset). For a directory, set `ELBENCHO_SINGLE_BIG_FILE=0`. The `/mnt/fs` paths
-here are SSH/Slurm style; on Kubernetes, pass `--read-from` as
-`[namespace/]claim:path`.
+`--write-only` retains one dataset per cell, so use one thread value for the
+staged write (the two values above would retain two files). With
+`ELBENCHO_SINGLE_BIG_FILE=1`, `--read-from` must name the file itself: the
+printed directory plus `elbencho-bigfile` (`ELBENCHO_SINGLE_BIG_FILE_BASENAME`).
+Its size comes from the file, so `ELBENCHO_SINGLE_BIG_FILE_SIZE` may be unset.
+On Kubernetes the printed directory is a Pod path, which `--read-from` accepts
+as is; collect the `--write-only` run before a dependent `--read-from` or
+report.
 
 ### Phase 2: Partitioned vs Full-File Read
 
@@ -464,8 +468,11 @@ lock contention.
 
 ### Cleanup
 
+On SSH or Slurm, delete the retained directory (on Kubernetes, delete it from
+a Pod that mounts the claim):
+
 ```bash
-./storage-tests/fs/nv-elbencho-sweep.sh --delete-only /mnt/fs/elbencho-sweep-target-1-<DS>
+./storage-tests/fs/nv-elbencho-sweep.sh --delete-only /mnt/fs/elbencho-sweep-target-1-<DS>-e0001
 ```
 
 ---
@@ -509,7 +516,7 @@ in parallel. The example approximates eight saving ranks per node, one writer
 thread per rank, and one 64 GiB checkpoint file per rank:
 
 ```bash
-# Exactly one TEST_DIRS entry with weight 1 is required.
+# env.sh or --env-override file; TEST_DIRS must have one root with weight 1
 export ELBENCHO_FILE_LAYOUT=shared-directory
 export ELBENCHO_FILES_PER_NODE=8
 export ELBENCHO_FILE_SIZE=64G
@@ -615,6 +622,8 @@ nodes. `ELBENCHO_FILES_PER_NODE` and `ELBENCHO_FILE_SIZE` are ignored.
 ./storage-tests/fs/nv-elbencho-sweep.sh \
     --read-from /mnt/fs/checkpoints/example --nodes 1,3
 ```
+
+On Kubernetes, collect the `--write-only` run before reading or reporting it.
 
 Direct IO staged reads are time-limited by default; buffered IO or
 `--run-to-completion` reads the scanned dataset to completion. The first read
@@ -769,16 +778,18 @@ the keys are paths that exist on every worker:
 TEST_DIRS=(["/mnt/lustre-a/scale-test"]=2 ["/mnt/lustre-b/scale-test"]=1)
 ```
 
-On Kubernetes the keys are `[namespace/]claim:path`; the namespace defaults to
-`KUBECTL_NAMESPACE`, and every root of one target must share a namespace:
+On Kubernetes the keys are `[namespace/]claim:path`. A key without a namespace
+uses `KUBECTL_NAMESPACE`; all roots of one target must be in one namespace:
 
 ```bash
 KUBECTL_NAMESPACE=validation   # in env.sh; a target file cannot set it
 TEST_DIRS=(["lustre-a:scale-test"]=2 ["lustre-b:scale-test"]=1)
 ```
 
-Run any recipe as usual. More than one root always runs writes and reads to
-completion instead of for a fixed duration. Set `FS_MAX_AGG_THROUGHPUT`,
+Recipes 1-3 run as usual, except that with more than one root, writes and
+reads run to completion rather than for the configured duration. Recipes 4 and
+5 and the staged `--write-only`, `--read-from`, and `--delete-only` modes need
+one root with weight 1. Set `FS_MAX_AGG_THROUGHPUT`,
 `FS_MAX_NODE_THROUGHPUT_GBPS` and `FS_MAX_NODE_IOPS` for the filesystems
 combined; they size the generated dataset.
 
@@ -802,9 +813,9 @@ BATCH=$("$IO" --batch --target targets/vendor-a.env \
     --env-override overrides/r2-requirements.env --nodes 8,16 \
     | sed -n 's/^STORAGE_SCALE_TEST_BATCH_RESULTS=//p'); test -n "$BATCH"
 "$IO" --start "$BATCH"
-# Kubernetes only: wait for a terminal --status, then collect.
-"$IO" --status "$BATCH"
-"$IO" --collect "$BATCH"
+# Kubernetes only: wait for --status to print NEXT_ACTION=COLLECT, then collect.
+# "$IO" --status "$BATCH"
+# "$IO" --collect "$BATCH"
 ./utils/extract-filesystem.py "$BATCH"
 ```
 

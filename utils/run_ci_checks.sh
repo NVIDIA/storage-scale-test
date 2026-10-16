@@ -48,8 +48,8 @@ usage() {
 check_macos_test_prerequisites() {
     [[ "$(uname -s)" == "Darwin" ]] || return 0
     if ((BASH_VERSINFO[0] < 4 || \
-         (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
-        echo "Error: macOS developer tests require Bash 4.3 or newer; /bin/bash is too old." >&2
+         (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
+        echo "Error: macOS developer tests require Bash 4.4 or newer; /bin/bash is too old." >&2
         echo "Install the prerequisites with: brew install bash coreutils" >&2
         echo "Then ensure Homebrew's bin directory precedes /bin on PATH." >&2
         return 1

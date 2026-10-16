@@ -19,8 +19,11 @@ limitations under the License.
 
 ## Summary and user workflow
 
-This is an unimplemented follow-on to the implemented
-[prepared filesystem batch mode](elbencho-filesystem-batch-mode.md).
+Status: proposed, not implemented. It extends
+[prepared filesystem batches](../FILESYSTEM_TESTING.md#prepared-filesystem-batches)
+and predates v2.0.0, so its Kubernetes details assume one claim per attempt;
+revalidate them against per-claim Leases and namespace segments
+([lifecycle](../KUBERNETES_ELBENCHO_LIFECYCLE.md)) before implementing.
 This plan adds ordered reuse and deletion of datasets
 produced earlier in the same batch; it does not add live append or a general
 dependency scheduler.

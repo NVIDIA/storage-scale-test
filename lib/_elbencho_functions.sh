@@ -3763,6 +3763,12 @@ reify_all_elbencho_executions() {
         echo "Error: Node specification produced no node counts" >&2
         return 1
     fi
+    # One cell per node count, IO size, thread count, and IO depth.
+    if (( ${#node_counts[@]} * ${#ELBENCHO_SCALE_IO_SIZES[@]} \
+            * ${#ELBENCHO_SCALE_THREAD_LIST[@]} * ${#ELBENCHO_IODEPTH_LIST[@]} > 9999 )); then
+        echo "Error: sweep exceeds the 9999-execution ledger limit" >&2
+        return 1
+    fi
 
     local executions_dir="${output_dir}/executions"
     mkdir -p "$executions_dir" || return 1

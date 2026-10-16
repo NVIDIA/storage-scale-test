@@ -361,7 +361,7 @@ def test_exit_between_leases_is_rolled_back_by_a_later_status(tmp_path):
             kubectl_lifecycle_operation status {str(state.parent)!r}
             """))
     assert result.returncode == 0, result.stderr
-    assert "STATE=SUBMISSION_FAILED" in result.stdout
+    assert "STATE=SUBMISSION_FAILED\nNEXT_ACTION=INSPECT\n" in result.stdout
     events = _events(tmp_path)
     assert events[:2] == ["verify-identity ns-a", "verify-identity ns-b"]
     assert f"delete Pod ns-a/{_upload()}" in events
@@ -747,7 +747,7 @@ def test_status_restarts_a_lost_sequencers_next_segment(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     keys = _keys(result.stdout)
-    assert keys["STATE"] == "BETWEEN_EXECUTIONS"
+    assert keys["STATE"] == "RUNNING"
     assert keys["NEXT_ACTION"] == "WAIT"
     assert (keys["EXECUTIONS_TOTAL"], keys["EXECUTIONS_SUCCEEDED"]) == ("4", "2")
     assert keys["EXECUTIONS_PENDING"] == "2"
@@ -1075,7 +1075,11 @@ def test_v1_attempt_is_refused_with_the_collect_with_v1_message(tmp_path):
         )
         assert result.returncode != 0
         assert "was started by storage-scale-test v1.x" in result.stderr
-        assert "Collect this attempt with storage-scale-test v1.x" in result.stderr
+        assert (
+            "Collect this attempt with a separate storage-scale-test v1.x checkout"
+            in result.stderr
+        )
+        assert "no valid current Kubernetes attempt" not in result.stderr
     assert _events(tmp_path) == []
     after = sorted(str(path) for path in state.rglob("*") if path.name != ".lock")
     assert [path for path in after if path in before] == [
@@ -1300,7 +1304,7 @@ def test_status_continues_after_a_segment_recovered_to_success(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     keys = _keys(result.stdout)
-    assert keys["STATE"] == "BETWEEN_EXECUTIONS"
+    assert keys["STATE"] == "RUNNING"
     assert (keys["SEGMENT_0_STATE"], keys["SEGMENT_1_STATE"]) == ("SUCCESS", "PENDING")
     assert keys["SEGMENT_CURRENT"] == "1"
     events = _events(tmp_path)

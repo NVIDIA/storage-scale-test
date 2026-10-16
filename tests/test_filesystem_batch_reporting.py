@@ -767,7 +767,7 @@ def test_index_and_omnibus_name_each_groups_storage_target(tmp_path):
     combined = (manifest.root / "reports.txt").read_text(encoding="utf-8")
     for header in (
         'Group 0001 (io) target: "lustre-a"\n',
-        'Group 0002 (mdtest) target: "/mnt/w,/mnt/x (derived)"\n',
+        'Group 0002 (mdtest) target: "/mnt/w,/mnt/x" (derived)\n',
         'Group 0003 (io) target: "a|b"\n',
         'Group 0004 (mdtest) target: "unknown"\n',
     ):

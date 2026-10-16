@@ -574,6 +574,12 @@ def _write_report_index(
     _publish_report_text(output / "index.md", "\n".join(lines) + "\n")
 
 
+def _quoted_target_label(label: str) -> str:
+    """``"name"``, with a ``(derived)`` marker kept outside the quotes."""
+    name, marked, _ = label.rpartition(" (derived)")
+    return f'"{name}" (derived)' if marked else f'"{label}"'
+
+
 def _group_target(manifest: BatchManifest, group: BatchGroup) -> str:
     """Describe the storage target saved with the group; unknown when unreadable."""
     source = manifest.group_path(group) / ENV_YAML
@@ -643,7 +649,7 @@ def _write_combined_report(
             annotated = format_io_snapshot_summary(snapshot) + "\n" + content
         sections.append(
             f"\n\n{'=' * 80}\nGroup {group.group_id} ({group.kind}) "
-            f'target: "{_group_target(manifest, group)}"\n'
+            f"target: {_quoted_target_label(_group_target(manifest, group))}\n"
             f"Report: {report}\nSaved settings: {source}\n\n" + annotated
         )
     _publish_report_text(destination, "".join(sections) + "\n")
