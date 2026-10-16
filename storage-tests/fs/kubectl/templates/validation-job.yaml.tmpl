@@ -16,8 +16,8 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: @@RESOURCE_NAME@@
-  namespace: @@NAMESPACE@@
+  name: "@@RESOURCE_NAME@@"
+  namespace: "@@NAMESPACE@@"
   labels:
     app.kubernetes.io/name: storage-scale-test
     app.kubernetes.io/instance: sst-elb-@@ATTEMPT_ID@@
@@ -44,7 +44,7 @@ spec:
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 1
       restartPolicy: Never
-      nodeName: @@NODE_NAME@@
+      nodeName: "@@NODE_NAME@@"
       securityContext:
         runAsNonRoot: true
         runAsUser: @@RUN_AS_USER@@
@@ -54,7 +54,7 @@ spec:
           type: Unconfined
       containers:
         - name: validation
-          image: @@IMAGE@@
+          image: "@@IMAGE@@"
           imagePullPolicy: @@IMAGE_PULL_POLICY@@
           command: ["/bin/bash", "-ceu", "--"]
           args:
@@ -103,29 +103,49 @@ spec:
 @@TEST_ROOT_ARGUMENTS@@
               )
               printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-permissions\n'
+              # Name each root as env.sh does (claim:path), not by its Pod path.
+              mount_root="@@MOUNT_ROOT@@"
+              ids="$(id -u):$(id -g)"
               for test_root in "${test_roots[@]}"; do
+                  relative=${test_root#"$mount_root"/}
+                  claim=${relative%%/*}
+                  path=.
+                  [[ "$relative" != */* ]] || path=${relative#*/}
+                  key="$claim:$path"
+                  if ! test -e "$test_root"; then
+                      if test -x "$(dirname -- "$test_root")"; then
+                          echo "Error: TEST_DIRS root $key does not exist: create $path on claim $claim, readable and writable by UID:GID $ids" >&2
+                      else
+                          echo "Error: TEST_DIRS root $key is unreachable: UID:GID $ids cannot search its parent directory on claim $claim" >&2
+                      fi
+                      exit 1
+                  fi
+                  test -d "$test_root" || {
+                      echo "Error: TEST_DIRS root $key is not a directory on claim $claim" >&2
+                      exit 1
+                  }
                   test -r "$test_root" || {
-                      echo "Error: configured UID/GID cannot read TEST_DIRS root $test_root" >&2
+                      echo "Error: UID:GID $ids cannot read TEST_DIRS root $key" >&2
                       exit 1
                   }
                   test -w "$test_root" || {
-                      echo "Error: configured UID/GID cannot write TEST_DIRS root $test_root" >&2
+                      echo "Error: UID:GID $ids cannot write TEST_DIRS root $key" >&2
                       exit 1
                   }
                   printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-create path=%s\n' "$test_root"
                   probe=$(mktemp "$test_root/.sst-validation.XXXXXXXX") || {
-                      echo "Error: configured UID/GID cannot create a file in TEST_DIRS root $test_root" >&2
+                      echo "Error: UID:GID $ids cannot create a file in TEST_DIRS root $key" >&2
                       exit 1
                   }
                   trap 'rm -f -- "$probe"' EXIT
                   printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-write path=%s\n' "$test_root"
                   printf 'storage-scale-test-validation\n' > "$probe" || {
-                      echo "Error: validation Pod could not write its PVC probe in $test_root" >&2
+                      echo "Error: validation Pod could not write its PVC probe in TEST_DIRS root $key" >&2
                       exit 1
                   }
                   printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=pvc-read path=%s\n' "$test_root"
                   test "$(cat "$probe")" = storage-scale-test-validation || {
-                      echo "Error: validation Pod could not read back its PVC probe in $test_root" >&2
+                      echo "Error: validation Pod could not read back its PVC probe in TEST_DIRS root $key" >&2
                       exit 1
                   }
                   rm -f -- "$probe"
@@ -137,9 +157,6 @@ spec:
             capabilities:
               drop: ["ALL"]
           volumeMounts:
-            - name: storage
-              mountPath: /mnt/storage-scale-test
+@@CLAIM_VOLUME_MOUNTS@@
       volumes:
-        - name: storage
-          persistentVolumeClaim:
-            claimName: @@PVC_NAME@@
+@@CLAIM_VOLUMES@@

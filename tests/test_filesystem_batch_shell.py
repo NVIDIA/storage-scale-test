@@ -22,8 +22,13 @@ import shlex
 import subprocess
 
 import pytest
+import yaml
 
 from tests.filesystem_checkout_test_support import make_filesystem_checkout
+from tests.kubectl_segment_test_helpers import (
+    DEFAULT_SEQUENCER_IMAGE,
+    SEQUENCER_IMAGE as MIRROR_SEQUENCER_IMAGE,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 IO = "nv-elbencho-sweep.sh"
@@ -381,22 +386,34 @@ def test_kubernetes_batch_start_loads_helpers_in_preflight_and_dispatch(
     checkout, entry
 ):
     """The actual batch path must tolerate both loads under strict Bash."""
+    # The claim helpers are stubbed: this test is about sourcing, not claims.
+    stubs = (
+        "kubectl_validate_test_dirs() { :; }\n"
+        "kubectl_parse_test_dir_key() { printf 'test-ns\\ttest-pvc\\tdata/one\\n'; }\n"
+    )
     with (checkout / "env.sh").open("a") as environment:
         environment.write(
-            "\nexport EXECUTION_SUBSTRATE=kubectl\nTEST_DIRS=([data/one]=1)\n"
-            "export KUBECTL_NAMESPACE=test-ns KUBECTL_PV=test-pv KUBECTL_PVC=test-pvc\n"
-            "export KUBECTL_NODE_SELECTOR=benchmark=true\n"
+            "\nexport EXECUTION_SUBSTRATE=kubectl\n"
+            'TEST_DIRS=(["test-pvc:data/one"]=1)\n'
+            "export KUBECTL_NAMESPACE=test-ns\n"
+            "export KUBECTL_NODE_SELECTOR=benchmark=true\n" + stubs
         )
     batch = create(checkout, entry)
-    body = r"""
+    body = stubs + r"""
         SCRIPT_DIR="$1/storage-tests/fs"
         source "$1/lib/_batch_functions.sh"
         source() {
             builtin source "$@" || return
             if [[ "$1" == */_nv-elbencho-kubectl-functions.sh ]]; then
-                kubectl_validate_runtime_configuration() { :; }
-                kubectl_validate_cluster_identity() { :; }
-                kubectl_discover_candidate_nodes() { printf 'worker\n' > "$2"; }
+                kubectl_batch_preflight() { :; }
+                kubectl_select_control_root() {
+                    printf -v "$1" %s data/one
+                    printf -v "$2" %s /mnt/storage-scale-test/test-pvc/data/one
+                }
+                kubectl_set_control_layout() {
+                    export KUBECTL_CONTROL_LOGICAL_ROOT="$1" KUBECTL_CONTROL_TEST_ROOT="$2"
+                    export KUBECTL_CONTROL_ROOT="$2/.storage-scale-test"
+                }
                 kubectl_submit_sweep() {
                     [[ "$2" == 1 && "$KUBECTL_CONTROL_LOGICAL_ROOT" == data/one ]]
                     printf 'DISPATCH_REACHED\n'
@@ -427,6 +444,34 @@ def test_batch_status_labels_counts_as_local(checkout):
     assert "STATE=NOT_STARTED" in result.stdout
     assert "EXECUTIONS_PENDING=1" in result.stdout
     assert "NEXT_ACTION=START" in result.stdout
+
+
+def test_batch_status_and_publish_report_each_groups_storage_target(checkout):
+    batch = create(checkout)
+    target = checkout / "named.env"
+    target.write_text(
+        'STORAGE_TARGET_NAME=vendor-b:fs-1\nTEST_DIRS=(["/data/two"]=1)\n'
+    )
+    appended = launch(
+        checkout, MD, "--append", batch, "--nodes", "1", "--tasks", "1",
+        "--target", target,
+    )  # fmt: skip
+    assert appended.returncode == 0, appended.stdout + appended.stderr
+    assert "STORAGE_SCALE_TEST_BATCH_GROUP_TARGET=vendor-b:fs-1\n" in appended.stdout
+    assert (
+        "STORAGE_SCALE_TEST_BATCH_GROUP_0002_TARGET=vendor-b:fs-1\n" in appended.stdout
+    )
+    assert "_CLAIM=" not in appended.stdout
+    result = launch(checkout, IO, "--status", batch)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[lines.index("NEXT_ACTION=START") + 1 :] == [
+        "GROUP_0001_KIND=io",
+        "GROUP_0001_TARGET=/data/one",
+        "GROUP_0002_KIND=mdtest",
+        "GROUP_0002_TARGET=vendor-b:fs-1",
+    ]
+    assert len({line.partition("=")[0] for line in lines}) == len(lines)
 
 
 @pytest.mark.parametrize(
@@ -469,3 +514,418 @@ def test_local_batch_status_distinguishes_owner_from_cell_state(
     assert fields["STATE"] == state
     assert fields["NEXT_ACTION"] == next_action
     assert fields["EXECUTION_SCOPE"] == "BATCH"
+
+
+MANIFEST = "batch-manifest.tsv"
+GROUP = "STORAGE_SCALE_TEST_BATCH_GROUP"
+GROUP_TARGET = f"{GROUP}_TARGET"
+MDTEST = "MDTEST_ITEMS_PER_DIR"
+ARGS = {IO: ("--nodes", "1"), MD: ("--nodes", "1", "--tasks", "1")}
+
+
+def target_file(checkout, name, text):
+    """Write a --target file beneath the checkout and return its path."""
+    path = checkout / "targets" / name
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def two_targets(checkout):
+    """Target files for two filesystems: the first is named, the second is not."""
+    vendor_a = target_file(
+        checkout,
+        "vendor-a.env",
+        'STORAGE_TARGET_NAME=vendor-a\nTEST_DIRS=(["/data/a"]=1)\n',
+    )
+    vendor_b = target_file(
+        checkout, "vendor-b.env", 'TEST_DIRS=(["/data/b"]=1)\nFS_MAX_NODE_IOPS=5000\n'
+    )
+    return vendor_a, vendor_b
+
+
+def output_keys(stdout):
+    """Return the STORAGE_SCALE_TEST_BATCH_* output lines as (key, value) pairs."""
+    return [
+        tuple(line.split("=", 1))
+        for line in stdout.splitlines()
+        if line.startswith("STORAGE_SCALE_TEST_BATCH_")
+    ]
+
+
+def batch_dir(stdout):
+    """Return the results directory a --batch printed."""
+    return Path(dict(output_keys(stdout))["STORAGE_SCALE_TEST_BATCH_RESULTS"])
+
+
+def groups(batch):
+    """Return the committed (gid, kind, relative) group rows."""
+    return [
+        tuple(row.split("\t")[1:4])
+        for row in (batch / MANIFEST).read_text().splitlines()
+        if row.startswith("group\t")
+    ]
+
+
+def saved_group(batch, relative):
+    """Return a group's parsed env_used.yaml."""
+    return yaml.safe_load((batch / relative / "env_used.yaml").read_text())
+
+
+def prepare_two_targets(checkout, *extra):
+    """Batch an IO submission and append an mdtest one across two target files."""
+    vendor_a, vendor_b = two_targets(checkout)
+    targets = ("--target", vendor_a, "--target", vendor_b)
+    first = launch(checkout, IO, "--batch", *targets, *extra, *ARGS[IO])
+    assert first.returncode == 0, first.stdout + first.stderr
+    batch = next((checkout / "results").glob("filesystem-batch-*"))
+    second = launch(checkout, MD, "--append", batch, *targets, *extra, *ARGS[MD])
+    assert second.returncode == 0, second.stdout + second.stderr
+    return batch, first, second
+
+
+def test_a_target_file_sees_its_own_directory_in_a_batch_as_in_a_plain_run(checkout):
+    """BASH_SOURCE names the operator's file, not the staged private copy."""
+    target = target_file(
+        checkout,
+        "relative.env",
+        'TEST_DIRS=(["$(dirname "${BASH_SOURCE[0]}")/data"]=1)\n',
+    )
+    plain = launch(checkout, IO, "--target", target, *ARGS[IO])
+    assert "Target file: " in plain.stdout, plain.stderr
+    plain_dir = next((checkout / "results").glob("elbencho-*"))
+    expected = [str(target.parent / "data")]
+    assert (
+        list(yaml.safe_load((plain_dir / "env_used.yaml").read_text())["TEST_DIRS"])
+        == expected
+    )
+    batch = launch(checkout, IO, "--batch", "--target", target, *ARGS[IO])
+    assert batch.returncode == 0, batch.stdout + batch.stderr
+    root = batch_dir(batch.stdout)
+    ((_, _, relative),) = groups(root)
+    assert list(saved_group(root, relative)["TEST_DIRS"]) == expected
+
+
+@pytest.mark.parametrize(
+    ("origin_changed", "expected"), [(False, "origin"), (True, "stage")]
+)
+def test_only_an_origin_with_the_staged_content_is_evaluated(
+    checkout, origin_changed, expected
+):
+    """An edited or missing origin falls back to the staged copy."""
+    text = 'TEST_DIRS=(["$(dirname "${BASH_SOURCE[0]}")"]=1)\n'
+    (checkout / "targets" / "stage").mkdir(parents=True)
+    (checkout / "targets" / "origin").mkdir()
+    staged = checkout / "targets" / "stage" / "t.env"
+    origin = checkout / "targets" / "origin" / "t.env"
+    staged.write_text(text)
+    origin.write_text(text + "# edited\n" if origin_changed else text)
+    result = script(
+        checkout,
+        f"d=$(filesystem_target_declarations {shlex.quote(str(staged))} "
+        f'{shlex.quote(str(origin))}) || exit 1; eval "$d"; '
+        'echo "${!TEST_DIRS[*]}"',
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(checkout / "targets" / expected)
+
+
+def test_each_submission_expands_one_group_per_target_in_command_line_order(checkout):
+    batch, first, second = prepare_two_targets(checkout)
+    assert output_keys(first.stdout) == [
+        ("STORAGE_SCALE_TEST_BATCH_RESULTS", str(batch)),
+        (GROUP, "0001"),
+        ("STORAGE_SCALE_TEST_BATCH_GROUPS", "0001,0002"),
+        (f"{GROUP}_0001_TARGET", "vendor-a"),
+        (f"{GROUP}_0002_TARGET", "/data/b"),
+        ("STORAGE_SCALE_TEST_BATCH_EXECUTIONS", "0001-0002"),
+    ]
+    assert output_keys(second.stdout)[2:] == [
+        ("STORAGE_SCALE_TEST_BATCH_GROUPS", "0003,0004"),
+        (f"{GROUP}_0003_TARGET", "vendor-a"),
+        (f"{GROUP}_0004_TARGET", "/data/b"),
+        ("STORAGE_SCALE_TEST_BATCH_EXECUTIONS", "0003-0004"),
+    ]
+    # The legacy single-group key and any claim key are never printed.
+    assert GROUP_TARGET not in {key for key, _ in output_keys(first.stdout)}
+    assert "_CLAIM" not in first.stdout + second.stdout
+    assert "revision\t4\n" in (batch / MANIFEST).read_text()
+    rows = groups(batch)
+    assert [(gid, kind) for gid, kind, _ in rows] == [
+        ("0001", "io"), ("0002", "io"), ("0003", "mdtest"), ("0004", "mdtest"),
+    ]  # fmt: skip
+    vendor_a, vendor_b = two_targets(checkout)
+    expected = [
+        (vendor_a, "vendor-a", "/data/a"),
+        (vendor_b, "/data/b", "/data/b"),
+    ] * 2
+    for (gid, _, relative), (path, name, root) in zip(rows, expected):
+        saved = saved_group(batch, relative)
+        assert saved["STORAGE_TARGET_NAME"] == name, gid
+        assert list(saved["TEST_DIRS"]) == [root], gid
+        # Each group records the operator's own target file, not a staged copy.
+        assert saved["target_file"]["file"] == str(path), gid
+        assert (
+            saved["target_file"]["sha256"]
+            == hashlib.sha256(path.read_bytes()).hexdigest()
+        )
+        assert saved["env_override"] is None
+    # An FS_MAX_* a target omits keeps env.sh's value; one it sets replaces it.
+    assert saved_group(batch, rows[1][2])["FS_MAX_NODE_IOPS"] == 5000
+    assert saved_group(batch, rows[0][2])["FS_MAX_NODE_IOPS"] != 5000
+    # Staged copies and their origins are never published.
+    assert not any(batch.rglob(".target-file*"))
+    assert not list((checkout / "results").glob(".group-staging.*"))
+    status = launch(checkout, IO, "--status", batch)
+    assert status.returncode == 0, status.stderr
+    assert "GROUP_0002_TARGET=/data/b" in status.stdout
+    assert "GROUP_0003_TARGET=vendor-a" in status.stdout
+
+
+def test_a_target_is_never_named_by_env_sh(checkout):
+    """STORAGE_TARGET_NAME in env.sh is cleared before every target file."""
+    with (checkout / "env.sh").open("a") as stream:
+        stream.write("\nexport STORAGE_TARGET_NAME=env-name\n")
+    vendor_a, vendor_b = two_targets(checkout)
+    created = launch(
+        checkout, IO, "--batch", "--target", vendor_b, "--target", vendor_a, *ARGS[IO]
+    )
+    assert created.returncode == 0, created.stdout + created.stderr
+    assert f"{GROUP}_0001_TARGET=/data/b\n" in created.stdout
+    assert f"{GROUP}_0002_TARGET=vendor-a\n" in created.stdout
+    # Without a target file the one target still comes from env.sh.
+    batch = batch_dir(created.stdout)
+    plain = launch(checkout, MD, "--append", batch, *ARGS[MD])
+    assert plain.returncode == 0, plain.stderr
+    assert f"{GROUP_TARGET}=env-name\n" in plain.stdout
+
+
+def test_overrides_apply_to_every_target_after_that_groups_target(checkout):
+    """Each group applies exactly its own target file and then the overrides."""
+    recipe = target_file(
+        checkout,
+        "recipe.env",
+        "ELBENCHO_FILE_SIZE_MULTIPLIER=$((FS_MAX_NODE_IOPS / 10))\n"
+        "MDTEST_ITEMS_PER_DIR=$((FS_MAX_NODE_IOPS / 100))\n",
+    )
+    batch, _, _ = prepare_two_targets(checkout, "--env-override", recipe)
+    rows = groups(batch)
+    assert len(rows) == 4
+    # The override reads the target's own FS_MAX_NODE_IOPS: each target is
+    # applied to its group first, so the two filesystems' groups differ.
+    divisors = {"io": ("ELBENCHO_FILE_SIZE_MULTIPLIER", 10), "mdtest": (MDTEST, 100)}
+    for gid, kind, relative in rows:
+        saved = saved_group(batch, relative)
+        assert [item["file"] for item in saved["env_override"]["files"]] == [
+            str(recipe)
+        ], gid
+        name, divisor = divisors[kind]
+        assert saved[name] == saved["FS_MAX_NODE_IOPS"] // divisor, gid
+    assert saved_group(batch, rows[1][2])["ELBENCHO_FILE_SIZE_MULTIPLIER"] == 500
+    assert saved_group(batch, rows[0][2])["ELBENCHO_FILE_SIZE_MULTIPLIER"] != 500
+    assert saved_group(batch, rows[3][2])[MDTEST] == 50
+
+
+def test_failure_while_staging_a_later_target_commits_nothing(checkout):
+    batch, _, _ = prepare_two_targets(checkout)
+    vendor_a, _ = two_targets(checkout)
+    broken = target_file(
+        checkout, "broken.env", 'TEST_DIRS=(["/data/c"]=1)\nELBENCHO_LIVEINT=5\n'
+    )
+    before = (batch / MANIFEST).read_bytes()
+    result = launch(
+        checkout, IO, "--append", batch, "--target", vendor_a, "--target", broken,
+        "--nodes", "2",
+    )  # fmt: skip
+    assert result.returncode != 0
+    assert "sets workload setting(s): ELBENCHO_LIVEINT" in result.stderr
+    assert (batch / MANIFEST).read_bytes() == before
+    assert not (batch / "groups/0005").exists()
+    assert not list((checkout / "results").glob(".group-staging.*"))
+    fresh = launch(
+        checkout,
+        IO,
+        "--batch",
+        "--target",
+        vendor_a,
+        "--target",
+        broken,
+        "--nodes",
+        "2",
+    )
+    assert fresh.returncode != 0
+    assert len(list((checkout / "results").glob("filesystem-batch-*"))) == 1
+
+
+def test_retry_replaces_uncommitted_debris_for_every_new_group(checkout):
+    batch, _, _ = prepare_two_targets(checkout)
+    vendor_a, vendor_b = two_targets(checkout)
+    for gid in ("0005", "0006"):
+        (batch / "groups" / gid / "debris").mkdir(parents=True)
+    result = launch(
+        checkout, IO, "--append", batch, "--target", vendor_a, "--target", vendor_b,
+        "--nodes", "2",
+    )  # fmt: skip
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "STORAGE_SCALE_TEST_BATCH_GROUPS=0005,0006" in result.stdout
+    assert "revision\t6\n" in (batch / MANIFEST).read_text()
+    assert not list(batch.glob("groups/*/debris"))
+
+
+def test_single_group_publication_prints_both_key_shapes(checkout):
+    """One group keeps the legacy key and also gets its own per-group key."""
+    vendor_a, _ = two_targets(checkout)
+    for arguments, name in (((), "/data/one"), (("--target", vendor_a), "vendor-a")):
+        result = launch(checkout, IO, "--batch", *arguments, *ARGS[IO])
+        assert result.returncode == 0, result.stderr
+        keys = [key for key, _ in output_keys(result.stdout)]
+        assert keys == [
+            "STORAGE_SCALE_TEST_BATCH_RESULTS",
+            GROUP,
+            GROUP_TARGET,
+            f"{GROUP}_0001_TARGET",
+            "STORAGE_SCALE_TEST_BATCH_EXECUTIONS",
+        ]
+        assert f"{GROUP_TARGET}={name}\n" in result.stdout
+        assert f"{GROUP}_0001_TARGET={name}\n" in result.stdout
+        # Remove the batch so the second pass has a fresh results directory.
+        for path in (checkout / "results").glob("filesystem-batch-*"):
+            subprocess.run(["rm", "-r", str(path)], check=True)
+
+
+@pytest.mark.parametrize("spelling", ["same", "relative", "symlink"])
+def test_the_same_target_file_twice_is_rejected(checkout, spelling):
+    vendor_a, _ = two_targets(checkout)
+    link = checkout / "targets" / "link.env"
+    link.symlink_to(vendor_a)
+    other = {
+        "same": vendor_a,
+        "relative": Path("targets/../targets/vendor-a.env"),
+        "symlink": link,
+    }[spelling]
+    result = launch(
+        checkout, IO, "--batch", "--target", vendor_a, "--target", other, *ARGS[IO]
+    )
+    assert result.returncode == 1
+    assert "--target given more than once for the same file" in result.stderr
+    assert not (checkout / "results").exists() or not any(
+        (checkout / "results").glob("*")
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "message"),
+    [("targets/missing.env", "not found"), ("targets", "regular file")],
+)
+def test_target_path_must_be_a_readable_file(checkout, path, message):
+    two_targets(checkout)
+    result = launch(checkout, IO, "--batch", "--target", path, *ARGS[IO])
+    assert result.returncode == 1 and message in result.stderr
+
+
+@pytest.mark.parametrize("operation", ["--start", "--status", "--cancel", "--collect"])
+@pytest.mark.parametrize("entry", [IO, MD])
+def test_lifecycle_operations_reject_target(checkout, entry, operation):
+    batch = create(checkout)
+    vendor_a, _ = two_targets(checkout)
+    result = launch(checkout, entry, operation, batch, "--target", vendor_a)
+    assert result.returncode == 1
+    assert f"{operation} rejects workload arguments (--target)" in result.stderr
+
+
+def test_resume_rejects_target(checkout):
+    vendor_a, _ = two_targets(checkout)
+    result = launch(checkout, IO, "--resume", "/missing", "--target", vendor_a)
+    assert result.returncode == 1
+    assert "--target applies only to a new submission" in result.stderr
+
+
+def test_kubernetes_batch_freezes_only_shared_settings(checkout):
+    """Claims vary per group; PV/PVC and the old list are no longer batch settings."""
+    result = script(
+        checkout,
+        "EXECUTION_SUBSTRATE=kubectl; _elbencho_batch_common_names | sed -n '/^KUBECTL/p'",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == [
+        "KUBECTL_NAMESPACE",
+        "KUBECTL_NODE_SELECTOR",
+        "KUBECTL_ELBENCHO_IMAGE",
+        "KUBECTL_IMAGE_PULL_POLICY",
+        "KUBECTL_RUN_AS_USER",
+        "KUBECTL_RUN_AS_GROUP",
+        "KUBECTL_SEQUENCER_IMAGE",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected"),
+    [
+        ("unset KUBECTL_SEQUENCER_IMAGE", DEFAULT_SEQUENCER_IMAGE),
+        ("KUBECTL_SEQUENCER_IMAGE=", DEFAULT_SEQUENCER_IMAGE),
+        (f"KUBECTL_SEQUENCER_IMAGE={MIRROR_SEQUENCER_IMAGE}", MIRROR_SEQUENCER_IMAGE),
+    ],
+)
+def test_kubernetes_batch_freezes_the_effective_sequencer_image(
+    checkout, tmp_path, setting, expected
+):
+    """The image the sequencer resolves to is frozen, so a newer default is drift."""
+    profile = tmp_path / "profile.tsv"
+    result = script(
+        checkout,
+        f"EXECUTION_SUBSTRATE=kubectl; {setting}; kubectl_resolve_sequencer_image; "
+        f"_elbencho_batch_write_profile {shlex.quote(str(profile))}",
+    )
+    assert result.returncode == 0, result.stderr
+    rows = dict(line.split("\t", 1) for line in profile.read_text().splitlines())
+    assert rows["KUBECTL_SEQUENCER_IMAGE"] == (
+        f'declare -gx KUBECTL_SEQUENCER_IMAGE="{expected}"'
+    )
+    assert not {"KUBECTL_PV", "KUBECTL_PVC", "KUBECTL_STORAGE_TARGETS"} & set(rows)
+
+
+PREFLIGHT_BODY = r"""
+    batch=$1
+    EXECUTION_SUBSTRATE=kubectl
+    source() {
+        builtin source "$@" || return
+        if [[ "$1" == */_nv-elbencho-kubectl-functions.sh ]]; then
+            %s
+        fi
+    }
+    _elbencho_batch_preflight "$batch"
+"""
+
+
+def preflight(checkout, batch, definition):
+    """Run the Kubernetes branch of batch preflight with one stubbed helper."""
+    return script(
+        checkout,
+        PREFLIGHT_BODY.replace("%s", definition)
+        .replace("batch=$1", f"batch={shlex.quote(str(batch))}")
+        .strip(),
+    )
+
+
+def test_kubernetes_preflight_delegates_to_the_claim_preflight(checkout):
+    batch = create(checkout)
+    result = preflight(
+        checkout,
+        batch,
+        "kubectl_batch_preflight() { printf 'PREFLIGHT %s\\n' \"$1\"; }",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"PREFLIGHT {batch}\n"
+
+
+def test_kubernetes_preflight_failure_stops_the_batch(checkout):
+    batch = create(checkout)
+    result = preflight(checkout, batch, "kubectl_batch_preflight() { return 7; }")
+    assert result.returncode != 0
+
+
+def test_kubernetes_preflight_without_the_claim_preflight_is_a_clear_error(checkout):
+    batch = create(checkout)
+    result = preflight(checkout, batch, "unset -f kubectl_batch_preflight")
+    assert result.returncode != 0
+    assert "kubectl_batch_preflight) is unavailable" in result.stderr

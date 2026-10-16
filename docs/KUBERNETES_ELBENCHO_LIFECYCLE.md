@@ -33,7 +33,14 @@ Prepared filesystem batches add a local assembly phase before attempt creation.
 definitions, and the versioned batch manifest. They create no Kubernetes or PVC
 resources. Start validates the complete saved profile and discovers capacity,
 then permanently seals the manifest before entering the attempt lifecycle below.
-A sealed batch remains immutable after submission failure.
+A sealed batch remains immutable after submission failure. Its saved profile
+freezes what the groups share: `KUBECTL_NAMESPACE` (the default namespace of
+keys that name none; optional when every key names its namespace), the node
+selector, image, pull policy, workload identity, and `KUBECTL_SEQUENCER_IMAGE`,
+which is frozen as the image it resolves to (the built-in default when unset)
+so that neither a later `env.sh` edit nor a newer default changes how a
+prepared batch sequences its namespaces. Each group's snapshot records its own
+roots, and so its claims and namespace.
 
 ## Failure policy and boundary
 
@@ -100,7 +107,8 @@ require collection before resume.
 
 ### PVC run lifecycle
 
-The PVC is authoritative for benchmark progress until collection:
+The run tree on a claim is authoritative for benchmark progress until
+collection:
 
 ```text
 PREPARED -> RUNNING -> SUCCESS
@@ -114,15 +122,23 @@ PREPARED -> RUNNING -> SUCCESS
 may reconstruct a missing terminal summary or publication manifest from a
 consistent ledger, but may not change one terminal outcome into another.
 
+Every `TEST_DIRS` key names its claim: `[NAMESPACE/]CLAIM:PATH`, the
+namespace defaulting to `KUBECTL_NAMESPACE`. Its normalized form
+`NAMESPACE/CLAIM:PATH` is the root's logical path, and every claim is mounted
+at `/mnt/storage-scale-test/<claim>`, so the root's Pod path is
+`/mnt/storage-scale-test/<claim>/<path>`. The roots of one target share a
+namespace.
+
 Durable run state resides at
-`<canonical TEST_DIR>/.storage-scale-test/runs/<attempt-id>`. The canonical
-root is the lexically first normalized `TEST_DIRS` key and is saved in the
-immutable attempt configuration. The hidden directory is created by the
-configured workload identity; the PVC mount root need not be writable. The
-PVC-wide Lease remains discoverable even when competing invocations configure
-different test roots.
-For batches, selection uses the union of all saved group roots; resume retains
-that same canonical root even when only a later group's cells remain.
+`<control root>/.storage-scale-test/runs/<attempt-id>`. The control root of a
+segment (see below) is the lexically first normalized root of every group in
+its namespace, and the run tree lives on that root's claim. The control roots
+are saved in the immutable attempt configuration. The hidden directory is
+created by the configured workload identity; the claim's mount root need not
+be writable. Each claim's Lease remains discoverable even when competing
+invocations configure different test roots. Because a namespace's control
+root is derived from all of the batch's groups in it, a resume keeps the same
+control root even when only a later group's cells remain.
 
 ### Per-cell lifecycle
 
@@ -157,9 +173,151 @@ NOT_CREATED, CREATE_AMBIGUOUS, ACTIVE, COMPLETE, FAILED, or DELETED
 
 Only the saved kind, name, namespace, UID, ownership nonce, and attempt labels
 establish identity. A broad label query never establishes ownership. A failed
-or externally deleted exact Job with a nonterminal PVC ledger is bounded
+or externally deleted exact Job with a nonterminal run ledger is bounded
 coordinator-loss evidence: a lifecycle command may recover the run to a
 collectible failure when the saved identity and durable control state agree.
+
+### Attempt identity: segments and claims
+
+New attempts write identity schema 4. A *segment* is one namespace; the
+identity lists the attempt's segments in run order and, for every segment,
+the claims its Pods mount. Each claim records its namespace and namespace UID,
+its name and UID, the PersistentVolume it is bound to and that PV's UID, and
+the deterministic Lease name derived from the three UIDs. Claims are numbered
+`j = 0..M-1` in sorted order (namespace, then claim name) across the whole
+attempt: that is the Lease acquisition order. The order is byte order
+(`LC_ALL=C`), whatever the locale of the host that writes or reads the
+identity. Every segment has at least one claim, and no two claims share a PV.
+An attempt has at most 16 segments and 32 claims; `kubectl_validate_test_dirs`
+and batch preflight reject more claims, naming the limit, before any cluster
+or claim mutation.
+
+Attempts started by storage-scale-test v1.x (identity schemas 2 and 3, one
+claim per target, configured with `KUBECTL_PVC` and `KUBECTL_PV`) are not
+loaded: every lifecycle command refuses them, names the schema, and says to
+collect the attempt with storage-scale-test v1.x before upgrading. It changes
+nothing.
+
+Segment 0 keeps the plain resource names and journal keys. Segment `k > 0`
+inserts `-s<k>` after the attempt ID in names (`sst-elb-<id>-s<k>-workers`)
+and appends it to journal keys (`workers-s<k>`). The per-segment local files
+`remote-reservation.sh`, `worker-endpoints.tsv`, `endpoint-drift.tsv`,
+`control-bundle` and `collected-state`, and the steps `release-remote-run`,
+`segment-succeeded` and `segment-not-started`, take the same suffix. Claim
+`j`'s Lease has the journal key `pvc-lease` (claim 0) or `pvc-lease-c<j>`, and
+its release step is `release-` followed by that key. Every Pod of a segment
+(workers, coordinator, helpers) carries the label
+`storage-scale-test.nvidia.com/segment: "<k>"`, and every per-segment selector,
+diagnostic capture, and readiness classification includes it.
+
+Cleanup uses one enumeration derived from the saved identity: the sequencer,
+sweep Jobs, DaemonSets in reverse segment order, transfer helpers, inspectors,
+policies, then sequencer RBAC. Leases are released last, in reverse claim
+order (claim 0 last).
+
+### Segments and the sequencer
+
+A plain run, or a batch whose groups all use one namespace, is one segment:
+one worker DaemonSet, one coordinator Job (created unsuspended), and one set
+of NetworkPolicies, all in that namespace; the workers, the coordinator and
+the transfer helper mount every claim the namespace's groups use. Several targets in one namespace therefore need no
+sequencer, ServiceAccount, Role, RoleBinding or sequencer image.
+
+A batch whose groups span namespaces has one segment per namespace that runs
+at least one of the attempt's executions. Segments are ordered by the first
+execution of each namespace in batch-ledger order, and each segment's cells
+run in ledger order. Each execution belongs to the namespace of its group's
+roots. Each segment `k` has:
+
+- a Lease per claim of its namespace, a worker DaemonSet, and same-namespace
+  NetworkPolicies;
+- a run tree below its own control root;
+- a coordinator Job in its namespace that mounts every claim of the namespace
+  and runs only the executions of its namespace's groups, in global
+  execution-ID order. Its control bundle holds just those definitions, the
+  complete batch manifest and group snapshots, that segment's worker
+  endpoints, and a `segment.tsv` row naming its index and namespace. The
+  coordinator refuses, before any ledger mutation, a definition whose group's
+  roots are in another namespace. Its control root is the first root of its
+  own namespace. Each cell runs with its own group's roots, read from the
+  group snapshot, so its generated targets and read-from path are checked as
+  `NAMESPACE/CLAIM:PATH` against that group alone, never against the batch's
+  union of roots, which may hold the same `claim:path` in another namespace
+  or a root nested in another group's.
+
+A one-segment batch attempt's bundle carries `segment.tsv` too, so every
+batch coordinator knows its namespace among the batch's roots.
+
+The claims, roots, control root and checked workload paths of a segment cover
+every group of the batch in its namespace, not only the groups with cells in
+this attempt, so a resume prepares the same storage.
+
+Status and collector helpers (inspectors) touch only a segment's run tree,
+so they mount only its control root's claim: a later deletion of another
+claim of the segment never keeps them from starting, and the cluster
+identity check still reports that claim as `IDENTITY_MISMATCH`.
+
+Every rendered manifest quotes its name, namespace, node, claim, image and
+node-selector strings, so valid names such as `123`, `1.5`, `yes`, `on` or
+`null` stay YAML strings.
+
+Prepare walks the segments in order through each phase: the cluster identity
+of every claim, one node discovery, a transfer helper per segment with path
+and access checks on its claims, every claim's Lease in claim order, every
+run-tree reservation, then every segment's policies and workers, and finally
+every segment's endpoints. A segment whose control root reaches storage that
+an earlier segment's control root reaches finds that run tree and fails its
+reservation; the error names the control root as a possible alias.
+
+Submission uploads each segment's bundle through that segment's helper. With
+several segments it then creates every coordinator Job with
+`spec.suspend: true` (Kubernetes 1.24 or newer), followed by the sequencer's
+ServiceAccount, Roles, RoleBindings, and Job. The sequencer runs
+`KUBECTL_DEFAULT_SEQUENCER_IMAGE` (a pinned `docker.io/alpine/kubectl`) unless
+`KUBECTL_SEQUENCER_IMAGE` names another digest-qualified image that provides
+`sh`, `kubectl`, `grep`, and `sleep`; a batch in one namespace needs none of
+this.
+
+The *sequencer* is a Job in segment 0's namespace. It unsuspends Job 0, waits
+for it to be `Complete`, unsuspends Job 1, and so on; on `Failed` it stops, so
+later segments never start. Its loop re-derives progress from live Job state
+after a restart. A coordinator exits 0 exactly when its published outcome is
+`SUCCESS`, so `Complete` means the segment succeeded. The sequencer exits 0
+when every Job is `Complete` or one `Failed`, 2 on bad input, 3 only when the
+API server answers NotFound for a Job, 4 on a UID change, and 5 when
+`kubectl`, `grep`, or `sleep` is missing or cannot run, or the mounted
+ServiceAccount credentials are missing. Because `kubectl` ignores its
+in-cluster configuration once a client flag such as `--request-timeout` is
+given, the sequencer writes a kubeconfig that names the mounted ServiceAccount
+token file (so a rotated token is picked up) and bounds every request with
+`--request-timeout` (`KUBECTL_SEQUENCER_REQUEST_TIMEOUT_SECONDS`, default 30). It
+re-observes every `KUBECTL_SEQUENCER_POLL_SECONDS` (default 10).
+
+The sequencer is the one narrowly scoped exception to the rule that no Pod
+holds Kubernetes API credentials. Only the sequencer Pod mounts a
+ServiceAccount token. In every segment's namespace a Role grants that
+ServiceAccount `get` and `patch` on exactly that segment's coordinator Job (by
+`resourceNames`), and each patch carries a JSON-patch `test` of the Job's UID.
+Coordinator, worker, and helper Pods still mount no token.
+
+A resume plans its own segments from the cells that remain, so a resume that
+leaves one namespace is a one-segment attempt without a sequencer. Batch
+preflight before a sealed batch resumes plans the same way, from the
+executions that have not succeeded: it checks the claims, the claim limit,
+and the sequencer image only for those segments, so a namespace or claim
+used only by succeeded executions may be gone.
+
+`validate_env.sh` checks the one target that `env.sh` describes, in its one
+namespace. `kubectl_validate_test_dirs` reports every claim-syntax problem
+first (stale `KUBECTL_PVC` or `KUBECTL_PV`, keys without a claim, invalid names,
+roots that span namespaces). It then checks each claim's identity (Bound,
+`ReadWriteMany`, Filesystem mode, the PV it is bound to) and runs one
+deadline-bounded validation Job in that namespace that mounts every claim, to
+check the image, workload identity, required tools, and a write, read, and
+removal on every root. The sequencer's RBAC, server version, and image
+(a short-lived Job, no API call) are checked as warnings only; `--sequencer`
+runs the full probe and makes problems errors (S-23, S-28); a batch spanning namespaces is
+validated per namespace when it starts.
 
 ### Public status projection
 
@@ -167,9 +325,9 @@ collectible failure when the saved identity and durable control state agree.
 |---|---|
 | `PREPARED` | Report preparation, or reconcile a provably failed submission to `SUBMISSION_FAILED`. |
 | `SUBMISSION_FAILED` | Report `SUBMISSION_FAILED`. |
-| `SUBMITTED` | Project the validated PVC state and current-attempt progress as described below. |
+| `SUBMITTED` | Project the validated run state and current-attempt progress as described below. |
 | `CANCEL_REQUESTED` | Report pending cancellation and direct the user to retry `--cancel`. |
-| `TERMINAL` | Report the validated terminal PVC outcome. |
+| `TERMINAL` | Report the validated terminal run outcome. |
 | `COLLECTION_IN_PROGRESS` | Report the terminal outcome and resumable collection context. |
 | `COLLECTED` | Report the locally verified terminal outcome without cluster access. |
 
@@ -183,33 +341,129 @@ projections, not additional durable states or proof of the coordinator's phase.
 The outcome is refreshed after the execution scan; a transition refreshes counts
 once. Counts remain bounded observations, not an atomic sweep-wide transaction.
 
+A multi-segment attempt aggregates its segments. Their Jobs are observed last
+segment first: segment `k+1` starts only after segment `k` is `Complete`, and
+`Complete` never changes, so one pass cannot see a later segment started while
+an earlier one still runs merely because the earlier one finished between two
+observations. Segments before the current one (the first whose Job is not
+`Complete`) succeeded; the current segment is observed through an inspector in
+its namespace; later segments have not started. Counts span every segment.
+`RUNNING` covers the gap between two segments, and `NEXT_ACTION=COLLECT`
+follows once the last segment is terminal or any segment failed or was
+cancelled. Status also starts the current segment's still-suspended Job when
+every earlier Job is `Complete`, with the user's credentials and the same
+UID-tested patch, which recovers a lost sequencer. A coordinator lost after
+its last cell leaves a `Failed` (or deleted) Job, so the sequencer stops; when
+lost-coordinator recovery proves the segment's ledger `SUCCESS`, status
+journals `segment-succeeded[-s<k>]` (treated as `Complete` from then on) and
+starts the next segment. Worker drift on the current segment or any later one
+fails the attempt: the sequencer is deleted, the current Job is observed once
+more, `stopped-by-drift` is journaled and the Job is deleted, the current
+segment recovers to `FAILED`, and later segments are recorded as never started before
+their suspended Jobs are deleted. If the current segment succeeded meanwhile
+(its Job is `Complete` at that last observation, or its ledger is `SUCCESS`
+after the deletion, which is then journaled `segment-succeeded[-s<k>]`),
+status fails without touching it and the next `--status` fails the following
+segment instead. The view adds `SEGMENT_COUNT`, `SEGMENT_CURRENT`, and per
+segment `SEGMENT_<k>_NAMESPACE` and `SEGMENT_<k>_STATE` (`SUCCESS`, `FAILED`,
+`CANCELLED`, `RUNNING`, `PENDING`, or `NOT_STARTED`), with `k` the 0-based
+segment index; a one-segment attempt prints none of them. In
+`CANCEL_REQUESTED`, status names the segment being cancelled (the first whose
+Job is not `Complete`) with `SEGMENT_CURRENT`, `SEGMENT_<k>_NAMESPACE`, and its
+exact Job in the `CANCELLATION_INCOMPLETE` diagnostic.
+
+Cancellation linearizes first: `SUBMITTED -> CANCEL_REQUESTED`, then the
+sequencer's exact deletion, and only then are the segments classified, so no
+segment can start after that observation. It cancels the first segment that
+has not succeeded exactly as a one-segment attempt is cancelled, and records
+every later segment as never started before deleting its suspended Job. A
+segment that succeeds while it is being cancelled passes cancellation to the
+next one; so does a segment whose next one the sequencer started just before
+it was stopped, which is then the one cancelled. Right before deleting a
+coordinator Job, cancellation observes it again and leaves a `Complete` Job
+and its ledger alone. The coordinator's `--finalize-cancelled` never
+overwrites a terminal ledger: `SUCCESS` and `CANCELLED` keep their outcome
+(only a bounded publication gap is repaired), and `FAILED` becomes `CANCELLED`
+only when it is the failure that the coordinator's own TERM or INT handler
+published while its Job was deleted (run-summary exit code 143 or 130). A
+segment whose Job cancellation deleted but whose ledger is `SUCCESS` is
+journaled `segment-succeeded[-s<k>]`. `--cancel` reports the outcome the
+ledgers hold, which is `SUCCESS` when every segment finished first. Every step
+is journaled or idempotent, so repeating an interrupted `--cancel` completes
+it. Workers, run trees, and Leases remain until collection.
+
+Collection gates every started segment (terminal run outcome and quiescent
+exact Job; endpoint drift is checked on the last started segment), stops the
+sequencer, streams each segment's state tree through a collector in its own
+namespace that mounts the segment's control claim, then imports the segments in
+order as `collected-state[-s<k>]` and journals `collection-published`.
+Unstarted segments contribute no results. Cleanup then releases every
+segment's run tree, deletes every owned object including the sequencer's
+ServiceAccount, Roles, and RoleBindings, and releases the Leases in reverse
+claim order. Each cleanup step is journaled, so an interrupted collection
+resumes where it stopped.
+
+At the results root, `run.status` and `run-summary.tsv` always describe the
+attempt. A one-segment attempt publishes its own ledger files under their
+plain names: `run.status`, `run-summary.tsv`, `startup-error.txt`, and
+`coordinator-loss.tsv`. In a multi-segment attempt every segment publishes its
+ledger files with the suffix of its namespace: `run-<namespace>.status`,
+`run-summary-<namespace>.tsv`, `startup-error-<namespace>.txt`, and
+`coordinator-loss-<namespace>.tsv`. After every started segment is imported,
+collection publishes the attempt's aggregate outcome as `run.status`:
+`SUCCESS` only when every segment ran and succeeded; otherwise the `FAILED` or
+`CANCELLED` outcome of the segment that did not succeed (segments run in order
+and nothing starts after one that did not succeed, so there is at most one);
+and, when every segment that ran succeeded but later ones were abandoned,
+`FAILED` if worker drift stopped the attempt (journaled `stopped-by-drift`)
+and `CANCELLED` if a user's cancellation did. Worker drift never ends an
+attempt `CANCELLED`. The aggregate `run-summary.tsv` (`scope attempt`) holds
+the attempt's execution counts, a `reason worker-drift` row after `run_status`
+when drift handling stopped the attempt, a `segments <N>` row, and one
+`segment <k> <namespace> <outcome>` row per segment (`NOT_STARTED` for an
+abandoned one). Both files are deterministic, and their digests are first
+recorded in the attempt's local `results-aggregate.tsv`, so a repeated import
+republishes identical bytes and a later attempt can supersede them. Every
+other published path belongs to one execution or one group, or is a
+byte-identical snapshot. A later attempt's collection removes every earlier
+attempt's `run*.status` and `run-summary*` files, including an aggregate, and
+replaces an earlier `startup-error*` or `coordinator-loss*` file only at a
+path it publishes itself; the earlier copies remain in that attempt's
+`collected-state[-s<k>]`. Status, cancel, collect, and resume read each
+segment's ledger only from those local `collected-state[-s<k>]` copies.
+
 `ATTEMPT` identifies the current attempt. `EXECUTION_SCOPE=CURRENT_ATTEMPT` and
 `EXECUTIONS_{TOTAL,PENDING,RUNNING,SUCCEEDED,FAILED}` exclude previously successful
 cells on resume. Only one progress view is emitted: `PROGRESS_SOURCE=PVC` before
 publication, or `LOCAL` for verified collected state. `RESULT_COLLECTION` is
 `PENDING`, `CLEANUP_PENDING`, or `COMPLETE`; `NEXT_ACTION` is `WAIT`, `COLLECT`,
-`RESUME`, or `NONE`. A terminal PVC outcome permits collect, which still enforces
+`RESUME`, or `NONE`. A terminal run outcome permits collect, which still enforces
 exact Job quiescence before import. Zero running cells alone never permits it.
 
 ## Invariants
 
-1. Attempt ID, ownership nonce, namespace/PV/PVC identity, configuration,
-   image, workload identity, and execution definitions are immutable.
+1. Attempt ID, ownership nonce, segment and claim identity (namespace, claim,
+   bound PV, and their UIDs), control roots, configuration, image, workload
+   identity, and execution definitions are immutable.
 2. One attempt is current per result tree. The current pointer is atomic;
    historical attempt metadata remains immutable.
 3. One mutating lifecycle command may operate on a result tree. Concurrent
    commands are rejected rather than queued.
-4. One active sweep may own the configured PVC. A deterministic namespaced
-   Kubernetes Lease keyed by the namespace, PV, and PVC UIDs is its global
-   reservation; it is never renewed, expired, or stolen.
+4. One active sweep may own a claim. A deterministic namespaced Kubernetes
+   Lease per claim, keyed by the namespace, PV, and PVC UIDs, is its global
+   reservation; it is never renewed, expired, or stolen. An attempt acquires
+   its claims' Leases in claim order (namespace, then claim) and releases them
+   in reverse.
 5. Every external create follows `durable intent -> create -> exact identity
    observation -> durable UID journal -> intent removal`.
 6. Destructive operations require exact kind, name, namespace, UID, ownership
    nonce, and attempt identity. Operational lookup failure is not absence.
 7. `PREPARED` may contain partial resources, but every possible resource is
    represented by a creation intent or exact resource journal.
-8. `SUBMITTED` has an exact UID-journaled sweep Job.
-9. The per-attempt coordinator lock in the PVC run tree gives one Job Pod
+8. `SUBMITTED` has an exact UID-journaled sweep Job per segment (one segment
+   per namespace) and, with several segments, an exact UID-journaled
+   sequencer Job.
+9. The per-attempt coordinator lock in the segment's run tree gives one Job Pod
    authority to mutate the ledger; duplicate Job Pods exit first.
 10. Node UID, architecture, resolved image identity, and Pod IPv4 address are
     frozen. A worker Pod name or UID may change only when the same Node and IP
@@ -220,9 +474,9 @@ exact Job quiescence before import. Zero running cells alone never permits it.
 13. A terminal run is collectible only when its ledger, summary, publication
     manifest, and exact Job quiescence agree.
 14. Remote cleanup begins only after the complete local publication verifies.
-15. `COLLECTED` means the local publication verifies, the remote run and PVC
-    Lease are gone, exact owned resources are gone, and no benchmark work
-    remains.
+15. `COLLECTED` means the local publication verifies, every remote run tree
+    and every claim's Lease are gone, exact owned resources are gone, and no
+    benchmark work remains.
 16. Resume never reruns a collected successful cell.
 17. Traversing, linked, contradictory, corrupt, or identity-mismatched state
     fails closed.
@@ -236,17 +490,20 @@ exact Job quiescence before import. Zero running cells alone never permits it.
 | Attempt identity exists | Atomic rename of the complete attempt metadata directory. |
 | Attempt becomes current and recoverable | Atomic replacement of `current-attempt` before external mutation. |
 | Local transition | Atomic replacement of `state.sh`. |
-| PVC ownership | API creation of the deterministic Lease, followed by exact identity observation and durable UID journaling. |
-| PVC ownership release | UID-preconditioned deletion of the exact Lease after remote state and all other owned resources are gone. |
+| Claim ownership | API creation of the claim's deterministic Lease, followed by exact identity observation and durable UID journaling, in claim order. |
+| Claim ownership release | UID-preconditioned deletion of the exact Lease after remote state, all other owned resources, and every later claim's Lease are gone. |
 | A Kubernetes resource may exist | Creation intent is durable before `kubectl create`. |
 | Kubernetes ownership is locally established | Exact UID-bearing resource journal is atomically published. |
-| Submission succeeds | Exact Job UID is journaled and local state becomes `SUBMITTED`. |
+| Submission succeeds | Exact Job UID is journaled and local state becomes `SUBMITTED`. With several segments, every Job is created suspended, and the sequencer's ServiceAccount, Roles, RoleBindings, and Job are journaled before `SUBMITTED`. |
+| Segment starts | UID-tested patch of a suspended Job to `suspend: false`, made by the sequencer or by `--status` only after every earlier segment's Job is `Complete`. |
+| Segment abandoned | Journal step `segment-not-started[-s<k>]` after observing the Job still suspended, before its exact deletion. |
+| Drift stops a multi-segment attempt | Journal step `stopped-by-drift` before the current segment's Job is deleted. |
 | Coordinator ownership | Atomic creation of `coordinator.lock`; owner-file completion is recoverable initialization. |
 | Run becomes active | Atomic `run.status=RUNNING` after bundle, snapshots, ledger, and service validation. |
 | Cell begins | Atomic `NNNN.status=RUNNING`. |
 | Cell commits | Atomic replacement of the publication manifest after artifacts, exit code, terminal cell status, and summary. |
 | Run commits its outcome | Terminal summary and status plus a consistent publication manifest. |
-| Cancellation begins | `SUBMITTED -> CANCEL_REQUESTED` before exact Job deletion. |
+| Cancellation begins | `SUBMITTED -> CANCEL_REQUESTED` before exact Job deletion. With several segments, the sequencer's exact deletion follows and precedes any segment observation. |
 | Collection publication begins | `TERMINAL -> COLLECTION_IN_PROGRESS` after bounded archive receipt and before extraction or result publication. The unpublished archive may exist while local state remains `TERMINAL`. |
 | Local import checkpoint | Verified state is atomically installed as `collected-state` after result merging. |
 | Collection completes | Remote and resource cleanup completes, then local state becomes `COLLECTED`. |
@@ -271,7 +528,7 @@ contract change rather than silently expanding the release boundary.
 | S-05 | Competing result trees reserve one PVC | Required recovery | One owner; loser rolls back without touching it. | Covered |
 | S-06 | Exit around PVC Lease creation or journaling | Required recovery | Reconcile exact owner/intent; never steal the Lease. | Covered |
 | S-07 | API accepts create but response is lost | Required recovery | Resolve deterministic identity, then journal or delete the exact object. | Covered |
-| S-17 | Create request fails in transit and the object is absent | Required recovery X Covered |
+| S-17 | Create request fails in transit and the object is absent | Required recovery | Resolve by exact-name GET, then adopt the object or resend the same manifest and nonce under the create-retry rules below. | Covered |
 | S-08 | API visibility is delayed within the creation ambiguity horizon (defined below the table) | Required recovery | Wait and perform a later linearizable GET. | Covered |
 | S-09 | Object appears after the creation ambiguity horizon (defined below the table) | Required diagnosis | Retain possible identity and print exact inspection/cleanup guidance. | Covered diagnostically; automatic recovery unsupported |
 | S-10 | API 429, 5xx, timeout, or disconnect during observation | Required recovery | Bounded retry with jitter, then safe retry guidance. | Covered |
@@ -281,6 +538,22 @@ contract change rather than silently expanding the release boundary.
 | S-14 | Exit after Job acceptance but before `SUBMITTED` | Required recovery | Quiesce exact Job and workers before releasing remote state. | Covered |
 | S-15 | Submitter exits after `SUBMITTED` but before printing commands | Required diagnosis | Retain discoverable state under the supplied result directory. | Covered; lost stdout is accepted |
 | S-16 | Original Teleport credential expires after handoff | Required recovery | Job continues; later client reports authentication and safely retries after login. | Acceptance pending |
+| S-18 | An invalid claim-qualified root: `KUBECTL_PVC` or `KUBECTL_PV` still set, a key without its claim, an invalid namespace, claim or path, or a target whose roots span namespaces | Required recovery | Reject before any cluster or claim mutation, report every problem (with the replacement `TEST_DIRS` line for v1.x settings), and name the batch group. | Covered |
+| S-19 | Exit after acquiring an earlier claim's Lease but before a later one | Required recovery | A later lifecycle command rolls back every journaled object and releases the acquired Leases in reverse claim order. | Covered |
+| S-20 | A competitor holds a later claim's Lease | Required recovery | Roll back, releasing only this attempt's earlier Leases; never touch the competitor. | Covered |
+| S-21 | One segment's workers never become Ready | Required recovery | Roll back every namespace: stop workloads, release every run tree, delete every object, release Leases in reverse claim order. | Covered |
+| S-22 | Two segments' control roots reach the same storage | Required recovery | The later segment's run-tree reservation fails, the error names the control root as a possible alias, and everything rolls back. | Covered |
+| S-23 | The sequencer's image, token, or RBAC is unavailable, or the probe is interrupted | Required recovery | With `--sequencer`, when the server version and sequencer permissions check out, `validate_env.sh` runs the checked-in sequencer (its effective image) against an absent Job in the target's namespace and reports success only on its NotFound exit code 3; any other result is an error with the keep-one-namespace fallback. Probe objects are deleted on every exit, including INT/TERM and lost create responses, by UID or by deterministic name after nonce verification. A refused RBAC object at submission rolls back every namespace. | Covered |
+| S-24 | A policy or worker create fails after the transfer helpers exist | Required recovery | Leave the failed object to its creation intent or journal; the rollback releases every run tree through the helpers (or a fresh inspector when a helper is gone), deletes every object, releases the Leases, and records `SUBMISSION_FAILED`. | Covered |
+| S-25 | An exit or lost create response leaves only a creation intent for a sequencer object (ServiceAccount, Role, RoleBinding, or Job) | Required recovery | The submitter's rollback, or a later status or collect, reconciles the intent by exact name and nonce, deletes the object, and completes the rollback. | Covered |
+| S-26 | Several claims share one namespace | Required recovery | They form one segment: one Lease per claim in sorted order, and the segment's workers, coordinator and transfer helper mount every claim (status and collector helpers mount its control claim); every per-segment Pod selector includes the segment label. | Covered |
+| S-27 | Several targets of one batch share one namespace | Required recovery | Submit one segment with one unsuspended coordinator Job and no sequencer, ServiceAccount, Role, RoleBinding or sequencer image. | Covered |
+| S-28 | The cluster grants no sequencer RBAC or cannot run the sequencer image | Required recovery | Without `--sequencer`, `validate_env.sh` checks the sequencer RBAC, server version, and image (a short-lived Job that pulls it and runs `sh`, `kubectl`, `grep`, `sleep` and `kubectl version --client`, ending at once on an image-pull or container-config waiting reason) and reports problems only as warnings, so one-namespace use never fails because of them; with `--sequencer`, missing prerequisites are errors naming the keep-one-namespace fallback. | Covered |
+| S-29 | Two namespaces of a batch use the same `claim:path`, or one group's root is nested in another group's | Required recovery | Each segment's control root is the first root of its own namespace; each cell's generated targets and read-from path are checked against its own group's roots as `NAMESPACE/CLAIM:PATH`, so a cell planning accepted runs, and a target on another namespace's root fails the cell before any benchmark I/O. A bundle without `segment.tsv` whose roots span namespaces fails before any state. | Covered |
+| S-30 | Namespace or claim names whose locale collation differs from byte order (`a`, `a-b`, `ab`; `storage-test`, `storage-test-2`) | Required recovery | Claims and Leases are ordered, and the identity validated, in byte order under any locale. | Covered |
+| S-31 | A valid name that plain YAML reads as a number, boolean or null (`123`, `1.5`, `yes`, `on`, `null`) | Required recovery | Every rendered manifest quotes it, so the API server receives a string. | Covered |
+| S-32 | More claims than one attempt can hold (`KUBECTL_MAX_CLAIMS`, 32) | Required recovery | `kubectl_validate_test_dirs` and batch preflight reject them before any cluster or claim mutation and name the limit. | Covered |
+| S-33 | `--read-from` and its `TEST_DIRS` key spell the default namespace differently | Required recovery | The launch-time check compares normalized `NAMESPACE/CLAIM:PATH` forms: accepted when they name the same claim and path, rejected for another namespace or claim. | Covered |
 
 **Creation ambiguity horizon:** the longer of 30 seconds and
 `KUBECTL_PROCESS_TIMEOUT_SECONDS` (default 30), measured from the creation
@@ -339,6 +612,12 @@ exact-name GET before recording ambiguous absence (S-08, S-09).
 | T-08 | Client exits during cancellation | Required recovery | Repeated `--cancel` resumes exact deletion and finalization. | Covered |
 | T-09 | Status observes `CANCEL_REQUESTED` | Required recovery | Tell the user to retry `--cancel`; never report ordinary running state. | Covered |
 | T-10 | Same resource name has another UID or nonce | Required diagnosis | Refuse deletion and report expected and observed identity. | Covered |
+| T-11 | The sequencer is lost between segments | Required recovery | `--status` starts the next suspended Job with the UID-tested patch once every earlier Job is `Complete`. | Covered |
+| T-12 | A segment fails | Required recovery | Later Jobs never start; status reports the failure and `NEXT_ACTION=COLLECT`. | Covered |
+| T-13 | Worker drift on one unfinished segment | Required recovery | Stop the sequencer, journal `stopped-by-drift`, fail the current segment, abandon later segments, and permit collect and resume. | Covered |
+| T-14 | A segment's coordinator is lost after its last cell committed | Required recovery | Recover its ledger to `SUCCESS`, record the segment as succeeded, and start the next segment. | Covered |
+| T-15 | A segment completes, or the sequencer starts the next one, while cancellation or drift handling is under way | Required recovery | Stop the sequencer before classifying; never delete a `Complete` Job or overwrite a terminal ledger; cancel a next segment that already started; keep a segment that succeeded meanwhile; repeated `--cancel` completes. | Covered |
+| T-16 | A segment completes and the next one starts between two Job observations | Required recovery | Observe segments last to first, so a consistent attempt never looks out of order. | Covered |
 
 ### Collection and resume
 
@@ -364,6 +643,14 @@ exact-name GET before recording ambiguous absence (S-08, S-09).
 | R-18 | Resume exits after publishing a new `PREPARED` attempt | Required recovery | Roll it back and restore the collected predecessor. | Covered |
 | R-19 | Local attempt metadata or collected state is lost or corrupt | Unsupported | Refuse mutation; do not reconstruct ownership from labels. | Covered detection; automatic repair unsupported |
 | R-20 | Cluster is replaced while PVC survives | Required diagnosis | Detect UID mismatch and refuse adoption or cleanup. | Covered |
+| R-21 | Collect is interrupted between per-segment cleanups | Required recovery | Repeated collect resumes from the journaled per-segment and per-claim steps without retransfer. | Covered |
+| R-22 | An attempt started by storage-scale-test v1.x (identity schema 2 or 3) is found | Required diagnosis | Refuse status, cancel, collect and resume without mutation, naming the schema and saying to collect the attempt with storage-scale-test v1.x. | Covered |
+| R-23 | Resume of a batch spanning namespaces | Required recovery | Plan the new attempt's segments from the remaining cells; only namespaces with remaining cells get a segment, in ledger order. | Covered |
+| R-24 | Several segments publish attempt-level diagnostics (`coordinator-loss.tsv`, `startup-error.txt`) | Required recovery | Import each at its own per-segment results-root path, keep every one, and let a resumed attempt supersede them. | Covered |
+| R-25 | A multi-segment attempt is collected or resumed | Required recovery | Name every segment's results-root ledger files by its namespace, number status keys by segment, publish the attempt's aggregate outcome as `run.status` and `run-summary.tsv` (drift `FAILED`, user cancellation `CANCELLED`), and let a later attempt supersede both. | Covered |
+| R-26 | A sealed batch resumes after a namespace or claim used only by succeeded executions was deleted | Required recovery | Preflight plans the executions that have not succeeded, as the resume submits them; it checks only their segments' claims and plans a sequencer only when they span namespaces. | Covered |
+| R-27 | A segment's non-control claim is deleted while the attempt is unfinished | Required diagnosis | Status and collector helpers mount only the control claim, so they can start; the cluster identity check reports the deleted claim as `IDENTITY_MISMATCH` and nothing is adopted or cleaned up. | Covered |
+| R-28 | Claim diagnostics for a claim name of up to 253 bytes, or a diagnostic file that cannot be written | Required diagnosis | Store each claim's evidence as `pvc-<N>.yaml` (N its position, its name on the first line); report a write failure on stderr without hiding it or replacing the primary error. | Covered |
 
 ### Regression evidence map
 
@@ -403,9 +690,9 @@ assertion at the appropriate layer; merely reaching the branch is not evidence.
 | T-03 | `test_terminal_job_evidence_preserves_empty_active_field` |
 | T-04, T-06 | `test_public_status_recovers_coordinator_loss_before_running` |
 | T-05 | `test_completed_job_with_nonterminal_ledger_is_diagnosed` |
-| T-07 | `test_cancel_recovery_publishes_collectable_terminal_ledger` |
-| T-08 | `test_cancel_retries_after_job_delete_was_already_journaled` |
-| T-09 | `test_status_reports_incomplete_cancellation_as_retryable_failure` |
+| T-07 | `test_cancel_recovery_publishes_collectable_terminal_ledger`, `test_finalize_cancelled_converts_the_failure_its_job_deletion_caused` |
+| T-08 | `test_cancel_retries_after_job_delete_was_already_journaled`, `test_interrupted_multi_target_cancel_completes_when_repeated` |
+| T-09 | `test_status_reports_incomplete_cancellation_as_retryable_failure`, `test_cancel_requested_status_names_the_segment_being_cancelled` |
 | R-02 | `test_helper_template_is_rendered_and_removed_when_readiness_fails` |
 | R-03, R-04, R-05 | `test_collection_stream_uses_its_operation_sized_deadline`, `test_collection_stream_failure_removes_partial_and_reports_auth`, `test_collection_retries_transient_transfer_and_publishes_complete_results`, `test_collection_never_retries_permanent_or_unknown_remote_errors`, `test_collection_retry_limit_keeps_bounded_error_history`, `test_collection_retries_share_one_deadline`, `test_collection_byte_limit_is_enforced_while_streaming`, `test_collection_changed_source_exhaustion_preserves_remote_data` |
 | R-06, R-07, R-08 | `test_collection_archive_metadata_is_streamed_and_member_bounded`, `test_hostile_collection_archives_never_extract`, `test_collected_manifest_rejects_duplicate_semantic_rows`, `test_collected_manifest_requires_complete_terminal_evidence`, `test_collected_manifest_rejects_cross_execution_workload_substitution`, `test_changed_source_retry_still_rejects_content_corruption` |
@@ -419,6 +706,36 @@ assertion at the appropriate layer; merely reaching the branch is not evidence.
 | R-18 | `test_clean_failed_resume_restores_collected_predecessor_pointer` |
 | R-20 | `test_r20_cluster_uid_mismatch_emits_structured_diagnosis` |
 | S-16 | The dated external acceptance record described below; still pending |
+| S-18 | `test_invalid_group_root_is_rejected_before_mutation`, `test_group_roots_spanning_namespaces_are_rejected_before_mutation`, `test_kubectl_pvc_prints_the_exact_replacement` |
+| S-19 | `test_exit_between_leases_is_rolled_back_by_a_later_status` |
+| S-20 | `test_competitor_on_a_later_lease_releases_only_earlier_leases` |
+| S-21 | `test_unready_target_rolls_back_both_namespaces_and_leases_in_reverse` |
+| S-22 | `test_aliased_claims_fail_at_the_second_run_tree_reservation`, `test_reservation_script_reports_a_run_tree_reached_through_another_claim` |
+| S-23 | `test_sequencer_probe_failure_is_an_error_with_the_fallback`, `test_sequencer_rbac_denial_rolls_back_every_namespace`, `test_probe_job_runs_the_real_sequencer_against_absent_jobs`, `test_probe_lost_create_response_is_cleaned_up_by_name`, `test_probe_never_deletes_a_foreign_object_of_its_name`, `test_probe_signal_mid_wait_still_deletes_every_object`, `test_probe_tolerates_transient_observation_failures`, `test_probe_exercises_a_cross_namespace_role_binding` |
+| S-24 | `test_policy_create_failure_rolls_back_through_transfer_helpers` |
+| S-25 | `test_sequencer_creation_intent_is_reconciled_by_rollback_and_collect` |
+| S-26 | `test_claims_in_one_namespace_are_one_segment_that_mounts_every_claim` |
+| T-11 | `test_status_restarts_a_lost_sequencers_next_segment` |
+| T-12 | `test_failed_segment_permits_collect_and_never_starts_later_targets` |
+| T-13 | `test_drift_in_a_later_target_fails_the_attempt` |
+| T-14 | `test_status_continues_after_a_segment_recovered_to_success` |
+| T-15 | `test_cancel_keeps_a_segment_that_completed_before_its_deletion`, `test_cancel_keeps_success_published_while_the_job_was_deleted`, `test_cancel_also_cancels_a_segment_the_sequencer_started_first`, `test_drift_handling_keeps_a_segment_that_completed_meanwhile`, `test_single_target_cancel_keeps_a_job_that_completed_first`, `test_finalize_cancelled_never_overwrites_a_terminal_outcome` |
+| T-16 | `test_segment_classification_observes_later_segments_first` |
+| S-27 | `test_one_namespace_batch_has_one_segment_and_no_sequencer` |
+| S-28 | `test_default_sequencer_checks_only_warn_and_never_fail`, `test_image_check_fails_fast_on_a_fatal_waiting_reason`, `test_image_check_passes_and_deletes_its_job`, `test_sequencer_prerequisite_failures_are_errors_with_the_fallback` |
+| R-21 | `test_collect_interrupted_between_per_target_cleanups_resumes` |
+| R-22 | `test_v1_attempt_is_refused_with_the_collect_with_v1_message` |
+| R-23 | `test_resume_plans_segments_only_for_namespaces_with_remaining_cells` |
+| R-24 | `test_lost_coordinators_in_two_segments_collect_with_both_diagnostics`, `test_resume_after_two_lost_coordinators_reruns_and_merges_cleanly` |
+| R-25 | `test_resume_plans_segments_from_the_namespaces_that_still_have_cells`, `test_collect_publishes_namespace_named_ledgers_and_the_aggregate`, `test_aggregate_outcome_of_a_cancelled_attempt_with_an_abandoned_segment` |
+| S-29 | `test_mdtest_cell_checks_targets_against_its_own_namespace_roots`, `test_mdtest_cell_rejects_a_target_on_another_namespaces_root`, `test_read_from_is_checked_against_its_own_groups_roots`, `test_segment_control_root_is_chosen_from_its_own_namespace`, `test_bundle_without_segment_row_refuses_roots_spanning_namespaces` |
+| S-30 | `test_identity_claim_order_is_byte_order_in_every_locale` |
+| S-31 | `test_ambiguous_names_render_as_yaml_strings_in_helper_pods`, `test_ambiguous_names_render_as_yaml_strings_in_workloads` |
+| S-32 | `test_validate_rejects_more_claims_than_one_attempt_mounts`, `test_kubectl_batch_preflight_rejects_more_claims_than_one_attempt_mounts` |
+| S-33 | `test_kubectl_read_from_compares_normalized_claim_paths` |
+| R-26 | `test_kubectl_batch_preflight_checks_only_the_namespaces_still_to_run` |
+| R-27 | `test_status_and_collector_helpers_mount_only_the_control_claim` |
+| R-28 | `test_pvc_diagnostics_name_files_by_position_and_report_write_failures` |
 
 Real tests validate cross-component behavior without reproducing every fast
 branch. A matrix row may say `Covered` only while a focused assertion exercises

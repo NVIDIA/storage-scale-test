@@ -167,6 +167,55 @@ class TestSummarizeElbenchoEnv(unittest.TestCase):
             (executions / "0001.status").write_text("SUCCESS\n", encoding="utf-8")
             self.assertEqual(_execution_status_incomplete_note(result_dir), "")
 
+    def _line1(self, **overrides):
+        env = self._minimal_env(**overrides)
+        with tempfile.TemporaryDirectory() as result_dir:
+            return _format_three_lines(
+                "elbencho-20260101Z120000", env, result_dir, result_dir
+            )[0]
+
+    def test_roots_default_adds_no_suffix(self):
+        line1 = self._line1(TEST_DIRS={"/mnt/a/": 1})
+        self.assertTrue(line1.endswith("nodes: 1,4 /mnt/a/"), line1)
+        self.assertNotIn("target=", line1)
+
+    def test_missing_identity_adds_no_suffix(self):
+        self.assertNotIn("target=", self._line1())
+
+    def test_explicit_name_is_appended(self):
+        line1 = self._line1(TEST_DIRS={"/mnt/a": 1}, STORAGE_TARGET_NAME="lustre-a")
+        self.assertTrue(line1.endswith("nodes: 1,4 /mnt/a target=lustre-a"), line1)
+
+    def test_kubectl_default_is_appended(self):
+        line1 = self._line1(
+            TEST_DIRS={"/mnt/a": 1},
+            EXECUTION_SUBSTRATE="kubectl",
+            KUBECTL_NAMESPACE="team-a",
+            KUBECTL_PVC="claim-1",
+        )
+        self.assertTrue(line1.endswith(" target=team-a/claim-1"), line1)
+
+    def test_explicit_name_equal_to_the_roots_adds_no_suffix(self):
+        line1 = self._line1(TEST_DIRS={"/mnt/a": 1}, STORAGE_TARGET_NAME="/mnt/a")
+        self.assertNotIn("target=", line1)
+
+    def test_several_roots_still_show_the_target_that_line_one_cannot(self):
+        # Line 1 collapses several TEST_DIRS keys to a marker, so the derived
+        # (or recorded) name is the only place the roots appear.
+        line1 = self._line1(
+            TEST_DIRS={"/mnt/b": 1, "/mnt/a/": 1}, STORAGE_TARGET_NAME="/mnt/a,/mnt/b"
+        )
+        self.assertIn("(multiple TEST_DIRs)", line1)
+        self.assertTrue(line1.endswith(" target=/mnt/a,/mnt/b"), line1)
+
+    def test_several_roots_without_a_name_show_the_derived_target(self):
+        line1 = self._line1(TEST_DIRS={"/mnt/b": 1, "/mnt/a": 1})
+        self.assertTrue(line1.endswith(" target=/mnt/a,/mnt/b"), line1)
+
+    def test_slash_only_root_equal_to_the_name_adds_no_suffix(self):
+        line1 = self._line1(TEST_DIRS={"//": 1}, STORAGE_TARGET_NAME="/")
+        self.assertNotIn("target=", line1)
+
 
 if __name__ == "__main__":
     unittest.main()

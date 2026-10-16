@@ -38,7 +38,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,6 +65,13 @@ from fixture_capacity import (  # pylint: disable=wrong-import-position
 from fixture_images import (  # pylint: disable=wrong-import-position
     ELBENCHO_FIXTURE,
     ELBENCHO_FIXTURE_IMAGE,
+    kubectl_sequencer_fixture,
+)
+from fixture_storage import (  # pylint: disable=wrong-import-position
+    SAME_NAMESPACE_CLAIM,
+    SBX_SHARED_DIRECTORIES,
+    STORAGE_CLAIM,
+    second_namespace,
 )
 from scenario_planner import (  # pylint: disable=wrong-import-position
     SUBSTRATES,
@@ -188,8 +195,10 @@ SSH_STORAGE_VISIBILITY_TIMEOUT_SECONDS = 30
 IMAGE_PULL_ATTEMPTS = image_acquisition.IMAGE_PULL_ATTEMPTS
 IMAGE_PULL_TIMEOUT_SECONDS = image_acquisition.IMAGE_PULL_TIMEOUT_SECONDS
 IMAGE_PULL_DEADLINE_SECONDS = image_acquisition.IMAGE_PULL_DEADLINE_SECONDS
-TEMPORARY_UNMOUNT_ATTEMPTS = 10
-TEMPORARY_UNMOUNT_RETRY_SECONDS = 1
+# A busy mount (temporary or the fixture export) is retried this many times,
+# this many seconds apart, before cleanup fails.
+UNMOUNT_ATTEMPTS = 10
+UNMOUNT_RETRY_SECONDS = 1
 DEFAULT_STATE_DIR = Path(__file__).resolve().parents[2] / "tmp" / "integration-state"
 DEFAULT_EXPORT_DIR = Path("/srv/storage-scale-test-integration")
 DEFAULT_SBX_SHARED_ROOT = (
@@ -1368,7 +1377,7 @@ def _prepare_sbx_shared(runner: Runner, config: Config) -> None:
             _write_text(marker, json.dumps(expected_marker, sort_keys=True) + "\n")
     else:
         _write_text(marker, json.dumps(expected_marker, sort_keys=True) + "\n")
-    for directory in (root / "storage-test", root / "ssh-home"):
+    for directory in (root / name for name in SBX_SHARED_DIRECTORIES):
         if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
             raise ProvisionError(f"refusing unsafe SBX shared child path: {directory}")
         directory.mkdir(exist_ok=True)
@@ -1850,10 +1859,23 @@ def _export_mount_type(runner: Runner, config: Config) -> str:
     )
 
 
-def _unmount_temporary_filesystem(runner: Runner, mountpoint: Path) -> None:
-    """Unmount a temporary filesystem and verify it is no longer mounted."""
+def _unmount_verified(
+    runner: Runner,
+    mountpoint: Path,
+    label: str,
+    on_busy: Callable[[], None] | None = None,
+) -> None:
+    """Unmount MOUNTPOINT and verify with findmnt that it is gone.
+
+    A mount still present after an attempt is retried, up to UNMOUNT_ATTEMPTS
+    times UNMOUNT_RETRY_SECONDS apart; a first attempt that succeeds never
+    waits. ON_BUSY runs after the first busy attempt and again when the
+    attempts run out, to record what holds the mount while it still does.
+    Exhaustion, or a findmnt that cannot tell, raises, so the caller never
+    goes on to detach or delete a mounted path.
+    """
     last_result: subprocess.CompletedProcess[str] | None = None
-    for attempt in range(1, TEMPORARY_UNMOUNT_ATTEMPTS + 1):
+    for attempt in range(1, UNMOUNT_ATTEMPTS + 1):
         last_result = runner.run([*_sudo_prefix(), "umount", mountpoint], check=False)
         mounted = runner.run(
             [
@@ -1868,25 +1890,32 @@ def _unmount_temporary_filesystem(runner: Runner, mountpoint: Path) -> None:
             return
         if mounted.returncode != 0:
             raise ProvisionError(
-                f"could not verify temporary mount was removed at {mountpoint}: "
+                f"could not verify {label} was removed at {mountpoint}: "
                 f"findmnt exited {mounted.returncode}"
             )
-        if attempt < TEMPORARY_UNMOUNT_ATTEMPTS:
+        if on_busy is not None and attempt in (1, UNMOUNT_ATTEMPTS):
+            on_busy()
+        if attempt < UNMOUNT_ATTEMPTS:
             LOG.warning(
-                "Temporary mount %s remains active after unmount attempt %d/%d; "
-                "retrying",
+                "%s %s remains active after unmount attempt %d/%d; retrying",
+                label[:1].upper() + label[1:],
                 mountpoint,
                 attempt,
-                TEMPORARY_UNMOUNT_ATTEMPTS,
+                UNMOUNT_ATTEMPTS,
             )
-            time.sleep(TEMPORARY_UNMOUNT_RETRY_SECONDS)
+            time.sleep(UNMOUNT_RETRY_SECONDS)
 
     detail = (last_result.stderr or last_result.stdout).strip() if last_result else ""
     suffix = f": {detail}" if detail else ""
     raise ProvisionError(
-        f"temporary mount remains active at {mountpoint} after "
-        f"{TEMPORARY_UNMOUNT_ATTEMPTS} unmount attempts{suffix}"
+        f"{label} remains active at {mountpoint} after "
+        f"{UNMOUNT_ATTEMPTS} unmount attempts{suffix}"
     )
+
+
+def _unmount_temporary_filesystem(runner: Runner, mountpoint: Path) -> None:
+    """Unmount a temporary filesystem and verify it is no longer mounted."""
+    _unmount_verified(runner, mountpoint, "temporary mount")
 
 
 def _loop_devices_for_file(runner: Runner, path: Path) -> list[str]:
@@ -2749,7 +2778,7 @@ def _load_image_into_nodes(
 
 
 def _install_nfs_csi(runner: Runner, config: Config, gateway: str) -> None:
-    """Install NFS CSI and bind the two RWX claims."""
+    """Install NFS CSI and bind the fixture's RWX claims."""
     _prepare_csi_images(runner, config)
     chart = _ensure_nfs_csi_chart(runner, config)
     values = _resource_path("manifests/nfs-csi-values.yaml")
@@ -2773,11 +2802,13 @@ def _install_nfs_csi(runner: Runner, config: Config, gateway: str) -> None:
         timeout=420,
     )
     _ensure_namespace(runner, config)
+    _ensure_namespace(runner, config, second_namespace(config.namespace))
     storage = _render_resource(
         config,
         "manifests/nfs-storage.yaml.tmpl",
         {
             "NAMESPACE": config.namespace,
+            "NAMESPACE_2": second_namespace(config.namespace),
             "NFS_SERVER": gateway,
             "STORAGE_TEST_CAPACITY": STORAGE_TEST_CAPACITY,
             "SSH_HOME_CAPACITY": SSH_HOME_CAPACITY,
@@ -2793,20 +2824,24 @@ def _install_nfs_csi(runner: Runner, config: Config, gateway: str) -> None:
             "--for=jsonpath={.status.phase}=Bound",
             "pvc/storage-test-rwx",
             "pvc/ssh-home-rwx",
+            f"pvc/{SAME_NAMESPACE_CLAIM}",
             "--timeout=180s",
         ),
         timeout=210,
     )
+    _wait_for_second_storage_claim(runner, config, timeout=180)
 
 
 def _install_sbx_shared_storage(runner: Runner, config: Config) -> None:
     """Bind the shared kind-node paths to the fixture's stable RWX claims."""
     _ensure_namespace(runner, config)
+    _ensure_namespace(runner, config, second_namespace(config.namespace))
     storage = _render_resource(
         config,
         "manifests/sbx-storage.yaml.tmpl",
         {
             "NAMESPACE": config.namespace,
+            "NAMESPACE_2": second_namespace(config.namespace),
             "STORAGE_TEST_CAPACITY": STORAGE_TEST_CAPACITY,
             "SSH_HOME_CAPACITY": SSH_HOME_CAPACITY,
         },
@@ -2821,10 +2856,12 @@ def _install_sbx_shared_storage(runner: Runner, config: Config) -> None:
             "--for=jsonpath={.status.phase}=Bound",
             "pvc/storage-test-rwx",
             "pvc/ssh-home-rwx",
+            f"pvc/{SAME_NAMESPACE_CLAIM}",
             "--timeout=60s",
         ),
         timeout=90,
     )
+    _wait_for_second_storage_claim(runner, config, timeout=60)
 
 
 def _ensure_nfs_csi_chart(runner: Runner, config: Config) -> Path:
@@ -2856,13 +2893,32 @@ def _ensure_nfs_csi_chart(runner: Runner, config: Config) -> Path:
     return chart
 
 
-def _ensure_namespace(runner: Runner, config: Config) -> None:
-    """Create the integration namespace when absent."""
-    probe = runner.run(
-        _kubectl(config, "get", "namespace", config.namespace), check=False
+def _wait_for_second_storage_claim(
+    runner: Runner, config: Config, *, timeout: int
+) -> None:
+    """Wait for the second storage target's claim, which multi-target scenarios use."""
+    runner.run(
+        _kubectl(
+            config,
+            "-n",
+            second_namespace(config.namespace),
+            "wait",
+            "--for=jsonpath={.status.phase}=Bound",
+            f"pvc/{STORAGE_CLAIM}",
+            f"--timeout={timeout}s",
+        ),
+        timeout=timeout + 30,
     )
+
+
+def _ensure_namespace(
+    runner: Runner, config: Config, namespace: str | None = None
+) -> None:
+    """Create the integration namespace, or another named one, when absent."""
+    name = namespace or config.namespace
+    probe = runner.run(_kubectl(config, "get", "namespace", name), check=False)
     if probe.returncode:
-        runner.run(_kubectl(config, "create", "namespace", config.namespace))
+        runner.run(_kubectl(config, "create", "namespace", name))
 
 
 def _ensure_ssh_key(runner: Runner, config: Config) -> tuple[Path, Path]:
@@ -3520,6 +3576,17 @@ def _prepare_kubectl_prerequisite_image(runner: Runner, config: Config) -> None:
     _prepare_fixture_node_image(runner, config, ELBENCHO_FIXTURE)
 
 
+def _prepare_kubectl_sequencer_image(
+    runner: Runner, config: Config, backend: str
+) -> None:
+    """Load the profile's pinned kubectl+sh sequencer image onto every node.
+
+    Host Docker acquires and verifies it for both storage profiles, exactly as
+    for the Elbencho image, so kind nodes never pull it from a registry.
+    """
+    _prepare_fixture_node_image(runner, config, kubectl_sequencer_fixture(backend))
+
+
 def _ensure_calico_manifest(runner: Runner, config: Config) -> Path:
     """Return the checksum-verified Calico manifest cached in fixture state."""
     source = config.state_dir / "downloads" / f"calico-{CALICO_VERSION}.yaml"
@@ -4086,6 +4153,7 @@ def _validate_kubectl_prerequisites(
     """Prove the retained fixture can support the planned kubectl substrate."""
     cni_profile = _validate_network_policy_profile(runner, config, backend)
     _prepare_kubectl_prerequisite_image(runner, config)
+    _prepare_kubectl_sequencer_image(runner, config, backend)
     token = secrets.token_hex(16)
     workload_manifest = _render_resource(
         config,
@@ -4716,6 +4784,8 @@ def _write_state_summary(
         "cni_version": CALICO_VERSION if backend == "sbx-shared" else None,
         "cni_image": None if backend == "sbx-shared" else KINDNET_IMAGE,
         "kubectl_probe_image": ELBENCHO_FIXTURE_IMAGE,
+        "kubectl_sequencer_image": kubectl_sequencer_fixture(backend).fixture,
+        "second_storage_namespace": second_namespace(config.namespace),
     }
     _write_text(config.state_dir / "state.json", json.dumps(state, indent=2) + "\n")
 
@@ -5072,7 +5142,7 @@ def _validate_sbx_teardown_ownership(
             )
         if marker.is_file() and document == legacy_marker:
             _write_text(marker, json.dumps(expected_marker, sort_keys=True) + "\n")
-        allowed = {EXPORT_MARKER, "storage-test", "ssh-home"}
+        allowed = {EXPORT_MARKER, *SBX_SHARED_DIRECTORIES}
         unexpected = sorted(
             path.name for path in root.iterdir() if path.name not in allowed
         )
@@ -5486,8 +5556,14 @@ def _remove_nfs_configuration(runner: Runner, config: Config) -> None:
 def _unmount_export_filesystem(runner: Runner, config: Config) -> None:
     """Unmount and detach only the verified fixture backing filesystem."""
     if _export_mount_type(runner, config):
+        # Ownership first: only the verified fixture loop mount is unmounted.
         _verified_export_loop(runner, config)
-        runner.run([*_sudo_prefix(), "umount", config.export_dir])
+        _unmount_verified(
+            runner,
+            config.export_dir,
+            "fixture export mount",
+            on_busy=lambda: _busy_export_diagnostics(runner, config),
+        )
     _validate_loop_associations(runner, config)
     for device in _associated_loop_devices(runner, config):
         runner.run([*_sudo_prefix(), "losetup", "--detach", device])
@@ -5495,6 +5571,30 @@ def _unmount_export_filesystem(runner: Runner, config: Config) -> None:
         raise ProvisionError(f"export remains mounted: {config.export_dir}")
     if _associated_loop_devices(runner, config):
         raise ProvisionError(f"loop devices remain attached to {config.nfs_image}")
+
+
+def _busy_export_diagnostics(runner: Runner, config: Config) -> None:
+    """Log what may hold the busy fixture export mount (never raises).
+
+    Each command is bounded and independent, so a missing or failing tool
+    neither hides the others nor replaces the unmount error.
+    """
+    LOG.error("Fixture export %s is busy; recording what holds it", config.export_dir)
+    sudo = _sudo_prefix()
+    for command in (
+        [
+            "findmnt",
+            "--output",
+            "TARGET,SOURCE,FSTYPE,PROPAGATION",
+            "--submounts",
+            "--mountpoint",
+            config.export_dir,
+        ],
+        [*sudo, "losetup", "--list", "--associated", config.nfs_image],
+        [*sudo, "fuser", "-vm", config.export_dir],
+        [*sudo, "exportfs", "-v"],
+    ):
+        _run_diagnostic(runner, command)
 
 
 def _remove_harness_images(runner: Runner, config: Config) -> None:

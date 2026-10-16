@@ -26,6 +26,7 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
 import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -181,6 +182,13 @@ def test_teardown_failure_makes_successful_lifecycle_fail(tmp_path):
         )
         == 2
     )
+    manifest = json.loads(
+        (tmp_path / "manifests" / f"{architecture}-all.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["exit_code"] != 0
+    assert [t["exit_code"] for t in manifest["timings"] if t["step"] == "test"] == [0]
 
 
 def test_unwritable_diagnostics_do_not_prevent_teardown(tmp_path):
@@ -249,52 +257,68 @@ def _run_wrapper(environment, *arguments):
     )
 
 
-def test_substrate_shard_keeps_the_full_lifecycle_and_writes_a_manifest(tmp_path):
-    """A shard runs every lifecycle call and tests only its substrate."""
+@pytest.mark.parametrize("substrate", ("kubectl", "slurm"))
+def test_substrate_shard_sets_up_once_and_writes_a_manifest(tmp_path, substrate):
+    """A shard other than SSH sets up once (no repeat, stop or start) and tests
+    only its substrate."""
     environment, calls = _fixture(tmp_path)
     planned = subprocess.run(
         [sys.executable, _REPO_ROOT / "integration-tests/lib/shard_manifest.py"]
-        + ["plan", "kubectl"],
+        + ["plan", substrate],
         check=True,
         capture_output=True,
         text=True,
     ).stdout
     (tmp_path / "planned").write_text(planned, encoding="utf-8")
 
-    result = _run_wrapper(environment, "kubectl")
+    result = _run_wrapper(environment, substrate)
 
     assert result.returncode == 0, result.stderr
     actions = [line.split()[:-1] for line in calls.read_text().splitlines()]
     assert actions == [
         ["setup"],
         ["setup"],
-        ["stop"],
-        ["start"],
-        ["setup"],
         ["test"],
-        ["test", "--substrate", "kubectl"],
+        ["test", "--substrate", substrate],
         ["teardown"],
         ["teardown"],
     ]
     manifest = json.loads(
-        (tmp_path / "manifests" / f"{_architecture()}-kubectl.json").read_text()
+        (tmp_path / "manifests" / f"{_architecture()}-{substrate}.json").read_text()
     )
     assert manifest["architecture"] == _architecture()
     assert manifest["backend"] == "sbx-shared"
-    assert manifest["substrate"] == "kubectl"
+    assert manifest["substrate"] == substrate
     assert manifest["exit_code"] == 0
     assert manifest["planned"] == planned.split()
     assert manifest["completed"] == planned.split()
     assert [timing["step"] for timing in manifest["timings"]] == [
         "setup-1",
-        "setup-2",
-        "stop",
-        "start",
         "root-setup",
         "root-test",
         "test",
         "teardown-1",
         "teardown-2",
+    ]
+
+
+@pytest.mark.parametrize("substrate", ("ssh", None))
+def test_ssh_and_unsharded_runs_prove_the_full_lifecycle(tmp_path, substrate):
+    """Only SSH (and all substrates) repeat setup, then stop and start."""
+    environment, calls = _fixture(tmp_path)
+    if substrate is None:
+        result = _run_wrapper(environment)
+    else:
+        result = _run_wrapper(environment, substrate)
+    assert result.returncode == 0, result.stderr
+    actions = [line.split()[:-1] for line in calls.read_text().splitlines()]
+    assert actions[:6] == [
+        ["setup"],
+        ["setup"],
+        ["stop"],
+        ["start"],
+        ["setup"],
+        ["test"],
     ]
 
 

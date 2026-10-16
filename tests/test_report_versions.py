@@ -21,6 +21,8 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
+from lib.report_provenance import with_versions
+
 from tests.extract_elbencho_test_support import install_extract_heavy_dependency_stubs
 from tests.test_extract_elbencho_cli_contracts import _EXTRACT, _metric
 
@@ -167,3 +169,20 @@ def test_warp_report_lists_versions_of_unfiltered_detail_tables(
     assert _header(capsys.readouterr().out)[0] == (
         "Produced by storage-scale-test: v1.0.0, v2.0.0"
     )
+
+
+def test_with_versions_prints_the_storage_target_after_the_reporter_line(capsys):
+    for markdown, prefix in ((False, ""), (True, "- ")):
+        printed = with_versions(
+            lambda: print("body"), ["v1.0.0"], markdown, target="lustre-a"
+        )
+        printed()
+        lines = capsys.readouterr().out.splitlines()
+        assert lines[0] == f"{prefix}Produced by storage-scale-test: v1.0.0"
+        assert lines[1].startswith(f"{prefix}Reported by storage-scale-test: ")
+        assert lines[2:] == [f"{prefix}Storage target: lustre-a", "", "body"]
+
+
+def test_with_versions_omits_the_storage_target_line_by_default(capsys):
+    with_versions(lambda: print("body"), [])()
+    assert "Storage target" not in capsys.readouterr().out

@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The segment label selects this segment's coordinator and workers only, so
+# two segments' Pods never match each other's policies.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: @@RESOURCE_NAME@@
-  namespace: @@NAMESPACE@@
+  name: "@@RESOURCE_NAME@@"
+  namespace: "@@NAMESPACE@@"
   labels:
     app.kubernetes.io/name: storage-scale-test
     app.kubernetes.io/instance: sst-elb-@@ATTEMPT_ID@@
@@ -25,6 +27,7 @@ metadata:
     app.kubernetes.io/managed-by: storage-scale-test
     storage-scale-test.nvidia.com/benchmark: elbencho
     storage-scale-test.nvidia.com/run: "@@ATTEMPT_ID@@"
+    storage-scale-test.nvidia.com/segment: "@@SEGMENT_INDEX@@"
   annotations:
     storage-scale-test.nvidia.com/ownership: "@@OWNERSHIP_NONCE@@"
 spec:
@@ -32,6 +35,7 @@ spec:
     matchLabels:
       app.kubernetes.io/instance: sst-elb-@@ATTEMPT_ID@@
       app.kubernetes.io/component: workers
+      storage-scale-test.nvidia.com/segment: "@@SEGMENT_INDEX@@"
   policyTypes: ["Ingress"]
   ingress:
     - from:
@@ -39,6 +43,7 @@ spec:
             matchLabels:
               app.kubernetes.io/instance: sst-elb-@@ATTEMPT_ID@@
               app.kubernetes.io/component: coordinator
+              storage-scale-test.nvidia.com/segment: "@@SEGMENT_INDEX@@"
       ports:
         - protocol: TCP
           port: 1611

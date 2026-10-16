@@ -209,6 +209,27 @@ SCENARIO_CATALOG = (
         140,
         phase=SchedulePhase.KUBECTL,
     ),
+    Scenario(
+        "kubectl-multi-target",
+        "Two Kubernetes storage targets run by one sequenced attempt",
+        frozenset({Substrate.KUBECTL}),
+        150,
+        phase=SchedulePhase.KUBECTL,
+    ),
+    Scenario(
+        "kubectl-multi-target-unbound",
+        "Kubernetes start rejected and rolled back when a target claim is unbound",
+        frozenset({Substrate.KUBECTL}),
+        160,
+        phase=SchedulePhase.KUBECTL,
+    ),
+    Scenario(
+        "kubectl-same-namespace-targets",
+        "Two storage targets in one Kubernetes namespace share one coordinator Job",
+        frozenset({Substrate.KUBECTL}),
+        170,
+        phase=SchedulePhase.KUBECTL,
+    ),
 )
 
 SCENARIOS = SCENARIO_CATALOG

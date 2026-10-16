@@ -83,3 +83,71 @@ spec:
   resources:
     requests:
       storage: @@SSH_HOME_CAPACITY@@
+---
+# The second storage target for multi-target Kubernetes scenarios: its own
+# directory under the shared root and a same-named claim in a second namespace.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: storage-scale-sbx-data-2
+spec:
+  capacity:
+    storage: @@STORAGE_TEST_CAPACITY@@
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: sbx-shared
+  claimRef:
+    namespace: @@NAMESPACE_2@@
+    name: storage-test-rwx
+  hostPath:
+    path: /var/local/storage-scale-shared/storage-test-2
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: storage-test-rwx
+  namespace: @@NAMESPACE_2@@
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: sbx-shared
+  volumeName: storage-scale-sbx-data-2
+  resources:
+    requests:
+      storage: @@STORAGE_TEST_CAPACITY@@
+---
+# A third claim in the primary namespace, for the same-namespace storage-target
+# scenario: its own PV and directory under the shared root.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: storage-scale-sbx-data-3
+spec:
+  capacity:
+    storage: @@STORAGE_TEST_CAPACITY@@
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: sbx-shared
+  claimRef:
+    namespace: @@NAMESPACE@@
+    name: storage-test-rwx-2
+  hostPath:
+    path: /var/local/storage-scale-shared/storage-test-3
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: storage-test-rwx-2
+  namespace: @@NAMESPACE@@
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: sbx-shared
+  volumeName: storage-scale-sbx-data-3
+  resources:
+    requests:
+      storage: @@STORAGE_TEST_CAPACITY@@

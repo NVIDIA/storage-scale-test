@@ -213,6 +213,33 @@ def test_read_and_delete_path_guards_resolve_symlinks(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize(
+    ("root", "read_from", "accepted"),
+    (
+        ("rwx:bench", "ns1/rwx:bench/d", True),
+        ("ns1/rwx:bench", "rwx:bench/d", True),
+        ("ns1/rwx:bench", "rwx:/bench//d/", True),
+        ("rwx:bench", "rwx:bench", True),
+        ("rwx:bench", "ns2/rwx:bench/d", False),
+        ("ns2/rwx:bench", "rwx:bench/d", False),
+        ("rwx:bench", "rwx:benchmark/d", False),
+        ("rwx:bench", "other:bench/d", False),
+        ("rwx:bench", "rwx:bench/../d", False),
+    ),
+)
+def test_kubectl_read_from_compares_normalized_claim_paths(root, read_from, accepted):
+    """[S-33] On Kubernetes the launch-time --read-from check compares normalized
+    namespace/claim:path forms, so a key and a read-from path that spell the
+    default namespace differently still agree."""
+    result = _run_bash(f"""
+        source "{_ENV_FUNCTIONS}"
+        EXECUTION_SUBSTRATE=kubectl KUBECTL_NAMESPACE=ns1
+        declare -A TEST_DIRS=(["{root}"]=1)
+        validate_elbencho_sweep_read_from_path "{read_from}"
+        """)
+    assert (result.returncode == 0) is accepted, result.stderr
+
+
 def test_single_big_file_validation_partitions(tmp_path):
     """Single-file mode enforces one root, sequential I/O, and extent rules."""
     result = _run_bash(f"""

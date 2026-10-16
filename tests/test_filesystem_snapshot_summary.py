@@ -61,6 +61,11 @@ def snapshot_fixture():
             "sha256": "a" * 64,
             "variables": ["ELBENCHO_FILE_SIZE", "ELBENCHO_SCALE_THREAD_LIST"],
         },
+        "target_file": {
+            "file": "/ops/targets/vendor-a.env",
+            "sha256": "9" * 64,
+            "variables": ["TEST_DIRS"],
+        },
     }
 
 
@@ -75,15 +80,19 @@ def test_representative_summary_is_six_readable_lines_with_units(snapshot):
         "Sweep",
         "Files/sizing",
         "Lifecycle",
-        "Override",
+        "Setting files",
     ]
+    assert 'name="dgxc-system/grtmk04-local-pvc" (derived); roots=' in lines[1]
     for value in ("kubectl", "dgxc-system", "grtmk04-local-pvc", "scale-test", "1G"):
         assert value in summary
     assert "nodeGroup=customer-cpu" in summary
     for unit_value in ("50 GB/s", "40 Gbps", "10000 IOPS", "60 s"):
         assert unit_value in summary
-    assert "01-sequential-characterization.env" in summary
-    assert "/a/long/location" not in summary
+    assert (
+        lines[-1] == 'Setting files: target "vendor-a.env"; '
+        'overrides "01-sequential-characterization.env"'
+    )
+    assert "/a/long/location" not in summary and "/ops/targets" not in summary
     assert "a" * 64 not in summary
     assert "ELBENCHO_FILE_SIZE" not in summary
     assert "size_multiplier" not in summary
@@ -243,14 +252,31 @@ def test_shared_layout_count_weighted_targets_and_compound_sizes_are_unambiguous
         ELBENCHO_SCALE_IO_SIZES=["1M,r4K", "r64K"],
         TEST_DIRS={"/data/one": 1, "/data/two": 3},
         KUBECTL_MAPPED_TEST_DIRS={"/pod/one": 1, "/pod/two": 3},
+        KUBECTL_NODE_SELECTOR="",
     )
     summary = format_io_snapshot_summary(snapshot)
     assert '"1M,r4K"' in summary and '"r64K"' in summary
     assert '"1M", "r4K"' not in summary
     assert "shared-directory" in summary and 'files/node="8"' in summary
-    for target in ("/data/one", "/data/two", "/pod/one", "/pod/two"):
-        assert target in summary
-    assert "weight=1" in summary and "weight=3" in summary
+    targets = summary.splitlines()[1]
+    assert len(targets) <= 132
+    # The name and both path lists cannot fit one line: lists shrink, then clip.
+    assert "/data/one" in targets and "/data/two" not in targets
+    assert "(+1 more)" in targets and targets.endswith(ELLIPSIS)
+    assert "weight=1" in targets
+
+
+def test_short_weighted_roots_are_listed_in_full(snapshot):
+    snapshot.update(
+        EXECUTION_SUBSTRATE="ssh",
+        STORAGE_TARGET_NAME="fs-a",
+        TEST_DIRS={"/data/one": 1, "/data/two": 3},
+        KUBECTL_NODE_SELECTOR="",
+    )
+    row = format_io_snapshot_summary(snapshot).splitlines()[1]
+    assert row == (
+        'Targets: name="fs-a"; roots={"/data/one" (weight=1), "/data/two" (weight=3)}'
+    )
 
 
 def test_special_characters_and_long_provenance_stay_on_six_physical_lines(snapshot):
@@ -276,6 +302,10 @@ def test_special_characters_and_long_provenance_stay_on_six_physical_lines(snaps
     assert "extended_capture=1" in summary
 
 
+FILES_ROW = "Setting files: "
+TARGET_ROW = FILES_ROW + 'target "vendor-a.env"; overrides '
+
+
 @pytest.mark.parametrize(
     "provenance,expected", [(None, "none recorded"), ({}, "unknown")]
 )
@@ -283,8 +313,197 @@ def test_explicit_null_and_incomplete_provenance_remain_distinct(
     snapshot, provenance, expected
 ):
     snapshot["env_override"] = provenance
+    snapshot["target_file"] = provenance
     assert (
-        format_io_snapshot_summary(snapshot).splitlines()[-1] == f"Override: {expected}"
+        format_io_snapshot_summary(snapshot).splitlines()[-1]
+        == f"{FILES_ROW}target {expected}; overrides {expected}"
     )
-    del snapshot["env_override"]
-    assert format_io_snapshot_summary(snapshot).splitlines()[-1] == "Override: unknown"
+    del snapshot["env_override"], snapshot["target_file"]
+    assert (
+        format_io_snapshot_summary(snapshot).splitlines()[-1]
+        == f"{FILES_ROW}target unknown; overrides unknown"
+    )
+
+
+def test_target_file_and_overrides_are_independent_parts_of_the_last_row(snapshot):
+    snapshot["env_override"] = None
+    assert (
+        format_io_snapshot_summary(snapshot).splitlines()[-1]
+        == TARGET_ROW + "none recorded"
+    )
+    snapshot["target_file"] = None
+    snapshot["env_override"] = {
+        "files": [{"file": "/ops/recipes/rand-4k.env", "sha256": "d" * 64}]
+    }
+    assert (
+        format_io_snapshot_summary(snapshot).splitlines()[-1]
+        == FILES_ROW + 'target none recorded; overrides "rand-4k.env"'
+    )
+
+
+def test_a_long_target_file_name_is_shortened_and_the_row_stays_on_one_line(
+    snapshot,
+):
+    snapshot["target_file"] = {"file": "/ops/" + "t" * 300 + "\n.env"}
+    summary = format_io_snapshot_summary(snapshot)
+    row = summary.splitlines()[-1]
+    assert len(summary.splitlines()) == 6 and len(row) <= 132
+    assert row.startswith(FILES_ROW + 'target "' + "t" * 20)
+    assert "t" * 300 not in row and "\u2026" in row
+    assert row.endswith('overrides "01-sequential-characterization.env"')
+
+
+@pytest.mark.parametrize(
+    "changes, expected",
+    [
+        ({"STORAGE_TARGET_NAME": "lustre-a"}, 'name="lustre-a"; roots='),
+        (
+            {"STORAGE_TARGET_NAME": ""},
+            'name="dgxc-system/grtmk04-local-pvc" (derived); ',
+        ),
+        (
+            {"EXECUTION_SUBSTRATE": "ssh", "TEST_DIRS": {"/mnt/b/": 1, "/mnt/a": 1}},
+            'name="/mnt/a,/mnt/b" (derived); roots=',
+        ),
+        ({"EXECUTION_SUBSTRATE": "ssh", "TEST_DIRS": {}}, "name=unknown; roots="),
+    ],
+)
+def test_targets_row_leads_with_the_storage_target_and_stays_compact(
+    snapshot, changes, expected
+):
+    snapshot.update(changes)
+    lines = format_io_snapshot_summary(snapshot).splitlines()
+    assert len(lines) == 6 and max(map(len, lines)) <= 132
+    assert lines[1].startswith(f"Targets: {expected}")
+
+
+def test_missing_snapshot_has_an_unknown_target():
+    summary = format_io_snapshot_summary({})
+    assert "Targets: name=unknown; roots=unknown" in summary
+
+
+def _override_row(snapshot, files):
+    snapshot["env_override"] = {
+        "file": files[-1],
+        "sha256": "c" * 64,
+        "variables": ["SETTING"],
+        "files": [
+            {"file": path, "sha256": "d" * 64, "variables": []} for path in files
+        ],
+    }
+    return format_io_snapshot_summary(snapshot).splitlines()[-1]
+
+
+def test_override_row_lists_basenames_in_application_order(snapshot):
+    row = _override_row(
+        snapshot, ["/ops/targets/fs-a.env", "/ops/recipes/large-seq.env", "c.env"]
+    )
+    assert row == TARGET_ROW + '"fs-a.env", "large-seq.env", "c.env"'
+
+
+def test_override_row_truncates_with_a_count_and_fits_the_line(snapshot):
+    paths = [f"/ops/{'n' * 20}-{index:02d}.env" for index in range(10)]
+    row = _override_row(snapshot, paths)
+    assert len(row) <= 132
+    assert row.startswith(TARGET_ROW + f'"{"n" * 20}-00.env", "{"n" * 20}-01.env"')
+    shown, _, hidden = row.rpartition(" (+")
+    # One ".env" in the shown text belongs to the target file.
+    assert hidden.endswith(" more)") and shown.count(".env") - 1 + int(
+        hidden.split()[0]
+    ) == len(paths)
+    assert "-09.env" not in row
+
+
+def test_override_row_shortens_a_long_first_file_and_keeps_one_line(snapshot):
+    row = _override_row(snapshot, ["/x/" + "a" * 200 + ".env", "/x/b\nb.env"])
+    assert len(row) <= 132 and row.endswith(ELLIPSIS + '" (+1 more)')
+    assert row.startswith(TARGET_ROW + '"' + "a" * 20)
+    assert len(format_io_snapshot_summary(snapshot).splitlines()) == 6
+    assert "b.env" not in row
+
+
+@pytest.mark.parametrize("override_count", [1, 2, 5])
+def test_setting_files_row_fits_with_long_target_and_override_names(
+    snapshot, override_count
+):
+    snapshot["target_file"] = {"file": "/ops/" + "t" * 48 + ".env"}
+    row = _override_row(
+        snapshot, [f"/ops/{'o' * 59}-{i}.env" for i in range(override_count)]
+    )
+    lines = format_io_snapshot_summary(snapshot).splitlines()
+    assert len(lines) == 6 and max(map(len, lines)) <= 132
+    assert row == lines[-1] and row.startswith(FILES_ROW + 'target "' + "t" * 20)
+    assert "overrides " in row and "o" * 20 in row
+    assert row.endswith(f" (+{override_count - 1} more)") == (override_count > 1)
+
+
+def test_a_long_legacy_override_name_is_shortened_to_fit(snapshot):
+    snapshot["env_override"] = {"file": "/ops/" + "l" * 300 + ".env"}
+    lines = format_io_snapshot_summary(snapshot).splitlines()
+    assert len(lines) == 6 and len(lines[-1]) <= 132
+    assert lines[-1].endswith(ELLIPSIS + '"') and "l" * 20 in lines[-1]
+
+
+def test_override_row_with_one_listed_file_matches_the_legacy_rendering(snapshot):
+    assert _override_row(snapshot, ["/ops/only.env"]) == TARGET_ROW + '"only.env"'
+
+
+@pytest.mark.parametrize(
+    "mapping, expected",
+    [
+        ({"file": "/ops/old.env", "sha256": "e" * 64}, '"old.env"'),
+        ({"file": "", "files": []}, "none recorded"),
+        ({"file": "/ops/last.env", "files": "oops"}, '"last.env"'),
+        ({"files": [{"sha256": "f"}]}, "unknown"),
+    ],
+)
+def test_override_row_without_a_usable_files_list_uses_the_legacy_mapping(
+    snapshot, mapping, expected
+):
+    snapshot["env_override"] = mapping
+    assert (
+        format_io_snapshot_summary(snapshot).splitlines()[-1] == TARGET_ROW + expected
+    )
+
+
+READ_FROM_KEY = "sweep_read_from"
+ELLIPSIS = "…"
+
+
+def _row_of(snapshot, label):
+    summary = format_io_snapshot_summary(snapshot)
+    assert len(summary.splitlines()) == 6
+    return next(line for line in summary.splitlines() if line.startswith(f"{label}: "))
+
+
+def test_targets_row_fits_with_a_very_long_name_and_many_roots(snapshot):
+    roots = {f"/mnt/filesystem-{index:02d}/{'x' * 20}": 1 for index in range(12)}
+    snapshot.update(
+        EXECUTION_SUBSTRATE="ssh", STORAGE_TARGET_NAME="n" * 120, TEST_DIRS=roots
+    )
+    row = _row_of(snapshot, "Targets")
+    assert len(row) <= 132
+    assert f'name="{"n" * 20}' in row and f'{ELLIPSIS}"' in row
+    assert "n" * 120 not in row
+    assert "filesystem-00" in row and "filesystem-11" not in row
+    assert "(+11 m" in row
+
+
+def test_targets_row_shortens_one_overlong_root_with_an_ellipsis(snapshot):
+    snapshot.update(TEST_DIRS={"/r/" + "z" * 400: 1}, KUBECTL_NODE_SELECTOR="")
+    row = _row_of(snapshot, "Targets")
+    assert len(row) == 132 and row.endswith(ELLIPSIS)
+
+
+def test_other_rows_with_user_names_also_fit_the_line(snapshot):
+    snapshot["KUBECTL_NAMESPACE"] = "n" * 300
+    row = _row_of(snapshot, "Runner")
+    assert len(row) == 132 and row.endswith(ELLIPSIS)
+    snapshot[READ_FROM_KEY] = {"/p/" + "q" * 300: 1}
+    row = _row_of(snapshot, "Files/sizing")
+    assert len(row) == 132 and row.endswith(ELLIPSIS)
+
+
+def test_name_with_a_quote_is_json_escaped_in_the_targets_row(snapshot):
+    snapshot.update(STORAGE_TARGET_NAME='a"b')
+    assert 'name="a\\"b"; ' in _row_of(snapshot, "Targets")

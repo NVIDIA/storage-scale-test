@@ -52,6 +52,7 @@ from typing import (
     Set,
     Tuple,
     TypedDict,
+    Union,
     cast,
     get_type_hints,
 )
@@ -98,6 +99,12 @@ from lib.reporting_common import histogram_axis_ranges
 from lib.stdout_report_file import (  # pylint: disable=wrong-import-position
     REPORT_TXT_FILENAME,
     mirror_stdout_to_file,
+)
+from lib.storage_target import (
+    StorageTarget,
+    cached_target_sources,
+    guarded_report_target,
+    storage_target_from_env,
 )
 
 
@@ -277,6 +284,10 @@ class ElbenchoMetrics:
     # Histogram data (optional, for visualization); latency histogram data
     # as {time_sec: count}
     histogram: Dict[float, int] = field(default_factory=dict)
+
+    # Storage target name from the snapshot ("" when unknown). Keep last: it is
+    # the newest column, and older CSVs without it still load.
+    storage_target_name: str = ""
 
 
 _ELBENCHO_METRIC_FIELD_TYPES = get_type_hints(ElbenchoMetrics)
@@ -2710,6 +2721,7 @@ def _elbencho_csv_apply_backward_compat_defaults(row: Dict[str, Any]) -> None:
     _csv_row_set_if_absent_or_empty(row, "all_nodes_all_data", "False")
     for workload_key in _WORKLOAD_STRING_CSV_KEYS:
         _csv_row_set_if_absent_or_empty(row, workload_key, "")
+    _csv_row_set_if_absent_or_empty(row, "storage_target_name", "")
     _elbencho_csv_parse_histogram_cell(row)
 
 
@@ -2766,6 +2778,7 @@ def read_csv(csv_file: str) -> List[ElbenchoMetrics]:
                     "treescan_first_file_bytes",
                     "is_single_big_file",
                     "all_nodes_all_data",
+                    "storage_target_name",
                     *_WORKLOAD_STRING_CSV_KEYS,
                 )
             ]
@@ -4471,6 +4484,26 @@ def print_markdown_metrics_table_and_command(
         print("\n*Command information not available*")
 
 
+def _load_input_environments(input_dirs: List[str]) -> Dict[str, dict]:
+    """Read each input directory's env_used.yaml once, keyed by the given path."""
+    return {input_dir: load_env_used_yaml(input_dir) for input_dir in input_dirs}
+
+
+def _target_sources(
+    environments: Dict[str, dict], csv_file: Optional[str], metrics: List[Any]
+) -> List[Tuple[str, Union[StorageTarget, str, None]]]:
+    """Label every report input with its storage target, or None when unknown."""
+    sources: List[Tuple[str, Union[StorageTarget, str, None]]] = [
+        (input_dir, storage_target_from_env(env))
+        for input_dir, env in environments.items()
+    ]
+    if csv_file:
+        sources.extend(
+            cached_target_sources(csv_file, (m.storage_target_name for m in metrics))
+        )
+    return sources
+
+
 def main() -> None:
     """Script entry point."""
     parser = extract_elbencho_parser()
@@ -4509,6 +4542,13 @@ def main() -> None:
             eprint(f"Error reading CSV: {e}")
             sys.exit(1)
 
+    # Refuse results from different storage targets before parsing or writing.
+    environments = _load_input_environments(args.input_dirs)
+    target_label = guarded_report_target(
+        _target_sources(environments, args.from_csv, metrics),
+        args.allow_mixed_targets,
+    )
+
     # Parse elbencho files from input directories (if any)
     live_files = []
     for input_dir in args.input_dirs:
@@ -4540,8 +4580,7 @@ def main() -> None:
             except Exception as e:  # pylint: disable=broad-exception-caught
                 eprint(f"Error parsing {base_filename}: {e}")
 
-        env_used = load_env_used_yaml(input_dir)
-        apply_env_used_to_metrics(env_used, dir_metrics)
+        apply_env_used_to_metrics(environments[input_dir], dir_metrics)
         apply_execution_workloads(input_dir, dir_metrics)
 
         # Set multi-node flag if any node count is greater than 1
@@ -4652,13 +4691,18 @@ def main() -> None:
 
     if metrics:
         if args.markdown:
-            with_versions(print_markdown_table, versions.of(metrics), markdown=True)(
-                metrics, args.no_dual_y_axis
-            )
+            with_versions(
+                print_markdown_table,
+                versions.of(metrics),
+                markdown=True,
+                target=target_label,
+            )(metrics, args.no_dual_y_axis)
         else:
             mirror_stdout_to_file(
                 os.path.join(output_dir, REPORT_TXT_FILENAME),
-                with_versions(print_terminal_table, versions.of(metrics)),
+                with_versions(
+                    print_terminal_table, versions.of(metrics), target=target_label
+                ),
                 metrics,
             )
 

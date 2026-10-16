@@ -37,3 +37,38 @@ ELBENCHO_FIXTURE = FixtureImage(
     fixture=ELBENCHO_FIXTURE_IMAGE,
     component="elbencho",
 )
+
+
+# The in-cluster sequencer (multi-target Kubernetes attempts) needs an image
+# with `kubectl` and `sh`. Both storage profiles preload the product's default
+# sequencer image (KUBECTL_DEFAULT_SEQUENCER_IMAGE in
+# storage-tests/fs/kubectl/_nv-elbencho-kubectl-functions.sh, written with its
+# docker.io/ prefix there; a unit test keeps the two equal). Its kubectl minor
+# can be newer than a profile's cluster: the sequencer's only API calls (get
+# job -o jsonpath, patch job --type=json) are stable across versions. The
+# digest is the multi-architecture image index digest, as for the Elbencho
+# image.
+SEQUENCER_UPSTREAM_IMAGE = (
+    "alpine/kubectl:1.37.0@"
+    "sha256:954b65dea0eb140219b440413ede17c2eca205866df350d3c1fbc84d28af14ae"
+)
+SEQUENCER_BACKENDS = ("nfs", "sbx-shared")
+SEQUENCER_FIXTURE_REPOSITORY = "docker.io/library/storage-scale-integration-kubectl"
+
+
+def kubectl_sequencer_fixture(backend: str) -> FixtureImage:
+    """Return the sequencer image identity for one storage backend profile.
+
+    Every profile uses the product's default image. KUBECTL_SEQUENCER_IMAGE
+    must be digest-qualified, so the fixture-private node alias is itself a
+    digest reference to the pinned index digest. The nodes hold it under that
+    exact name; no pull is ever attempted.
+    """
+    if backend not in SEQUENCER_BACKENDS:
+        raise ValueError(f"no sequencer image for storage backend {backend!r}")
+    digest = SEQUENCER_UPSTREAM_IMAGE.rpartition("@")[2]
+    return FixtureImage(
+        upstream=SEQUENCER_UPSTREAM_IMAGE,
+        fixture=f"{SEQUENCER_FIXTURE_REPOSITORY}@{digest}",
+        component="kubectl-sequencer",
+    )

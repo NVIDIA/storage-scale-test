@@ -313,6 +313,7 @@ def _kubectl_fixture() -> object:
         kubectl_pv="storage-pv",
         kubectl_pvc="storage-test-rwx",
         kubectl_image="docker.io/example/elbencho@sha256:" + "a" * 64,
+        kubectl_sequencer_image="docker.io/example/kubectl@sha256:" + "b" * 64,
     )
 
 
@@ -586,10 +587,12 @@ def test_kubectl_renderer_uses_logical_roots_and_private_fixture_values():
         "kubectl", "/tmp/workspace", _kubectl_fixture(), timeout_seconds=120
     )
 
-    assert "declare -A TEST_DIRS=([primary]=1)" in overrides
+    assert "declare -A TEST_DIRS=([storage-test-rwx:primary]=1)" in overrides
     assert "KUBECTL_NAMESPACE=test-namespace" in overrides
-    assert "KUBECTL_PV=storage-pv" in overrides
-    assert "KUBECTL_PVC=storage-test-rwx" in overrides
+    assert "KUBECTL_SEQUENCER_IMAGE=docker.io/example/kubectl@sha256:" in overrides
+    # Roots name their claim, so the fixture never sets a PV or claim.
+    for removed in ("KUBECTL_PV", "KUBECTL_PVC", "KUBECTL_STORAGE_TARGETS"):
+        assert removed not in overrides
     assert "KUBECTL_NODE_SELECTOR=storage-scale-test/target=true" in overrides
     assert "KUBECTL_IMAGE_PULL_POLICY=Never" in overrides
     assert "unset SSH_HOST_LIST SSH_USER SSH_HOMEDIR_SHARED" in overrides
@@ -603,8 +606,8 @@ def test_kubectl_renderer_uses_logical_roots_and_private_fixture_values():
         logical_test_root="integration-regression/run-1-baseline-kubectl/primary",
     )
     assert (
-        "declare -A TEST_DIRS=([integration-regression/run-1-baseline-kubectl/primary]=1)"
-        in overrides
+        "declare -A TEST_DIRS=([storage-test-rwx:"
+        "integration-regression/run-1-baseline-kubectl/primary]=1)" in overrides
     )
 
 
@@ -648,8 +651,28 @@ def test_kubectl_utility_manifest_is_nonroot_tokenless_and_uses_private_image():
     assert spec["securityContext"]["runAsUser"] == 2000
     assert container["imagePullPolicy"] == "Never"
     assert container["image"] == _kubectl_fixture().kubectl_image
-    assert container["volumeMounts"][0]["mountPath"] == "/mnt/storage-scale-test"
+    # Each claim is mounted where the product mounts it: one directory per claim.
+    assert container["volumeMounts"][0]["mountPath"] == (
+        "/mnt/storage-scale-test/storage-test-rwx"
+    )
     assert spec["nodeSelector"] == {"storage-scale-test/login": "true"}
+
+    several = json.loads(
+        _kubectl_utility_manifest(
+            "utility-1234abcd",
+            _kubectl_fixture(),
+            claims=("storage-test-rwx", "storage-test-rwx-2"),
+        )
+    )["spec"]
+    assert [
+        item["claimName"]
+        for item in (volume["persistentVolumeClaim"] for volume in several["volumes"])
+    ] == ["storage-test-rwx", "storage-test-rwx-2"]
+    assert [item["mountPath"] for item in several["containers"][0]["volumeMounts"]] == [
+        "/mnt/storage-scale-test/storage-test-rwx",
+        "/mnt/storage-scale-test/storage-test-rwx-2",
+    ]
+    assert len({item["name"] for item in several["volumes"]}) == 2
 
     pinned = json.loads(
         _kubectl_utility_manifest("utility-1234abcd", _kubectl_fixture(), "worker-a")
@@ -912,7 +935,10 @@ def test_kubectl_generated_inputs_are_created_under_the_storage_mount(monkeypatc
     )
     fixture = SimpleNamespace(login_pod=None, login_container=None)
     _create_generated_inputs(object(), object(), fixture, runtime, step)
-    assert "/mnt/storage-scale-test/integration-regression/run/primary" in commands[0]
+    assert (
+        "/mnt/storage-scale-test/storage-test-rwx/integration-regression/run/primary"
+        in commands[0]
+    )
 
 
 @pytest.mark.parametrize(
@@ -1013,8 +1039,8 @@ def test_kubectl_storage_cleanup_targets_only_owned_root(tmp_path, monkeypatch):
 
     _cleanup_scenario_storage(object(), config, fixture, runtime)
     assert any(
-        "/mnt/storage-scale-test/integration-regression/run-1-baseline-kubectl"
-        in command
+        "/mnt/storage-scale-test/storage-test-rwx/"
+        "integration-regression/run-1-baseline-kubectl" in command
         for command in commands
     )
 
@@ -1246,22 +1272,231 @@ def test_temporary_unmount_retries_until_mount_disappears(tmp_path, monkeypatch)
 
     assert runner.unmount_attempts == 3
     assert sleeps == [
-        _DRIVER.TEMPORARY_UNMOUNT_RETRY_SECONDS,
-        _DRIVER.TEMPORARY_UNMOUNT_RETRY_SECONDS,
+        _DRIVER.UNMOUNT_RETRY_SECONDS,
+        _DRIVER.UNMOUNT_RETRY_SECONDS,
     ]
 
 
 def test_temporary_unmount_rejects_persistent_mount(tmp_path, monkeypatch):
     """Setup fails safely instead of deleting a still-mounted temporary path."""
-    runner = _TemporaryUnmountRunner(
-        unmounted_after=_DRIVER.TEMPORARY_UNMOUNT_ATTEMPTS + 1
-    )
+    runner = _TemporaryUnmountRunner(unmounted_after=_DRIVER.UNMOUNT_ATTEMPTS + 1)
     monkeypatch.setattr(_DRIVER.time, "sleep", lambda _seconds: None)
 
     with pytest.raises(_DRIVER.ProvisionError, match="mount remains active"):
         _unmount_temporary_filesystem(runner, tmp_path / "migration-mount")
 
-    assert runner.unmount_attempts == _DRIVER.TEMPORARY_UNMOUNT_ATTEMPTS
+    assert runner.unmount_attempts == _DRIVER.UNMOUNT_ATTEMPTS
+
+
+class _BusyExportRunner:  # pylint: disable=too-many-instance-attributes
+    """Model the fixture export: a verified ext4 loop mount that stays busy
+    for a chosen number of unmount attempts, with recorded commands."""
+
+    def __init__(self, config, unmounted_after=1, **options):
+        self.config = config
+        self.unmounted_after = unmounted_after
+        self.unmount_attempts = 0
+        self.mounted = options.get("mounted", True)
+        self.attached = True
+        self.source = options.get("source", "/dev/loop7")
+        self.backing = options.get("backing", str(config.nfs_image))
+        self.verify_rc = options.get("verify_rc")
+        self.failing = options.get("failing_diagnostics", {})
+        self.calls = []
+
+    @staticmethod
+    def _result(returncode=0, stdout=""):
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+
+    def _diagnostic(self, command):
+        for name, error in self.failing.items():
+            if name in command:
+                raise error
+        return self._result(stdout="diagnostic\n")
+
+    def _findmnt(self, command):
+        if "--submounts" in command:
+            return self._diagnostic(command)
+        if "--source" in command:
+            return self._result(1)
+        if "SOURCE,FSTYPE" in command:
+            return self._result(stdout=f"{self.source} ext4\n")
+        if "FSTYPE" in command:
+            return self._result(0, "ext4\n") if self.mounted else self._result(1)
+        if self.verify_rc is not None:
+            return self._result(self.verify_rc)
+        return self._result(0 if self.mounted else 1)
+
+    def _umount(self):
+        self.unmount_attempts += 1
+        if self.unmount_attempts >= self.unmounted_after:
+            self.mounted = False
+            return self._result()
+        return SimpleNamespace(returncode=32, stdout="", stderr="target is busy")
+
+    def run(self, arguments, **_kwargs):
+        """Return deterministic outcomes for the export teardown commands."""
+        command = [str(item) for item in arguments]
+        self.calls.append(command)
+        if command[0] == "findmnt":
+            return self._findmnt(command)
+        if "umount" in command:
+            return self._umount()
+        if "losetup" in command:
+            if "--detach" in command:
+                self.attached = False
+                return self._result()
+            if "BACK-FILE" in command:
+                return self._result(stdout=self.backing + "\n")
+            if "--list" in command:
+                return self._diagnostic(command)
+            return self._result(
+                stdout=(
+                    f"/dev/loop7: []: ({self.config.nfs_image})\n"
+                    if self.attached
+                    else ""
+                )
+            )
+        if "fuser" in command or "exportfs" in command:
+            return self._diagnostic(command)
+        raise AssertionError(f"unexpected command {command}")
+
+    def count(self, word):
+        """Return how many recorded commands contain WORD."""
+        return sum(word in command for command in self.calls)
+
+    def first(self, word):
+        """Return the index of the first recorded command containing WORD."""
+        return next(i for i, command in enumerate(self.calls) if word in command)
+
+
+def _export_runner(tmp_path, **options):
+    config = _config(tmp_path / "state", tmp_path / "export")
+    config.state_dir.mkdir()
+    config.nfs_image.touch()
+    return _BusyExportRunner(config, **options)
+
+
+def test_export_teardown_waits_out_a_transiently_busy_mount(tmp_path, monkeypatch):
+    """A busy export is retried, verified gone, and only then detached."""
+    runner = _export_runner(tmp_path, unmounted_after=3)
+    sleeps = []
+    monkeypatch.setattr(_DRIVER.time, "sleep", sleeps.append)
+
+    _DRIVER._unmount_export_filesystem(  # pylint: disable=protected-access
+        runner, runner.config
+    )
+
+    assert runner.unmount_attempts == 3
+    assert sleeps == [_DRIVER.UNMOUNT_RETRY_SECONDS] * 2
+    assert runner.first("--detach") > max(
+        i for i, command in enumerate(runner.calls) if "umount" in command
+    )
+    # Holder evidence is captured once, on the first busy attempt.
+    assert runner.count("fuser") == 1
+    assert not runner.attached
+
+
+def test_export_teardown_fast_path_never_waits(tmp_path, monkeypatch):
+    """An export that unmounts at once costs no retry wait or diagnostics."""
+    runner = _export_runner(tmp_path)
+    monkeypatch.setattr(_DRIVER.time, "sleep", pytest.fail)
+
+    _DRIVER._unmount_export_filesystem(  # pylint: disable=protected-access
+        runner, runner.config
+    )
+
+    assert runner.unmount_attempts == 1
+    assert runner.count("fuser") == 0
+
+
+def test_export_teardown_fails_safely_on_a_persistently_busy_mount(
+    tmp_path, monkeypatch
+):
+    """Bounded attempts, evidence captured, and nothing detached or deleted."""
+    runner = _export_runner(tmp_path, unmounted_after=_DRIVER.UNMOUNT_ATTEMPTS + 1)
+    sleeps = []
+    monkeypatch.setattr(_DRIVER.time, "sleep", sleeps.append)
+
+    with pytest.raises(
+        _DRIVER.ProvisionError,
+        match="fixture export mount remains active .* target is busy",
+    ):
+        _DRIVER._unmount_export_filesystem(  # pylint: disable=protected-access
+            runner, runner.config
+        )
+
+    assert runner.unmount_attempts == _DRIVER.UNMOUNT_ATTEMPTS
+    assert len(sleeps) == _DRIVER.UNMOUNT_ATTEMPTS - 1
+    assert runner.count("--detach") == 0
+    assert runner.count("fuser") == 2  # first busy attempt and exhaustion
+
+
+def test_export_teardown_never_trusts_a_failed_mount_inspection(tmp_path, monkeypatch):
+    """findmnt failing is not an unmount: cleanup stops before detaching."""
+    runner = _export_runner(tmp_path, verify_rc=2)
+    monkeypatch.setattr(_DRIVER.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(_DRIVER.ProvisionError, match="could not verify"):
+        _DRIVER._unmount_export_filesystem(  # pylint: disable=protected-access
+            runner, runner.config
+        )
+
+    assert runner.count("--detach") == 0
+
+
+def test_export_teardown_is_idempotent_once_unmounted(tmp_path):
+    """An already unmounted export issues no umount, so no parent is targeted."""
+    runner = _export_runner(tmp_path, mounted=False)
+
+    for _ in range(2):
+        _DRIVER._unmount_export_filesystem(  # pylint: disable=protected-access
+            runner, runner.config
+        )
+
+    assert runner.count("umount") == 0
+    assert not runner.attached
+
+
+@pytest.mark.parametrize(
+    "options",
+    ({"source": "/dev/sda1"}, {"backing": "/var/lib/other.img"}),
+)
+def test_export_teardown_refuses_a_foreign_mount_before_unmounting(tmp_path, options):
+    """A foreign source or backing image is rejected before umount or detach."""
+    runner = _export_runner(tmp_path, **options)
+
+    with pytest.raises(_DRIVER.ProvisionError, match="refusing"):
+        _DRIVER._unmount_export_filesystem(  # pylint: disable=protected-access
+            runner, runner.config
+        )
+
+    assert runner.count("umount") == 0
+    assert runner.count("--detach") == 0
+
+
+def test_failing_diagnostics_neither_hide_each_other_nor_the_error(
+    tmp_path, monkeypatch
+):
+    """A missing or hung diagnostic tool does not stop the others or replace
+    the unmount error."""
+    runner = _export_runner(
+        tmp_path,
+        unmounted_after=_DRIVER.UNMOUNT_ATTEMPTS + 1,
+        failing_diagnostics={
+            "--submounts": OSError("findmnt missing"),
+            "fuser": subprocess.TimeoutExpired("fuser", 10),
+        },
+    )
+    monkeypatch.setattr(_DRIVER.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(_DRIVER.ProvisionError, match="remains active"):
+        _DRIVER._unmount_export_filesystem(  # pylint: disable=protected-access
+            runner, runner.config
+        )
+
+    assert runner.count("exportfs") == 2
+    assert runner.count("--list") == 2
 
 
 def test_nfs_migration_retains_verified_active_mountpoint(tmp_path, monkeypatch):
@@ -1276,7 +1511,7 @@ def test_nfs_migration_retains_verified_active_mountpoint(tmp_path, monkeypatch)
         mountpoint.mkdir()
         return str(mountpoint)
 
-    runner = _MigrationRunner(unmounted_after=_DRIVER.TEMPORARY_UNMOUNT_ATTEMPTS + 1)
+    runner = _MigrationRunner(unmounted_after=_DRIVER.UNMOUNT_ATTEMPTS + 1)
     monkeypatch.setattr(_DRIVER.tempfile, "mkdtemp", _make_mountpoint)
     monkeypatch.setattr(_DRIVER.time, "sleep", lambda _seconds: None)
 
@@ -1286,7 +1521,7 @@ def test_nfs_migration_retains_verified_active_mountpoint(tmp_path, monkeypatch)
     assert mountpoint.is_dir()
     assert not (state_dir / "nfs-export.ext4").exists()
     assert (state_dir / "nfs-export.ext4.new").exists()
-    assert runner.unmount_attempts == _DRIVER.TEMPORARY_UNMOUNT_ATTEMPTS
+    assert runner.unmount_attempts == _DRIVER.UNMOUNT_ATTEMPTS
 
 
 def test_nfs_migration_removes_mountpoint_only_after_verified_unmount(
@@ -2298,7 +2533,7 @@ def test_sbx_shared_directories_allow_replacement_pod_cleanup(tmp_path, monkeypa
         ("acquire", _DRIVER.SBX_KIND_NODE_IMAGE),
         ("run", "docker"),
     ]
-    for name in ("storage-test", "ssh-home"):
+    for name in _DRIVER.SBX_SHARED_DIRECTORIES:
         mode = (config.sbx_shared_root / name).stat().st_mode & 0o7777
         assert mode == _DRIVER.SBX_SHARED_DIRECTORY_MODE == 0o777
 
@@ -2537,6 +2772,7 @@ def test_sbx_shared_teardown_migrates_legacy_marker(tmp_path, monkeypatch):
         json.dumps(legacy_marker), encoding="utf-8"
     )
     (config.sbx_shared_root / "storage-test").mkdir()
+    (config.sbx_shared_root / "storage-test-2").mkdir()
     (config.sbx_shared_root / "ssh-home").mkdir()
     monkeypatch.setattr(_DRIVER, "_repository_root", lambda: repository)
 

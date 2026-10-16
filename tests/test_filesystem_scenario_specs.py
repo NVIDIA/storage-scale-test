@@ -22,7 +22,10 @@ import sys
 
 import pytest
 
-from tests.integration_scenario_test_helpers import EXPECTED_SCENARIO_NAMES
+from tests.integration_scenario_test_helpers import (
+    EXPECTED_SCENARIO_NAMES,
+    load_integration_lib,
+)
 
 _MODULE_PATH = (
     Path(__file__).resolve().parents[1]
@@ -30,13 +33,8 @@ _MODULE_PATH = (
     / "lib"
     / "filesystem_scenario_specs.py"
 )
-_SPEC = importlib.util.spec_from_file_location(
-    "filesystem_scenario_specs", _MODULE_PATH
-)
-assert _SPEC is not None and _SPEC.loader is not None
-_SCENARIOS = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = _SCENARIOS
-_SPEC.loader.exec_module(_SCENARIOS)
+# The shared load keeps enum classes identical across every integration test.
+_SCENARIOS = load_integration_lib("filesystem_scenario_specs")
 
 _PLANNER_PATH = _MODULE_PATH.with_name("scenario_planner.py")
 _PLANNER_SPEC = importlib.util.spec_from_file_location(
@@ -54,6 +52,9 @@ FailureInjection = _SCENARIOS.FailureInjection
 ScenarioSpecError = _SCENARIOS.ScenarioSpecError
 WorkloadPhase = _SCENARIOS.WorkloadPhase
 validate_scenario_specs = _SCENARIOS.validate_scenario_specs
+MIXED_BATCH_TARGET_NAME = _SCENARIOS.MIXED_BATCH_TARGET_NAME
+MIXED_BATCH_TARGET_FILE = _SCENARIOS.MIXED_BATCH_TARGET_FILE
+MIXED_BATCH_METADATA_OVERRIDE = _SCENARIOS.MIXED_BATCH_METADATA_OVERRIDE
 
 
 EXPECTED_NAMES = set(EXPECTED_SCENARIO_NAMES)
@@ -117,6 +118,20 @@ def test_catalog_defines_every_planned_real_scenario():
     }
     assert planned_substrates == specified_substrates
     validate_scenario_specs()
+
+
+def test_validate_env_runs_once_per_validated_configuration():
+    """Exactly the pinned steps validate, and every substrate validates its
+    single-root and its two-root worker-directory configurations."""
+    marked = {
+        (spec.name, step.name)
+        for spec in _SCENARIOS.SCENARIO_SPECS
+        for step in spec.steps
+        if step.validate_env
+    }
+    assert marked == _SCENARIOS.VALIDATED_CONFIGURATIONS
+    for name in ("baseline", "default-dio"):
+        assert _scenario(name).substrates >= {"ssh", "slurm", "kubectl"}
 
 
 def test_each_step_is_bounded_and_has_semantic_expectations():
@@ -190,13 +205,41 @@ def test_mixed_batch_prepares_changed_groups_with_repeated_coordinates():
     assert metadata.arguments[0] == repeated.arguments[0] == "--append"
     assert [step.executions[0].coordinate.nodes for step in scenario.steps] == [1, 2, 1]
     assert first.executions[0].coordinate == repeated.executions[0].coordinate
-    # env.sh never changes; appended groups differ only through override files.
+    # env.sh never changes; appended groups differ only through workload
+    # override files and, for the metadata group, a target file.
     assert first.env_lines == metadata.env_lines == repeated.env_lines
     for step in (metadata, repeated):
-        override = step.arguments[step.arguments.index("--env-override") + 1]
-        assert not override.startswith("/")
-        assert [item.relative_path for item in step.support_files] == [override]
-    assert "{test_root_secondary}" in metadata.support_files[0].content
+        overrides = [
+            step.arguments[index + 1]
+            for index, argument in enumerate(step.arguments)
+            if argument == "--env-override"
+        ]
+        assert overrides
+        assert not any(override.startswith("/") for override in overrides)
+        targets = [
+            step.arguments[index + 1]
+            for index, argument in enumerate(step.arguments)
+            if argument == "--target"
+        ]
+        assert not any(target.startswith("/") for target in targets)
+        assert [item.relative_path for item in step.support_files] == [
+            *targets,
+            *overrides,
+        ]
+    # The metadata group passes a target file and a workload recipe. Target
+    # settings never ride in an override file, so the recipe holds none.
+    target_file, recipe_file = metadata.support_files
+    assert metadata.arguments[2:6] == (
+        "--target",
+        MIXED_BATCH_TARGET_FILE,
+        "--env-override",
+        MIXED_BATCH_METADATA_OVERRIDE,
+    )
+    assert f"STORAGE_TARGET_NAME={MIXED_BATCH_TARGET_NAME}\n" in target_file.content
+    assert "{test_key_secondary}" in target_file.content
+    for setting in ("TEST_DIRS", "STORAGE_TARGET_NAME", "FS_MAX_"):
+        assert setting not in recipe_file.content
+    assert "MDTEST_ITERATIONS=2" in recipe_file.content
     assert 'ELBENCHO_FILE_SIZE="8M"' in repeated.support_files[0].content
     assert metadata.failure_injection is FailureInjection.FAIL_AFTER_WRITE_ONCE
     assert metadata.executions[0].status is ExecutionStatus.FAILED
@@ -301,8 +344,8 @@ def test_weighted_roots_activates_run_to_completion_sizing_with_bounded_limits()
     environment = "\n".join(step.env_lines)
 
     assert step.arguments == ("--bio", "--run-to-completion", "--nodes", "1")
-    assert '["{test_root}"]=1' in environment
-    assert '["{test_root_secondary}"]=2' in environment
+    assert '["{test_key}"]=1' in environment
+    assert '["{test_key_secondary}"]=2' in environment
     assert "FS_MAX_NODE_IOPS=100" in environment
 
 
@@ -314,7 +357,7 @@ def test_worker_directories_exercise_explicit_run_to_completion_on_every_substra
     assert step.arguments == ("--run-to-completion", "--nodes", "1,2")
     assert "export ELBENCHO_FILES_PER_NODE=5" in step.env_lines
     assert (
-        'declare -A TEST_DIRS=(["{test_root}"]=1 ["{test_root_secondary}"]=1)'
+        'declare -A TEST_DIRS=(["{test_key}"]=1 ["{test_key_secondary}"]=1)'
         in step.env_lines
     )
     assert 'export ELBENCHO_FILE_SIZE="256K"' in step.env_lines
@@ -343,7 +386,11 @@ def test_slurm_scheduling_renders_include_and_ignore_files():
 def test_template_rendering_resolves_driver_owned_paths():
     """The driver can render env and argument templates without shell discovery."""
     step = _scenario("retained-lifecycle").steps[1]
-    values = {"test_root": "/mnt/test", "retained_data_dir": "/mnt/test/data"}
+    values = {
+        "test_root": "/mnt/test",
+        "test_key": "/mnt/test",
+        "retained_data_dir": "/mnt/test/data",
+    }
 
     assert step.render_arguments(values) == (
         "--read-from",
@@ -352,6 +399,14 @@ def test_template_rendering_resolves_driver_owned_paths():
         "1",
     )
     assert '["/mnt/test"]=1' in step.render_env(values)
+    # Values that name only the plain roots render the keys the same way.
+    plain = {"test_root": "/mnt/test", "test_root_secondary": "/mnt/other"}
+    assert '["/mnt/test"]=1' in step.render_env(plain)
+    metadata = _scenario("mixed-batch").steps[1]
+    target, _ = metadata.render_support_files(plain)
+    assert 'TEST_DIRS=(["/mnt/other"]=1)' in target.content
+    with pytest.raises(KeyError):
+        step.render_env({})
 
 
 def test_validation_rejects_missing_sequence_dependency():

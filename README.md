@@ -50,6 +50,13 @@ printed directory, not its parent, for reporting and lifecycle commands.
 Filesystem launchers can also vary workload settings per run with
 [`--env-override <file>`](docs/FILESYSTEM_TESTING.md#workload-override-files)
 instead of edits to `env.sh`.
+
+To test several filesystems, either spread one workload across them (several
+weighted `TEST_DIRS` roots) or compare them (one `--target <file>` per
+filesystem, each becoming its own batch group and report). What to test comes
+from `env.sh` or `--target`; how to test comes from `env.sh` or
+`--env-override`. See
+[Testing several filesystems](docs/FILESYSTEM_TESTING.md#testing-several-filesystems).
 Kubernetes runs asynchronously: collect terminal results before reporting.
 
 ## Prerequisites and deployment
@@ -128,40 +135,57 @@ Authorize `kubectl` for the intended context first:
 ```bash
 export EXECUTION_SUBSTRATE=kubectl
 export KUBECTL_NAMESPACE=storage-scale-test
-export KUBECTL_PV=storage-scale-test-pv
-export KUBECTL_PVC=storage-scale-test-pvc
 export KUBECTL_NODE_SELECTOR='storage-scale-test/worker=true'
-export KUBECTL_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.2-1
 export KUBECTL_IMAGE_PULL_POLICY=IfNotPresent
 export KUBECTL_RUN_AS_USER=2000
 export KUBECTL_RUN_AS_GROUP=2000
-declare -A TEST_DIRS=(["scale-test"]=1)
+declare -A TEST_DIRS=(["scale-test-pvc:scale-test"]=1)
 ```
 
+Each `TEST_DIRS` key is `[namespace/]claim:path`: here the directory
+`scale-test` inside the claim (PVC) `scale-test-pvc` in `KUBECTL_NAMESPACE`.
 The tool provisions no cluster, namespace, PV, or PVC; complete the
-[Kubernetes prerequisites](docs/FILESYSTEM_TESTING.md#kubernetes-prerequisites)
-before validating. For lifecycle commands, durable storage layout, and
+[Kubernetes setup](docs/FILESYSTEM_TESTING.md#kubernetes-setup) before
+validating. For lifecycle commands, durable storage layout, and
 troubleshooting, see the
 [filesystem guide](docs/FILESYSTEM_TESTING.md#kubernetes-run-inspect-and-collect).
 
+**Upgrading from v1.8.0 to v2.0.0**
+([details](docs/FILESYSTEM_TESTING.md#upgrading-from-v180)):
+
+- Delete `KUBECTL_PVC` and `KUBECTL_PV`; write `claim:path` `TEST_DIRS` keys.
+- Collect in-progress v1.x Kubernetes runs with v1.x first.
+- Move `TEST_DIRS`, `STORAGE_TARGET_NAME`, and `FS_MAX_*` from
+  `--env-override` files to `--target` files (with claim-qualified keys on
+  Kubernetes).
+
 ## Validate and correct the configuration
 
-Run `./validate_env.sh` after configuration changes. It probes the selected
-substrate and enabled workloads (nonempty `TEST_DIRS` for filesystem, a set
-`OBJ_BUCKET` for object): writable paths, object access (a nonempty bucket
-fails), and temporary Kubernetes validation resources. Read detailed errors and
-diagnostic paths above the final summary. Disabled-test notes and the
-[Kubernetes object inventory](docs/FILESYSTEM_TESTING.md#kubernetes-access-and-troubleshooting)
-are informational, not failures.
+Run `./validate_env.sh` after configuration changes and repeat until it prints
+`All validation checks passed successfully`. A passing run prints a few
+summary lines; errors, warnings, and notes are always printed, and `--verbose`
+(`-v`) adds a detail line for every check that passed.
 
-Fix configuration errors in `env.sh`; take mount, admission, registry, or CNI
-evidence to your cluster/storage administrator. Repeat until it prints
-`All validation checks passed successfully`. Validation cannot prove every
-workload or performance limit; start with a small run before scaling.
+- It probes the selected substrate and enabled workloads (filesystem: nonempty
+  `TEST_DIRS`; object: `OBJ_BUCKET`): writable paths, bucket access and, on
+  Kubernetes, each claim plus one temporary validation Job. It checks only
+  `env.sh`'s target; `--target` files are checked when a run is prepared or
+  started.
+- On Kubernetes, `./validate_env.sh` warns (never fails) when the in-cluster
+  sequencer that batches spanning several namespaces need lacks its image or
+  RBAC; `./validate_env.sh --sequencer` runs its full probe and makes problems
+  errors.
+- Read the errors above the final summary. Fix configuration errors in
+  `env.sh`; take mount, admission, registry, or CNI problems to your
+  cluster/storage administrator. Disabled-test notes and the
+  [Kubernetes object inventory](docs/FILESYSTEM_TESTING.md#kubernetes-access-and-troubleshooting)
+  are informational. Validation cannot prove every workload or performance
+  limit; start with a small run before scaling.
 
 ## Further reading
 
 - [Filesystem benchmark recipes](BENCHMARK_RECIPES_FILESYSTEM.md): tuned settings by use case.
+- [Testing several filesystems](docs/FILESYSTEM_TESTING.md#testing-several-filesystems): spread load across filesystems, or compare them with `--target`.
 - [Design](docs/DESIGN.md), [requirements](docs/REQUIREMENTS.md), and [architecture diagrams](docs/ARCHITECTURE_DIAGRAMS.md).
 - [Kubernetes lifecycle contract](docs/KUBERNETES_ELBENCHO_LIFECYCLE.md): authoritative recovery and fault boundaries.
 - [Roadmap](ROADMAP.md), [security policy](SECURITY.md), [LICENSE](LICENSE), and [NOTICE](NOTICE).

@@ -32,6 +32,7 @@ from unittest import mock
 import pytest
 
 from tests.extract_elbencho_test_support import load_extract_elbencho_module
+import lib.filesystem_batch as batch_module
 from lib.filesystem_batch import (
     BATCH_MARKERS,
     ENV_SHELL,
@@ -61,7 +62,8 @@ def _digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _create_batch(root, kinds=("io", "mdtest", "io")):
+def _create_batch(root, kinds=("io", "mdtest", "io"), snapshots=None):
+    """Prepare a batch; ``snapshots`` maps group ids to saved env_used.yaml text."""
     root.mkdir()
     ledger = root / "executions"
     ledger.mkdir()
@@ -76,7 +78,8 @@ def _create_batch(root, kinds=("io", "mdtest", "io")):
             f"export TEST_ROOT=/saved/{identifier}\n", encoding="utf-8"
         )
         (group / ENV_YAML).write_text(
-            f"TEST_ROOT: /saved/{identifier}\n", encoding="utf-8"
+            (snapshots or {}).get(identifier, f"TEST_ROOT: /saved/{identifier}\n"),
+            encoding="utf-8",
         )
         (group / "executions").mkdir()
         definition = ledger / f"{identifier}.sh"
@@ -703,7 +706,7 @@ def test_omnibus_report_preserves_tables_with_each_saved_environment(
             group_start = combined.index(contents[group.group_id])
             prefix = combined[previous_end:group_start]
             assert prefix.count("Runner:") == 1
-            assert prefix.count("Override:") == 1
+            assert prefix.count("Setting files:") == 1
             previous_end = group_start + len(contents[group.group_id])
         assert (report_root / "groups" / group.group_id / "report.txt").read_text(
             encoding="utf-8"
@@ -718,6 +721,100 @@ def test_omnibus_report_preserves_tables_with_each_saved_environment(
     assert "reports.txt" in index
     if not custom_output:
         assert not (report_root / "reports.txt").exists()
+
+
+TARGET_SNAPSHOTS = {
+    "0001": "STORAGE_TARGET_NAME: lustre-a\n",
+    "0002": 'TEST_DIRS:\n  "/mnt/x/": 1\n  "/mnt/w": 1\n',
+    "0003": 'STORAGE_TARGET_NAME: "a|b"\n',
+    "0004": "TEST_ROOT: /saved/0004\n",
+}
+
+
+def _targeted_batch(tmp_path):
+    manifest = _create_batch(
+        tmp_path / "batch",
+        kinds=("io", "mdtest", "io", "mdtest"),
+        snapshots=TARGET_SNAPSHOTS,
+    )
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+    return manifest
+
+
+def _fake_report(_manifest, group, _successful, destination, _options):
+    (destination / "report.txt").write_text(group.group_id, encoding="utf-8")
+
+
+def test_index_and_omnibus_name_each_groups_storage_target(tmp_path):
+    manifest = _targeted_batch(tmp_path)
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=_fake_report):
+        assert report_batch(manifest.root) == 0
+    index = (manifest.root / "reports/index.md").read_text(encoding="utf-8")
+    assert "| Group | Kind | Target | Saved settings | Cell states | Reports |" in index
+    assert "| --- | --- | --- | --- | --- | --- |" in index
+    rows = {
+        line.split(" | ")[0].strip("| "): line.split(" | ")[2]
+        for line in index.splitlines()
+        if line.startswith("| 000")
+    }
+    assert rows == {
+        "0001": "lustre-a",
+        "0002": "/mnt/w,/mnt/x (derived)",
+        "0003": "a\\|b",
+        "0004": "unknown",
+    }
+    combined = (manifest.root / "reports.txt").read_text(encoding="utf-8")
+    for header in (
+        'Group 0001 (io) target: "lustre-a"\n',
+        'Group 0002 (mdtest) target: "/mnt/w,/mnt/x (derived)"\n',
+        'Group 0003 (io) target: "a|b"\n',
+        'Group 0004 (mdtest) target: "unknown"\n',
+    ):
+        assert header in combined
+
+
+def test_unreadable_group_snapshot_is_an_unknown_target(tmp_path):
+    # pylint: disable=protected-access
+    manifest = _targeted_batch(tmp_path)
+    broken = manifest.group_path(manifest.groups[0]) / ENV_YAML
+    broken.write_text("STORAGE_TARGET_NAME: tampered\n", encoding="utf-8")
+    # The digest no longer matches, so the saved target cannot be trusted.
+    assert batch_module._group_target(manifest, manifest.groups[0]) == "unknown"
+    broken.unlink()
+    assert batch_module._group_target(manifest, manifest.groups[0]) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("plain/name", "plain/name"),
+        ("a|b", "a\\|b"),
+        ("a\\|b", "a\\\\\\|b"),
+        ("trailing\\", "trailing\\\\"),
+        ("`code`", "\\`code\\`"),
+        ("<b>x</b>", "&lt;b>x&lt;/b>"),
+        ("&lt; literal", "&amp;lt; literal"),
+        ("two\nlines\r", "two lines "),
+    ],
+)
+def test_markdown_cell_renders_names_literally(text, expected):
+    # pylint: disable=protected-access
+    assert batch_module._markdown_cell(text) == expected
+
+
+def test_index_row_keeps_a_hostile_target_name_in_one_cell(tmp_path):
+    manifest = _create_batch(
+        tmp_path / "batch",
+        kinds=("io",),
+        snapshots={"0001": "STORAGE_TARGET_NAME: 'a\\|b`c<d'\n"},
+    )
+    _publish_result(manifest, manifest.groups[0])
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=_fake_report):
+        assert report_batch(manifest.root) == 0
+    index = (manifest.root / "reports/index.md").read_text(encoding="utf-8")
+    row = next(line for line in index.splitlines() if line.startswith("| 0001"))
+    assert row.split(" | ")[2] == "a\\\\\\|b\\`c&lt;d"
 
 
 def test_filtered_omnibus_retains_owned_reports_and_removes_stale_output(tmp_path):
@@ -1018,7 +1115,7 @@ printer([metric, replace(metric, operation="READ")])
         summary = combined[previous_end:start]
         assert summary.count("Runner:") == 1
         assert summary.count("Files/sizing:") == 1
-        assert summary.count("Override:") == 1
+        assert summary.count("Setting files:") == 1
         assert "```yaml" not in summary
         assert (
             manifest.root / "reports/groups" / group.group_id / "report.txt"
@@ -1188,6 +1285,114 @@ def test_legacy_reporter_batch_routing_forwards_options(tmp_path):
     args.input_dirs.append(str(tmp_path))
     with pytest.raises(ValueError, match="sole raw"):
         route_batch_report(args, "io", argv)
+
+
+def _real_mdtest_batch(root):
+    """A one-group metadata batch holding a real, parseable result pair."""
+    from tests.test_extract_mdtest_elbencho import _DENSE_CSV, _DENSE_OUT
+
+    manifest = _create_batch(root, kinds=("mdtest",))
+    source = _publish_result(manifest, manifest.groups[0])
+    (source / f"{MD_STEM}.csv").write_text(_DENSE_CSV, encoding="utf-8")
+    (source / f"{MD_STEM}.out").write_text(_DENSE_OUT, encoding="utf-8")
+    return manifest
+
+
+def _assert_real_engine_accepted_the_flag(run, manifest):
+    command = run.call_args.args[0]
+    assert Path(command[1]).name == "extract-mdtest-elbencho.py"
+    assert "--allow-mixed-targets" in command
+    report = manifest.root / "reports/groups/0001/report.txt"
+    assert "mdtest" in report.read_text(encoding="utf-8").lower()
+
+
+def test_allow_mixed_targets_reaches_the_real_engine_from_route_batch_report(
+    tmp_path, reporting_checkout
+):
+    manifest = _real_mdtest_batch(tmp_path / "batch")
+    args = argparse.Namespace(
+        input_dirs=[str(manifest.root)], groups=None, output_dir=None, from_csv=None
+    )
+    argv = ["--allow-mixed-targets", "--markdown", str(manifest.root)]
+    with (
+        mock.patch.object(batch_module, "_REPO_ROOT", reporting_checkout),
+        mock.patch("lib.filesystem_batch.subprocess.run", wraps=subprocess.run) as run,
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        with pytest.raises(SystemExit) as exited:
+            route_batch_report(args, "mdtest", argv)
+    # A real engine that rejected the option would exit 2 and fail the group.
+    assert exited.value.code == 0
+    _assert_real_engine_accepted_the_flag(run, manifest)
+
+
+def test_allow_mixed_targets_reaches_the_real_engine_from_report_batch(
+    tmp_path, reporting_checkout
+):
+    from lib.report_cli import extract_filesystem_parser
+
+    manifest = _real_mdtest_batch(tmp_path / "batch")
+    args = extract_filesystem_parser().parse_args(
+        ["--allow-mixed-targets", "--markdown", str(manifest.root)]
+    )
+    with (
+        mock.patch.object(batch_module, "_REPO_ROOT", reporting_checkout),
+        mock.patch("lib.filesystem_batch.subprocess.run", wraps=subprocess.run) as run,
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        code = report_batch(
+            manifest.root, args.kind, args.groups, args.output_dir, analysis_args=args
+        )
+    assert code == 0
+    _assert_real_engine_accepted_the_flag(run, manifest)
+
+
+def test_unified_front_door_guards_mixed_cached_reports_with_the_real_engine(
+    tmp_path, reporting_checkout
+):
+    """extract-filesystem.py forwards the flag to the unmocked metadata engine."""
+    from tests.test_extract_mdtest_elbencho import _DENSE_CSV, _DENSE_OUT
+
+    inputs = []
+    for name, stamp, target in (
+        ("a", "20260930Z120000", "lustre-a"),
+        ("b", "20260930Z130000", "weka-b"),
+    ):
+        directory = tmp_path / name
+        directory.mkdir()
+        stem = MD_STEM.replace(DATESTAMP, stamp)
+        (directory / f"{stem}.csv").write_text(_DENSE_CSV, encoding="utf-8")
+        (directory / f"{stem}.out").write_text(_DENSE_OUT, encoding="utf-8")
+        (directory / "env_used.yaml").write_text(
+            f"STORAGE_TARGET_NAME: {target}\n", encoding="utf-8"
+        )
+        inputs.append(str(directory))
+    engine = reporting_checkout / "utils/extract-mdtest-elbencho.py"
+    cached_dir = tmp_path / "cached"
+    completed = subprocess.run(
+        [sys.executable, str(engine), *inputs, "--allow-mixed-targets", "--to-csv"]
+        + ["--markdown", "--output-dir", str(cached_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    (cache,) = cached_dir.glob("mdtest-elbencho-metrics-*.csv")
+    wrapper = [sys.executable, str(reporting_checkout / "utils/extract-filesystem.py")]
+    options = ["--kind", "mdtest", "--from-csv", str(cache), "--markdown"]
+    refused = subprocess.run(
+        [*wrapper, *options], capture_output=True, text=True, check=False
+    )
+    assert refused.returncode == 1
+    assert "inputs come from different storage targets" in refused.stderr
+    allowed = subprocess.run(
+        [*wrapper, *options, "--allow-mixed-targets"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert allowed.returncode == 0, allowed.stderr
+    assert '- Storage target: mixed: "lustre-a", "weka-b"' in allowed.stdout
 
 
 def test_ordinary_reporter_routing_is_unchanged(tmp_path):

@@ -16,8 +16,8 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: @@RESOURCE_NAME@@
-  namespace: @@NAMESPACE@@
+  name: "@@RESOURCE_NAME@@"
+  namespace: "@@NAMESPACE@@"
   labels:
     app.kubernetes.io/name: storage-scale-test
     app.kubernetes.io/instance: sst-elb-@@ATTEMPT_ID@@
@@ -25,6 +25,7 @@ metadata:
     app.kubernetes.io/managed-by: storage-scale-test
     storage-scale-test.nvidia.com/benchmark: elbencho
     storage-scale-test.nvidia.com/run: "@@ATTEMPT_ID@@"
+    storage-scale-test.nvidia.com/segment: "@@SEGMENT_INDEX@@"
     storage-scale-test.nvidia.com/operation: "@@OPERATION_TOKEN@@"
   annotations:
     storage-scale-test.nvidia.com/ownership: "@@OWNERSHIP_NONCE@@"
@@ -32,7 +33,7 @@ spec:
   automountServiceAccountToken: false
   terminationGracePeriodSeconds: 1
   restartPolicy: Never
-  nodeName: @@NODE_NAME@@
+  nodeName: "@@NODE_NAME@@"
   securityContext:
     runAsNonRoot: true
     runAsUser: @@RUN_AS_USER@@
@@ -41,21 +42,18 @@ spec:
       type: RuntimeDefault
   containers:
     - name: transfer
-      image: @@IMAGE@@
+      image: "@@IMAGE@@"
       imagePullPolicy: @@IMAGE_PULL_POLICY@@
       command: ["/bin/bash", "-ceu", "--"]
       args: ["exec sleep infinity"]
       env:
         - name: KUBECTL_REMOTE_RUN_DIRECTORY
-          value: @@REMOTE_RUN_DIRECTORY@@
+          value: "@@REMOTE_RUN_DIRECTORY@@"
       securityContext:
         allowPrivilegeEscalation: false
         capabilities:
           drop: ["ALL"]
       volumeMounts:
-        - name: storage
-          mountPath: /mnt/storage-scale-test
+@@CLAIM_VOLUME_MOUNTS@@
   volumes:
-    - name: storage
-      persistentVolumeClaim:
-        claimName: @@PVC_NAME@@
+@@CLAIM_VOLUMES@@

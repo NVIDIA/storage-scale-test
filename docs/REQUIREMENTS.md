@@ -17,7 +17,7 @@ limitations under the License.
 
 # NVIDIA Storage Scale Test — Requirements
 
-**Last Updated**: 2026-10-08\
+**Last Updated**: 2026-10-11\
 **Status**: Accurate as of last update.
 
 ---
@@ -103,7 +103,7 @@ These requirements are driven by the primary use cases of an **NVIDIA Storage Sc
 | UC-5.1 | The tool shall benchmark filesystem throughput across varying numbers of nodes. | Yes |
 | UC-5.2 | The tool shall support flexible node count specifications (single values, ranges with increments, comma-separated lists). | Yes |
 | UC-5.3 | The filesystem IO sweep shall reify every `(node count, IO size, thread count, IO depth)` cell before dispatch. Slurm mode shall execute pending cells sequentially in one coordinator allocation sized to the largest pending node count; SSH mode shall dispatch them sequentially with fresh host selection for each cell. | Yes |
-| UC-5.4 | The tool shall support testing against one or more filesystems simultaneously, with configurable weight-based load balancing across them. | Yes |
+| UC-5.4 | The tool shall support testing against one or more filesystems simultaneously as one storage target, with configurable weight-based load balancing across the target's roots, on every substrate (on Kubernetes, roots on several claims of one namespace). Several filesystems shall also be comparable as separate targets, one batch group per target (CV-1.9). See [Testing several filesystems](FILESYSTEM_TESTING.md#testing-several-filesystems). | Yes |
 | UC-5.5 | The tool shall support a generated shared-directory many-file workload with a configurable file count per node and optional exact per-file size. | Yes |
 | UC-5.6 | The tool shall support generated and pre-existing single-shared-file workloads, including partitioned access and an option for every participating node to access the full file. | Yes |
 | UC-5.7 | The filesystem IO sweep shall support retaining generated datasets, repeatedly reading staged datasets, safely deleting retained datasets, and resuming incomplete sweep executions from persisted state. | Yes |
@@ -161,8 +161,8 @@ These requirements are driven by the primary use cases of an **NVIDIA Storage Sc
 | UC-9.3 | All benchmark orchestration scripts shall support both SSH and Slurm modes from a single entry point. | Yes |
 | UC-9.4 | The SSH mode shall transmit all necessary code to remote nodes as self-contained scriptlets (no requirement for remote nodes to have the repository). | Yes |
 | UC-9.5 | The tool shall support environments where remote nodes share a home directory (e.g., NFS) and environments where they do not. | Yes |
-| UC-9.6 | Filesystem sweeps shall support an explicitly selected Kubernetes substrate using an already authorized cluster, a pre-existing bound PVC, and a configured node selector. | Yes |
-| UC-9.7 | Kubernetes sweeps shall submit one asynchronous attempt for the whole sweep and shall support durable status, cancellation, collection, and collection-gated resume operations. | Yes |
+| UC-9.6 | Filesystem sweeps shall support an explicitly selected Kubernetes substrate using an already authorized cluster, pre-existing Bound RWX claims named by claim-qualified `TEST_DIRS` roots (`[namespace/]claim:path`), and a configured node selector. | Yes |
+| UC-9.7 | Kubernetes sweeps shall submit one asynchronous attempt for the whole sweep or batch, covering every claim its targets use, and shall support durable status, cancellation, collection, and collection-gated resume operations. | Yes |
 
 ---
 
@@ -192,8 +192,9 @@ These requirements address the infrastructure and runtime constraints the tool m
 | EE-3.1 | Multi-node benchmarks shall use a coordinator/service pattern: services run on all participating nodes and a coordinator drives the test. Bidirectional netbench may use two coordinators, one per direction. | Yes |
 | EE-3.2 | In SSH mode, services and the coordinator shall be started and stopped by the orchestration scripts; the user shall not need to manage them manually. | Yes |
 | EE-3.3 | Results produced by an SSH remote coordinator shall be streamed back to the executing host; Slurm results shall be written to the configured shared results location. | Yes |
-| EE-3.4 | Kubernetes filesystem sweeps shall run one coordinator Job and one service Pod per selected worker over ordinary Pod networking, with the PVC mounted at the fixed Pod path `/mnt/storage-scale-test`. | Yes |
+| EE-3.4 | Kubernetes filesystem sweeps shall run, per namespace segment, one coordinator Job and one service Pod per selected worker over ordinary Pod networking, each mounting every claim the segment uses in one subdirectory per claim under `/mnt/storage-scale-test` (`/mnt/storage-scale-test/<claim>`). An attempt shall have one segment per namespace, run one at a time in the order each namespace first appears in the batch; only an attempt spanning several namespaces shall use a sequencer. | Yes |
 | EE-3.5 | Kubernetes Pods that execute or validate Elbencho shall request an `Unconfined` seccomp profile so supported Linux AIO workloads are not blocked, while retaining non-root execution, dropped capabilities, and disabled privilege escalation. | Yes |
+| EE-3.6 | A Kubernetes attempt spanning several namespaces shall identify every segment to the user (status keys, per-segment result files, messages) by its namespace, and its results-root `run.status` shall hold the attempt's aggregate outcome. Each group's storage target shall be reported by name. | Yes |
 
 ### EE-4: Python Environment
 
@@ -209,14 +210,15 @@ These requirements address the infrastructure and runtime constraints the tool m
 
 | ID | Requirement | Satisfied? |
 |----|-------------|:----------:|
-| CV-1.1 | All test parameters shall be configured in `env.sh`; filesystem launchers may layer one per-submission workload override file (CV-1.8). | Yes |
+| CV-1.1 | All test parameters shall be configured in `env.sh`; filesystem launchers may layer per-submission target files (CV-1.9) and workload override files (CV-1.8). | Yes |
 | CV-1.2 | A template configuration file (`env.sh.template`) shall be provided with documented defaults and comments explaining every parameter. | Yes |
 | CV-1.3 | The configuration file shall support Slurm-specific settings (account, reservation, partition, timeout). | Yes |
 | CV-1.4 | The configuration file shall support SSH-specific settings (host list file, SSH user, shared homedir flag). | Yes |
 | CV-1.5 | Benchmark parameters shall support configurable sweep lists (IO sizes, thread counts, IO depths, and object sizes), while node and task counts shall be supplied through the entry-point CLI. | Yes |
 | CV-1.6 | The tool shall support backward compatibility when new configuration variables are introduced (fall back to old variable names or hardcoded defaults). | Yes |
-| CV-1.7 | The configuration shall support Kubernetes namespace, PV, PVC, node-selector, benchmark-image, image-pull-policy, and workload UID/GID settings when `EXECUTION_SUBSTRATE=kubectl`. | Yes |
-| CV-1.8 | Filesystem launchers shall accept `--env-override <file>` for a new submission, `--batch`, or `--append`. The file shall change only the filesystem workload settings recorded in `env_used.sh`; other names and wrongly typed values shall be rejected before results are created. The file's path, SHA-256, and changed variable names shall be recorded in `env_used.sh` and `env_used.yaml`. See [Workload override files](FILESYSTEM_TESTING.md#workload-override-files). | Yes |
+| CV-1.7 | When `EXECUTION_SUBSTRATE=kubectl`, every `TEST_DIRS` key shall name its claim as `[namespace/]claim:path`, with the namespace defaulting to `KUBECTL_NAMESPACE`, and all roots of one target shall share a namespace. Unqualified keys and the removed v1.x single-claim settings shall be rejected before anything runs, printing a replacement `TEST_DIRS` line. The configuration shall also support node-selector, benchmark-image, image-pull-policy, workload UID/GID, and sequencer-image settings. See [Upgrading from v1.8.0](FILESYSTEM_TESTING.md#upgrading-from-v180). | Yes |
+| CV-1.8 | Filesystem launchers shall accept `--env-override <file>` for a new submission, `--batch`, or `--append`. The file shall change only the filesystem workload settings recorded in `env_used.sh`, on every substrate; target settings (CV-1.9), other names, and wrongly typed values shall be rejected before results are created, a target setting with an error that says to pass the file with `--target`. The flag may repeat; the files shall apply in command-line order, each on top of the previous result, and the same file given twice shall be rejected. Each file's path, SHA-256, and changed variable names shall be recorded in application order in `env_used.sh` and `env_used.yaml`. See [Workload override files](FILESYSTEM_TESTING.md#workload-override-files). | Yes |
+| CV-1.9 | Filesystem launchers shall accept a repeatable `--target <file>` for a new submission, `--batch`, or `--append`. A target file shall set `TEST_DIRS` and may set only `STORAGE_TARGET_NAME`, `FS_MAX_AGG_THROUGHPUT`, `FS_MAX_NODE_THROUGHPUT_GBPS`, and `FS_MAX_NODE_IOPS` besides; N flags shall create N batch groups in command-line order, and a plain run with more than one shall be rejected with the equivalent `--batch` and `--start` commands. Each group's target file path and SHA-256 shall be recorded separately from its override files. | Yes |
 
 ### CV-2: Configuration Validation
 
@@ -232,7 +234,7 @@ These requirements address the infrastructure and runtime constraints the tool m
 | CV-2.8 | Validation shall warn if the target S3 bucket contains existing objects (warp deletes all objects). | Yes |
 | CV-2.9 | Validation shall validate elbencho configuration parameters (thread list contains integers, IO sizes are valid, duration is valid). | Yes |
 | CV-2.10 | Validation shall accumulate all errors and report them together at the end, rather than stopping at the first error. | Yes |
-| CV-2.11 | Kubernetes validation shall verify API access, namespace and PV/PVC identity, PVC binding and mount usability, selected Ready-node compatibility, admission and use of the required Elbencho seccomp profile, and benchmark runtime prerequisites. Submission shall verify requested capacity, service readiness, and coordinator connectivity before executing a cell. Validation shall also list, without failing, existing Kubernetes objects labeled as belonging to this toolset. | Yes |
+| CV-2.11 | Kubernetes validation shall verify claim-qualified `TEST_DIRS` keys, API access, per-claim identity (Bound, RWX, Filesystem volume mode, with the bound PV recorded), mount usability of every claim from one runtime check in the namespace of `TEST_DIRS`, selected Ready-node compatibility, admission and use of the required Elbencho seccomp profile, and benchmark runtime prerequisites. Submission shall verify requested capacity, service readiness, and coordinator connectivity before executing a cell. Validation shall also list, without failing, existing Kubernetes objects labeled as belonging to this toolset. | Yes |
 
 ### CV-3: Slurm Advanced Configuration
 
@@ -295,7 +297,7 @@ These requirements address the infrastructure and runtime constraints the tool m
 | BM-5.4 | Filesystem IO, filesystem metadata, and network sweep entry points shall require explicit `--nodes` (and `--tasks` where applicable). The Warp sweep shall retain its documented legacy positional node-count syntax. | Yes |
 | BM-5.5 | The Warp sweep shall produce a clear error when `--nodes` is mixed with its legacy positional arguments. Other sweep entry points shall reject unexpected positional arguments. | Yes |
 | BM-5.6 | All sweep scripts shall provide a usage message accessible via `-h` or `--help`. | Yes |
-| BM-5.7 | The filesystem sweep shall support Kubernetes submission, status, cancellation, collection, and collection-gated resume while preserving successful cells and publishing completed results from durable PVC state. | Yes |
+| BM-5.7 | The filesystem sweep shall support Kubernetes submission, status, cancellation, collection, and collection-gated resume while preserving successful cells and publishing completed results from durable state on the claims. | Yes |
 
 ---
 
@@ -389,8 +391,8 @@ This repository does not include or distribute third-party benchmark binaries. U
 
 | Component | Requirements Addressed |
 |-----------|----------------------|
-| `storage-tests/fs/nv-elbencho-sweep.sh` | UC-2, UC-5, UC-9, CV-1.8, BM-1, BM-5 |
-| `storage-tests/fs/nv-mdtest-elbencho.sh` | UC-3, UC-6, UC-9, CV-1.8, BM-2, BM-5 |
+| `storage-tests/fs/nv-elbencho-sweep.sh` | UC-2, UC-5, UC-9, CV-1.8, CV-1.9, BM-1, BM-5 |
+| `storage-tests/fs/nv-mdtest-elbencho.sh` | UC-3, UC-6, UC-9, CV-1.8, CV-1.9, BM-2, BM-5 |
 | `storage-tests/object/nv-warp-sweep.sh` | UC-4, UC-7, UC-9, BM-3, BM-5 |
 | `storage-tests/network/nv-netbench.sh` | UC-1, UC-9, BM-4, BM-5 |
 | `utils/extract-elbencho.py` | UC-8, RA-1, RA-2, RA-3 |
@@ -400,7 +402,7 @@ This repository does not include or distribute third-party benchmark binaries. U
 | `validate_env.sh` | EE-2, CV-2 |
 | `env.sh` / `env.sh.template` | EE-2, CV-1 |
 | `lib/env_base.sh` | EE-2, CV-1 |
-| `lib/env_functions.sh` | UC-9, EE-3, EE-4, CV-1.8, CV-3 |
+| `lib/env_functions.sh` | UC-9, EE-3, EE-4, CV-1.7, CV-1.8, CV-1.9, CV-3 |
 | `storage-tests/fs/kubectl/` | UC-5, UC-9, EE-3, CV-1, CV-2, BM-1, BM-5 |
 | `lib/_elbencho_functions.sh` | BM-1, BM-2, EE-3 |
 | `lib/_warp_functions.sh` | BM-3, EE-3 |

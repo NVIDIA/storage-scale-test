@@ -27,6 +27,8 @@ from typing import Any, List
 
 import yaml
 
+from lib.storage_target import storage_target_from_env
+
 
 def _eprint(*args: Any, **kwargs: Any) -> None:
     print(*args, file=sys.stderr, **kwargs)
@@ -53,7 +55,12 @@ def _snapshot_string(env: dict, key: str) -> str:
 
 def apply_env_used_to_metrics(env: dict, metrics: List[Any]) -> None:
     """Set sweep-related flags on metrics from env_used.yaml data."""
-    if not env or not metrics:
+    if not metrics:
+        return
+    target_name = storage_target_from_env(env).name or ""
+    for metric in metrics:
+        metric.storage_target_name = target_name
+    if not env:
         return
     sbf = env.get("ELBENCHO_SINGLE_BIG_FILE")
     anad = env.get("ELBENCHO_ALL_NODES_ACCESS_ALL_DATA")

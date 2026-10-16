@@ -72,6 +72,14 @@ from lib.reporting_common import (  # pylint: disable=wrong-import-position
     parse_int_values_with_ranges as parse_int_ranges,
     strip_command_options,
 )
+from lib.storage_target import (  # pylint: disable=wrong-import-position
+    MIXED_PREFIX,
+    cached_target_sources,
+    exported_target_cell,
+    guarded_report_target,
+    has_unverified_source,
+    storage_target_from_env,
+)
 from lib.stdout_report_file import (  # pylint: disable=wrong-import-position
     REPORT_TXT_FILENAME,
     mirror_stdout_to_file,
@@ -195,6 +203,9 @@ class AggregatedMetrics:
     stat_command: str = ""
     delete_command: str = ""
 
+    # Storage target recorded in a cached CSV ("" when unknown or computed fresh)
+    storage_target_name: str = ""
+
 
 # =============================================================================
 # File Discovery and Parsing
@@ -214,17 +225,36 @@ MDTEST_CONFIG_KEYS = (
 
 def discover_files(
     input_dirs: List[str],
-) -> Dict[Tuple[int, int, str, int], Tuple[str, str]]:
+    target_groups: Optional[Dict[str, List[str]]] = None,
+) -> Dict[Tuple[Any, ...], Tuple[str, str]]:
     """
     Scan directories for matching file pairs.
 
     Args:
         input_dirs: List of directories to scan
+        target_groups: input directories grouped by storage target name. When
+            given, identical (nodes, threads, datestamp, iteration) results are
+            kept from every group instead of being rejected as ambiguous, and
+            each key gains the group name as a fifth element. Directories of one
+            group still reject duplicates among themselves.
 
     Returns:
         Dict mapping (node_count, thread_count, datestamp, iteration)
         to (csv_path, out_path)
     """
+    if target_groups is None:
+        return _discover_directories(input_dirs)
+    pairs: Dict[Tuple[Any, ...], Tuple[str, str]] = {}
+    for name, directories in target_groups.items():
+        for key, paths in _discover_directories(directories).items():
+            pairs[(*key, name)] = paths
+    return pairs
+
+
+def _discover_directories(
+    input_dirs: List[str],
+) -> Dict[Tuple[int, int, str, int], Tuple[str, str]]:
+    """Find successful result pairs, rejecting duplicate keys across directories."""
 
     def key_from_match(match: re.Match[str]) -> Tuple[int, int, str, int]:
         return (
@@ -254,6 +284,17 @@ def discover_files(
                 f"entry: {os.path.basename(paths[0])}"
             )
     return filtered_pairs
+
+
+def _directories_by_target(
+    environments: Dict[str, dict],
+) -> Dict[str, List[str]]:
+    """Group input directories by storage target name; "" collects unknown ones."""
+    groups: Dict[str, List[str]] = {}
+    for input_dir, env in environments.items():
+        name = storage_target_from_env(env).name or ""
+        groups.setdefault(name, []).append(input_dir)
+    return groups
 
 
 def _successful_mdtest_coordinates(
@@ -334,11 +375,19 @@ def _render_configuration_values(
     return configuration
 
 
-def load_mdtest_configuration(input_dirs: List[str]) -> Dict[str, str]:
-    """Load reportable mdtest settings across result directories."""
+def load_mdtest_configuration(
+    input_dirs: List[str], environments: Optional[Dict[str, Dict[str, Any]]] = None
+) -> Dict[str, str]:
+    """Load reportable mdtest settings across result directories.
+
+    ``environments`` holds env_used.yaml data already read, keyed by directory.
+    """
     values_by_key: Dict[str, List[str]] = {key: [] for key in MDTEST_CONFIG_KEYS}
     for input_dir in dict.fromkeys(input_dirs):
-        _collect_configuration_values(values_by_key, load_env_used_yaml(input_dir))
+        loaded = (environments or {}).get(input_dir)
+        if loaded is None:
+            loaded = load_env_used_yaml(input_dir)
+        _collect_configuration_values(values_by_key, loaded)
     return _render_configuration_values(values_by_key, "input directories")
 
 
@@ -1465,8 +1514,9 @@ def write_csv_export(
     csv_path: str,
     metrics: List[AggregatedMetrics],
     test_configuration: Optional[Dict[str, str]] = None,
+    storage_target: str = "",
 ) -> None:
-    """Write aggregated metrics and configuration provenance to CSV."""
+    """Write aggregated metrics, configuration provenance and target to CSV."""
     if not metrics:
         return
 
@@ -1513,6 +1563,7 @@ def write_csv_export(
         "create_command",
         "stat_command",
         "delete_command",
+        "storage_target_name",
     ]
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -1561,6 +1612,7 @@ def write_csv_export(
                 "create_command": m.create_command,
                 "stat_command": m.stat_command,
                 "delete_command": m.delete_command,
+                "storage_target_name": storage_target,
             }
             row.update(
                 {
@@ -1623,6 +1675,7 @@ def read_csv_import(
                 create_command=row.get("create_command", row.get("command", "")),
                 stat_command=row.get("stat_command", ""),
                 delete_command=row.get("delete_command", ""),
+                storage_target_name=row.get("storage_target_name") or "",
             )
             metrics.append(m)
 
@@ -2330,6 +2383,10 @@ def main() -> None:
         parser.error("At least one input directory required (or use --from-csv)")
 
     # Load metrics
+    environments = {
+        input_dir: load_env_used_yaml(input_dir)
+        for input_dir in dict.fromkeys(args.input_dirs)
+    }
     aggregated_metrics: List[AggregatedMetrics] = []
     test_configuration: Dict[str, str] = {}
     versions: List[Tuple[IterationMetrics, str]] = []
@@ -2338,9 +2395,25 @@ def main() -> None:
         eprint(f"Loading metrics from {args.from_csv}")
         aggregated_metrics, test_configuration = read_csv_import(args.from_csv)
         eprint(f"Loaded {len(aggregated_metrics)} aggregated metrics")
+        target_sources = cached_target_sources(
+            args.from_csv, (m.storage_target_name for m in aggregated_metrics)
+        )
+        target_label = guarded_report_target(target_sources, args.allow_mixed_targets)
     else:
+        # Refuse results from different storage targets before parsing or writing.
+        target_sources = [
+            (input_dir, storage_target_from_env(env))
+            for input_dir, env in environments.items()
+        ]
+        target_label = guarded_report_target(target_sources, args.allow_mixed_targets)
+        # Mixing was explicitly allowed: keep same-coordinate results per target.
+        target_groups = (
+            _directories_by_target(environments)
+            if target_label.startswith(MIXED_PREFIX)
+            else None
+        )
         # Discover and parse files
-        file_pairs = discover_files(args.input_dirs)
+        file_pairs = discover_files(args.input_dirs, target_groups)
         eprint(f"Found {len(file_pairs)} file pairs")
 
         if not file_pairs:
@@ -2350,7 +2423,7 @@ def main() -> None:
         # Parse all file pairs
         iterations: List[IterationMetrics] = []
         for key, (csv_path, out_path) in file_pairs.items():
-            node_count, thread_count, datestamp, iteration = key
+            node_count, thread_count, datestamp, iteration = key[:4]
             m = parse_file_pair(
                 csv_path, out_path, node_count, thread_count, datestamp, iteration
             )
@@ -2401,7 +2474,7 @@ def main() -> None:
         configuration_dirs = args.input_dirs or [
             os.path.dirname(os.path.abspath(args.from_csv)) or "."
         ]
-        test_configuration = load_mdtest_configuration(configuration_dirs)
+        test_configuration = load_mdtest_configuration(configuration_dirs, environments)
 
     # Export to CSV if requested
     if args.to_csv:
@@ -2414,7 +2487,12 @@ def main() -> None:
             ".csv"
         )
         csv_path = os.path.join(output_dir, csv_filename)
-        write_csv_export(csv_path, aggregated_metrics, test_configuration)
+        write_csv_export(
+            csv_path,
+            aggregated_metrics,
+            test_configuration,
+            exported_target_cell(target_label, has_unverified_source(target_sources)),
+        )
         eprint(f"Wrote metrics to {csv_path}")
 
     # Print output
@@ -2424,7 +2502,9 @@ def main() -> None:
         lambda metric: (metric.node_count, metric.thread_count),
     )
     if args.markdown:
-        with_versions(print_markdown_report, produced_by, markdown=True)(
+        with_versions(
+            print_markdown_report, produced_by, markdown=True, target=target_label
+        )(
             aggregated_metrics,
             normalize_to=args.normalize_to,
             test_configuration=test_configuration,
@@ -2432,7 +2512,7 @@ def main() -> None:
     else:
         mirror_stdout_to_file(
             os.path.join(output_dir, REPORT_TXT_FILENAME),
-            with_versions(print_terminal_table, produced_by),
+            with_versions(print_terminal_table, produced_by, target=target_label),
             aggregated_metrics,
             normalize_to=args.normalize_to,
             test_configuration=test_configuration,

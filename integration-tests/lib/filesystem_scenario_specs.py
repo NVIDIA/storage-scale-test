@@ -113,6 +113,27 @@ class GeneratedInput:
     size_bytes: int
 
 
+class TemplateValues(dict):
+    """Driver-owned template values with plain-path fallbacks for root keys.
+
+    ``{test_key}`` and ``{test_key_secondary}`` are the TEST_DIRS keys of the
+    scenario's two roots: claim-qualified on Kubernetes, the plain paths
+    ``{test_root}`` and ``{test_root_secondary}`` everywhere else. Values that
+    supply only the plain roots therefore render the non-Kubernetes keys.
+    """
+
+    _FALLBACKS = {
+        "test_key": "test_root",
+        "test_key_secondary": "test_root_secondary",
+    }
+
+    def __missing__(self, key: str) -> str:
+        fallback = self._FALLBACKS.get(key)
+        if fallback is not None and fallback in self:
+            return self[fallback]
+        raise KeyError(key)
+
+
 @dataclass(frozen=True)
 class ScenarioStep:
     """One command and its stable semantic expectations."""
@@ -132,19 +153,27 @@ class ScenarioStep:
     failure_injection: FailureInjection = FailureInjection.NONE
     preserve_failure_staging: bool = False
     workload_kind: str = "filesystem"
+    # Run validate_env.sh on this step's environment first. Only one step per
+    # configuration validate_env.sh treats differently does (see
+    # VALIDATED_CONFIGURATIONS); repeating it elsewhere re-checks the same
+    # cluster facts and the workload settings the launchers check anyway.
+    validate_env: bool = False
 
     def render_arguments(self, values: Mapping[str, str]) -> tuple[str, ...]:
         """Render driver-controlled placeholders in command arguments."""
+        values = TemplateValues(values)
         return tuple(argument.format_map(values) for argument in self.arguments)
 
     def render_env(self, values: Mapping[str, str]) -> str:
         """Render the environment override block for this step."""
+        values = TemplateValues(values)
         return "\n".join(line.format_map(values) for line in self.env_lines) + "\n"
 
     def render_support_files(
         self, values: Mapping[str, str]
     ) -> tuple[SupportFile, ...]:
         """Render paths and contents of small scenario support files."""
+        values = TemplateValues(values)
         return tuple(
             SupportFile(
                 item.relative_path.format_map(values), item.content.format_map(values)
@@ -160,6 +189,13 @@ class FilesystemScenarioSpec:
     name: str
     substrates: frozenset[str]
     steps: tuple[ScenarioStep, ...]
+    # Kubernetes storage targets the scenario's --target files name. More than
+    # one means the driver prepares the fixture's second claim for them.
+    storage_targets: int = 1
+    # Select the fixture's two claims in the primary namespace instead of its
+    # claims in two namespaces. Every group then runs in one attempt without a
+    # sequencer, so the environment carries no sequencer image.
+    same_namespace: bool = False
 
 
 # Completion-based direct-I/O workloads that only check structure (counts,
@@ -173,7 +209,7 @@ SMALL_DIO_SIZE_MULTIPLIER = 64  # automatic size = 4K block x 64 = 256K
 
 _SHARED_ENV = (
     "unset TEST_DIRS",
-    'declare -A TEST_DIRS=(["{test_root}"]=1)',
+    'declare -A TEST_DIRS=(["{test_key}"]=1)',
     'export ELBENCHO_FILE_LAYOUT="shared-directory"',
     "export ELBENCHO_FILES_PER_NODE=1",
     'export ELBENCHO_FILE_SIZE="16M"',
@@ -187,7 +223,7 @@ _SHARED_ENV = (
 
 _WORKER_ENV = (
     "unset TEST_DIRS",
-    'declare -A TEST_DIRS=(["{test_root}"]=1 ["{test_root_secondary}"]=1)',
+    'declare -A TEST_DIRS=(["{test_key}"]=1 ["{test_key_secondary}"]=1)',
     'export ELBENCHO_FILE_LAYOUT="worker-directories"',
     "export ELBENCHO_FILES_PER_NODE=",
     "export ELBENCHO_FILE_SIZE=",
@@ -313,6 +349,7 @@ def _step(
     preserve_failure_staging: bool = False,
     workload_kind: str = "filesystem",
     support_files: tuple[SupportFile, ...] = (),
+    validate_env: bool = False,
 ) -> ScenarioStep:
     """Build a sweep step with bounded defaults."""
     return ScenarioStep(
@@ -331,6 +368,7 @@ def _step(
         failure_injection=failure_injection,
         preserve_failure_staging=preserve_failure_staging,
         workload_kind=workload_kind,
+        validate_env=validate_env,
     )
 
 
@@ -345,6 +383,7 @@ def _baseline() -> FilesystemScenarioSpec:
                 _SHARED_ENV,
                 _coordinates((1, 2), ("4K",), (1,), (1,)),
                 _NORMAL_PHASES,
+                validate_env=True,
             ),
         ),
     )
@@ -354,7 +393,7 @@ def _mdtest_sweep() -> FilesystemScenarioSpec:
     """Small metadata workload that exercises all three substrates."""
     environment = (
         "unset TEST_DIRS",
-        'declare -A TEST_DIRS=(["{test_root}"]=1)',
+        'declare -A TEST_DIRS=(["{test_key}"]=1)',
         "export MDTEST_BRANCH_FACTOR=1",
         "export MDTEST_ITEMS_PER_DIR=2",
         "export MDTEST_ITERATIONS=1",
@@ -418,6 +457,7 @@ def _default_dio() -> FilesystemScenarioSpec:
                 _WORKER_ENV,
                 _coordinates((1, 2), ("4K",), (1,), (1,)),
                 _NORMAL_PHASES,
+                validate_env=True,
             ),
             _step(
                 "explicit-completion-based",
@@ -486,15 +526,23 @@ def _failure_resume() -> FilesystemScenarioSpec:
     )
 
 
+MIXED_BATCH_TARGET_FILE = "targets/mixed-target.env"
 MIXED_BATCH_METADATA_OVERRIDE = "env-overrides/mixed-metadata.env"
 MIXED_BATCH_REPEATED_OVERRIDE = "env-overrides/mixed-repeated-io.env"
+# The appended metadata group's explicit storage target name. The other two
+# groups name no target, so each records the name derived from its settings.
+MIXED_BATCH_TARGET_NAME = "itest-mixed-target-b"
 
 
 def _mixed_batch() -> FilesystemScenarioSpec:
     """Prepare three groups with repeated IO coordinates and changed provenance.
 
-    env.sh is identical for every step; appended groups change their workload
-    only through relative --env-override files, as a batch driver would.
+    env.sh is identical for every step. Appended groups change their workload
+    through relative --env-override files, as a batch driver would, and the
+    metadata group also changes its target through a relative --target file
+    (an explicit storage target name and a distinct TEST_DIRS root), so the
+    batch records the target file beside the workload override and one group
+    carries an explicit name beside two derived ones.
     """
     first = _step(
         "prepare-first-io",
@@ -510,6 +558,8 @@ def _mixed_batch() -> FilesystemScenarioSpec:
         (
             "--append",
             "{batch_results_dir}",
+            "--target",
+            MIXED_BATCH_TARGET_FILE,
             "--env-override",
             MIXED_BATCH_METADATA_OVERRIDE,
             "--nodes",
@@ -531,8 +581,12 @@ def _mixed_batch() -> FilesystemScenarioSpec:
         workload_kind="mdtest",
         support_files=(
             SupportFile(
+                MIXED_BATCH_TARGET_FILE,
+                f"STORAGE_TARGET_NAME={MIXED_BATCH_TARGET_NAME}\n"
+                'TEST_DIRS=(["{test_key_secondary}"]=1)\n',
+            ),
+            SupportFile(
                 MIXED_BATCH_METADATA_OVERRIDE,
-                'TEST_DIRS=(["{test_root_secondary}"]=1)\n'
                 "MDTEST_BRANCH_FACTOR=1\n"
                 "MDTEST_ITEMS_PER_DIR=2\n"
                 "MDTEST_ITERATIONS=2\n",
@@ -564,6 +618,186 @@ def _mixed_batch() -> FilesystemScenarioSpec:
     )
     return FilesystemScenarioSpec(
         "mixed-batch", _BASELINE_SUBSTRATES, (first, metadata, repeated)
+    )
+
+
+MAX_STORAGE_TARGETS = 2
+MULTI_TARGET_STORAGE_TARGETS = 2
+MULTI_TARGET_METADATA_ENV = (
+    "export MDTEST_BRANCH_FACTOR=1",
+    "export MDTEST_ITEMS_PER_DIR=2",
+    "export MDTEST_ITERATIONS=1",
+)
+# The sequencer notices a finished Job only every poll interval (10 seconds by
+# default); a short one keeps the sequenced scenario's hand-offs quick.
+SEQUENCER_POLL_ENV = ("export KUBECTL_SEQUENCER_POLL_SECONDS=2",)
+
+# Target files of the two-namespace scenarios: one root on the fixture's claim
+# in each namespace. The driver renders {test_key_ns1} and {test_key_ns2}.
+NAMESPACE_TARGET_A = "targets/a.env"
+NAMESPACE_TARGET_B = "targets/b.env"
+NAMESPACE_TARGET_FILES = (
+    SupportFile(NAMESPACE_TARGET_A, 'TEST_DIRS=(["{test_key_ns1}"]=1)\n'),
+    SupportFile(NAMESPACE_TARGET_B, 'TEST_DIRS=(["{test_key_ns2}"]=1)\n'),
+)
+NAMESPACE_TARGET_ARGUMENTS = (
+    "--target",
+    NAMESPACE_TARGET_A,
+    "--target",
+    NAMESPACE_TARGET_B,
+)
+
+# Target files of the aggregate scenario, both in the primary namespace: an
+# aggregate target weighting its first claim 2:1 over its second, and a separate
+# single-root target on the second claim.
+AGGREGATE_TARGET = "targets/agg.env"
+SINGLE_TARGET = "targets/single.env"
+AGGREGATE_TEST_DIRS = '(["{test_key}"]=2 ["{test_key_claim2_secondary}"]=1)'
+AGGREGATE_TARGET_FILES = (
+    SupportFile(AGGREGATE_TARGET, f"TEST_DIRS={AGGREGATE_TEST_DIRS}\n"),
+    SupportFile(SINGLE_TARGET, 'TEST_DIRS=(["{test_key_claim2}"]=1)\n'),
+)
+AGGREGATE_TARGET_ARGUMENTS = (
+    "--target",
+    AGGREGATE_TARGET,
+    "--target",
+    SINGLE_TARGET,
+)
+# Worker-directory sizing with small direct-I/O files. env.sh carries the
+# aggregate map too, so validate_env.sh checks both claims. Both groups run to
+# completion (the aggregate group has several roots, and --run-to-completion
+# gives the single-root group the same bounded dataset).
+_AGGREGATE_ENV = (
+    "unset TEST_DIRS",
+    f"declare -A TEST_DIRS={AGGREGATE_TEST_DIRS}",
+    *_WORKER_ENV[2:],
+)
+
+
+def _multi_target_env() -> tuple[str, ...]:
+    """Small time-limited IO and metadata settings shared by every group.
+
+    Both launchers read the same env.sh, so one block serves the IO batch and
+    the appended mdtest submission; only the target files differ per group.
+    """
+    return _small_file_env(_SHARED_ENV) + MULTI_TARGET_METADATA_ENV
+
+
+def _kubectl_multi_target() -> FilesystemScenarioSpec:
+    """Prepare IO and mdtest submissions across two namespaces' claims.
+
+    Every submission passes the same two target files, so it publishes one group
+    per file in command-line order: 0001 (IO, namespace 1), 0002 (IO, namespace
+    2), 0003 (mdtest, namespace 1), and 0004 (mdtest, namespace 2). The driver
+    validates the environment, then starts one attempt and waits for the
+    in-cluster sequencer Job to complete (reading its log) before it ever calls
+    --status, because --status starts the next segment itself when the sequencer
+    is lost. Only then does it poll for NEXT_ACTION=COLLECT and collect.
+    """
+    environment = _multi_target_env() + SEQUENCER_POLL_ENV
+    first = _step(
+        "prepare-io",
+        ("--batch", *NAMESPACE_TARGET_ARGUMENTS, "--nodes", "1,2"),
+        environment,
+        _coordinates((1, 2), ("4K",), (1,), (1,)),
+        _NORMAL_PHASES,
+        timeout_seconds=600,
+        exports=("batch_results_dir",),
+        support_files=NAMESPACE_TARGET_FILES,
+        validate_env=True,
+    )
+    metadata = _step(
+        "append-metadata",
+        (
+            "--append",
+            "{batch_results_dir}",
+            *NAMESPACE_TARGET_ARGUMENTS,
+            "--nodes",
+            "1",
+            "--tasks",
+            "1",
+        ),
+        environment,
+        (
+            ExpectedExecution(
+                ExecutionCoordinate(1, workload_kind="mdtest", tasks_per_node=1)
+            ),
+        ),
+        (WorkloadPhase.MDTEST_RESULTS,),
+        timeout_seconds=600,
+        requires=("batch_results_dir",),
+        workload_kind="mdtest",
+        support_files=NAMESPACE_TARGET_FILES,
+    )
+    return FilesystemScenarioSpec(
+        "kubectl-multi-target",
+        _KUBECTL_ONLY,
+        (first, metadata),
+        storage_targets=MULTI_TARGET_STORAGE_TARGETS,
+    )
+
+
+def _kubectl_multi_target_unbound() -> FilesystemScenarioSpec:
+    """Reject a start whose second target's claim is not bound.
+
+    The driver substitutes a scenario-owned claim that can never bind for the
+    second target file's claim before preparing a single IO group per file.
+    """
+    prepare = _step(
+        "prepare-io",
+        ("--batch", *NAMESPACE_TARGET_ARGUMENTS, "--nodes", "1"),
+        _multi_target_env(),
+        _coordinates(
+            (1,),
+            ("4K",),
+            (1,),
+            (1,),
+            statuses={ExecutionCoordinate(1, "4K", 1, 1): ExecutionStatus.PENDING},
+        ),
+        _NORMAL_PHASES,
+        timeout_seconds=600,
+        exports=("batch_results_dir",),
+        support_files=NAMESPACE_TARGET_FILES,
+    )
+    return FilesystemScenarioSpec(
+        "kubectl-multi-target-unbound",
+        _KUBECTL_ONLY,
+        (prepare,),
+        storage_targets=MULTI_TARGET_STORAGE_TARGETS,
+    )
+
+
+def _kubectl_same_namespace_targets() -> FilesystemScenarioSpec:
+    """Run one small IO cell on an aggregate target and on a separate target.
+
+    Both targets live in the primary namespace, so one batch submission with two
+    --target files runs as one attempt with no sequencer: groups 0001 (an
+    aggregate of the fixture's two claims, weighted 2:1) and 0002 (a single
+    root on the second claim), both run to completion.
+    """
+    prepare = _step(
+        "prepare-io",
+        (
+            "--batch",
+            *AGGREGATE_TARGET_ARGUMENTS,
+            "--run-to-completion",
+            "--nodes",
+            "1",
+        ),
+        _AGGREGATE_ENV,
+        _coordinates((1,), ("4K",), (1,), (1,)),
+        _NORMAL_PHASES,
+        timeout_seconds=600,
+        exports=("batch_results_dir",),
+        support_files=AGGREGATE_TARGET_FILES,
+        validate_env=True,
+    )
+    return FilesystemScenarioSpec(
+        "kubectl-same-namespace-targets",
+        _KUBECTL_ONLY,
+        (prepare,),
+        storage_targets=MULTI_TARGET_STORAGE_TARGETS,
+        same_namespace=True,
     )
 
 
@@ -795,7 +1029,7 @@ def _slurm_cartesian() -> FilesystemScenarioSpec:
 def _ssh_single_big_file() -> FilesystemScenarioSpec:
     env_lines = (
         "unset TEST_DIRS",
-        'declare -A TEST_DIRS=(["{test_root}"]=1)',
+        'declare -A TEST_DIRS=(["{test_key}"]=1)',
         'export ELBENCHO_FILE_LAYOUT="worker-directories"',
         "export ELBENCHO_FILES_PER_NODE=",
         "export ELBENCHO_FILE_SIZE=",
@@ -815,6 +1049,7 @@ def _ssh_single_big_file() -> FilesystemScenarioSpec:
         env_lines,
         _coordinates((1, 2), ("4K",), (1,), (1,)),
         (WorkloadPhase.WRITE, WorkloadPhase.READ, WorkloadPhase.REMOVE_FILES),
+        validate_env=True,
     )
     read_env = _override_env(
         env_lines,
@@ -864,7 +1099,7 @@ def _ssh_single_big_file() -> FilesystemScenarioSpec:
 def _ssh_weighted_roots() -> FilesystemScenarioSpec:
     env_lines = (
         "unset TEST_DIRS",
-        'declare -A TEST_DIRS=(["{test_root}"]=1 ["{test_root_secondary}"]=2)',
+        'declare -A TEST_DIRS=(["{test_key}"]=1 ["{test_key_secondary}"]=2)',
         'export ELBENCHO_FILE_LAYOUT="worker-directories"',
         "export ELBENCHO_FILES_PER_NODE=",
         'export ELBENCHO_FILE_SIZE="1M"',
@@ -887,6 +1122,7 @@ def _ssh_weighted_roots() -> FilesystemScenarioSpec:
                 env_lines,
                 _coordinates((1,), ("4K",), (1,), (1,)),
                 _NORMAL_PHASES,
+                validate_env=True,
             ),
         ),
     )
@@ -903,6 +1139,7 @@ def _ssh_shared_home() -> FilesystemScenarioSpec:
                 _SHARED_ENV + ("export SSH_HOMEDIR_SHARED=1",),
                 _coordinates((1, 2), ("4K",), (1,), (1,)),
                 _NORMAL_PHASES,
+                validate_env=True,
             ),
         ),
     )
@@ -933,9 +1170,29 @@ def _slurm_scheduling() -> FilesystemScenarioSpec:
         executions=_coordinates((1,), ("4K",), (1,), (1,)),
         required_phases=_NORMAL_PHASES,
         dataset=DatasetExpectation.CLEANED,
+        validate_env=True,
     )
     return FilesystemScenarioSpec("slurm-scheduling", _SLURM_ONLY, (step,))
 
+
+# The (scenario, step) pairs that run validate_env.sh, one per configuration it
+# treats differently: one root with a shared directory; two roots with worker
+# directories and automatic sizing; then, per substrate, two namespaces with
+# --sequencer and an aggregate over two claims (kubectl), a single big file,
+# weighted roots, and a shared home directory (SSH), and allocation options
+# (Slurm). Tests pin this set.
+VALIDATED_CONFIGURATIONS = frozenset(
+    {
+        ("baseline", "buffered-sweep"),
+        ("default-dio", "direct-worker-directories"),
+        ("kubectl-multi-target", "prepare-io"),
+        ("kubectl-same-namespace-targets", "prepare-io"),
+        ("ssh-single-big-file", "cooperative-readwrite"),
+        ("ssh-weighted-roots", "completion-based-automatic-sizing"),
+        ("ssh-shared-home", "shared-home-smoke"),
+        ("slurm-scheduling", "allocation-options"),
+    }
+)
 
 SCENARIO_SPECS = (
     _baseline(),
@@ -949,6 +1206,9 @@ SCENARIO_SPECS = (
     _kubectl_cancel(),
     _kubectl_coordinator_loss(),
     _kubectl_endpoint_drift(),
+    _kubectl_multi_target(),
+    _kubectl_multi_target_unbound(),
+    _kubectl_same_namespace_targets(),
     _slurm_cartesian(),
     _ssh_single_big_file(),
     _ssh_weighted_roots(),
@@ -978,6 +1238,12 @@ def _validate_spec(spec: FilesystemScenarioSpec) -> None:
     allowed_substrates = _BOTH_SUBSTRATES | {"kubectl"}
     if not spec.substrates or not spec.substrates <= allowed_substrates:
         raise ScenarioSpecError(f"{spec.name}: invalid substrates")
+    if (
+        not 1 <= spec.storage_targets <= MAX_STORAGE_TARGETS
+        or (spec.storage_targets > 1 and spec.substrates != _KUBECTL_ONLY)
+        or (spec.same_namespace and spec.storage_targets != MAX_STORAGE_TARGETS)
+    ):
+        raise ScenarioSpecError(f"{spec.name}: invalid storage target count")
     available: set[str] = set()
     step_names: set[str] = set()
     for step in spec.steps:

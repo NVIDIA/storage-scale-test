@@ -18,6 +18,14 @@
 # shellcheck source=lib/_platform_functions.sh
 # shellcheck disable=SC1091  # Resolved beside this library in the repository
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_platform_functions.sh"
+# The Kubernetes claim helpers are absent from deployments that ship only the
+# credential-free coordinator bundle; they are needed only for kubectl runs.
+if ! declare -F kubectl_validate_test_dirs >/dev/null \
+        && [[ -f "$(dirname "${BASH_SOURCE[0]}")/_kubectl_claims.sh" ]]; then
+    # shellcheck source=lib/_kubectl_claims.sh
+    # shellcheck disable=SC1091  # Resolved beside this library in the repository
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_kubectl_claims.sh"
+fi
 
 if ! declare -F elbencho_batch_is_batch >/dev/null; then
     # Batch cells restore globals in isolated contexts; this library is linted
@@ -1333,18 +1341,28 @@ print_elbencho_sweep_compact_summary() {
 # Filesystem workload defaults and --env-override files
 # =============================================================================
 
-# Print the filesystem workload settings an --env-override file may change,
-# one "<name>\t<kind>" row each (kind: assoc, array, or scalar). Every name is
-# defaulted by apply_filesystem_workload_defaults and recorded in the IO sweep
-# env_used.sh, so an overridden value survives every later re-source of env.sh
-# (Slurm coordinators, --resume). Substrate and transport settings are
-# deliberately excluded: they are frozen per batch and re-read on compute nodes.
-filesystem_env_override_names() {
+# Print the target settings a --target file may set, one "<name>\t<kind>" row
+# each (kind: assoc, array, or scalar). They say WHAT to test: the roots, the
+# optional report name and the throughput hints that size the sweep to that
+# filesystem. A target file sets only these and must set TEST_DIRS.
+filesystem_target_setting_names() {
     printf '%s\tassoc\n' TEST_DIRS
+    printf '%s\tscalar\n' STORAGE_TARGET_NAME FS_MAX_AGG_THROUGHPUT \
+        FS_MAX_NODE_THROUGHPUT_GBPS FS_MAX_NODE_IOPS
+}
+
+# Print the filesystem workload settings an --env-override file may change,
+# one "<name>\t<kind>" row each (kind: assoc, array, or scalar). They say HOW
+# to test; the target settings (filesystem_target_setting_names) are
+# deliberately excluded. Every name is defaulted by
+# apply_filesystem_workload_defaults and recorded in the IO sweep env_used.sh,
+# so an overridden value survives every later re-source of env.sh (Slurm
+# coordinators, --resume). Substrate and transport settings are also excluded:
+# they are frozen per batch and re-read on compute nodes.
+filesystem_env_override_names() {
     printf '%s\tarray\n' ELBENCHO_SCALE_THREAD_LIST ELBENCHO_SCALE_IO_SIZES \
         ELBENCHO_IODEPTH_LIST
-    printf '%s\tscalar\n' FS_MAX_AGG_THROUGHPUT FS_MAX_NODE_THROUGHPUT_GBPS \
-        FS_MAX_NODE_IOPS MDTEST_BRANCH_FACTOR MDTEST_ITEMS_PER_DIR \
+    printf '%s\tscalar\n' MDTEST_BRANCH_FACTOR MDTEST_ITEMS_PER_DIR \
         MDTEST_ITERATIONS ELBENCHO_FILE_SIZE_MULTIPLIER ELBENCHO_FILE_LAYOUT \
         ELBENCHO_FILES_PER_NODE ELBENCHO_FILE_SIZE \
         ELBENCHO_SCALE_READ_WRITE_DURATION ELBENCHO_READ_AFTER_WRITE_PAUSE \
@@ -1369,6 +1387,19 @@ filesystem_enabled_from_test_dirs() {
 # applied, so this is idempotent: env_base.sh calls it once after env.sh, and an
 # --env-override file is followed by a second call that restores the default
 # for anything the override unset (exactly as if it had been unset in env.sh).
+# The elbencho image Kubernetes sweeps run when KUBECTL_ELBENCHO_IMAGE is unset
+# or empty: the release utils/build_tarball.sh downloads (ELBENCHO_VERSION_TAG).
+KUBECTL_DEFAULT_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.2-1
+
+# apply_kubectl_defaults: on EXECUTION_SUBSTRATE=kubectl, default the settings
+# env.sh may leave out. env_base.sh calls it, and so does every entry point
+# right after sourcing env.sh, so settings appended after env_base.sh's
+# source line are covered too.
+apply_kubectl_defaults() {
+    [[ "${EXECUTION_SUBSTRATE:-}" == kubectl ]] || return 0
+    export KUBECTL_ELBENCHO_IMAGE="${KUBECTL_ELBENCHO_IMAGE:-$KUBECTL_DEFAULT_ELBENCHO_IMAGE}"
+}
+
 apply_filesystem_workload_defaults() {
     # Default values for FS_MAX_* estimates
     # If IOR_FS_MAX_AGG_THROUGHPUT is defined, use it as the default for FS_MAX_AGG_THROUGHPUT
@@ -1414,44 +1445,230 @@ apply_filesystem_workload_defaults() {
     export ELBENCHO_SINGLE_BIG_FILE_SIZE=${ELBENCHO_SINGLE_BIG_FILE_SIZE:-}
     # When 1, maps to elbencho --nosvcshare (each service touches full file)
     export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=${ELBENCHO_ALL_NODES_ACCESS_ALL_DATA:-0}
+    # Operator-chosen storage target label (reporting metadata only). Empty means
+    # "derive it when a snapshot is written"; the derived value is never stored here.
+    export STORAGE_TARGET_NAME=${STORAGE_TARGET_NAME:-}
 }
+
+# Make the provenance arrays readable under `set -u` before any reset, without
+# clobbering values a caller or a sourced snapshot already set.
+_init_env_override_provenance_arrays() {
+    local name
+    for name in STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S \
+            STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES; do
+        declare -p "$name" &>/dev/null || declare -ga "$name=()"
+    done
+}
+_init_env_override_provenance_arrays
 
 # Clear the provenance recorded in env_used snapshots. Launchers call this on
 # every new submission so a value inherited from a caller is never recorded.
+# The arrays hold one entry per applied --env-override file, in application
+# order; the scalars keep the legacy meaning (last file, union of variables).
 reset_env_override_provenance() {
     STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE=""
     STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256=""
     STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES=""
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES=()
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S=()
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES=()
 }
 
-# Print the absolute path of an --env-override file, relative to the current
-# directory. Symlinks are accepted; the target must be a readable regular file.
-resolve_env_override_file() {
-    local path="$1" dir
+# Recompute the legacy scalars from the arrays: _FILE and _SHA256 are the last
+# applied file's, _VARIABLES is the sorted union of every file's variables.
+_refresh_env_override_scalars() {
+    local count=${#STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[@]}
+    local -a words=() union=()
+    if [[ "$count" -eq 0 ]]; then
+        STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE=""
+        STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256=""
+        STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES=""
+        return 0
+    fi
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE="${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[count-1]}"
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256="${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S[count-1]:-}"
+    read -r -a words <<< "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES[*]:-}"
+    if [[ "${#words[@]}" -gt 0 ]]; then
+        mapfile -t union < <(printf '%s\n' "${words[@]}" | LC_ALL=C sort -u)
+    fi
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES="${union[*]:-}"
+}
+
+# Record one applied --env-override file: <label> <sha256> <variables>, where
+# <variables> is the space-separated list of names the file changed. The
+# declarations printed by filesystem_env_override_declarations call this.
+record_env_override_applied() {
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES+=("$1")
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S+=("$2")
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES+=("${3:-}")
+    _refresh_env_override_scalars
+}
+
+# Upgrade provenance loaded from a snapshot that predates the arrays (it has
+# only the scalars) into one-entry arrays. Arrays that already agree with the
+# scalars are left alone; anything else is rebuilt from the scalars so a
+# snapshot never inherits another snapshot's list.
+normalize_env_override_provenance() {
+    local file="${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE:-}"
+    local sha="${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256:-}"
+    local variables="${STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES:-}"
+    local count=${#STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[@]}
+    if [[ "$count" -gt 0 && -n "$file" \
+            && "${#STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S[@]}" -eq "$count" \
+            && "${#STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES[@]}" -eq "$count" ]]; then
+        # The arrays must reproduce every scalar, not just the file name: the
+        # union of variables disagrees when stale arrays from an earlier
+        # snapshot share only the last file.
+        _refresh_env_override_scalars
+        if [[ "$STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE" == "$file" \
+                && "$STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256" == "$sha" \
+                && "$STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES" == "$variables" ]]; then
+            return 0
+        fi
+        STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE="$file"
+        STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256="$sha"
+        STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES="$variables"
+    fi
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES=()
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S=()
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES=()
+    [[ -n "$file" ]] || return 0
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES=("$file")
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S=("${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256:-}")
+    STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES=("${STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES:-}")
+}
+
+# Target-file provenance: the one --target file a submission applied (empty
+# when the target came from env.sh), its SHA-256 and the space-separated names
+# it changed. Launchers reset it on every new submission so a value inherited
+# from a caller is never recorded.
+reset_target_file_provenance() {
+    STORAGE_SCALE_TEST_TARGET_FILE=""
+    STORAGE_SCALE_TEST_TARGET_FILE_SHA256=""
+    STORAGE_SCALE_TEST_TARGET_FILE_VARIABLES=""
+}
+
+# Record the applied --target file: <label> <sha256> <variables>. The
+# declarations printed by filesystem_target_declarations call this.
+record_target_file_applied() {
+    STORAGE_SCALE_TEST_TARGET_FILE="$1"
+    STORAGE_SCALE_TEST_TARGET_FILE_SHA256="$2"
+    STORAGE_SCALE_TEST_TARGET_FILE_VARIABLES="${3:-}"
+}
+
+# Print the absolute path of a settings file, relative to the current
+# directory. FLAG and NOUN word the errors. Symlinks are accepted; the target
+# must be a readable regular file.
+_resolve_settings_file() {
+    local path="$1" flag="$2" noun="$3" dir
     if [[ -z "$path" ]]; then
-        echo "Error: --env-override requires a file argument" >&2
+        echo "Error: $flag requires a file argument" >&2
         return 1
     fi
     if [[ ! -e "$path" ]]; then
-        echo "Error: env override file not found: $path" >&2
+        echo "Error: $noun not found: $path" >&2
         return 1
     fi
     if [[ ! -f "$path" || ! -r "$path" ]]; then
-        echo "Error: env override file is not a readable regular file: $path" >&2
+        echo "Error: $noun is not a readable regular file: $path" >&2
         return 1
     fi
     dir=$(cd "$(dirname -- "$path")" && pwd) || return 1
     printf '%s/%s\n' "$dir" "$(basename -- "$path")"
 }
 
-# Child-shell program for filesystem_env_override_declarations. It restores the
-# caller's allowed settings, sources the override at top level (so `declare`
-# stays global), and prints declarations for the allowed names it changed.
+# Print the absolute path of an --env-override file.
+resolve_env_override_file() {
+    _resolve_settings_file "$1" --env-override "env override file"
+}
+
+# Print the absolute path of a --target file.
+resolve_target_file() {
+    _resolve_settings_file "$1" --target "target file"
+}
+
+# Print the provenance label of a resolved --target file: its path, or in batch
+# preparation (ELBENCHO_BATCH_PREPARE_DIR holding .target-file-origin) the
+# operator's original path recorded beside the staged copy.
+target_file_provenance_label() {
+    local origin_file="${ELBENCHO_BATCH_PREPARE_DIR:-}/.target-file-origin" origin=""
+    if [[ -n "${ELBENCHO_BATCH_PREPARE_DIR:-}" && -f "$origin_file" ]]; then
+        IFS= read -r -d '' origin < "$origin_file" || [[ -n "$origin" ]] || {
+            echo "Error: staged target file origin is empty" >&2
+            return 1
+        }
+        printf '%s\n' "$origin"
+        return 0
+    fi
+    printf '%s\n' "$1"
+}
+
+# Resolve every --env-override path of one submission and label each for
+# provenance.
+#
+# Usage: resolve_env_override_chain <files_array> <labels_array>
+# <files_array> names an array of operator-supplied paths, replaced in place by
+# absolute paths. <labels_array> receives each file's provenance label: the
+# resolved path, or in batch preparation (ELBENCHO_BATCH_PREPARE_DIR set) the
+# operator's original path recorded beside the staged copies. The same file
+# given twice (even through a symlink) is an error: applying it again would
+# double every relative edit.
+resolve_env_override_chain() {
+    # shellcheck disable=SC2178  # Namerefs to the caller's arrays.
+    local -n __eoc_files="$1" __eoc_labels="$2"
+    local __eoc_index __eoc_other __eoc_resolved
+    local -a __eoc_origins=()
+    for __eoc_index in "${!__eoc_files[@]}"; do
+        __eoc_resolved=$(resolve_env_override_file "${__eoc_files[__eoc_index]}") || return 1
+        __eoc_files[__eoc_index]="$__eoc_resolved"
+    done
+    __eoc_labels=("${__eoc_files[@]}")
+    if [[ -n "${ELBENCHO_BATCH_PREPARE_DIR:-}" \
+            && -f "$ELBENCHO_BATCH_PREPARE_DIR/.env-override-origins" ]]; then
+        mapfile -d '' -t __eoc_origins < "$ELBENCHO_BATCH_PREPARE_DIR/.env-override-origins"
+        if [[ "${#__eoc_origins[@]}" -ne "${#__eoc_files[@]}" ]]; then
+            echo "Error: staged env override origins do not match the override files" >&2
+            return 1
+        fi
+        __eoc_labels=("${__eoc_origins[@]}")
+    fi
+    for __eoc_index in "${!__eoc_files[@]}"; do
+        for ((__eoc_other = 0; __eoc_other < __eoc_index; __eoc_other++)); do
+            [[ "${__eoc_files[__eoc_index]}" -ef "${__eoc_files[__eoc_other]}" ]] || continue
+            printf 'Error: --env-override given more than once for the same file: %s\n' \
+                "${__eoc_labels[__eoc_index]}" >&2
+            return 1
+        done
+    done
+}
+
+# Child-shell program for filesystem_env_override_declarations and
+# filesystem_target_declarations. It restores the caller's settings, sources
+# the file at top level (so `declare` stays global), and prints declarations
+# for the allowed names it changed. __SSTO_MODE selects the allowlist's
+# wording: "override" (workload settings) or "target" (target settings, with
+# TEST_DIRS required); __SSTO_OTHER lists the opposite allowlist's names, so a
+# setting in the wrong kind of file gets a message that says where it belongs.
+# Detection is by comparing each variable's declaration before and after the
+# file runs. So a setting that is assigned its current value is not seen as a
+# change: an --env-override that restates an unchanged target setting (say
+# TEST_DIRS exactly as env.sh has it) is accepted as a no-op, and a --target
+# file that restates a workload setting likewise. Rejecting the assignment
+# itself would need to trace every write (readonly variables, DEBUG traps) and
+# would not be reliable for declare/read/eval, so the loader does not try.
+# tests/test_env_override_shell.py pins this.
 # shellcheck disable=SC2016  # Expanded by the child shell.
 _FILESYSTEM_ENV_OVERRIDE_LOADER='
 __ssto_file=$1
 __ssto_label=$2
+__ssto_digest=$__SSTO_DIGEST
+__ssto_mode=$__SSTO_MODE
+__ssto_other=" $__SSTO_OTHER "
+__ssto_record=$__SSTO_RECORD
+__ssto_substrate=$__SSTO_SUBSTRATE
 shift 2
+__ssto_noun="env override file"
+[[ $__ssto_mode != target ]] || __ssto_noun="target file"
 declare -A __ssto_kind=() __ssto_known=() __ssto_before=() __ssto_seen=()
 while [[ $# -ge 2 ]]; do
     __ssto_kind[$1]=$2
@@ -1461,7 +1678,8 @@ for __ssto_name in $__SSTO_KNOWN; do
     __ssto_known[$__ssto_name]=1
 done
 eval "$__SSTO_BASELINE" || exit 1
-unset __SSTO_KNOWN __SSTO_BASELINE
+unset __SSTO_KNOWN __SSTO_BASELINE __SSTO_DIGEST __SSTO_MODE __SSTO_OTHER \
+    __SSTO_RECORD __SSTO_SUBSTRATE
 __ssto_ignored() {
     case $1 in
         __ssto_*|__SSTO_*|BASH*|_|RANDOM|SRANDOM|LINENO|SECONDS|EPOCHREALTIME \
@@ -1475,10 +1693,10 @@ for __ssto_name in $(compgen -A variable); do
         || __ssto_before[$__ssto_name]=$(declare -p "$__ssto_name" 2>/dev/null)
 done
 source "$__ssto_file" >&2 || {
-    printf "Error: env override file returned status %s: %s\n" "$?" "$__ssto_label" >&2
+    printf "Error: %s returned status %s: %s\n" "$__ssto_noun" "$?" "$__ssto_label" >&2
     exit 1
 }
-__ssto_changed=() __ssto_rejected=() __ssto_invalid=()
+__ssto_changed=() __ssto_rejected=() __ssto_misplaced=() __ssto_invalid=()
 for __ssto_name in $(compgen -A variable) "${!__ssto_before[@]}"; do
     [[ -z ${__ssto_seen[$__ssto_name]:-} ]] || continue
     __ssto_seen[$__ssto_name]=1
@@ -1487,6 +1705,8 @@ for __ssto_name in $(compgen -A variable) "${!__ssto_before[@]}"; do
     [[ "$__ssto_now" != "${__ssto_before[$__ssto_name]:-}" ]] || continue
     if [[ -n ${__ssto_kind[$__ssto_name]:-} ]]; then
         __ssto_changed+=("$__ssto_name")
+    elif [[ $__ssto_other == *" $__ssto_name "* ]]; then
+        __ssto_misplaced+=("$__ssto_name")
     elif [[ -z ${__ssto_known[$__ssto_name]:-} && -z ${__ssto_before[$__ssto_name]+x} \
             && $__ssto_name =~ ^[a-z][a-z0-9_]*$ ]]; then
         continue  # New lowercase helper variable, e.g. a loop counter: discarded.
@@ -1520,23 +1740,68 @@ for __ssto_name in "${__ssto_changed[@]}"; do
                 || __ssto_invalid+=("$__ssto_name must be a scalar, not an array") ;;
     esac
 done
+__ssto_allowed=$(printf "%s\n" "${!__ssto_kind[@]}" | LC_ALL=C sort | tr "\n" " ")
+__ssto_failed=0
+if [[ ${#__ssto_misplaced[@]} -gt 0 ]]; then
+    __ssto_failed=1
+    if [[ $__ssto_mode == target ]]; then
+        printf "Error: target file %s sets workload setting(s): %s\n" \
+            "$__ssto_label" "${__ssto_misplaced[*]}" >&2
+        printf "  A target file says what to test and may set only: %s\n" "$__ssto_allowed" >&2
+        printf "  Put workload settings in a separate file and pass it with --env-override.\n" >&2
+    else
+        printf "Error: env override file %s sets target setting(s): %s\n" \
+            "$__ssto_label" "${__ssto_misplaced[*]}" >&2
+        printf "  Target settings say what to test: pass this file with --target instead of --env-override.\n" >&2
+        printf "  A target file may hold only: %s\n" \
+            "$(printf "%s\n" $__ssto_other | LC_ALL=C sort | tr "\n" " ")" >&2
+        printf "  Keep any workload settings in a separate --env-override file.\n" >&2
+    fi
+fi
 if [[ ${#__ssto_rejected[@]} -gt 0 ]]; then
-    printf "Error: env override file %s changes unsupported variable(s): %s\n" \
-        "$__ssto_label" "${__ssto_rejected[*]}" >&2
+    __ssto_failed=1
+    printf "Error: %s %s changes unsupported variable(s): %s\n" \
+        "$__ssto_noun" "$__ssto_label" "${__ssto_rejected[*]}" >&2
     for __ssto_name in "${__ssto_rejected[@]}"; do
         case $__ssto_name in
             TEST_DIR) printf "  Use TEST_DIRS (an associative array) instead of TEST_DIR.\n" >&2 ;;
         esac
     done
-    printf "  Only filesystem workload settings may be overridden: %s\n" \
-        "$(printf "%s\n" "${!__ssto_kind[@]}" | LC_ALL=C sort | tr "\n" " ")" >&2
+    if [[ $__ssto_mode == target ]]; then
+        printf "  Only target settings may be set in a target file: %s\n" "$__ssto_allowed" >&2
+    else
+        printf "  Only filesystem workload settings may be overridden: %s\n" "$__ssto_allowed" >&2
+    fi
     printf "  Substrate, transport, and path settings belong in env.sh.\n" >&2
     printf "  Lowercase helper variables that env.sh does not define are allowed and discarded.\n" >&2
-    exit 1
+fi
+[[ $__ssto_failed == 0 ]] || exit 1
+if [[ $__ssto_mode == target ]]; then
+    # Judge the final TEST_DIRS itself, not whether the file changed it: an
+    # `unset TEST_DIRS` or a scalar/indexed assignment must not slip through.
+    __ssto_now=$(declare -p TEST_DIRS 2>/dev/null) || __ssto_now=
+    __ssto_flags=${__ssto_now#declare -}
+    __ssto_flags=${__ssto_flags%% *}
+    if [[ -z $__ssto_now || ( $__ssto_flags == *A* && ${#TEST_DIRS[@]} -eq 0 ) ]]; then
+        __ssto_invalid+=("must set TEST_DIRS with at least one root, e.g. TEST_DIRS=([\"/mnt/fs-a/data\"]=1)")
+    elif [[ $__ssto_flags == *A* ]]; then
+        declare -n __ssto_ref=TEST_DIRS
+        for __ssto_key in "${!__ssto_ref[@]}"; do
+            __ssto_weight=${__ssto_ref[$__ssto_key]}
+            if [[ -z $__ssto_key ]]; then
+                __ssto_invalid+=("TEST_DIRS has an empty root; each key must be a path")
+            elif [[ $__ssto_substrate != kubectl && $__ssto_key != /* ]]; then
+                __ssto_invalid+=("TEST_DIRS root \"$__ssto_key\" must be an absolute path")
+            fi
+            [[ $__ssto_weight =~ ^[1-9][0-9]*$ ]] \
+                || __ssto_invalid+=("TEST_DIRS weight for \"$__ssto_key\" must be a positive integer, got \"$__ssto_weight\"")
+        done
+        unset -n __ssto_ref
+    fi
 fi
 if [[ ${#__ssto_invalid[@]} -gt 0 ]]; then
     for __ssto_value in "${__ssto_invalid[@]}"; do
-        printf "Error: env override file %s: %s\n" "$__ssto_label" "$__ssto_value" >&2
+        printf "Error: %s %s: %s\n" "$__ssto_noun" "$__ssto_label" "$__ssto_value" >&2
     done
     exit 1
 fi
@@ -1545,40 +1810,72 @@ for __ssto_name in "${__ssto_changed[@]}"; do
     printf "unset -v %s\n" "$__ssto_name"
     declare -p "$__ssto_name" 2>/dev/null || :
 done
-printf "STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES=%q\n" "${__ssto_changed[*]}"
+printf "%s %q %q %q\n" "$__ssto_record" \
+    "$__ssto_label" "$__ssto_digest" "${__ssto_changed[*]}"
 printf ": env-override-complete\n"
 '
 
-# Evaluate an --env-override file and print declarations for the caller to
-# eval in its own scope, so overrides land beside env.sh's values whether
-# env.sh was sourced at top level (launchers) or in a function (batch prepare).
-# The file runs in an isolated child shell seeded with the caller's current
-# allowed settings, so relative edits such as LIST+=(x) work. Changing any
-# other existing or uppercase variable is an error. The printed text ends by
-# re-applying workload defaults, which gives unset names their usual default.
-#
-# Usage: declarations=$(filesystem_env_override_declarations <file> [label] [save]) || exit 1
-#        eval "$declarations"
-# <label> is the path recorded as provenance (defaults to <file>).
-# <save> optionally saves the validated declarations for batch preparation.
-filesystem_env_override_declarations() {
+# Evaluate one settings file in an isolated child shell and print declarations
+# for the caller to eval in its own scope. MODE is "override" or "target";
+# filesystem_env_override_declarations and filesystem_target_declarations are
+# the public entry points. The child is seeded with the caller's current
+# target and workload settings, so relative edits such as LIST+=(x) work and
+# the file can read what env.sh set. A target file is seeded with an empty
+# TEST_DIRS and STORAGE_TARGET_NAME, so it replaces the roots whole and is
+# named by itself, never by env.sh. A name outside the mode's allowlist is an
+# error; lowercase scratch variables are discarded.
+_filesystem_settings_declarations() {
     # Capture caller names before adding implementation locals. Lowercase
     # scratch variables must not collide with the loader's own bookkeeping.
     local __ssto_known
     __ssto_known=$(compgen -A variable | tr '\n' ' ')
-    local file="$1" label="${2:-$1}" baseline="" name kind digest output
+    local mode="$1" file="$2" label="${3:-$2}" baseline="" name kind digest output
+    local allowed=filesystem_env_override_names other=filesystem_target_setting_names
+    local record=record_env_override_applied other_names=""
     local -a kinds=()
+    if [[ "$mode" == target ]]; then
+        allowed=filesystem_target_setting_names
+        other=filesystem_env_override_names
+        record=record_target_file_applied
+    fi
     while IFS=$'\t' read -r name kind; do
         kinds+=("$name" "$kind")
+    done < <("$allowed")
+    while IFS=$'\t' read -r name kind; do
+        other_names+="$name "
+    done < <("$other")
+    while IFS=$'\t' read -r name kind; do
+        [[ "$mode$name" != targetTEST_DIRS ]] || continue
         baseline+="$(_elbencho_batch_emit_variable "$name")"$'\n'
-    done < <(filesystem_env_override_names)
+    done < <(filesystem_target_setting_names; filesystem_env_override_names)
+    if [[ "$mode" == target ]]; then
+        baseline+='declare -g -A TEST_DIRS=()'$'\n''declare -g -x STORAGE_TARGET_NAME='$'\n'
+    fi
     digest=$(_elbencho_batch_sha256 "$file") || return 1
+    # A batch stages private copies and passes the operator's path as the label.
+    # Evaluate the original when it still has the staged content, so a file that
+    # reads ${BASH_SOURCE[0]} (e.g. to find sibling files) behaves as in a plain
+    # run; otherwise (moved or edited since staging) evaluate the staged copy.
+    local source_file="$file"
+    if [[ "$label" != "$file" && "$label" == /* && -f "$label" ]] \
+            && [[ "$(_elbencho_batch_sha256 "$label" 2>/dev/null)" == "$digest" ]]; then
+        source_file="$label"
+    fi
     if ! output=$(__SSTO_BASELINE="$baseline" \
             __SSTO_KNOWN="$__ssto_known" \
+            __SSTO_DIGEST="$digest" \
+            __SSTO_MODE="$mode" \
+            __SSTO_OTHER="$other_names" \
+            __SSTO_RECORD="$record" \
+            __SSTO_SUBSTRATE="${EXECUTION_SUBSTRATE:-}" \
             env -u BASH_ENV -u ENV "$BASH" --noprofile --norc \
-            -c "$_FILESYSTEM_ENV_OVERRIDE_LOADER" env-override "$file" "$label" \
+            -c "$_FILESYSTEM_ENV_OVERRIDE_LOADER" env-override "$source_file" "$label" \
             "${kinds[@]}"); then
-        printf 'Error: invalid env override file: %s\n' "$label" >&2
+        if [[ "$mode" == target ]]; then
+            printf 'Error: invalid target file: %s\n' "$label" >&2
+        else
+            printf 'Error: invalid env override file: %s\n' "$label" >&2
+        fi
         return 1
     fi
     if [[ "$output" != *": env-override-complete" ]]; then
@@ -1586,30 +1883,204 @@ filesystem_env_override_declarations() {
             "$label" >&2
         return 1
     fi
+    if [[ "$mode" == target ]]; then
+        # The file's own STORAGE_TARGET_NAME (if any) follows this clear.
+        output="export STORAGE_TARGET_NAME="$'\n'"$output"
+    fi
     output+=$'\n'"$(
-        printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE=%q\n' "$label"
-        printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256=%q\n' "$digest"
         printf 'apply_filesystem_workload_defaults\n'
         printf 'filesystem_enabled_from_test_dirs\n'
     )"
-    if [[ -n "${3:-}" ]]; then
-        printf '%s\n' "$output" > "$3" || return 1
-    fi
     printf '%s\n' "$output"
 }
 
-# Print the override applied to this submission, if any.
+# Evaluate an --env-override file and print declarations for the caller to
+# eval in its own scope, so overrides land beside env.sh's values whether
+# env.sh was sourced at top level (launchers) or in a function (batch prepare).
+# The file runs in an isolated child shell seeded with the caller's current
+# settings, so relative edits such as LIST+=(x) work. Changing any other
+# existing or uppercase variable is an error, and so is changing a target
+# setting (filesystem_target_setting_names): that belongs in a --target file.
+# The printed text records the file in the provenance arrays
+# (record_env_override_applied) and ends by re-applying workload defaults,
+# which gives unset names their usual default.
+#
+# Several files compose: eval each result before evaluating the next, so each
+# file builds on the previous one's values. Concatenating the printed
+# declarations in order reproduces the combined result.
+#
+# Usage: declarations=$(filesystem_env_override_declarations <file> [label]) || exit 1
+#        eval "$declarations"
+# <label> is the path recorded as provenance (defaults to <file>).
+filesystem_env_override_declarations() {
+    _filesystem_settings_declarations override "$@"
+}
+
+# Evaluate a --target file like filesystem_env_override_declarations does, for
+# the target settings (filesystem_target_setting_names). The file must set
+# TEST_DIRS, which replaces the caller's roots whole; STORAGE_TARGET_NAME is
+# cleared first and kept only if the file sets it; FS_MAX_* values the file
+# does not set keep the caller's. The printed text records the file with
+# record_target_file_applied.
+#
+# Usage: declarations=$(filesystem_target_declarations <file> [label]) || exit 1
+filesystem_target_declarations() {
+    _filesystem_settings_declarations target "$@"
+}
+
+# Print the declarations that apply one submission's settings, in order: the
+# target file (if any) and then every override file. TARGET is the file to
+# load or empty and TARGET_LABEL its provenance label; the last two arguments
+# name the arrays of override files and their labels. Each file is evaluated
+# on top of the previous results (inside this subshell); the concatenated
+# declarations are for the caller to eval at its own top level, which
+# reproduces the combined state and the provenance records.
+#
+# Usage: declarations=$(filesystem_submission_declarations "$target" \
+#            "$target_label" env_override_files env_override_labels) || exit 1
+#        eval "$declarations"
+filesystem_submission_declarations() (
+    local target="$1" target_label="$2" index declarations
+    # shellcheck disable=SC2178  # Namerefs to the caller's arrays.
+    local -n files_ref="$3" labels_ref="$4"
+    if [[ -n "$target" ]]; then
+        declarations=$(filesystem_target_declarations "$target" "$target_label") || exit 1
+        eval "$declarations"
+        printf '%s\n' "$declarations"
+    fi
+    for index in "${!files_ref[@]}"; do
+        declarations=$(filesystem_env_override_declarations \
+            "${files_ref[index]}" "${labels_ref[index]}") || exit 1
+        eval "$declarations"
+        printf '%s\n' "$declarations"
+    done
+)
+
+# Print the override files applied to this submission, one line each. The
+# "i/N" position appears only when more than one file was applied.
 print_env_override_summary() {
-    [[ -n "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE:-}" ]] || return 0
-    printf 'Env override: %s (sha256 %s): %s\n' \
-        "$STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE" \
-        "$STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256" \
-        "${STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES:-no settings changed}"
+    normalize_env_override_provenance
+    local count=${#STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[@]} index prefix
+    for ((index = 0; index < count; index++)); do
+        prefix="Env override"
+        [[ "$count" -eq 1 ]] || prefix+=" $((index + 1))/$count"
+        printf '%s: %s (sha256 %s): %s\n' "$prefix" \
+            "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[index]}" \
+            "${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S[index]:-}" \
+            "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES[index]:-no settings changed}"
+    done
+    return 0
+}
+
+# Print the target file applied to this submission, if any.
+print_target_file_summary() {
+    [[ -n "${STORAGE_SCALE_TEST_TARGET_FILE:-}" ]] || return 0
+    printf 'Target file: %s (sha256 %s): %s\n' "$STORAGE_SCALE_TEST_TARGET_FILE" \
+        "${STORAGE_SCALE_TEST_TARGET_FILE_SHA256:-}" \
+        "${STORAGE_SCALE_TEST_TARGET_FILE_VARIABLES:-no settings changed}"
+}
+
+# =============================================================================
+# Storage target identity (reporting metadata only)
+# =============================================================================
+
+# Accepted shape of an explicit STORAGE_TARGET_NAME.
+_STORAGE_TARGET_NAME_REGEX='^[A-Za-z0-9][A-Za-z0-9._:@+/-]{0,127}$'
+
+# Print the derived storage target name, followed by one newline. Reads
+# EXECUTION_SUBSTRATE, KUBECTL_NAMESPACE and TEST_DIRS. It is the TEST_DIRS
+# keys with trailing slashes stripped (a bare "/" stays "/"), de-duplicated,
+# sorted bytewise and joined with ",". On kubectl, when every key is a valid
+# claim-qualified root, each key is first normalized to
+# "<namespace>/<claim>:<path>" (kubectl_parse_test_dir_key), so a key that
+# relies on KUBECTL_NAMESPACE names its namespace. Prints nothing and returns
+# 1 without roots. lib/storage_target.py mirrors this rule; keep the two in
+# step.
+storage_target_name_default() {
+    declare -p TEST_DIRS &>/dev/null || return 1
+    [[ "${#TEST_DIRS[@]}" -gt 0 ]] || return 1
+    local key root joined="" sep="" parsed namespace claim relative qualified=0
+    local -a roots=() qualified_roots=()
+    if [[ "${EXECUTION_SUBSTRATE:-}" == kubectl ]] \
+            && declare -F kubectl_parse_test_dir_key >/dev/null; then
+        # Load the parser once here rather than in every substitution below.
+        if declare -F _kubectl_claims_load_helpers >/dev/null; then
+            _kubectl_claims_load_helpers 2>/dev/null || true
+        fi
+        qualified=1
+        for key in "${!TEST_DIRS[@]}"; do
+            parsed=$(kubectl_parse_test_dir_key "$key" 2>/dev/null) || { qualified=0; break; }
+            IFS=$'\t' read -r namespace claim relative <<< "$parsed"
+            qualified_roots+=("$namespace/$claim:$relative")
+        done
+    fi
+    for key in "${!TEST_DIRS[@]}"; do
+        [[ -n "$key" ]] || continue
+        root="${key%"${key##*[!/]}"}"
+        [[ -n "$root" ]] || root="/"
+        roots+=("$root")
+    done
+    [[ "$qualified" -eq 0 ]] || roots=("${qualified_roots[@]}")
+    [[ "${#roots[@]}" -gt 0 ]] || return 1
+    while IFS= read -r -d '' root; do
+        joined+="${sep}${root}"
+        sep=","
+    done < <(printf '%s\0' "${roots[@]}" | LC_ALL=C sort -zu)
+    printf '%s\n' "$joined"
+}
+
+# Print the effective storage target name: the explicit STORAGE_TARGET_NAME, or
+# the derived default. Returns 1 (printing nothing) when neither exists.
+storage_target_name_effective() {
+    if [[ -n "${STORAGE_TARGET_NAME:-}" ]]; then
+        printf '%s\n' "$STORAGE_TARGET_NAME"
+        return 0
+    fi
+    storage_target_name_default
+}
+
+# Reject an explicit STORAGE_TARGET_NAME that is not a short, printable token.
+# An empty value is valid (the name is derived).
+validate_storage_target_name() {
+    [[ -n "${STORAGE_TARGET_NAME:-}" ]] || return 0
+    # Reports use "unknown" for a target they cannot identify.
+    if [[ "$STORAGE_TARGET_NAME" == unknown ]]; then
+        printf 'Error: STORAGE_TARGET_NAME "unknown" is reserved\n' >&2
+        return 1
+    fi
+    if [[ "$STORAGE_TARGET_NAME" =~ $_STORAGE_TARGET_NAME_REGEX ]]; then
+        return 0
+    fi
+    printf 'Error: STORAGE_TARGET_NAME must match %s (1-128 characters, no whitespace), got: %q\n' \
+        "$_STORAGE_TARGET_NAME_REGEX" "$STORAGE_TARGET_NAME" >&2
+    return 1
+}
+
+# Print the storage target this submission will record.
+print_storage_target_summary() {
+    local name
+    name=$(storage_target_name_effective) || name="unknown"
+    printf 'Storage target: %s\n' "$name"
+}
+
+# Print "<name>=(<%q words>)" for a bash array assignment, one word per element.
+_emit_sh_array_assignment() {
+    local name="$1" element sep=""
+    shift
+    printf '%s=(' "$name"
+    for element in "$@"; do
+        printf '%s%q' "$sep" "$element"
+        sep=" "
+    done
+    printf ')\n'
 }
 
 # Emit env_used.sh provenance. Always written, empty without an override, so
 # sourcing one group's snapshot after another's cannot inherit its provenance.
+# The scalars describe the last file and the union of variables; the arrays list
+# every file in application order (each variables entry is space-separated).
 _emit_env_override_provenance_sh() {
+    normalize_env_override_provenance
     printf '# --env-override provenance (empty when none was used).\n'
     printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE=%q\n' \
         "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE:-}"
@@ -1617,19 +2088,64 @@ _emit_env_override_provenance_sh() {
         "${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256:-}"
     printf 'STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES=%q\n' \
         "${STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES:-}"
+    _emit_sh_array_assignment STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES \
+        "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[@]}"
+    _emit_sh_array_assignment STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S \
+        "${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S[@]}"
+    _emit_sh_array_assignment STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES \
+        "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES[@]}"
 }
 
-# Emit env_used.yaml provenance: a mapping, or null without an override.
+# Emit env_used.yaml provenance: null without an override, else a mapping whose
+# file/sha256/variables describe the last file and the union of variables (the
+# original schema) plus "files": every file in application order.
 _emit_env_override_provenance_yaml() {
+    normalize_env_override_provenance
     if [[ -z "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE:-}" ]]; then
         printf 'env_override: null\n'
         return 0
     fi
     local -a variables=()
+    local index
     read -r -a variables <<< "${STORAGE_SCALE_TEST_ENV_OVERRIDE_VARIABLES:-}"
     printf 'env_override:\n'
     printf '  file: %s\n' "$(yaml_double_quote "$STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE")"
     printf '  sha256: "%s"\n' "${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256:-}"
+    printf '  variables: [%s]\n' "$(_yaml_flow_seq "${variables[@]}")"
+    printf '  files:\n'
+    for index in "${!STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[@]}"; do
+        read -r -a variables <<< "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILE_VARIABLES[index]:-}"
+        printf '    - file: %s\n' \
+            "$(yaml_double_quote "${STORAGE_SCALE_TEST_ENV_OVERRIDE_FILES[index]}")"
+        printf '      sha256: "%s"\n' "${STORAGE_SCALE_TEST_ENV_OVERRIDE_SHA256S[index]:-}"
+        printf '      variables: [%s]\n' "$(_yaml_flow_seq "${variables[@]}")"
+    done
+}
+
+# Emit env_used.sh target-file provenance. Always written, empty without a
+# --target file, so sourcing one group's snapshot after another's cannot
+# inherit its provenance.
+_emit_target_file_provenance_sh() {
+    printf '# --target provenance (empty when the target came from env.sh).\n'
+    printf 'STORAGE_SCALE_TEST_TARGET_FILE=%q\n' "${STORAGE_SCALE_TEST_TARGET_FILE:-}"
+    printf 'STORAGE_SCALE_TEST_TARGET_FILE_SHA256=%q\n' \
+        "${STORAGE_SCALE_TEST_TARGET_FILE_SHA256:-}"
+    printf 'STORAGE_SCALE_TEST_TARGET_FILE_VARIABLES=%q\n' \
+        "${STORAGE_SCALE_TEST_TARGET_FILE_VARIABLES:-}"
+}
+
+# Emit env_used.yaml target-file provenance: null without a --target file,
+# else a mapping of the file, its sha256 and the variables it set.
+_emit_target_file_provenance_yaml() {
+    if [[ -z "${STORAGE_SCALE_TEST_TARGET_FILE:-}" ]]; then
+        printf 'target_file: null\n'
+        return 0
+    fi
+    local -a variables=()
+    read -r -a variables <<< "${STORAGE_SCALE_TEST_TARGET_FILE_VARIABLES:-}"
+    printf 'target_file:\n'
+    printf '  file: %s\n' "$(yaml_double_quote "$STORAGE_SCALE_TEST_TARGET_FILE")"
+    printf '  sha256: "%s"\n' "${STORAGE_SCALE_TEST_TARGET_FILE_SHA256:-}"
     printf '  variables: [%s]\n' "$(_yaml_flow_seq "${variables[@]}")"
 }
 
@@ -1699,6 +2215,46 @@ _elbencho_env_used_emit_treefile_cache_sh() {
     return 0
 }
 
+# Print the storage target name a snapshot records: the effective name, or
+# nothing when it is unknown (stored as an empty string).
+_storage_target_name_recorded() {
+    storage_target_name_effective 2>/dev/null || true
+}
+
+# Set _KUBECTL_SNAPSHOT_NAMESPACE to the namespace a Kubernetes snapshot
+# records: the one namespace of the claim-qualified TEST_DIRS roots, else
+# KUBECTL_NAMESPACE. Also set KUBECTL_MAPPED_TEST_DIRS to the roots' Pod
+# paths when they map, so the snapshot writers record them. The claims and
+# their bound PVs are recorded in the attempt identity, not in the snapshot.
+_kubectl_snapshot_target() {
+    local namespace=""
+    if declare -F _kubectl_claims_load_helpers >/dev/null; then
+        _kubectl_claims_load_helpers 2>/dev/null || true
+    fi
+    if declare -F kubectl_test_dirs_namespace >/dev/null; then
+        namespace=$(kubectl_test_dirs_namespace 2>/dev/null) || namespace=""
+    fi
+    if [[ -n "$namespace" ]] && declare -F kubectl_map_test_dirs >/dev/null; then
+        unset KUBECTL_MAPPED_TEST_DIRS
+        declare -gA KUBECTL_MAPPED_TEST_DIRS=()
+        kubectl_map_test_dirs KUBECTL_MAPPED_TEST_DIRS 2>/dev/null \
+            || unset KUBECTL_MAPPED_TEST_DIRS
+    fi
+    _KUBECTL_SNAPSHOT_NAMESPACE="${namespace:-${KUBECTL_NAMESPACE:-}}"
+}
+
+# Emit the kubectl target namespace as env_used.yaml lines.
+_emit_kubectl_target_yaml() {
+    _kubectl_snapshot_target
+    printf 'KUBECTL_NAMESPACE: %s\n' "$(yaml_double_quote "$_KUBECTL_SNAPSHOT_NAMESPACE")"
+}
+
+# Emit the kubectl target namespace as env_used.sh lines.
+_emit_kubectl_target_sh() {
+    _kubectl_snapshot_target
+    printf 'export KUBECTL_NAMESPACE=%q\n' "$_KUBECTL_SNAPSHOT_NAMESPACE"
+}
+
 yaml_double_quote() {
     # Emit one YAML double-quoted scalar for generated immutable snapshots.
     # The shell snapshot remains authoritative for arbitrary Bash values.
@@ -1729,12 +2285,12 @@ write_elbencho_env_used() {
         printf '# Generated: %s\n\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
         printf 'EXECUTION_SUBSTRATE: "%s"\n' "${EXECUTION_SUBSTRATE:?}"
-        printf 'ORDER_NODES: %s\n\n' "$(yaml_double_quote "${ORDER_NODES:-0}")"
+        printf 'ORDER_NODES: %s\n' "$(yaml_double_quote "${ORDER_NODES:-0}")"
+        printf 'STORAGE_TARGET_NAME: %s\n\n' \
+            "$(yaml_double_quote "$(_storage_target_name_recorded)")"
 
         if [[ "${EXECUTION_SUBSTRATE:?}" == kubectl ]]; then
-            printf 'KUBECTL_NAMESPACE: %s\n' "$(yaml_double_quote "${KUBECTL_NAMESPACE:?}")"
-            printf 'KUBECTL_PV: %s\n' "$(yaml_double_quote "${KUBECTL_PV:?}")"
-            printf 'KUBECTL_PVC: %s\n' "$(yaml_double_quote "${KUBECTL_PVC:?}")"
+            _emit_kubectl_target_yaml
             printf 'KUBECTL_NODE_SELECTOR: %s\n' "$(yaml_double_quote "${KUBECTL_NODE_SELECTOR:?}")"
             printf 'KUBECTL_ELBENCHO_IMAGE: %s\n' "$(yaml_double_quote "${KUBECTL_ELBENCHO_IMAGE:?}")"
             printf 'KUBECTL_IMAGE_PULL_POLICY: %s\n' "$(yaml_double_quote "${KUBECTL_IMAGE_PULL_POLICY:?}")"
@@ -1794,6 +2350,7 @@ write_elbencho_env_used() {
         printf 'nodes_spec: "%s"\n' "$nodes_spec"
         printf '\n'
         _emit_env_override_provenance_yaml
+        _emit_target_file_provenance_yaml
         printf '\ntreefile_cache:\n'
         printf '  path: "%s"\n' "$cache_path"
         _elbencho_env_used_emit_treefile_cache_yaml "$records_dir"
@@ -1871,12 +2428,11 @@ _write_elbencho_env_used_sh() {
 
         printf 'export EXECUTION_SUBSTRATE=%q\n' "${EXECUTION_SUBSTRATE:?}"
         printf 'export ORDER_NODES=%q\n' "${ORDER_NODES:-0}"
-        printf 'export ORDER_NODES_ENABLED=%q\n\n' "${ORDER_NODES_ENABLED:-}"
+        printf 'export ORDER_NODES_ENABLED=%q\n' "${ORDER_NODES_ENABLED:-}"
+        printf 'export STORAGE_TARGET_NAME=%q\n\n' "$(_storage_target_name_recorded)"
 
         if [[ "${EXECUTION_SUBSTRATE:?}" == kubectl ]]; then
-            printf 'export KUBECTL_NAMESPACE=%q\n' "${KUBECTL_NAMESPACE:?}"
-            printf 'export KUBECTL_PV=%q\n' "${KUBECTL_PV:?}"
-            printf 'export KUBECTL_PVC=%q\n' "${KUBECTL_PVC:?}"
+            _emit_kubectl_target_sh
             printf 'export KUBECTL_NODE_SELECTOR=%q\n' "${KUBECTL_NODE_SELECTOR:?}"
             printf 'export KUBECTL_ELBENCHO_IMAGE=%q\n' "${KUBECTL_ELBENCHO_IMAGE:?}"
             printf 'export KUBECTL_IMAGE_PULL_POLICY=%q\n' "${KUBECTL_IMAGE_PULL_POLICY:?}"
@@ -1922,6 +2478,7 @@ _write_elbencho_env_used_sh() {
         printf 'export ELBENCHO_SINGLE_BIG_FILE_SIZE=%q\n' "${ELBENCHO_SINGLE_BIG_FILE_SIZE:-}"
         printf 'export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=%q\n\n' "$ELBENCHO_ALL_NODES_ACCESS_ALL_DATA"
         _emit_env_override_provenance_sh
+        _emit_target_file_provenance_sh
         printf '\n'
 
         printf '# Original CLI flag values (resume reconstructs sweep behavior from these).\n'
@@ -1952,8 +2509,13 @@ update_elbencho_env_used_treefile_cache_usage() {
         ELBENCHO_FILES_PER_NODE=
         ELBENCHO_FILE_SIZE=
         export ELBENCHO_FILE_LAYOUT ELBENCHO_FILES_PER_NODE ELBENCHO_FILE_SIZE
+        # Snapshots older than the storage target name must derive it from their
+        # own settings, not inherit the current environment's value.
+        STORAGE_TARGET_NAME=
+        export STORAGE_TARGET_NAME
         # Snapshots older than --env-override carry no provenance.
         reset_env_override_provenance
+        reset_target_file_provenance
         # shellcheck disable=SC1090
         source "$snapshot_sh" || exit 1
         write_elbencho_env_used "${tmp_dir}/env_used.yaml" \
@@ -2059,9 +2621,15 @@ write_mdtest_elbencho_env_used() {
         printf '# env_used.yaml - mdtest-elbencho configuration snapshot\n'
         printf '# Generated: %s\n\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-        printf 'EXECUTION_SUBSTRATE: "%s"\n\n' "${EXECUTION_SUBSTRATE:?}"
+        printf 'EXECUTION_SUBSTRATE: "%s"\n' "${EXECUTION_SUBSTRATE:?}"
+        printf 'ORDER_NODES: %s\n' "$(yaml_double_quote "${ORDER_NODES:-0}")"
+        printf 'STORAGE_TARGET_NAME: %s\n' \
+            "$(yaml_double_quote "$(_storage_target_name_recorded)")"
+        if [[ "$EXECUTION_SUBSTRATE" == kubectl ]]; then
+            _emit_kubectl_target_yaml
+        fi
 
-        printf 'TEST_DIRS:\n'
+        printf '\nTEST_DIRS:\n'
         local _path
         for _path in "${!TEST_DIRS[@]}"; do
             printf '  "%s": %s\n' "$_path" "${TEST_DIRS[$_path]}"
@@ -2087,6 +2655,7 @@ write_mdtest_elbencho_env_used() {
         printf 'tasks_spec: "%s"\n' "$tasks_spec"
         printf '\n'
         _emit_env_override_provenance_yaml
+        _emit_target_file_provenance_yaml
     } > "$out_file"
     _write_mdtest_elbencho_env_used_sh "${out_file%.yaml}.sh" \
         "$nodes_spec" "$tasks_spec" "$single_dir_target_files" \
@@ -2107,10 +2676,9 @@ _write_mdtest_elbencho_env_used_sh() {
         printf 'export EXECUTION_SUBSTRATE=%q\n' "${EXECUTION_SUBSTRATE:?}"
         printf 'export ORDER_NODES=%q\n' "${ORDER_NODES:-0}"
         printf 'export ORDER_NODES_ENABLED=%q\n' "${ORDER_NODES_ENABLED:-}"
+        printf 'export STORAGE_TARGET_NAME=%q\n' "$(_storage_target_name_recorded)"
         if [[ "${EXECUTION_SUBSTRATE:?}" == kubectl ]]; then
-            printf 'export KUBECTL_NAMESPACE=%q\n' "${KUBECTL_NAMESPACE:?}"
-            printf 'export KUBECTL_PV=%q\n' "${KUBECTL_PV:?}"
-            printf 'export KUBECTL_PVC=%q\n' "${KUBECTL_PVC:?}"
+            _emit_kubectl_target_sh
             printf 'export KUBECTL_NODE_SELECTOR=%q\n' "${KUBECTL_NODE_SELECTOR:?}"
             printf 'export KUBECTL_ELBENCHO_IMAGE=%q\n' "${KUBECTL_ELBENCHO_IMAGE:?}"
             printf 'export KUBECTL_IMAGE_PULL_POLICY=%q\n' "${KUBECTL_IMAGE_PULL_POLICY:?}"
@@ -2143,6 +2711,7 @@ _write_mdtest_elbencho_env_used_sh() {
         printf 'export nodes_spec=%q\n' "$nodes_spec"
         printf 'export tasks_spec=%q\n' "$tasks_spec"
         _emit_env_override_provenance_sh
+        _emit_target_file_provenance_sh
     } > "$sh_path" || return 1
 }
 
@@ -4144,6 +4713,22 @@ _elbencho_path_strict_subdir_of_test_root() {
     [[ "$rp_user" == "$rp_base"/* ]]
 }
 
+# Kubernetes form of _elbencho_path_under_or_equal_test_root: both paths are
+# claim-qualified ([namespace/]claim:path), so compare their normalized
+# "namespace/claim:path" forms; "rwx:bench" and "ns1/rwx:bench" are one root
+# when ns1 is KUBECTL_NAMESPACE.
+# Usage: _elbencho_kubectl_logical_under_or_equal <user_path> <base_path>
+_elbencho_kubectl_logical_under_or_equal() {
+    local parsed namespace claim path user base
+    parsed=$(kubectl_parse_test_dir_key "$1") || return 1
+    IFS=$'\t' read -r namespace claim path <<< "$parsed"
+    user="$namespace/$claim:$path"
+    parsed=$(kubectl_parse_test_dir_key "$2") || return 1
+    IFS=$'\t' read -r namespace claim path <<< "$parsed"
+    base="$namespace/$claim:$path"
+    [[ "$user" == "$base" || "$user" == "$base"/* ]]
+}
+
 # Validate --read-from path is under TEST_DIRS (may equal mount root).
 # Usage: validate_elbencho_sweep_read_from_path <path>
 validate_elbencho_sweep_read_from_path() {
@@ -4153,7 +4738,9 @@ validate_elbencho_sweep_read_from_path() {
         echo "Error: internal: TEST_DIRS key lookup failed" >&2
         return 1
     }
-    if ! _elbencho_path_under_or_equal_test_root "$read_path" "$base"; then
+    local under=_elbencho_path_under_or_equal_test_root
+    [[ "${EXECUTION_SUBSTRATE:-}" != kubectl ]] || under=_elbencho_kubectl_logical_under_or_equal
+    if ! "$under" "$read_path" "$base"; then
         echo "Error: --read-from path must be the TEST_DIRS path or a subdirectory of it." >&2
         echo "  Got: $read_path" >&2
         echo "  Expected under: $base" >&2
