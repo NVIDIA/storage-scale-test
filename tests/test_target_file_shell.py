@@ -216,6 +216,30 @@ def test_kubectl_target_roots_need_only_be_non_empty(checkout):
 
 
 @pytest.mark.parametrize(
+    ("setting", "hint"),
+    [
+        ("KUBECTL_PVC=claim", "KUBECTL_PVC was removed in v2.0.0; name the claim"),
+        ("KUBECTL_PV=pv", "KUBECTL_PV was removed in v2.0.0; name the claim"),
+        ("KUBECTL_NAMESPACE=ns", "Name the namespace in each TEST_DIRS key instead"),
+    ],
+)
+def test_kubernetes_claim_settings_in_a_target_file_point_at_test_dirs_keys(
+    checkout, setting, hint
+):
+    """The Kubernetes claim settings are not told they belong in env.sh."""
+    target = write_target(
+        checkout, "k8s.env", 'TEST_DIRS=(["claim:data"]=1)\n' + setting + "\n"
+    )
+    result = declarations(checkout, target, env_lines="EXECUTION_SUBSTRATE=kubectl; ")
+    assert result.returncode == 1
+    assert hint in result.stderr
+    assert "belong in env.sh" not in result.stderr
+    empty = write_target(checkout, "empty.env", "STORAGE_TARGET_NAME=x\n")
+    result = declarations(checkout, empty, env_lines="EXECUTION_SUBSTRATE=kubectl; ")
+    assert 'e.g. TEST_DIRS=(["claim:path"]=1)' in result.stderr
+
+
+@pytest.mark.parametrize(
     "setting",
     ["ELBENCHO_SCALE_THREAD_LIST=(1 2)", "MDTEST_ITERATIONS=9", "ELBENCHO_LIVEINT=5"],
 )

@@ -630,8 +630,6 @@ def _submission_output(groups, *, claims=False):
         lines.append(f"{prefix}_TARGET={group.target.name}")
         if claims:
             lines.append(f"{prefix}_CLAIM=ns/pv/pvc")
-    if len(groups) == 1:
-        lines.append(f"STORAGE_SCALE_TEST_BATCH_GROUP_TARGET={groups[0].target.name}")
     return "\n".join(lines) + "\n"
 
 
@@ -655,8 +653,8 @@ def test_submission_output_must_list_each_groups_target():
     )
 
 
-def test_submission_output_rejects_claim_keys_and_a_legacy_key_for_several_groups():
-    """The contract has no _CLAIM key, and _GROUP_TARGET only for one group."""
+def test_submission_output_rejects_claim_keys_and_the_removed_group_target_key():
+    """The contract has no _CLAIM key and no _GROUP_TARGET key."""
     expected = _expected()
     first = _SPECS["kubectl-multi-target"].steps[0]
     with pytest.raises(_FILESYSTEM.IntegrationTestError, match="group claims"):
@@ -667,8 +665,15 @@ def test_submission_output_rejects_claim_keys_and_a_legacy_key_for_several_group
         _submission_output(expected[:2])
         + f"STORAGE_SCALE_TEST_BATCH_GROUP_TARGET={expected[0].target.name}\n"
     )
-    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="single-group"):
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="removed GROUP_TARGET"):
         _FILESYSTEM.assert_batch_submission_output(legacy, expected, first)
+    with pytest.raises(_FILESYSTEM.IntegrationTestError, match="removed GROUP_TARGET"):
+        _FILESYSTEM.assert_batch_submission_output(
+            _submission_output(expected[2:])
+            + f"STORAGE_SCALE_TEST_BATCH_GROUP_TARGET={expected[2].target.name}\n",
+            expected,
+            _SPECS["kubectl-multi-target"].steps[1],
+        )
     no_list = _submission_output(expected[:2]).replace(
         "STORAGE_SCALE_TEST_BATCH_GROUPS=0001,0002\n", ""
     )
@@ -1059,7 +1064,7 @@ def test_polling_only_reads_status_until_collect(monkeypatch):
         [
             "STATE=RUNNING\nNEXT_ACTION=WAIT\n",
             transient,
-            "STATE=BETWEEN_EXECUTIONS\nNEXT_ACTION=WAIT\n",
+            "STATE=RUNNING\nNEXT_ACTION=WAIT\n",
             "STATE=SUCCESS\nNEXT_ACTION=COLLECT\n",
         ],
     )

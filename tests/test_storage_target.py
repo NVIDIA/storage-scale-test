@@ -69,10 +69,18 @@ def test_explicit_name_wins_and_is_recorded():
     assert storage_target_from_env(env) == StorageTarget("lustre-a", True)
 
 
-def test_kubectl_default_uses_namespace_and_claim():
-    """A snapshot written before v2.0.0 records KUBECTL_PVC; it still names it."""
-    env = {**KUBECTL_ENV, "TEST_DIRS": {"/x": 1}, "STORAGE_TARGET_NAME": ""}
-    assert storage_target_from_env(env) == StorageTarget("team-a/claim-1", False)
+def test_refusal_marks_names_derived_from_old_results():
+    """Refusing derived names says where they came from."""
+    with pytest.raises(MixedStorageTargetsError) as refused:
+        resolve_report_target(
+            [("a", StorageTarget("/mnt/a", False)), ("b", StorageTarget("x", True))],
+            allow_mixed=False,
+            warn=lambda _message: None,
+        )
+    message = str(refused.value)
+    assert '"/mnt/a" (derived): a' in message
+    assert '"x": b' in message
+    assert "results saved before v2.0.0" in message
 
 
 @pytest.mark.parametrize(

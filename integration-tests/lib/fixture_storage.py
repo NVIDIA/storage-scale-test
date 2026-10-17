@@ -97,8 +97,8 @@ def kubectl_target_env_lines(
     """Return the Kubernetes lines of a scenario's env.sh.
 
     TEST_DIRS keys name their own claim, so the environment selects only the
-    default namespace for keys without one. It never sets KUBECTL_PVC,
-    KUBECTL_PV, or KUBECTL_STORAGE_TARGETS, which the product rejects. A batch
+    default namespace for keys without one. It never sets KUBECTL_PVC or
+    KUBECTL_PV, which the product rejects since v2.0.0. A batch
     whose target files span several namespaces needs the sequencer, and with it
     its digest-pinned image; one namespace runs without either, so the caller
     passes no image.

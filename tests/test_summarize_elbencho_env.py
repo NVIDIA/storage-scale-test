@@ -17,7 +17,9 @@
 
 """Unit tests for summarize-elbencho env_used.yaml summary lines."""
 
+import contextlib
 import importlib.util
+import io
 import sys
 import tempfile
 import unittest
@@ -188,12 +190,11 @@ class TestSummarizeElbenchoEnv(unittest.TestCase):
 
     def test_kubectl_default_is_appended(self):
         line1 = self._line1(
-            TEST_DIRS={"/mnt/a": 1},
+            TEST_DIRS={"claim-1:mnt/a": 1},
             EXECUTION_SUBSTRATE="kubectl",
             KUBECTL_NAMESPACE="team-a",
-            KUBECTL_PVC="claim-1",
         )
-        self.assertTrue(line1.endswith(" target=team-a/claim-1"), line1)
+        self.assertTrue(line1.endswith(" target=team-a/claim-1:mnt/a"), line1)
 
     def test_explicit_name_equal_to_the_roots_adds_no_suffix(self):
         line1 = self._line1(TEST_DIRS={"/mnt/a": 1}, STORAGE_TARGET_NAME="/mnt/a")
@@ -215,6 +216,20 @@ class TestSummarizeElbenchoEnv(unittest.TestCase):
     def test_slash_only_root_equal_to_the_name_adds_no_suffix(self):
         line1 = self._line1(TEST_DIRS={"//": 1}, STORAGE_TARGET_NAME="/")
         self.assertNotIn("target=", line1)
+
+
+class TestSummarizeElbenchoBatchDirectory(unittest.TestCase):
+    """A batch results directory is refused instead of skipped as malformed."""
+
+    def test_batch_directory_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "batch-manifest.tsv").write_text("", encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = _SUMMARIZE_MOD.main([tmp])
+        self.assertEqual(status, 2)
+        self.assertIn("is a batch results directory", stderr.getvalue())
+        self.assertIn("extract-filesystem.py", stderr.getvalue())
 
 
 if __name__ == "__main__":

@@ -288,7 +288,7 @@ _FALLBACK = (
 # (FAKE_MINOR) and `auth can-i` (denied for "<verb> <resource> <namespace>"
 # entries in the comma-separated FAKE_DENY). FAKE_DELAY lists comma-separated
 # "<verb> <resource>=<seconds>" (or "version=<seconds>") pauses, and a
-# FAKE_BARRIER_DIR makes every version and can-i call wait until ten of them are
+# FAKE_BARRIER_DIR makes every version and can-i call wait until 13 of them are
 # running at once, which only concurrent calls can satisfy.
 _FAKE_PREREQUISITE_KUBECTL = textwrap.dedent("""\
     fake_pause() {
@@ -296,10 +296,10 @@ _FAKE_PREREQUISITE_KUBECTL = textwrap.dedent("""\
         if [[ -n "${FAKE_BARRIER_DIR:-}" ]]; then
             : > "$FAKE_BARRIER_DIR/$$"
             for _ in {1..50}; do
-                (( $(ls "$FAKE_BARRIER_DIR" | wc -l) >= 10 )) && break
+                (( $(ls "$FAKE_BARRIER_DIR" | wc -l) >= 13 )) && break
                 sleep 0.1
             done
-            (( $(ls "$FAKE_BARRIER_DIR" | wc -l) >= 10 )) \
+            (( $(ls "$FAKE_BARRIER_DIR" | wc -l) >= 13 )) \
                 || echo "not concurrent: $1" >> "$FAKE_BARRIER_DIR.timeouts"
         fi
         IFS=, read -ra entries <<< "${FAKE_DELAY:-}"
@@ -618,7 +618,7 @@ def test_a_namespace_without_the_metadata_name_label_is_an_error(tmp_path):
         ),
         (
             'declare -A TEST_DIRS=(["a:x"]=1 ["ns-b/b:y"]=1)',
-            "pass each file with --target",
+            "pass each file to --batch with --target",
         ),
     ],
 )
@@ -743,6 +743,15 @@ def test_sequencer_probe_runs_in_the_target_namespace_and_passes(
         (
             {"FAKE_DENY": "create serviceaccounts ns-a"},
             "permission to create serviceaccounts in namespace ns-a",
+        ),
+        (
+            {"FAKE_DENY": "get serviceaccounts ns-a"},
+            "permission to get serviceaccounts in namespace ns-a",
+        ),
+        (
+            {"FAKE_DENY": "get rolebindings.rbac.authorization.k8s.io ns-a"},
+            "permission to get rolebindings.rbac.authorization.k8s.io "
+            "in namespace ns-a",
         ),
         (
             {"FAKE_DENY": "delete roles.rbac.authorization.k8s.io ns-a"},
@@ -936,12 +945,12 @@ def _slow_sequencer_fixture(tmp_path):
 def test_the_prerequisite_calls_run_concurrently_and_report_in_a_fixed_order(
     tmp_path,
 ):
-    """Ten API reads are in flight at once; problems keep the checks' order."""
+    """Thirteen API reads are in flight at once; problems keep the checks' order."""
     barrier, environment = _slow_sequencer_fixture(tmp_path)
     result, _ = _run_prerequisites(tmp_path, "", **environment)
     assert result.returncode == 0, result.stdout + result.stderr
     assert not (tmp_path / "barrier.timeouts").exists()
-    assert len(list(barrier.iterdir())) == 10
+    assert len(list(barrier.iterdir())) == 13
     problems = [line for line in result.stdout.splitlines() if line.startswith("  - ")]
     assert problems == [
         "  - Kubernetes server 1.23 is older than 1.24, which suspended Jobs require",
@@ -1339,7 +1348,7 @@ def test_term_during_the_prerequisite_calls_starts_no_sequencer_job(tmp_path):
         stderr=subprocess.DEVNULL,
     ) as process:
         deadline = time.monotonic() + 60
-        while len(list(barrier.iterdir())) < 10 and time.monotonic() < deadline:
+        while len(list(barrier.iterdir())) < 13 and time.monotonic() < deadline:
             time.sleep(0.02)
         process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=60) == 143

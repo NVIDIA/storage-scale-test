@@ -55,14 +55,15 @@ To test several filesystems, either spread one workload across them (several
 weighted `TEST_DIRS` roots) or compare them (one `--target <file>` per
 filesystem, each becoming its own batch group and report). What to test comes
 from `env.sh` or `--target`; how to test comes from `env.sh` or
-`--env-override`. See
+`--env-override`. Reports refuse to mix targets unless given
+`--allow-mixed-targets`. See
 [Testing several filesystems](docs/FILESYSTEM_TESTING.md#testing-several-filesystems).
 Kubernetes runs asynchronously: collect terminal results before reporting.
 
 ## Prerequisites and deployment
 
 - Benchmarks and Slurm orchestration require Linux. macOS can launch SSH and
-  kubectl filesystem sweeps with Homebrew's Bash (4.3+) first on `PATH`
+  kubectl filesystem sweeps with Homebrew's Bash first on `PATH`
   (`brew install bash coreutils`; kubectl also needs `gnu-tar flock`).
 - Reporting requires Python 3.12+. The extraction wrappers set up their Python
   dependencies.
@@ -149,15 +150,6 @@ The tool provisions no cluster, namespace, PV, or PVC; complete the
 validating. For lifecycle commands, durable storage layout, and
 troubleshooting, see the
 [filesystem guide](docs/FILESYSTEM_TESTING.md#kubernetes-run-inspect-and-collect).
-
-**Upgrading from v1.8.0 to v2.0.0**
-([details](docs/FILESYSTEM_TESTING.md#upgrading-from-v180)):
-
-- Delete `KUBECTL_PVC` and `KUBECTL_PV`; write `claim:path` `TEST_DIRS` keys.
-- Collect in-progress v1.x Kubernetes runs with v1.x first.
-- Move `TEST_DIRS`, `STORAGE_TARGET_NAME`, and `FS_MAX_*` from
-  `--env-override` files to `--target` files (with claim-qualified keys on
-  Kubernetes).
 
 ## Validate and correct the configuration
 

@@ -1012,7 +1012,10 @@ def test_v1_attempt_identity_is_refused_with_the_collect_with_v1_message(
     assert result.returncode == 0, result.stderr
     assert "started by storage-scale-test v1.x" in result.stderr
     assert f"attempt identity schema {schema}" in result.stderr
-    assert "Collect this attempt with storage-scale-test v1.x" in result.stderr
+    assert (
+        "Collect this attempt with a separate storage-scale-test v1.x checkout"
+        in result.stderr
+    )
 
 
 def test_worker_discovery_selects_the_active_segment(tmp_path: Path) -> None:
@@ -2284,6 +2287,7 @@ def test_always_pull_policy_requires_an_immutable_image_reference() -> None:
         kubectl_validate_runtime_configuration
         """)
     assert result.returncode == 0, result.stderr
+    assert "current: breuner/elbencho:v3.2-1\n" in result.stderr
 
 
 def test_pvc_path_validator_defends_reserved_tree_and_future_parent() -> None:
@@ -2911,6 +2915,28 @@ def test_lifecycle_commands_explain_missing_attempt_identity(tmp_path: Path) -> 
     assert result.stderr.count("has no valid current Kubernetes attempt") == 2
     assert "cannot be inspected, collected, or cancelled" in result.stderr
     assert "cannot be resumed" in result.stderr
+
+
+def test_lifecycle_commands_reject_missing_and_non_kubernetes_dirs(
+    tmp_path: Path,
+) -> None:
+    """A missing or SSH/Slurm results directory fails clearly and stays unchanged."""
+    results = tmp_path / "elbencho-ssh"
+    results.mkdir()
+    (results / "env_used.sh").write_text("export EXECUTION_SUBSTRATE=ssh\n")
+    for operation in ("status", "cancel", "collect"):
+        result = _bash(f"""
+            ! kubectl_lifecycle_operation {operation} {str(tmp_path / "missing")!r}
+            ! kubectl_lifecycle_operation {operation} {str(results)!r}
+        """)
+        assert result.returncode == 0, result.stderr
+        assert f"results directory not found: {tmp_path / 'missing'}" in result.stderr
+        assert (
+            f"--{operation} applies to Kubernetes sweeps and prepared batches; "
+            f"{results} is an EXECUTION_SUBSTRATE=ssh sweep (use --resume"
+        ) in result.stderr
+        assert "no valid current Kubernetes attempt" not in result.stderr
+    assert not (results / "kubernetes").exists()
 
 
 def test_pvc_lease_release_uses_uid_precondition_and_is_journaled(
@@ -4498,9 +4524,9 @@ def test_public_status_reads_progress_before_removing_inspector(
     [
         ("PREPARED", "30 0 0 0", "PENDING", "PREPARING", "WAIT"),
         ("RUNNING", "8 1 21 0", "PENDING", "RUNNING", "WAIT"),
-        ("RUNNING", "8 0 22 0", "PENDING", "BETWEEN_EXECUTIONS", "WAIT"),
-        ("RUNNING", "0 0 30 0", "PENDING", "AWAITING_COMPLETION", "WAIT"),
-        ("RUNNING", "29 0 0 1", "PENDING", "BETWEEN_EXECUTIONS", "WAIT"),
+        ("RUNNING", "8 0 22 0", "PENDING", "RUNNING", "WAIT"),
+        ("RUNNING", "0 0 30 0", "PENDING", "RUNNING", "WAIT"),
+        ("RUNNING", "29 0 0 1", "PENDING", "RUNNING", "WAIT"),
         ("SUCCESS", "0 0 30 0", "PENDING", "SUCCESS", "COLLECT"),
         ("FAILED", "1 0 1 1", "CLEANUP_PENDING", "FAILED", "COLLECT"),
         ("FAILED", "1 0 1 1", "COMPLETE", "FAILED", "RESUME"),
@@ -4582,6 +4608,32 @@ def test_status_refreshes_outcome_and_counts_after_completion(tmp_path):
     assert "NEXT_ACTION=COLLECT\n" in result.stdout
 
 
+@pytest.mark.parametrize(
+    ("batch", "next_action"), ((False, "INSPECT"), (True, "RESUME"))
+)
+def test_status_of_failed_submission_names_next_action(
+    tmp_path: Path, batch: bool, next_action: str
+) -> None:
+    """Pollers waiting for COLLECT learn that a failed submission never gets there."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    if batch:
+        results.mkdir()
+        (results / "batch-manifest.tsv").write_text("")
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd SUBMISSION_FAILED
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        _test_configuration "$root/attempts/1234abcd/configuration.sh"
+        kubectl_local_lock_release "$fd"
+        kubectl_cleanup_ephemeral_helpers() {{ :; }}
+        _kubectl_verify_saved_cluster_identity() {{ :; }}
+        kubectl_lifecycle_operation status {str(results)!r}
+    """)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"STATE=SUBMISSION_FAILED\nNEXT_ACTION={next_action}\n"
+
+
 def test_status_reports_incomplete_cancellation_as_retryable_failure(
     tmp_path: Path,
 ) -> None:
@@ -4603,7 +4655,7 @@ def test_status_reports_incomplete_cancellation_as_retryable_failure(
         ! kubectl_lifecycle_operation status {str(results)!r}
     """)
     assert result.returncode == 0, result.stderr
-    assert "STATE=CANCEL_REQUESTED" in result.stdout
+    assert "STATE=CANCEL_REQUESTED\nNEXT_ACTION=INSPECT\n" in result.stdout
     assert (
         "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=CANCELLATION_INCOMPLETE" in result.stderr
     )

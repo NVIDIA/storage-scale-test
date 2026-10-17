@@ -327,11 +327,11 @@ def test_sequenced_scenario_uses_a_short_sequencer_poll():
 
 _NAMESPACES = ("ns-one", "ns-two")
 _GOOD_LOG = (
-    "sequencer: starting target 0 (Job ns-one/sst-elb-x-sweep-t0)\n"
-    "sequencer: target 0 (Job ns-one/sst-elb-x-sweep-t0) complete\n"
-    "sequencer: starting target 1 (Job ns-two/sst-elb-x-sweep-t1)\n"
-    "sequencer: target 1 (Job ns-two/sst-elb-x-sweep-t1) complete\n"
-    "sequencer: all targets complete\n"
+    "sequencer: starting segment 0 (Job ns-one/sst-elb-x-sweep-t0)\n"
+    "sequencer: segment 0 (Job ns-one/sst-elb-x-sweep-t0) complete\n"
+    "sequencer: starting segment 1 (Job ns-two/sst-elb-x-sweep-t1)\n"
+    "sequencer: segment 1 (Job ns-two/sst-elb-x-sweep-t1) complete\n"
+    "sequencer: all segments complete\n"
 )
 
 
@@ -369,8 +369,8 @@ def test_sequencer_log_must_show_every_hand_off_in_order():
     """Start and completion of each segment, then all of them, in sequence."""
     _FILESYSTEM.assert_sequencer_log(_GOOD_LOG, _NAMESPACES)
     for broken, message in (
-        (_GOOD_LOG.replace("starting target 1", "starting target 9"), "segment 1"),
-        (_GOOD_LOG.replace("all targets complete", "stopped"), "all segments"),
+        (_GOOD_LOG.replace("starting segment 1", "starting segment 9"), "segment 1"),
+        (_GOOD_LOG.replace("all segments complete", "stopped"), "all segments"),
         (_GOOD_LOG.replace("ns-two/", "ns-one/"), "segment 1"),
         ("\n".join(reversed(_GOOD_LOG.splitlines())), "in order"),
         ("", "start of segment 0"),
@@ -869,7 +869,7 @@ def test_mixed_batch_target_file_renders_a_qualified_kubernetes_root():
         }
 
 
-def _publication(group, name, *, groups=False, claim=False, legacy=True):
+def _publication(group, name, *, groups=False, claim=False, legacy=False):
     lines = [f"STORAGE_SCALE_TEST_BATCH_GROUP={group}"]
     lines.append(f"STORAGE_SCALE_TEST_BATCH_GROUP_{group}_TARGET={name}")
     if legacy:
@@ -882,22 +882,19 @@ def _publication(group, name, *, groups=False, claim=False, legacy=True):
 
 
 def test_batch_group_publication_requires_its_own_target_and_no_claim():
-    """A one-group append prints its target, the legacy key, and no list or claim."""
+    """A one-group append prints its target and no removed key, list or claim."""
     good = _publication("0002", _NAME)
     _FILESYSTEM.assert_batch_group_publication(good, "0002", _NAME)
     for output, message in (
         (good.replace("0002", "0003"), "did not name 0002"),
-        (good.replace(_NAME, "other"), "printed group targets|legacy"),
+        (good.replace(_NAME, "other"), "printed group targets"),
         (_publication("0002", _NAME, claim=True), "claims"),
         (_publication("0002", _NAME, groups=True), "_GROUPS"),
-        (_publication("0002", _NAME, legacy=False), "omitted the single-group"),
-        ("", "omitted the single-group"),
+        (_publication("0002", _NAME, legacy=True), "removed GROUP_TARGET"),
+        ("", "lacks one safe"),
     ):
         with pytest.raises(_Error, match=message):
             _FILESYSTEM.assert_batch_group_publication(output, "0002", _NAME)
-    legacy_wrong = good.replace(f"GROUP_TARGET={_NAME}", "GROUP_TARGET=something-else")
-    with pytest.raises(_Error, match="legacy GROUP_TARGET"):
-        _FILESYSTEM.assert_batch_group_publication(legacy_wrong, "0002", _NAME)
 
 
 def test_group_status_keys_cover_every_group():

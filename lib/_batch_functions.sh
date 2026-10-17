@@ -456,9 +456,8 @@ _elbencho_batch_group_relative() {
 
 # Print the publication keys. Every published group gets
 # "GROUP_<gid>_TARGET=<effective target name>" (mirroring the GROUP_<NNNN>_TARGET
-# status keys). Exactly one group also keeps the historical
-# "GROUP_TARGET=<effective target name>" line. Several groups (one per --target
-# file) add GROUPS; GROUP names the first group and EXECUTIONS spans all of them.
+# status keys). Several groups (one per --target file) add GROUPS; GROUP names
+# the first group and EXECUTIONS spans all of them.
 _elbencho_batch_print_publication() {
     local root="$1" ds="$2" kind="$3" first="$4" last="$5" gid target prefix=STORAGE_SCALE_TEST_BATCH
     shift 5
@@ -466,7 +465,6 @@ _elbencho_batch_print_publication() {
     [[ $# -eq 1 ]] || printf '%s_GROUPS=%s\n' "$prefix" "$(IFS=,; printf '%s' "$*")"
     for gid in "$@"; do
         target=$(_elbencho_batch_group_target "$root/$(_elbencho_batch_group_relative "$gid" "$kind" "$ds")")
-        [[ $# -ne 1 ]] || printf '%s_GROUP_TARGET=%q\n' "$prefix" "$target"
         printf '%s_GROUP_%s_TARGET=%q\n' "$prefix" "$gid" "$target"
     done
     printf '%s_EXECUTIONS=%04d-%04d\n' "$prefix" "$first" "$last"
@@ -611,6 +609,10 @@ _elbencho_batch_prepare() (
     # RESULTS_DIR is initialized by env.sh, not by this helper's caller.
     # shellcheck disable=SC2153
     local base="${SCRIPT_DIR}/../.." root work stage ds token="" rc=0 index
+    [[ -f "$base/env.sh" ]] || {
+        echo "Error: env.sh not found; copy env.sh.template to env.sh and edit it" >&2
+        exit 1
+    }
     source "$base/env.sh" || exit 1
     source "$base/lib/_elbencho_functions.sh" || exit 1
     local -a targets=() stages=()
@@ -752,10 +754,6 @@ _elbencho_batch_status() {
         fi
         if (( active == 0 )); then
             state=RUNNING next=WAIT
-            if (( running == 0 )); then
-                state=BETWEEN_EXECUTIONS
-                (( pending > 0 )) || state=AWAITING_COMPLETION
-            fi
         elif (( active == 2 )); then
             state=UNKNOWN next=INSPECT
         elif (( pending + running + failed == 0 )); then
@@ -971,6 +969,7 @@ elbencho_batch_cli_route() {
     while [[ $# -gt 0 ]]; do
         argument="$1"
         case "$argument" in
+            -h|--help) return 2 ;;  # The launcher prints its usage.
             --batch)
                 _elbencho_batch_check_operation "$operation" "$argument" || return 1
                 if [[ $# -gt 1 && -n "$2" && "$2" != -* ]]; then

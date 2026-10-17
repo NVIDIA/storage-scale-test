@@ -52,8 +52,7 @@ REPORT_OPTIONS = (
         ALLOW_MIXED_TARGETS_FLAG,
         "common",
         "Report inputs from different storage targets together, labelled "
-        "'mixed: ...'. mdtest keeps same-coordinate results from each target "
-        "instead of rejecting them as duplicates.",
+        "'mixed: ...', instead of refusing them.",
         {"action": "store_true"},
     ),
     ReportOption(
@@ -162,7 +161,7 @@ def add_report_destination_arguments(parser: argparse.ArgumentParser) -> None:
     """Share batch selection and output help across filesystem reporters."""
     parser.add_argument("--groups", help="Comma-separated prepared batch group IDs.")
     parser.add_argument(
-        "--output-dir", help="Report destination (batches: RESULTS_DIR/reports)."
+        "--output-dir", help="Report destination (batches: <batch_dir>/reports)."
     )
 
 

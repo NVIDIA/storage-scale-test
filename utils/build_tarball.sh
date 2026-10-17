@@ -15,6 +15,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if (( BASH_VERSINFO[0] < 4 \
+        || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+    printf 'Bash 4.4 or newer is required; on macOS run: brew install bash\n' >&2
+    exit 1
+fi
+
 set -uo pipefail
 
 _warn() {
@@ -448,7 +454,7 @@ for spec in "${binaries_to_download[@]}"; do
     pids+=("$!")
 done
 
-for name in "${skipped[@]}"; do
+for name in ${skipped[@]+"${skipped[@]}"}; do
     echo "  using existing ${name} (add --force-download to override)"
 done
 
@@ -463,10 +469,10 @@ done
 download_end_time=$(date +%s)
 download_elapsed=$((download_end_time - download_start_time))
 
-for name in "${succeeded[@]}"; do
+for name in ${succeeded[@]+"${succeeded[@]}"}; do
     echo "  successfully downloaded ${name}"
 done
-for name in "${failed[@]}"; do
+for name in ${failed[@]+"${failed[@]}"}; do
     _warn "Failed to download ${name}"
 done
 echo "  Downloads completed in ${download_elapsed} seconds."

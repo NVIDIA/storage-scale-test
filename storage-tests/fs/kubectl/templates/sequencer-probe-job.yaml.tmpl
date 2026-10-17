@@ -19,7 +19,7 @@
 # get on exactly that name, so the sequencer must exit 3 (the API server
 # answered NotFound). That proves the image pulls, provides sh, kubectl, grep
 # and sleep, and reaches the API server with its own ServiceAccount token, in
-# target 0's namespace and, with a second namespace, through a cross-namespace
+# segment 0's namespace and, with a second namespace, through a cross-namespace
 # RoleBinding. Any other exit code fails the probe.
 apiVersion: batch/v1
 kind: Job

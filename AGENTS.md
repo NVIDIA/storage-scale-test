@@ -42,8 +42,9 @@ Warp for S3-compatible object storage) as **separate processes** — they are
   `sbatch/` substrate code; filesystem tests also have `kubectl/`.
 - `lib/` — shared Bash libraries (`env_*.sh`, `_*_functions.sh`) + a few Python helpers.
 - `utils/` — self-bootstrapping Python result tools (`extract-*.py`) and build helpers (`build_tarball.sh`, `build/`).
-- `tests/` — `pytest` unit tests for the Python parsers/reporters.
-- `docs/` — `DESIGN.md`, `REQUIREMENTS.md`, `ARCHITECTURE_DIAGRAMS.md`, `CONTEXT.md`, `CODING_STANDARDS.md`.
+- `tests/` — `pytest` unit tests (Python and shell).
+- `integration-tests/` — kind-based real-infrastructure lifecycle (see its README).
+- `docs/` — user guides (`*_TESTING.md`, `VERSIONING.md`), `KUBERNETES_ELBENCHO_LIFECYCLE.md`, `DESIGN.md`, `REQUIREMENTS.md`, `ARCHITECTURE_DIAGRAMS.md`, `CONTEXT.md`, `CODING_STANDARDS.md`, `plans/` (unimplemented proposals only).
 - Config is environment-driven (`env.sh`); `EXECUTION_SUBSTRATE` explicitly
   selects Slurm, passwordless SSH, or kubectl for filesystem sweeps.
 
@@ -56,7 +57,7 @@ pip install -r requirements.txt  # matplotlib, numpy, PyYAML, zstandard
 ./validate_env.sh                # iterate until it runs cleanly
 ```
 
-See the README "Getting Started" section for the full quickstart and
+See the README "Getting started" section for the full quickstart and
 [BENCHMARK_RECIPES_FILESYSTEM.md](BENCHMARK_RECIPES_FILESYSTEM.md) for tuned settings.
 
 ## Checks (run before committing)
