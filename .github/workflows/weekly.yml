@@ -25,6 +25,8 @@ permissions: {}
 jobs:
   source:
     name: Python 3.14
+    # NVIDIA's self-hosted runners exist only in the upstream repository.
+    if: github.repository == 'NVIDIA/storage-scale-test'
     permissions:
       contents: read
     uses: ./.github/workflows/.source.yml

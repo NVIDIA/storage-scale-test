@@ -26,13 +26,15 @@ permissions: {}
 jobs:
   source:
     name: Source checks
+    # NVIDIA's self-hosted runners exist only in the upstream repository.
+    if: github.repository == 'NVIDIA/storage-scale-test'
     permissions:
       contents: read
     uses: ./.github/workflows/.source.yml
 
   status:
     name: Publish aggregate status
-    if: ${{ always() }}
+    if: ${{ always() && github.repository == 'NVIDIA/storage-scale-test' }}
     needs: source
     runs-on: ubuntu-latest
     timeout-minutes: 5

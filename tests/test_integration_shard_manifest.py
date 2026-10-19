@@ -189,7 +189,9 @@ def test_workflow_matrix_matches_the_status_check():
     assert '"${{ matrix.substrate }}"' in lifecycle["run"]
     status = jobs["integration-status"]
     assert status["name"] == "Filesystem integration status"
-    assert status["if"] == "${{ always() }}"
+    upstream = "github.repository == 'NVIDIA/storage-scale-test'"
+    assert jobs["source"]["if"] == upstream
+    assert status["if"] == "${{ always() && " + upstream + " }}"
     verify = next(step for step in status["steps"] if "verify" in step.get("run", ""))
     assert "--architectures " + ",".join(_ARCHITECTURES) in verify["run"]
     assert "--backend nfs" in verify["run"]
