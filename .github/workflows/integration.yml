@@ -32,6 +32,8 @@ concurrency:
 jobs:
   source:
     name: Resolve the source commit
+    # NVIDIA's self-hosted runners exist only in the upstream repository.
+    if: github.repository == 'NVIDIA/storage-scale-test'
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
@@ -125,7 +127,7 @@ jobs:
 
   integration-status:
     name: Filesystem integration status
-    if: ${{ always() }}
+    if: ${{ always() && github.repository == 'NVIDIA/storage-scale-test' }}
     needs: [source, integration]
     runs-on: ubuntu-26.04
     timeout-minutes: 10
