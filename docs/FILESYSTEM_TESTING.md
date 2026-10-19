@@ -92,7 +92,9 @@ and all phases, startup, pauses, and cleanup.
 
 Ordinary sweeps default to direct IO; `-b/--bio` selects buffered IO.
 `-r/--rand` makes write and read access random; `r`-prefixed IO-size entries
-can instead select random access per phase. Random IO is incompatible with
+can instead select random access per phase. Random writes visit every block of
+each file once in random order, so files always reach full size; buffered
+random reads use unaligned offsets. Random IO is incompatible with
 single-shared-file mode. A sole `TEST_DIRS` root with weight other than 1 is
 rejected.
 

@@ -60,6 +60,10 @@ See [Upgrading from v1.8.0](docs/FILESYSTEM_TESTING.md#upgrading-from-v180).
 
 ### Changed
 
+- Buffered random writes now visit every block of each file once, in random
+  order, so files reach full size. They used unaligned offsets that could
+  repeat and leave files short, failing a later random read; buffered
+  random-write results differ from v1.8.0.
 - `validate_env.sh` is faster, especially on busy Slurm clusters, and prints a
   short summary unless `--verbose`. Errors name the node and the likely cause
   (such as a filesystem that cannot mount or is not writable).

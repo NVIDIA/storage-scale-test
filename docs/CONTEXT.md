@@ -175,6 +175,8 @@ Slurm it uses one sbatch and one srun probe; on SSH, one session.
 
 Operation is in [FILESYSTEM_TESTING.md](FILESYSTEM_TESTING.md). Invariants:
 
+- Write phases never pass `--norandalign`: elbencho's aligned random default
+  writes each block once; unaligned writes can leave files short.
 - Worker-directory layout with one weight-1 root and direct IO runs timed;
   buffered IO, several roots, or `--run-to-completion` select completion mode.
   The effective mode is recorded per cell and never reinterpreted on resume.
