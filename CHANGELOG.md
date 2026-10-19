@@ -52,6 +52,11 @@ See [Upgrading from v1.8.0](docs/FILESYSTEM_TESTING.md#upgrading-from-v180).
   [Reporting per target](docs/FILESYSTEM_TESTING.md#reporting-per-target).
 - Repeat `--env-override` to stack workload files. See
   [Workload override files](docs/FILESYSTEM_TESTING.md#workload-override-files).
+- After a failure, `--status` (and `--collect` on Kubernetes) names the failed
+  cell and its group, plus `FAILED_LOG`: the console output holding the
+  benchmark's error. Kubernetes now saves the failed coordinator's log (up to
+  its last 16 MiB), not just its last 200 lines. See
+  [Resume after failure](docs/FILESYSTEM_TESTING.md#resume-after-failure).
 
 ### Changed
 

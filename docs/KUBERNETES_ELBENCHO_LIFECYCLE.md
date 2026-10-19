@@ -442,7 +442,9 @@ state. `RESULT_COLLECTION` is `PENDING`, `CLEANUP_PENDING`, or `COMPLETE`;
 Kubernetes `--status` prints it: `SUBMISSION_FAILED` gives `RESUME` for a sealed
 batch and `INSPECT` for a plain run, and `CANCEL_REQUESTED` gives `INSPECT`. A
 sealed batch's status also prints `BATCH=SEALED` and, per group,
-`GROUP_<NNNN>_KIND` and `GROUP_<NNNN>_TARGET`. A terminal run outcome permits
+`GROUP_<NNNN>_KIND` and `GROUP_<NNNN>_TARGET`. When a cell failed, status
+and collect print `FAILED_EXECUTION`, a batch's `FAILED_GROUP`, and
+`FAILED_LOG` when a coordinator log was saved. A terminal run outcome permits
 collect, which still enforces exact Job quiescence before import. Zero running
 cells alone never permits it.
 
@@ -796,7 +798,9 @@ measured phases are never replayed.
 
 For required-recovery faults, capture bounded Job, Pod, and DaemonSet
 descriptions; relevant container logs and namespace events; durable PVC state;
-the publication manifest; and exact retained resource identities. Store the
+the publication manifest; and exact retained resource identities. A failed
+coordinator Job's log (its last 16 MiB) is saved once per segment as
+`coordinator[-s<K>].log` in the attempt metadata. Store the
 schema-versioned, bounded diagnostic bundle in the attempt's local Kubernetes
 metadata, not in
 the benchmark result/reporting contract. If diagnostic capture fails, retain

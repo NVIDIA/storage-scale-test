@@ -147,6 +147,8 @@ progress comes from claim-resident ledgers; zero running cells do not imply
 terminality. Collect before `--resume`, which starts a new attempt and keeps
 successful cells. On Kubernetes, `--read-from` also accepts the Pod path that
 `--write-only` printed. `KUBECTL_ELBENCHO_IMAGE` defaults to the pinned image.
+Progress strings are `P R S F[ ID]`, ID the first failed cell (`FAILED_*`
+keys); every reader must accept the optional fifth field.
 
 - Coordinator, worker, helper, and validation Pods carry no API token. Only the
   sequencer Job (and the `validate_env.sh --sequencer` probe), used only for

@@ -535,6 +535,86 @@ def test_local_batch_status_distinguishes_owner_from_cell_state(
     assert fields["EXECUTION_SCOPE"] == "BATCH"
 
 
+def failed_batch(checkout, *cells):
+    """A sealed two-group batch whose executions have the given states."""
+    batch = create(checkout)
+    appended = launch(checkout, MD, "--append", batch, "--nodes", "1", "--tasks", "1")
+    assert appended.returncode == 0, appended.stdout + appended.stderr
+    (batch / "batch-sealed.sha256").touch()
+    for number, cell in enumerate(cells, 1):
+        (batch / f"executions/{number:04d}.status").write_text(cell + "\n")
+    return batch
+
+
+def status_lines(checkout, batch, substrate="ssh"):
+    """Run the shared batch status for SSH or Slurm and return its lines."""
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1/lib/_batch_functions.sh"; '
+            'EXECUTION_SUBSTRATE="$3"; _elbencho_batch_status "$2"',
+            "status-test",
+            str(checkout),
+            str(batch),
+            substrate,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.splitlines()
+
+
+def write_cell_logs(batch, *ids):
+    """Create executions/<id>.log for each ID, as SSH and Slurm dispatch do."""
+    for execution in ids:
+        (batch / f"executions/{execution}.log").write_text(f"cell {execution}\n")
+
+
+@pytest.mark.parametrize("substrate", ["ssh", "slurm"])
+def test_failed_batch_status_names_group_and_cell_log(checkout, substrate):
+    """FAILED_* follows NEXT_ACTION and names the failed cell's own log."""
+    batch = failed_batch(checkout, "SUCCESS", "FAILED")
+    write_cell_logs(batch, "0001", "0002")
+    lines = status_lines(checkout, batch, substrate)
+    start = lines.index("NEXT_ACTION=RESUME") + 1
+    assert lines[start : start + 2] == ["FAILED_EXECUTION=0002", "FAILED_GROUP=0002"]
+    # The checkout path has a space and quote, so the value is %q-escaped.
+    key, _, value = lines[start + 2].partition("=")
+    assert key == "FAILED_LOG"
+    assert shlex.split(value) == [str(batch / "executions/0002.log")]
+    assert lines[start + 3] == "GROUP_0001_KIND=io"
+
+
+def test_failed_batch_status_omits_the_log_when_none_exists(checkout):
+    batch = failed_batch(checkout, "SUCCESS", "FAILED")
+    write_cell_logs(batch, "0001")
+    lines = status_lines(checkout, batch)
+    assert "FAILED_EXECUTION=0002" in lines
+    assert "FAILED_GROUP=0002" in lines
+    assert not any(line.startswith("FAILED_LOG=") for line in lines)
+
+
+def test_failed_batch_status_reports_the_first_failure_in_manifest_order(checkout):
+    batch = failed_batch(checkout, "FAILED", "FAILED")
+    lines = status_lines(checkout, batch)
+    assert [line for line in lines if line.startswith("FAILED_")] == [
+        "FAILED_EXECUTION=0001",
+        "FAILED_GROUP=0001",
+    ]
+    assert "EXECUTIONS_FAILED=2" in lines
+
+
+@pytest.mark.parametrize("cells", [("SUCCESS", "SUCCESS"), ("PENDING", "RUNNING")])
+def test_batch_status_without_failures_has_no_failed_keys(checkout, cells):
+    batch = failed_batch(checkout, *cells)
+    write_cell_logs(batch, "0001", "0002")
+    lines = status_lines(checkout, batch)
+    assert not any(line.startswith("FAILED_") for line in lines)
+
+
 MANIFEST = "batch-manifest.tsv"
 GROUP = "STORAGE_SCALE_TEST_BATCH_GROUP"
 GROUP_TARGET = f"{GROUP}_TARGET"

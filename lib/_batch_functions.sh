@@ -734,16 +734,40 @@ _elbencho_batch_print_group_targets() {
     done < "$root/batch-manifest.tsv"
 }
 
+# Print FAILED_EXECUTION=ID, then FAILED_GROUP for a batch and FAILED_LOG when
+# LOG is a file: where to start investigating a failed cell.
+elbencho_print_failed_execution() {
+    local root="$1" id="$2" log="${3:-}" group=""
+    [[ "$id" =~ ^[0-9]{4}$ ]] || return 1
+    printf 'FAILED_EXECUTION=%s\n' "$id"
+    if [[ -f "$root/batch-manifest.tsv" ]]; then
+        group=$(awk -F '\t' -v id="$id" '$1=="execution" && $2==id {print $3; exit}' \
+            "$root/batch-manifest.tsv") || return 1
+        [[ -z "$group" ]] || printf 'FAILED_GROUP=%s\n' "$group"
+    fi
+    [[ -z "$log" || ! -f "$log" ]] || printf 'FAILED_LOG=%q\n' "$log"
+}
+
+# The newest regular file among the arguments (unmatched globs are skipped).
+elbencho_newest_file() {
+    local newest="" candidate
+    for candidate in "$@"; do
+        [[ -f "$candidate" && ! -L "$candidate" ]] || continue
+        [[ -n "$newest" && ! "$candidate" -nt "$newest" ]] || newest="$candidate"
+    done
+    printf '%s' "$newest"
+}
+
 _elbencho_batch_status() {
     local root="$1" batch=DRAFT state=NOT_STARTED next=START id value
-    local pending=0 running=0 success=0 failed=0 active=1
+    local pending=0 running=0 success=0 failed=0 active=1 failed_id=""
     while IFS= read -r id; do
         value=$(< "$root/executions/$id.status") || return 1
         case "$value" in
             PENDING) pending=$((pending + 1)) ;;
             RUNNING) running=$((running + 1)) ;;
             SUCCESS) success=$((success + 1)) ;;
-            FAILED) failed=$((failed + 1)) ;;
+            FAILED) failed=$((failed + 1)); failed_id=${failed_id:-$id} ;;
             *) _elbencho_batch_error "invalid execution status: $id"; return 1 ;;
         esac
     done < <(awk -F '\t' '$1=="execution" {print $2}' "$root/batch-manifest.tsv")
@@ -767,6 +791,9 @@ _elbencho_batch_status() {
         "$((pending + running + success + failed))" "$pending" "$running"
     printf 'EXECUTIONS_SUCCEEDED=%s\nEXECUTIONS_FAILED=%s\n' "$success" "$failed"
     printf 'RESULT_COLLECTION=NOT_REQUIRED\nNEXT_ACTION=%s\n' "$next"
+    # SSH and Slurm dispatch keep each cell's console output beside its status.
+    [[ -z "$failed_id" ]] || elbencho_print_failed_execution "$root" "$failed_id" \
+        "$root/executions/$failed_id.log" || return 1
     _elbencho_batch_print_group_targets "$root"
 }
 

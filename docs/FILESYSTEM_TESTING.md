@@ -192,8 +192,12 @@ the details.
 
 ## Resume after failure
 
-The sweep records each cell separately and stops at the first failure. After
-correcting the cause, continue it with:
+The sweep records each cell separately and stops at the first failure. To
+find the cause, start with `FAILED_LOG` from `--status` (on Kubernetes,
+`--collect` prints it too); `FAILED_EXECUTION` and `FAILED_GROUP` name the
+cell (see the [key table](#prepared-filesystem-batches)). On SSH and Slurm,
+every cell's output is in `executions/<id>.log` of its result directory.
+After correcting the cause, continue it with:
 
 ```bash
 ./storage-tests/fs/nv-elbencho-sweep.sh --resume "$RUN"
@@ -375,6 +379,9 @@ argument; only `--append` adds work to an existing draft.
 | `EXECUTIONS_{TOTAL,PENDING,RUNNING,SUCCEEDED,FAILED}` | Cell counts within that scope |
 | `RESULT_COLLECTION` | `PENDING` (results remote), `CLEANUP_PENDING` (published, cleanup needed), `COMPLETE`; SSH/Slurm: `NOT_REQUIRED` |
 | `NEXT_ACTION` | `START`, `WAIT`, `COLLECT`, `RESUME`, `INSPECT`, or `NONE` |
+| `FAILED_EXECUTION` | After a failure: the first failed cell's ID; `executions/<id>.sh` holds its settings |
+| `FAILED_GROUP` | Batches only: that cell's group (results under `groups/<gid>/`) |
+| `FAILED_LOG` | Console output with the benchmark's error, shell-quoted: SSH/Slurm `executions/<id>.log`, or the saved Kubernetes coordinator log |
 | `SEGMENT_COUNT` | Kubernetes, [several namespaces](#appendix-one-batch-across-several-kubernetes-namespaces) only: namespaces in this attempt (a resume leaves out finished ones) |
 | `SEGMENT_CURRENT` | Several namespaces only: index `i` (from 0, in run order) of the running or last-run namespace |
 | `SEGMENT_<i>_NAMESPACE` | Several namespaces only: that namespace's name |
@@ -895,7 +902,9 @@ and use `--status`, `--collect`, or `--cancel`. Delete manually only after the
 object's ownership annotation matches the nonce recorded in that attempt.
 
 On failure, read the diagnostic bundle path and safe next action printed by
-validation or the sweep. Common causes are:
+validation or the sweep. A failed cell's error is in `FAILED_LOG` (see
+[Resume after failure](#resume-after-failure)); the bundle adds Pod
+descriptions, events, and recent worker logs. Common causes are:
 
 | Evidence | Check |
 | --- | --- |
