@@ -56,7 +56,15 @@ def _probe_server(
 
     class _Handler(socketserver.BaseRequestHandler):
         def handle(self) -> None:
-            self.request.recv(4096)
+            # Read the whole request first: the probe may send it in several
+            # writes, and replying early would close the socket under the
+            # later ones (SIGPIPE in the client).
+            received = b""
+            while b"\r\n\r\n" not in received and len(received) < 65536:
+                chunk = self.request.recv(4096)
+                if not chunk:
+                    break
+                received += chunk
             if delay:
                 time.sleep(delay)
             elif response is not None:
