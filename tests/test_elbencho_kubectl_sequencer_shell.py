@@ -36,7 +36,6 @@ _SEQUENCER = (
 _SHELL = shutil.which("dash") or shutil.which("sh") or "/bin/sh"
 _SEQUENCER_NAME = "storage-scale-test-sequencer"
 _POLL_ENV = "KUBECTL_SEQUENCER_POLL_SECONDS"
-_TIMEOUT_ENV = "KUBECTL_SEQUENCER_REQUEST_TIMEOUT_SECONDS"
 _JSONPATH = (
     'jsonpath={.metadata.uid}{"|"}{.spec.suspend}{"|"}'
     '{range .status.conditions[?(@.status=="True")]}{.type}{","}{end}'
@@ -145,7 +144,7 @@ def _run(root, args, env=None, via_dash_c=False):
     run_env = {
         key: value
         for key, value in os.environ.items()
-        if key not in (_POLL_ENV, _TIMEOUT_ENV, *_IN_CLUSTER_ENV)
+        if key not in (_POLL_ENV, *_IN_CLUSTER_ENV)
     }
     run_env.update(
         {
@@ -237,7 +236,7 @@ def test_unsuspends_targets_in_order_after_each_completes(tmp_path, via_dash_c):
         _add_job(root, target)
     result = _run(root, _triples(_ORDERED), via_dash_c=via_dash_c)
     assert result.returncode == 0, result.stderr
-    assert "all targets complete" in result.stdout
+    assert "all segments complete" in result.stdout
     assert _patch_calls(root) == [_expected_patch(*target) for target in _ORDERED]
     for previous, current in zip(_ORDERED, _ORDERED[1:]):
         assert _patch_index(root, current) > _complete_index(root, previous)
@@ -247,11 +246,11 @@ def test_observe_uses_exact_jsonpath_argv(tmp_path):
     root = _cluster(tmp_path)
     target = (_NS_A, "coord-0", "uid-0")
     _add_job(root, target, suspend="false", conditions=f"{_COMPLETE},")
-    result = _run(root, list(target), env={_TIMEOUT_ENV: "7"})
+    result = _run(root, list(target))
     assert result.returncode == 0, result.stderr
     first_call = _lines(root, _CALLS_LOG)[0]
     assert first_call == " ".join(
-        ["--request-timeout=7s", "-n", _NS_A, "get", "job", "coord-0", "-o", _JSONPATH]
+        ["--request-timeout=30s", "-n", _NS_A, "get", "job", "coord-0", "-o", _JSONPATH]
     )
 
 
@@ -276,7 +275,7 @@ def test_failed_target_stops_later_targets(tmp_path):
     _add_job(root, later)
     result = _run(root, _triples(_ORDERED))
     assert result.returncode == 0, result.stderr
-    assert "target 1 (Job bench-b/coord-1) failed" in result.stdout
+    assert "segment 1 (Job bench-b/coord-1) failed" in result.stdout
     assert _patched_jobs(root) == [first[1], failing[1]]
 
 
@@ -334,7 +333,6 @@ def test_invalid_arguments_exit_2_without_kubectl(tmp_path, args):
         {_POLL_ENV: "abc"},
         {_POLL_ENV: "010"},
         {_POLL_ENV: "3601"},
-        {_TIMEOUT_ENV: "-5"},
     ),
 )
 def test_invalid_environment_exits_2_without_kubectl(tmp_path, env):

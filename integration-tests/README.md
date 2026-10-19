@@ -335,8 +335,9 @@ ownership and path checks do not match the fixture.
 
 ## Logs, caches, and retries
 
-Add `--verbose` for command-level logging. On failure, the driver captures
-host, Docker, backend, Kubernetes node, Pod, and event diagnostics without
+Pass `--verbose` before the action (`integration-test.py --verbose <action>`)
+for command-level logging. On failure, the driver captures host, Docker,
+backend, Kubernetes node, Pod, and event diagnostics without
 printing Kubernetes Secrets.
 
 Image pulls reuse digest- and architecture-verified host Docker caches. Slinky

@@ -85,7 +85,10 @@ def test_repeated_helper_loading_preserves_constants_and_active_locks(tmp_path):
 
 @pytest.mark.parametrize("remote_state", ["PREPARED", "RUNNING", "FAILED", "SUCCESS"])
 def test_remote_execution_progress_counts_only_current_attempt(tmp_path, remote_state):
-    """Read live cells, not uncollected local states or a predecessor's cells."""
+    """Read live cells, not uncollected local states or a predecessor's cells.
+
+    The first failed cell follows the counts (--status prints FAILED_EXECUTION).
+    """
     run = tmp_path / "run"
     definitions = run / "control/executions"
     ledger = run / "state/executions"
@@ -105,7 +108,7 @@ def test_remote_execution_progress_counts_only_current_attempt(tmp_path, remote_
         kubectl_read_remote_execution_progress test-ns helper 1234abcd {remote_state}
         """)
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "1 1 1 1\n"
+    assert result.stdout == "1 1 1 1 0008\n"
 
 
 @pytest.mark.parametrize(
@@ -1012,7 +1015,10 @@ def test_v1_attempt_identity_is_refused_with_the_collect_with_v1_message(
     assert result.returncode == 0, result.stderr
     assert "started by storage-scale-test v1.x" in result.stderr
     assert f"attempt identity schema {schema}" in result.stderr
-    assert "Collect this attempt with storage-scale-test v1.x" in result.stderr
+    assert (
+        "Collect this attempt with a separate storage-scale-test v1.x checkout"
+        in result.stderr
+    )
 
 
 def test_worker_discovery_selects_the_active_segment(tmp_path: Path) -> None:
@@ -2284,6 +2290,7 @@ def test_always_pull_policy_requires_an_immutable_image_reference() -> None:
         kubectl_validate_runtime_configuration
         """)
     assert result.returncode == 0, result.stderr
+    assert "current: breuner/elbencho:v3.2-1\n" in result.stderr
 
 
 def test_pvc_path_validator_defends_reserved_tree_and_future_parent() -> None:
@@ -2911,6 +2918,28 @@ def test_lifecycle_commands_explain_missing_attempt_identity(tmp_path: Path) -> 
     assert result.stderr.count("has no valid current Kubernetes attempt") == 2
     assert "cannot be inspected, collected, or cancelled" in result.stderr
     assert "cannot be resumed" in result.stderr
+
+
+def test_lifecycle_commands_reject_missing_and_non_kubernetes_dirs(
+    tmp_path: Path,
+) -> None:
+    """A missing or SSH/Slurm results directory fails clearly and stays unchanged."""
+    results = tmp_path / "elbencho-ssh"
+    results.mkdir()
+    (results / "env_used.sh").write_text("export EXECUTION_SUBSTRATE=ssh\n")
+    for operation in ("status", "cancel", "collect"):
+        result = _bash(f"""
+            ! kubectl_lifecycle_operation {operation} {str(tmp_path / "missing")!r}
+            ! kubectl_lifecycle_operation {operation} {str(results)!r}
+        """)
+        assert result.returncode == 0, result.stderr
+        assert f"results directory not found: {tmp_path / 'missing'}" in result.stderr
+        assert (
+            f"--{operation} applies to Kubernetes sweeps and prepared batches; "
+            f"{results} is an EXECUTION_SUBSTRATE=ssh sweep (use --resume"
+        ) in result.stderr
+        assert "no valid current Kubernetes attempt" not in result.stderr
+    assert not (results / "kubernetes").exists()
 
 
 def test_pvc_lease_release_uses_uid_precondition_and_is_journaled(
@@ -4498,9 +4527,9 @@ def test_public_status_reads_progress_before_removing_inspector(
     [
         ("PREPARED", "30 0 0 0", "PENDING", "PREPARING", "WAIT"),
         ("RUNNING", "8 1 21 0", "PENDING", "RUNNING", "WAIT"),
-        ("RUNNING", "8 0 22 0", "PENDING", "BETWEEN_EXECUTIONS", "WAIT"),
-        ("RUNNING", "0 0 30 0", "PENDING", "AWAITING_COMPLETION", "WAIT"),
-        ("RUNNING", "29 0 0 1", "PENDING", "BETWEEN_EXECUTIONS", "WAIT"),
+        ("RUNNING", "8 0 22 0", "PENDING", "RUNNING", "WAIT"),
+        ("RUNNING", "0 0 30 0", "PENDING", "RUNNING", "WAIT"),
+        ("RUNNING", "29 0 0 1", "PENDING", "RUNNING", "WAIT"),
         ("SUCCESS", "0 0 30 0", "PENDING", "SUCCESS", "COLLECT"),
         ("FAILED", "1 0 1 1", "CLEANUP_PENDING", "FAILED", "COLLECT"),
         ("FAILED", "1 0 1 1", "COMPLETE", "FAILED", "RESUME"),
@@ -4582,6 +4611,32 @@ def test_status_refreshes_outcome_and_counts_after_completion(tmp_path):
     assert "NEXT_ACTION=COLLECT\n" in result.stdout
 
 
+@pytest.mark.parametrize(
+    ("batch", "next_action"), ((False, "INSPECT"), (True, "RESUME"))
+)
+def test_status_of_failed_submission_names_next_action(
+    tmp_path: Path, batch: bool, next_action: str
+) -> None:
+    """Pollers waiting for COLLECT learn that a failed submission never gets there."""
+    results = tmp_path / "results"
+    state = results / "kubernetes"
+    if batch:
+        results.mkdir()
+        (results / "batch-manifest.tsv").write_text("")
+    result = _bash(_identity(state) + f"""
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd PREPARED
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd SUBMISSION_FAILED
+        kubectl_attempt_write_current "$root" "$fd" 1234abcd
+        _test_configuration "$root/attempts/1234abcd/configuration.sh"
+        kubectl_local_lock_release "$fd"
+        kubectl_cleanup_ephemeral_helpers() {{ :; }}
+        _kubectl_verify_saved_cluster_identity() {{ :; }}
+        kubectl_lifecycle_operation status {str(results)!r}
+    """)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"STATE=SUBMISSION_FAILED\nNEXT_ACTION={next_action}\n"
+
+
 def test_status_reports_incomplete_cancellation_as_retryable_failure(
     tmp_path: Path,
 ) -> None:
@@ -4603,7 +4658,7 @@ def test_status_reports_incomplete_cancellation_as_retryable_failure(
         ! kubectl_lifecycle_operation status {str(results)!r}
     """)
     assert result.returncode == 0, result.stderr
-    assert "STATE=CANCEL_REQUESTED" in result.stdout
+    assert "STATE=CANCEL_REQUESTED\nNEXT_ACTION=INSPECT\n" in result.stdout
     assert (
         "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=CANCELLATION_INCOMPLETE" in result.stderr
     )
@@ -4698,3 +4753,245 @@ def test_missing_worker_daemonset_emits_identity_diagnostics(tmp_path: Path) -> 
     assert "STORAGE_SCALE_TEST_DIAGNOSTIC_RESOURCE_KIND=DaemonSet" in result.stderr
     assert "STORAGE_SCALE_TEST_DIAGNOSTIC_EXPECTED_UID=worker-uid" in result.stderr
     assert "STORAGE_SCALE_TEST_DIAGNOSTIC_PATH=/tmp/worker-identity" in result.stderr
+
+
+_FAILED_COUNTS = "1 0 1 1"
+
+
+def _status_view_fields(stdout: str) -> dict[str, str]:
+    return dict(line.split("=", 1) for line in stdout.splitlines() if "=" in line)
+
+
+def _write_coordinator_logs(results: Path) -> Path:
+    """Two coordinator logs of one attempt; return the newer one."""
+    attempt = results / "kubernetes/attempts/1234abcd"
+    attempt.mkdir(parents=True)
+    older, newer = attempt / "coordinator.log", attempt / "coordinator-s1.log"
+    older.write_text("old\n")
+    newer.write_text("new\n")
+    os.utime(older, (1_000_000, 1_000_000))
+    os.utime(newer, (2_000_000, 2_000_000))
+    return newer
+
+
+def test_status_view_names_the_failed_cell_of_a_batch(tmp_path: Path) -> None:
+    """FAILED_* follow NEXT_ACTION: cell, its group, newest coordinator log."""
+    (tmp_path / "batch-manifest.tsv").write_text(
+        "version\t1\nexecution\t0002\t0007\thash\n"
+    )
+    newer = _write_coordinator_logs(tmp_path)
+    result = _bash(f"""
+        kubectl_emit_status_view {str(tmp_path)!r} 1234abcd FAILED \
+            PVC PENDING '{_FAILED_COUNTS} 0002'
+        """)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    fields = _status_view_fields(result.stdout)
+    assert fields["FAILED_EXECUTION"] == "0002"
+    assert fields["FAILED_GROUP"] == "0007"
+    assert fields["FAILED_LOG"] == str(newer)
+    assert lines.index("NEXT_ACTION=COLLECT") + 1 == lines.index(
+        "FAILED_EXECUTION=0002"
+    )
+
+
+def test_status_view_of_a_failed_plain_run_has_no_group(tmp_path: Path) -> None:
+    """A plain run has no batch manifest, so FAILED_GROUP is omitted."""
+    result = _bash(f"""
+        kubectl_emit_status_view {str(tmp_path)!r} 1234abcd FAILED \
+            PVC PENDING '{_FAILED_COUNTS} 0001'
+        """)
+    assert result.returncode == 0, result.stderr
+    fields = _status_view_fields(result.stdout)
+    assert fields["FAILED_EXECUTION"] == "0001"
+    assert "FAILED_GROUP" not in fields
+    assert "FAILED_LOG" not in fields
+
+
+def test_status_view_prints_no_failed_keys_without_a_failed_id(tmp_path: Path) -> None:
+    """The FAILED_* keys appear only when the progress carries a failed id."""
+    _write_coordinator_logs(tmp_path)
+    result = _bash(f"""
+        kubectl_emit_status_view {str(tmp_path)!r} 1234abcd FAILED \
+            PVC PENDING '{_FAILED_COUNTS}'
+        """)
+    assert result.returncode == 0, result.stderr
+    assert not any(
+        key.startswith("FAILED_") for key in _status_view_fields(result.stdout)
+    )
+
+
+@pytest.mark.parametrize("failed_id", ["abc", "12", "00001", "0001 0002"])
+def test_status_view_rejects_an_invalid_failed_id(
+    tmp_path: Path, failed_id: str
+) -> None:
+    """The failed id must be exactly four digits, with nothing after it."""
+    result = _bash(f"""
+        ! kubectl_emit_status_view {str(tmp_path)!r} 1234abcd FAILED \
+            PVC PENDING '{_FAILED_COUNTS} {failed_id}'
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "invalid Kubernetes status view" in result.stderr
+    assert "STATE=" not in result.stdout
+
+
+def test_collected_progress_reports_the_first_failed_cell(tmp_path: Path) -> None:
+    """The failed id is the first FAILED row; none is printed without one."""
+    (tmp_path / "publication-manifest.tsv").write_text(
+        "execution\t0001\tSUCCESS\nexecution\t0002\tFAILED\n"
+        "execution\t0003\tFAILED\nexecution\t0004\tPENDING\n"
+    )
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    (clean / "publication-manifest.tsv").write_text("execution\t0001\tSUCCESS\n")
+    result = _bash(f"""
+        [[ $(kubectl_read_collected_execution_progress {str(tmp_path)!r}) == \
+            '1 0 1 2 0002' ]]
+        [[ $(kubectl_read_collected_execution_progress {str(clean)!r}) == \
+            '0 0 1 0' ]]
+        """)
+    assert result.returncode == 0, result.stderr
+
+
+def _collected_state(attempt: Path, name: str, rows: str) -> None:
+    directory = attempt / name
+    directory.mkdir(parents=True)
+    (directory / "publication-manifest.tsv").write_text(rows)
+
+
+def test_collected_state_of_a_failed_attempt_names_the_failed_cell(
+    tmp_path: Path,
+) -> None:
+    """--collect of a FAILED attempt prints STATE, then the FAILED_* keys."""
+    (tmp_path / "batch-manifest.tsv").write_text("execution\t0002\t0003\thash\n")
+    newer = _write_coordinator_logs(tmp_path)
+    _collected_state(
+        tmp_path / "kubernetes/attempts/1234abcd",
+        "collected-state",
+        "execution\t0001\tSUCCESS\nexecution\t0002\tFAILED\n",
+    )
+    result = _bash(f"_kubectl_emit_collected_state FAILED {str(tmp_path)!r} 1234abcd")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "STATE=FAILED",
+        "FAILED_EXECUTION=0002",
+        "FAILED_GROUP=0003",
+        f"FAILED_LOG={newer}",
+    ]
+
+
+def test_collected_state_of_a_successful_attempt_prints_only_the_state(
+    tmp_path: Path,
+) -> None:
+    """Even a stale failed row never adds FAILED_* keys to a SUCCESS state."""
+    _collected_state(
+        tmp_path / "kubernetes/attempts/1234abcd",
+        "collected-state",
+        "execution\t0001\tFAILED\n",
+    )
+    result = _bash(f"_kubectl_emit_collected_state SUCCESS {str(tmp_path)!r} 1234abcd")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "STATE=SUCCESS\n"
+
+
+def test_collected_state_of_a_segment_attempt_finds_the_later_failure(
+    tmp_path: Path,
+) -> None:
+    """Segments are searched in index order, so -s2 precedes -s10."""
+    attempt = tmp_path / "kubernetes/attempts/1234abcd"
+    _collected_state(attempt, "collected-state", "execution\t0001\tSUCCESS\n")
+    _collected_state(
+        attempt,
+        "collected-state-s2",
+        "execution\t0002\tSUCCESS\nexecution\t0003\tFAILED\n",
+    )
+    _collected_state(attempt, "collected-state-s10", "execution\t0009\tFAILED\n")
+    result = _bash(
+        "KUBECTL_SEGMENT_COUNT=11 "
+        f"_kubectl_emit_collected_state FAILED {str(tmp_path)!r} 1234abcd"
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["STATE=FAILED", "FAILED_EXECUTION=0003"]
+
+
+def test_collected_state_of_a_failed_attempt_without_a_failed_row(
+    tmp_path: Path,
+) -> None:
+    """No failed row to name: STATE alone, and still a successful query."""
+    _collected_state(
+        tmp_path / "kubernetes/attempts/1234abcd",
+        "collected-state",
+        "execution\t0001\tSUCCESS\n",
+    )
+    result = _bash(f"_kubectl_emit_collected_state FAILED {str(tmp_path)!r} 1234abcd")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "STATE=FAILED\n"
+
+
+def _save_coordinator_log(
+    tmp_path: Path, stub: str, kind: str = "Job", segment: int | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run _kubectl_save_coordinator_log with kubectl_run_bounded replaced by STUB.
+
+    Under errexit too: a failed capture must never abort its caller.
+    """
+    select = "" if segment is None else f"KUBECTL_SEGMENT_SELECTION={segment}"
+    return _bash(f"""
+        set -euo pipefail
+        metadata={str(tmp_path)!r}
+        {select}
+        kubectl_run_bounded() {{ printf '%s\\n' "$*" > "$metadata/args"; {stub}; }}
+        _kubectl_save_coordinator_log "$metadata" test-ns {kind} sst-elb-1234abcd
+        echo reached
+        """)
+
+
+def test_coordinator_log_is_saved_from_the_job(tmp_path: Path) -> None:
+    """A Job's log lands in coordinator.log; leftover temporaries are removed."""
+    result = _save_coordinator_log(tmp_path, "echo boom")
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "coordinator.log").read_text() == "boom\n"
+    assert (tmp_path / "args").read_text() == (
+        "-n test-ns logs job/sst-elb-1234abcd --all-containers=true\n"
+    )
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "args",
+        "coordinator.log",
+    ]
+
+
+def test_coordinator_log_of_a_selected_segment_uses_its_suffix(tmp_path: Path) -> None:
+    """Segment K saves coordinator-s<K>.log beside segment 0's log."""
+    result = _save_coordinator_log(tmp_path, "echo segment-one", kind="job", segment=1)
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "coordinator-s1.log").read_text() == "segment-one\n"
+    assert not (tmp_path / "coordinator.log").exists()
+
+
+def test_coordinator_log_is_kept_once_saved(tmp_path: Path) -> None:
+    """A finished Pod's log no longer changes: never ask kubectl again."""
+    (tmp_path / "coordinator.log").write_text("first\n")
+    result = _save_coordinator_log(tmp_path, "echo second")
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "coordinator.log").read_text() == "first\n"
+    assert not (tmp_path / "args").exists()
+
+
+@pytest.mark.parametrize(
+    ("stub", "kind"),
+    [
+        ("echo partial; return 1", "Job"),
+        ("true", "Job"),
+        ("echo boom", "DaemonSet"),
+    ],
+    ids=["kubectl-fails", "empty-output", "not-a-job"],
+)
+def test_coordinator_log_is_not_written_without_a_usable_log(
+    tmp_path: Path, stub: str, kind: str
+) -> None:
+    """Failed kubectl, empty output, or a non-Job kind: no file, never fatal."""
+    result = _save_coordinator_log(tmp_path, stub, kind=kind)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "reached\n"
+    assert not list(tmp_path.glob("coordinator*"))
+    assert not list(tmp_path.glob(".coordinator-log.*"))

@@ -16,8 +16,8 @@
 # limitations under the License.
 
 if (( BASH_VERSINFO[0] < 4 \
-        || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
-    printf 'Bash 4.3 or newer is required; on macOS run: brew install bash\n' >&2
+        || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+    printf 'Bash 4.4 or newer is required; on macOS run: brew install bash\n' >&2
     exit 1
 fi
 
@@ -95,6 +95,11 @@ For Kubernetes, first collect the terminal attempt. --status, --cancel, and
 USAGE
 }
 
+# Help wins over any operation, including the --batch forms routed above.
+for argument in "$@"; do
+    [[ "$argument" != -h && "$argument" != --help ]] || { usage; exit 0; }
+done
+
 nodes_spec=""
 tasks_spec=""
 single_dir_target_files=""
@@ -137,7 +142,7 @@ while [[ $# -gt 0 ]]; do
                     operation_dir="$2" ;;
             esac
             shift 2 ;;
-        *) echo "Error: unexpected argument: $1" >&2; usage >&2; exit 1 ;;
+        *) echo "Error: Unknown option: $1" >&2; usage >&2; exit 1 ;;
     esac
 done
 
@@ -159,7 +164,7 @@ if [[ "$operation" == submit && "${#target_files[@]}" -gt 1 ]]; then
 fi
 if [[ "$operation" != submit && ( -n "$nodes_spec" || -n "$tasks_spec" \
         || -n "$single_dir_target_files" ) ]]; then
-    echo "Error: $operation is mutually exclusive with workload flags" >&2
+    echo "Error: --$operation is mutually exclusive with workload flags" >&2
     exit 1
 fi
 if [[ "$operation" == submit && ( -z "$nodes_spec" || -z "$tasks_spec" ) ]]; then
@@ -180,7 +185,9 @@ if [[ "$operation" == status || "$operation" == cancel || "$operation" == collec
 fi
 
 if [[ "$operation" == resume ]]; then
-    [[ -d "$operation_dir" ]] || { echo "Error: results directory not found" >&2; exit 1; }
+    [[ -d "$operation_dir" ]] || {
+        echo "Error: results directory not found: $operation_dir" >&2; exit 1;
+    }
     OUTPUT_DIR=$(cd "$operation_dir" && pwd) || exit 1
     [[ "${OUTPUT_DIR##*/}" =~ ^mdtest-elbencho-[0-9]{8}Z[0-9]{6}$ \
         && -f "$OUTPUT_DIR/env_used.sh" && ! -L "$OUTPUT_DIR/env_used.sh" \
@@ -196,7 +203,13 @@ if [[ "$operation" == resume ]]; then
     # shellcheck disable=SC1090,SC1091  # Trusted canonical snapshot.
     source "$OUTPUT_DIR/env_used.sh" || exit 1
     SAVED_EXECUTION_SUBSTRATE="${EXECUTION_SUBSTRATE:-}"
-    case "$SAVED_EXECUTION_SUBSTRATE" in ssh|slurm|kubectl) ;; *) exit 1 ;; esac
+    case "$SAVED_EXECUTION_SUBSTRATE" in
+        ssh|slurm|kubectl) ;;
+        *)
+            echo "Error: saved EXECUTION_SUBSTRATE is missing or unsupported: ${SAVED_EXECUTION_SUBSTRATE:-unset}" >&2
+            exit 1
+            ;;
+    esac
     if [[ -n "$INVOKING_EXECUTION_SUBSTRATE" \
             && "$INVOKING_EXECUTION_SUBSTRATE" != "$SAVED_EXECUTION_SUBSTRATE" ]]; then
         echo "Error: inherited substrate differs from saved substrate" >&2
@@ -209,6 +222,10 @@ if [[ "$operation" == resume ]]; then
     fi
 fi
 
+if [[ ! -f "$SCRIPT_DIR/../../env.sh" ]]; then
+    echo "Error: env.sh not found; copy env.sh.template to env.sh and edit it" >&2
+    exit 1
+fi
 # shellcheck disable=SC2016  # $1 expands in the child shell.
 if ! source_output=$("$BASH" -c 'source "$1"' env-loader \
         "$SCRIPT_DIR/../../env.sh" 2>&1); then
@@ -260,7 +277,10 @@ if [[ "$operation" == submit ]]; then
     # Kubernetes roots name their claim; reject anything else before output.
     if [[ "${EXECUTION_SUBSTRATE:-}" == kubectl ]] \
             && declare -F kubectl_validate_test_dirs >/dev/null; then
-        kubectl_validate_test_dirs || exit 1
+        kubectl_validate_test_dirs || {
+            [[ -z "$target_label" ]] || echo "Error: invalid target file: $target_label" >&2
+            exit 1
+        }
     fi
 fi
 if [[ -n "${SLURM_JOB_ID:-}" && -z "${SSH_ENABLED:-}" ]]; then

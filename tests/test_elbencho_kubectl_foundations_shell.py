@@ -147,6 +147,23 @@ def test_test_dir_weights_and_read_from_suffix_are_preserved():
     assert result.returncode == 0, result.stderr
 
 
+def test_read_from_accepts_the_pod_path_write_only_prints():
+    """A Pod path becomes the claim's logical path in its TEST_DIRS namespace."""
+    result = _run_bash("""
+        declare -A TEST_DIRS=([other-ns/data-pvc:bench]=1)
+        kubectl_read_from_logical_path /mnt/storage-scale-test/data-pvc/bench/ds out
+        [[ "$out" == other-ns/data-pvc:bench/ds ]]
+        kubectl_read_from_logical_path data-pvc:bench/ds out
+        [[ "$out" == data-pvc:bench/ds ]]
+        ! kubectl_read_from_logical_path /mnt/storage-scale-test/other-pvc/bench out
+    """)
+    assert result.returncode == 0, result.stderr
+    assert (
+        "--read-from /mnt/storage-scale-test/other-pvc/bench is not on a claim of "
+        "this submission's TEST_DIRS; pass it as [namespace/]claim:path"
+    ) in result.stderr
+
+
 def test_nested_roots_make_read_from_mapping_ambiguous():
     """A read path must be owned by exactly one logical root."""
     result = _run_bash("""
@@ -882,7 +899,10 @@ def test_v1_identity_is_not_loaded_and_names_v1x(tmp_path, schema):
     assert result.returncode == 0, result.stderr
     assert "storage-scale-test v1.x" in result.stderr
     assert f"identity schema {schema}" in result.stderr
-    assert "Collect this attempt with storage-scale-test v1.x" in result.stderr
+    assert (
+        "Collect this attempt with a separate storage-scale-test v1.x checkout"
+        in result.stderr
+    )
 
 
 @pytest.mark.parametrize(

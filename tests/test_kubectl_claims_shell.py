@@ -130,7 +130,7 @@ def test_validate_reports_every_error_not_just_the_first():
     assert "claim Bad must be a lowercase" in result.stderr
     assert "c:.. has an invalid path" in result.stderr
     assert "span Kubernetes namespaces (team-a,team-b)" in result.stderr
-    assert "pass each file with --target" in result.stderr
+    assert "pass each file to --batch with --target" in result.stderr
 
 
 def test_duplicate_roots_are_rejected():

@@ -624,6 +624,17 @@ _slurm_restore_dispatch_traps() {
     ELBENCHO_SLURM_TRAPS_INSTALLED=0
 }
 
+# Run a saved `trap -p EXIT` action with $? preset to rc, in a child shell so
+# it cannot replace rc. Bash < 5.1 skips EXIT traps in a subshell started from
+# an EXIT trap, so run the extracted command instead of re-arming the trap.
+_run_saved_exit_trap() {
+    local saved_trap=$1 rc=$2 trap_command
+    trap_command=${saved_trap#trap -- }
+    trap_command=${trap_command% EXIT}
+    eval "trap_command=$trap_command"
+    ( (exit "$rc"); eval "$trap_command" ) || true
+}
+
 # shellcheck disable=SC2317,SC2329  # Invoked by the active dispatch EXIT trap.
 _slurm_active_dispatch_exit() {
     local original_rc=$?
@@ -631,7 +642,7 @@ _slurm_active_dispatch_exit() {
     trap - EXIT INT TERM
     _slurm_cancel_active_dispatch_once || true
     if [[ -n "$old_exit_trap" ]]; then
-        (eval "$old_exit_trap"; exit "$original_rc") || true
+        _run_saved_exit_trap "$old_exit_trap" "$original_rc"
     fi
     return "$original_rc"
 }
@@ -1383,10 +1394,6 @@ filesystem_enabled_from_test_dirs() {
     done
 }
 
-# Fill in defaults for unset filesystem workload settings. Only defaults are
-# applied, so this is idempotent: env_base.sh calls it once after env.sh, and an
-# --env-override file is followed by a second call that restores the default
-# for anything the override unset (exactly as if it had been unset in env.sh).
 # The elbencho image Kubernetes sweeps run when KUBECTL_ELBENCHO_IMAGE is unset
 # or empty: the release utils/build_tarball.sh downloads (ELBENCHO_VERSION_TAG).
 KUBECTL_DEFAULT_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.2-1
@@ -1400,6 +1407,10 @@ apply_kubectl_defaults() {
     export KUBECTL_ELBENCHO_IMAGE="${KUBECTL_ELBENCHO_IMAGE:-$KUBECTL_DEFAULT_ELBENCHO_IMAGE}"
 }
 
+# Fill in defaults for unset filesystem workload settings. Only defaults are
+# applied, so this is idempotent: env_base.sh calls it once after env.sh, and an
+# --env-override file is followed by a second call that restores the default
+# for anything the override unset (exactly as if it had been unset in env.sh).
 apply_filesystem_workload_defaults() {
     # Default values for FS_MAX_* estimates
     # If IOR_FS_MAX_AGG_THROUGHPUT is defined, use it as the default for FS_MAX_AGG_THROUGHPUT
@@ -1669,6 +1680,8 @@ __ssto_substrate=$__SSTO_SUBSTRATE
 shift 2
 __ssto_noun="env override file"
 [[ $__ssto_mode != target ]] || __ssto_noun="target file"
+__ssto_example_root=/mnt/fs-a/data
+[[ $__ssto_substrate != kubectl ]] || __ssto_example_root=claim:path
 declare -A __ssto_kind=() __ssto_known=() __ssto_before=() __ssto_seen=()
 while [[ $# -ge 2 ]]; do
     __ssto_kind[$1]=$2
@@ -1721,7 +1734,7 @@ for __ssto_name in "${__ssto_changed[@]}"; do
     case ${__ssto_kind[$__ssto_name]} in
         assoc)
             [[ $__ssto_flags == *A* ]] \
-                || __ssto_invalid+=("$__ssto_name must be an associative array, e.g. $__ssto_name=([\"/path\"]=1)") ;;
+                || __ssto_invalid+=("$__ssto_name must be an associative array, e.g. $__ssto_name=([\"$__ssto_example_root\"]=1)") ;;
         array)
             if [[ $__ssto_flags != *a* ]]; then
                 __ssto_invalid+=("$__ssto_name must be an indexed array, e.g. $__ssto_name=(\"a\" \"b\")")
@@ -1762,9 +1775,16 @@ if [[ ${#__ssto_rejected[@]} -gt 0 ]]; then
     __ssto_failed=1
     printf "Error: %s %s changes unsupported variable(s): %s\n" \
         "$__ssto_noun" "$__ssto_label" "${__ssto_rejected[*]}" >&2
+    __ssto_env_hint=0
     for __ssto_name in "${__ssto_rejected[@]}"; do
-        case $__ssto_name in
-            TEST_DIR) printf "  Use TEST_DIRS (an associative array) instead of TEST_DIR.\n" >&2 ;;
+        case $__ssto_mode:$__ssto_name in
+            *:TEST_DIR) printf "  Use TEST_DIRS (an associative array) instead of TEST_DIR.\n" >&2 ;;
+            *:KUBECTL_PVC|*:KUBECTL_PV)
+                printf "  %s was removed in v2.0.0; name the claim in each TEST_DIRS key: [namespace/]claim:path.\n" \
+                    "$__ssto_name" >&2 ;;
+            target:KUBECTL_NAMESPACE)
+                printf "  Name the namespace in each TEST_DIRS key instead: namespace/claim:path.\n" >&2 ;;
+            *) __ssto_env_hint=1 ;;
         esac
     done
     if [[ $__ssto_mode == target ]]; then
@@ -1772,7 +1792,8 @@ if [[ ${#__ssto_rejected[@]} -gt 0 ]]; then
     else
         printf "  Only filesystem workload settings may be overridden: %s\n" "$__ssto_allowed" >&2
     fi
-    printf "  Substrate, transport, and path settings belong in env.sh.\n" >&2
+    [[ $__ssto_env_hint == 0 ]] \
+        || printf "  Substrate, transport, and path settings belong in env.sh.\n" >&2
     printf "  Lowercase helper variables that env.sh does not define are allowed and discarded.\n" >&2
 fi
 [[ $__ssto_failed == 0 ]] || exit 1
@@ -1783,7 +1804,7 @@ if [[ $__ssto_mode == target ]]; then
     __ssto_flags=${__ssto_now#declare -}
     __ssto_flags=${__ssto_flags%% *}
     if [[ -z $__ssto_now || ( $__ssto_flags == *A* && ${#TEST_DIRS[@]} -eq 0 ) ]]; then
-        __ssto_invalid+=("must set TEST_DIRS with at least one root, e.g. TEST_DIRS=([\"/mnt/fs-a/data\"]=1)")
+        __ssto_invalid+=("must set TEST_DIRS with at least one root, e.g. TEST_DIRS=([\"$__ssto_example_root\"]=1)")
     elif [[ $__ssto_flags == *A* ]]; then
         declare -n __ssto_ref=TEST_DIRS
         for __ssto_key in "${!__ssto_ref[@]}"; do
@@ -3896,10 +3917,9 @@ _ssh_active_generated_shared_exit() {
     trap - EXIT INT TERM
     _ssh_finalize_active_generated_shared_execution
     # An EXIT trap cannot trigger a newly restored EXIT trap during the same
-    # exit. Run the prior action in a child shell so filesystem cleanup and
-    # other external side effects still occur without replacing original_rc.
+    # exit, so run the prior action directly without replacing original_rc.
     if [[ -n "$old_exit_trap" ]]; then
-        (eval "$old_exit_trap"; exit "$original_rc") || true
+        _run_saved_exit_trap "$old_exit_trap" "$original_rc"
     fi
     return "$original_rc"
 }

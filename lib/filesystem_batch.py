@@ -35,6 +35,7 @@ from lib.filesystem_snapshot_summary import format_io_snapshot_summary
 from lib.report_provenance import VERSION_SUFFIX
 from lib.storage_target import (
     UNKNOWN_TARGET,
+    StorageTarget,
     describe_storage_target,
     storage_target_from_env,
 )
@@ -574,16 +575,32 @@ def _write_report_index(
     _publish_report_text(output / "index.md", "\n".join(lines) + "\n")
 
 
-def _group_target(manifest: BatchManifest, group: BatchGroup) -> str:
-    """Describe the storage target saved with the group; unknown when unreadable."""
+def _single_line(text: str) -> str:
+    return text.replace("\r", " ").replace("\n", " ")
+
+
+def _quoted_target_label(target: StorageTarget) -> str:
+    """``"name"``, with a ``(derived)`` marker kept outside the quotes."""
+    if target.name is None:
+        return f'"{UNKNOWN_TARGET}"'
+    quoted = f'"{_single_line(target.name)}"'
+    return quoted if target.recorded else f"{quoted} (derived)"
+
+
+def _group_storage_target(manifest: BatchManifest, group: BatchGroup) -> StorageTarget:
+    """The storage target saved with the group; unknown when unreadable."""
     source = manifest.group_path(group) / ENV_YAML
     try:
         environment = _verify_digest(source, group.yaml_digest).decode("utf-8")
         snapshot = _parse_report_snapshot(environment, source)
     except (OSError, ValueError):
-        return UNKNOWN_TARGET
-    label = describe_storage_target(storage_target_from_env(snapshot))
-    return label.replace("\r", " ").replace("\n", " ")
+        return StorageTarget(None, False)
+    return storage_target_from_env(snapshot)
+
+
+def _group_target(manifest: BatchManifest, group: BatchGroup) -> str:
+    """Describe the storage target saved with the group; unknown when unreadable."""
+    return _single_line(describe_storage_target(_group_storage_target(manifest, group)))
 
 
 _CELL_ESCAPES = (
@@ -643,7 +660,7 @@ def _write_combined_report(
             annotated = format_io_snapshot_summary(snapshot) + "\n" + content
         sections.append(
             f"\n\n{'=' * 80}\nGroup {group.group_id} ({group.kind}) "
-            f'target: "{_group_target(manifest, group)}"\n'
+            f"target: {_quoted_target_label(_group_storage_target(manifest, group))}\n"
             f"Report: {report}\nSaved settings: {source}\n\n" + annotated
         )
     _publish_report_text(destination, "".join(sections) + "\n")

@@ -140,8 +140,6 @@ KUBECTL_STATUS_STATES = KUBECTL_TERMINAL_STATES | frozenset(
         "SUBMITTED",
         "PREPARING",
         "RUNNING",
-        "BETWEEN_EXECUTIONS",
-        "AWAITING_COMPLETION",
         "CANCEL_REQUESTED",
         "COLLECTED",
     }
@@ -184,9 +182,9 @@ RBAC_PERMISSION_PHRASE = "permission to {verb} {resource} in namespace {namespac
 SEQUENCER_FALLBACK_PHRASE = "Fallback: keep each batch in one namespace"
 # The validate_env.sh option that checks the sequencer (otherwise skipped).
 VALIDATE_SEQUENCER_OPTION = "--sequencer"
-# The sequencer log names each unit it starts and finishes ("target 0", or
-# "segment 0" once the unit is a namespace) and then all of them.
-SEQUENCER_UNIT_PATTERN = "(?:target|segment)"
+# The sequencer log names each namespace segment it starts and finishes
+# ("segment 0") and then all of them.
+SEQUENCER_UNIT_PATTERN = "segment"
 # --status prints SEGMENT_COUNT, SEGMENT_<i>_NAMESPACE and SEGMENT_<i>_STATE for
 # several namespaces only; i counts from this base in segment order.
 SEGMENT_INDEX_BASE = 0
@@ -6345,9 +6343,8 @@ def _has_output_key(output: str, key: str) -> bool:
 def _assert_publication_keys(output: str, group_ids: list[str], label: str) -> None:
     """Require the submission keys that depend on how many groups it published.
 
-    ``_GROUPS`` lists the IDs only for several groups, the legacy ``_GROUP_TARGET``
-    appears only for exactly one, ``_GROUP`` names the first, and no
-    ``_GROUP_<gid>_CLAIM`` key exists any more.
+    ``_GROUPS`` lists the IDs only for several groups, ``_GROUP`` names the
+    first, and neither ``_GROUP_TARGET`` nor ``_GROUP_<gid>_CLAIM`` exists.
     """
     several = len(group_ids) > 1
     if _has_output_key(output, f"{_BATCH_PREFIX}GROUPS") != several:
@@ -6363,11 +6360,8 @@ def _assert_publication_keys(output: str, group_ids: list[str], label: str) -> N
             f"{_kubectl_output_value(output, f'{_BATCH_PREFIX}GROUPS')}, expected "
             + ",".join(group_ids)
         )
-    if _has_output_key(output, f"{_BATCH_PREFIX}GROUP_TARGET") != (not several):
-        raise IntegrationTestError(
-            f"{label} {'printed' if several else 'omitted'} the single-group "
-            f"GROUP_TARGET key for {len(group_ids)} group(s)"
-        )
+    if _has_output_key(output, f"{_BATCH_PREFIX}GROUP_TARGET"):
+        raise IntegrationTestError(f"{label} printed the removed GROUP_TARGET key")
     if _kubectl_output_value(output, f"{_BATCH_PREFIX}GROUP") != group_ids[0]:
         raise IntegrationTestError(f"{label} did not name {group_ids[0]} as its group")
     claims = _batch_group_values(output, "CLAIM")
@@ -6417,8 +6411,8 @@ def assert_group_status_keys(output: str, rows: tuple[GroupRow, ...]) -> None:
 def assert_batch_group_publication(output: str, group_id: str, name: str) -> None:
     """Require a one-group submission to publish its own target name, no claim.
 
-    A single group prints GROUP_<gid>_TARGET and the legacy GROUP_TARGET (and no
-    ``_GROUPS`` list or ``_CLAIM`` key) on every substrate.
+    A single group prints GROUP_<gid>_TARGET (and no ``_GROUPS`` list or
+    ``_CLAIM`` key) on every substrate.
     """
     _assert_publication_keys(output, [group_id], f"group {group_id}")
     observed = batch_group_target_names(output)
@@ -6426,11 +6420,6 @@ def assert_batch_group_publication(output: str, group_id: str, name: str) -> Non
         raise IntegrationTestError(
             f"submission printed group targets {observed}, expected "
             f"{[(group_id, name)]}"
-        )
-    legacy = shlex.split(_kubectl_output_value(output, f"{_BATCH_PREFIX}GROUP_TARGET"))
-    if legacy != [name]:
-        raise IntegrationTestError(
-            f"submission printed legacy GROUP_TARGET {legacy}, expected {[name]}"
         )
 
 

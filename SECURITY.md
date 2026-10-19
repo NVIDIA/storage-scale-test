@@ -86,9 +86,9 @@ controls appropriate for their environment.
 
 **Key boundaries and interfaces.**
 
-- Configuration and secret sourcing: `env.sh`, filesystem `--env-override`
-  files, and the object-auth file selected by `$OBJ_AUTH_FILE` are
-  operator-controlled inputs sourced as Bash. `lib/env_base.sh` sources the
+- Configuration and secret sourcing: `env.sh`, filesystem `--target` and
+  `--env-override` files, and the object-auth file selected by `$OBJ_AUTH_FILE`
+  are operator-controlled inputs sourced as Bash. `lib/env_base.sh` sources the
   object-auth file and exports S3-compatible credential variables for Warp and
   helper tools.
 - Remote fleet execution: `lib/env_functions.sh` builds and runs commands on
@@ -96,12 +96,15 @@ controls appropriate for their environment.
   `storage-tests/**/sbatch` scriptlets execute benchmark commands on worker
   nodes.
 - Kubernetes execution: the launcher uses the operator's current `kubectl`
-  context to create Jobs, Pods, a DaemonSet, NetworkPolicies, and a Lease in
-  `$KUBECTL_NAMESPACE`, using the operator's existing PV/PVC and image. Pods
-  run as the configured non-root UID/GID with no API token, no added
-  capabilities, and no privilege escalation; Elbencho Pods request `Unconfined`
-  seccomp for Linux AIO. A sweep's control bundle and run state live on the
-  PVC and are executed by the coordinator Pod.
+  context to create Jobs, Pods, DaemonSets, NetworkPolicies, and one Lease per
+  claim in the namespaces the `TEST_DIRS` keys name, using the operator's
+  existing claims and images. Pods run as the configured non-root UID/GID with
+  no added capabilities and no privilege escalation; Elbencho Pods request
+  `Unconfined` seccomp for Linux AIO. No Pod has an API token, except that a
+  batch spanning namespaces adds a sequencer Pod whose ServiceAccount, Role,
+  and RoleBinding (created by the launcher) allow only reading and starting
+  that attempt's Jobs. A sweep's control bundle and run state live on a claim
+  and are executed by the coordinator Pod.
 - Temporary benchmark listeners: filesystem and network tests start
   `elbencho --service` on port 1611 or `$NETBENCH_PORT`. Multi-node Warp object
   tests start clients listening on `0.0.0.0:7761`. Kubernetes worker Pods listen
@@ -141,10 +144,10 @@ They are derived from the actual code paths and the intended deployment model.
 
 3. **Remote command execution across the test fleet:** SSH, Slurm, and
    Kubernetes execution are core features of this tool. A malicious `env.sh`,
-   `--env-override` file, host list, benchmark binary or image, or generated
-   scriptlet can execute commands on the configured worker fleet as the
-   invoking user or workload UID. Operators must treat those inputs as trusted
-   and protect them with normal host filesystem permissions.
+   `--target` or `--env-override` file, host list, benchmark binary or image, or
+   generated scriptlet can execute commands on the configured worker fleet as
+   the invoking user or workload UID. Operators must treat those inputs as
+   trusted and protect them with normal host filesystem permissions.
 
 4. **Temporary listener exposure during benchmark runs:** elbencho service mode
    and multi-node Warp client mode open temporary listeners on worker nodes. If
@@ -165,12 +168,14 @@ They are derived from the actual code paths and the intended deployment model.
    before extraction. Maintainers must review and update both the pinned release
    and its hashes together.
 
-7. **Kubernetes workload and PVC state:** The launcher acts with the operator's
-   Kubernetes credentials, and the coordinator Pod executes the control bundle
-   and run state stored on the PVC. Digest checks detect corruption, not a
-   malicious writer: anyone who can write that PVC path or create Pods in the
-   namespace can change what the sweep runs. Use a dedicated namespace and PVC,
-   least-privilege RBAC, and a digest-pinned image from a trusted registry.
+7. **Kubernetes workload and claim state:** The launcher acts with the
+   operator's Kubernetes credentials, and the coordinator Pod executes the
+   control bundle and run state stored on a claim. Digest checks detect
+   corruption, not a malicious writer: anyone who can write that claim path or
+   create Pods in the namespace can change what the sweep runs. Use dedicated
+   namespaces and claims, least-privilege RBAC, and digest-pinned images (the
+   elbencho image and, for batches spanning namespaces, the sequencer image)
+   from a trusted registry.
 
 ### Accepted Risks and Usage Assumptions
 
@@ -220,12 +225,12 @@ risk and is responsible for meeting the stated conditions.
   than on production systems or shared systems with untrusted users.
 - The configured filesystem paths and object buckets contain no production,
   sensitive, or valuable data.
-- `env.sh`, `--env-override` files, object-auth files, SSH host lists,
-  generated execution scripts, and results directories are writable only by
-  trusted users.
-- In Kubernetes mode, the namespace and the PVC paths used for test roots and
-  sweep state are writable only by trusted users, and the cluster's CNI
-  enforces NetworkPolicy or the Pod network is otherwise isolated.
+- `env.sh`, `--target` and `--env-override` files, object-auth files, SSH host
+  lists, generated execution scripts, and results directories are writable only
+  by trusted users.
+- In Kubernetes mode, the namespaces and the claim paths used for test roots and
+  sweep state are writable only by trusted users, and the cluster's CNI enforces
+  NetworkPolicy or the Pod network is otherwise isolated.
 - Object-storage credentials are scoped to disposable test buckets and can be
   rotated after use.
 - Worker nodes are allowed to execute benchmark commands as the invoking user,
@@ -257,7 +262,7 @@ code vulnerability includes:
 
 - Deleting data in configured benchmark paths or buckets.
 - Running commands on explicitly configured SSH or Slurm worker nodes, or as
-  Kubernetes workloads in the configured namespace.
+  Kubernetes workloads in the configured namespaces.
 - Opening temporary benchmark listeners during active test runs.
 - Requiring operators to supply, scope, protect, and rotate object-storage
   credentials used for their own test buckets.

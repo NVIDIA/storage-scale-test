@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Multi-target attempts only: unsuspend each target's coordinator Job in
-# order, starting the next only after the previous one is Complete. This is
-# the one Pod that holds an API token; its Roles allow only get and patch on
-# this attempt's exact Jobs. The script derives progress from Job state, so a
-# replacement Pod resumes where its predecessor stopped.
+# Multi-namespace attempts only: unsuspend each namespace segment's
+# coordinator Job in order, starting the next only after the previous one is
+# Complete. Besides the validate_env.sh --sequencer probe, this is the only Pod
+# with an API token; its Roles allow only get and patch on this attempt's
+# exact Jobs. The script derives progress from Job state, so a replacement Pod
+# resumes where its predecessor stopped.
 apiVersion: batch/v1
 kind: Job
 metadata:

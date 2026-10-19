@@ -435,6 +435,25 @@ def test_kubernetes_batch_start_loads_helpers_in_preflight_and_dispatch(
     assert (batch / "batch-sealed.sha256").is_file()
 
 
+def test_kubernetes_read_from_accepts_the_printed_pod_path(checkout):
+    """--read-from takes the Pod path --write-only prints and saves claim:path."""
+    with (checkout / "env.sh").open("a") as environment:
+        environment.write(
+            "\nexport EXECUTION_SUBSTRATE=kubectl\n"
+            'TEST_DIRS=(["test-pvc:data/one"]=1)\n'
+            "export KUBECTL_NAMESPACE=test-ns\n"
+            "export KUBECTL_NODE_SELECTOR=benchmark=true\n"
+        )
+    result = launch(
+        checkout, IO, "--batch", "--nodes", "1",
+        "--read-from", "/mnt/storage-scale-test/test-pvc/data/one/ds",
+    )  # fmt: skip
+    assert result.returncode == 0, result.stdout + result.stderr
+    batch = next((checkout / "results").glob("filesystem-batch-*"))
+    definition = (batch / "executions/0001.sh").read_text(encoding="utf-8")
+    assert "export ELBENCHO_SWEEP_READ_FROM=test-ns/test-pvc:data/one/ds" in definition
+
+
 def test_batch_status_labels_counts_as_local(checkout):
     batch = create(checkout)
     result = launch(checkout, IO, "--status", batch)
@@ -457,7 +476,7 @@ def test_batch_status_and_publish_report_each_groups_storage_target(checkout):
         "--target", target,
     )  # fmt: skip
     assert appended.returncode == 0, appended.stdout + appended.stderr
-    assert "STORAGE_SCALE_TEST_BATCH_GROUP_TARGET=vendor-b:fs-1\n" in appended.stdout
+    assert "STORAGE_SCALE_TEST_BATCH_GROUP_TARGET=" not in appended.stdout
     assert (
         "STORAGE_SCALE_TEST_BATCH_GROUP_0002_TARGET=vendor-b:fs-1\n" in appended.stdout
     )
@@ -478,8 +497,8 @@ def test_batch_status_and_publish_report_each_groups_storage_target(checkout):
     "cell,owner,state,next_action",
     [
         ("RUNNING", 0, "RUNNING", "WAIT"),
-        ("PENDING", 0, "BETWEEN_EXECUTIONS", "WAIT"),
-        ("SUCCESS", 0, "AWAITING_COMPLETION", "WAIT"),
+        ("PENDING", 0, "RUNNING", "WAIT"),
+        ("SUCCESS", 0, "RUNNING", "WAIT"),
         ("FAILED", 1, "FAILED", "RESUME"),
         ("SUCCESS", 1, "SUCCESS", "NONE"),
         ("SUCCESS", 2, "UNKNOWN", "INSPECT"),
@@ -514,6 +533,86 @@ def test_local_batch_status_distinguishes_owner_from_cell_state(
     assert fields["STATE"] == state
     assert fields["NEXT_ACTION"] == next_action
     assert fields["EXECUTION_SCOPE"] == "BATCH"
+
+
+def failed_batch(checkout, *cells):
+    """A sealed two-group batch whose executions have the given states."""
+    batch = create(checkout)
+    appended = launch(checkout, MD, "--append", batch, "--nodes", "1", "--tasks", "1")
+    assert appended.returncode == 0, appended.stdout + appended.stderr
+    (batch / "batch-sealed.sha256").touch()
+    for number, cell in enumerate(cells, 1):
+        (batch / f"executions/{number:04d}.status").write_text(cell + "\n")
+    return batch
+
+
+def status_lines(checkout, batch, substrate="ssh"):
+    """Run the shared batch status for SSH or Slurm and return its lines."""
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1/lib/_batch_functions.sh"; '
+            'EXECUTION_SUBSTRATE="$3"; _elbencho_batch_status "$2"',
+            "status-test",
+            str(checkout),
+            str(batch),
+            substrate,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.splitlines()
+
+
+def write_cell_logs(batch, *ids):
+    """Create executions/<id>.log for each ID, as SSH and Slurm dispatch do."""
+    for execution in ids:
+        (batch / f"executions/{execution}.log").write_text(f"cell {execution}\n")
+
+
+@pytest.mark.parametrize("substrate", ["ssh", "slurm"])
+def test_failed_batch_status_names_group_and_cell_log(checkout, substrate):
+    """FAILED_* follows NEXT_ACTION and names the failed cell's own log."""
+    batch = failed_batch(checkout, "SUCCESS", "FAILED")
+    write_cell_logs(batch, "0001", "0002")
+    lines = status_lines(checkout, batch, substrate)
+    start = lines.index("NEXT_ACTION=RESUME") + 1
+    assert lines[start : start + 2] == ["FAILED_EXECUTION=0002", "FAILED_GROUP=0002"]
+    # The checkout path has a space and quote, so the value is %q-escaped.
+    key, _, value = lines[start + 2].partition("=")
+    assert key == "FAILED_LOG"
+    assert shlex.split(value) == [str(batch / "executions/0002.log")]
+    assert lines[start + 3] == "GROUP_0001_KIND=io"
+
+
+def test_failed_batch_status_omits_the_log_when_none_exists(checkout):
+    batch = failed_batch(checkout, "SUCCESS", "FAILED")
+    write_cell_logs(batch, "0001")
+    lines = status_lines(checkout, batch)
+    assert "FAILED_EXECUTION=0002" in lines
+    assert "FAILED_GROUP=0002" in lines
+    assert not any(line.startswith("FAILED_LOG=") for line in lines)
+
+
+def test_failed_batch_status_reports_the_first_failure_in_manifest_order(checkout):
+    batch = failed_batch(checkout, "FAILED", "FAILED")
+    lines = status_lines(checkout, batch)
+    assert [line for line in lines if line.startswith("FAILED_")] == [
+        "FAILED_EXECUTION=0001",
+        "FAILED_GROUP=0001",
+    ]
+    assert "EXECUTIONS_FAILED=2" in lines
+
+
+@pytest.mark.parametrize("cells", [("SUCCESS", "SUCCESS"), ("PENDING", "RUNNING")])
+def test_batch_status_without_failures_has_no_failed_keys(checkout, cells):
+    batch = failed_batch(checkout, *cells)
+    write_cell_logs(batch, "0001", "0002")
+    lines = status_lines(checkout, batch)
+    assert not any(line.startswith("FAILED_") for line in lines)
 
 
 MANIFEST = "batch-manifest.tsv"
@@ -697,7 +796,7 @@ def test_a_target_is_never_named_by_env_sh(checkout):
     batch = batch_dir(created.stdout)
     plain = launch(checkout, MD, "--append", batch, *ARGS[MD])
     assert plain.returncode == 0, plain.stderr
-    assert f"{GROUP_TARGET}=env-name\n" in plain.stdout
+    assert f"{GROUP}_0003_TARGET=env-name\n" in plain.stdout
 
 
 def test_overrides_apply_to_every_target_after_that_groups_target(checkout):
@@ -772,8 +871,8 @@ def test_retry_replaces_uncommitted_debris_for_every_new_group(checkout):
     assert not list(batch.glob("groups/*/debris"))
 
 
-def test_single_group_publication_prints_both_key_shapes(checkout):
-    """One group keeps the legacy key and also gets its own per-group key."""
+def test_single_group_publication_prints_its_per_group_key(checkout):
+    """One group gets its own per-group key, as each of several groups does."""
     vendor_a, _ = two_targets(checkout)
     for arguments, name in (((), "/data/one"), (("--target", vendor_a), "vendor-a")):
         result = launch(checkout, IO, "--batch", *arguments, *ARGS[IO])
@@ -782,11 +881,9 @@ def test_single_group_publication_prints_both_key_shapes(checkout):
         assert keys == [
             "STORAGE_SCALE_TEST_BATCH_RESULTS",
             GROUP,
-            GROUP_TARGET,
             f"{GROUP}_0001_TARGET",
             "STORAGE_SCALE_TEST_BATCH_EXECUTIONS",
         ]
-        assert f"{GROUP_TARGET}={name}\n" in result.stdout
         assert f"{GROUP}_0001_TARGET={name}\n" in result.stdout
         # Remove the batch so the second pass has a fresh results directory.
         for path in (checkout / "results").glob("filesystem-batch-*"):
@@ -929,3 +1026,65 @@ def test_kubernetes_preflight_without_the_claim_preflight_is_a_clear_error(check
     result = preflight(checkout, batch, "unset -f kubectl_batch_preflight")
     assert result.returncode != 0
     assert "kubectl_batch_preflight) is unavailable" in result.stderr
+
+
+@pytest.mark.parametrize("entry", [IO, MD])
+def test_help_wins_over_batch_and_a_missing_env_sh_is_explained(checkout, entry):
+    """--batch --help prints usage; a missing env.sh names the template."""
+    result = launch(checkout, entry, "--batch", "--help")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("Usage: ")
+    (checkout / "env.sh").unlink()
+    for arguments in (("--batch", *ARGS[entry]), ARGS[entry]):
+        result = launch(checkout, entry, *arguments)
+        assert result.returncode == 1
+        assert result.stderr.endswith(
+            "\nError: env.sh not found; copy env.sh.template to env.sh and edit it\n"
+        )
+
+
+def test_kubernetes_target_errors_name_the_target_file(checkout):
+    """Of several --target files, the one with a bad claim key is named."""
+    with (checkout / "env.sh").open("a") as environment:
+        environment.write(
+            "\nexport EXECUTION_SUBSTRATE=kubectl\n"
+            'TEST_DIRS=(["test-pvc:data/one"]=1)\n'
+            "export KUBECTL_NAMESPACE=test-ns\n"
+            "export KUBECTL_NODE_SELECTOR=benchmark=true\n"
+        )
+    good = target_file(checkout, "good.env", 'TEST_DIRS=(["test-pvc:data/a"]=1)\n')
+    bad = target_file(checkout, "bad.env", 'TEST_DIRS=(["/data/b"]=1)\n')
+    result = launch(
+        checkout, IO, "--batch", "--target", good, "--target", bad, *ARGS[IO]
+    )
+    assert result.returncode != 0
+    assert f"Error: invalid target file: {bad}" in result.stderr
+    assert f"invalid target file: {good}" not in result.stderr
+
+
+def test_mdtest_resume_of_a_snapshot_without_substrate_explains(checkout, tmp_path):
+    results = tmp_path / "mdtest-elbencho-20260101Z000000"
+    (results / "executions").mkdir(parents=True)
+    (results / "env_used.sh").write_text("TEST_DIRS=()\n")
+    result = launch(checkout, MD, "--resume", results)
+    assert result.returncode == 1
+    assert "saved EXECUTION_SUBSTRATE is missing or unsupported: unset" in result.stderr
+    missing = launch(checkout, MD, "--resume", tmp_path / "absent")
+    assert f"results directory not found: {tmp_path / 'absent'}" in missing.stderr
+
+
+def test_delete_only_names_the_supported_substrates(checkout):
+    with (checkout / "env.sh").open("a") as environment:
+        # Appended after env_base.sh ran, so clear the selectors it derived.
+        environment.write(
+            "\nexport EXECUTION_SUBSTRATE=kubectl SSH_ENABLED= SLURM_ENABLED=\n"
+            'TEST_DIRS=(["test-pvc:data/one"]=1)\n'
+            "export KUBECTL_NAMESPACE=test-ns\n"
+            "export KUBECTL_NODE_SELECTOR=benchmark=true\n"
+        )
+    result = launch(checkout, IO, "--delete-only", "test-pvc:data/one/old")
+    assert result.returncode == 1
+    assert (
+        "--delete-only supports EXECUTION_SUBSTRATE=ssh or slurm (current: kubectl)"
+        in result.stderr
+    )

@@ -726,7 +726,8 @@ def test_omnibus_report_preserves_tables_with_each_saved_environment(
 TARGET_SNAPSHOTS = {
     "0001": "STORAGE_TARGET_NAME: lustre-a\n",
     "0002": 'TEST_DIRS:\n  "/mnt/x/": 1\n  "/mnt/w": 1\n',
-    "0003": 'STORAGE_TARGET_NAME: "a|b"\n',
+    # A recorded name may itself contain " (derived)".
+    "0003": 'STORAGE_TARGET_NAME: "a|b (derived)/c"\n',
     "0004": "TEST_ROOT: /saved/0004\n",
 }
 
@@ -761,14 +762,14 @@ def test_index_and_omnibus_name_each_groups_storage_target(tmp_path):
     assert rows == {
         "0001": "lustre-a",
         "0002": "/mnt/w,/mnt/x (derived)",
-        "0003": "a\\|b",
+        "0003": "a\\|b (derived)/c",
         "0004": "unknown",
     }
     combined = (manifest.root / "reports.txt").read_text(encoding="utf-8")
     for header in (
         'Group 0001 (io) target: "lustre-a"\n',
-        'Group 0002 (mdtest) target: "/mnt/w,/mnt/x (derived)"\n',
-        'Group 0003 (io) target: "a|b"\n',
+        'Group 0002 (mdtest) target: "/mnt/w,/mnt/x" (derived)\n',
+        'Group 0003 (io) target: "a|b (derived)/c"\n',
         'Group 0004 (mdtest) target: "unknown"\n',
     ):
         assert header in combined

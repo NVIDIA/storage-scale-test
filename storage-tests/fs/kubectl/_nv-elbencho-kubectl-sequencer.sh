@@ -15,12 +15,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kubernetes sequencer: start suspended coordinator Jobs one storage target at
-# a time. Arguments are NAMESPACE JOB_NAME JOB_UID triples in target order.
+# Kubernetes sequencer: start suspended coordinator Jobs one namespace segment
+# at a time. Arguments are NAMESPACE JOB_NAME JOB_UID triples in segment order.
 # Progress is derived from live Job state on every start, so a restarted
 # sequencer resumes at the first Job that is not Complete. Plain POSIX sh: it
 # runs as `sh FILE ARGS` or `sh -c SCRIPT NAME ARGS` in a kubectl image.
-# Exit: 0 all complete or a target Failed, 2 bad input, 3 Job gone (the API
+# Exit: 0 all complete or a segment Failed, 2 bad input, 3 Job gone (the API
 # server answered NotFound), 4 UID changed, 5 a required command (kubectl,
 # grep, sleep) is missing or cannot run, or the in-cluster ServiceAccount
 # credentials are missing.
@@ -28,7 +28,8 @@
 set -u
 
 POLL=${KUBECTL_SEQUENCER_POLL_SECONDS:-10}
-TIMEOUT=${KUBECTL_SEQUENCER_REQUEST_TIMEOUT_SECONDS:-30}
+# Seconds for each API request (kubectl --request-timeout).
+TIMEOUT=30
 JSONPATH='jsonpath={.metadata.uid}{"|"}{.spec.suspend}{"|"}{range .status.conditions[?(@.status=="True")]}{.type}{","}{end}'
 NL='
 '
@@ -147,9 +148,9 @@ unsuspend() {
         '[{"op":"test","path":"/metadata/uid","value":"'"$3"'"},{"op":"replace","path":"/spec/suspend","value":false}]'
 }
 
-# run_target INDEX NS NAME UID: returns once the Job is Complete.
-run_target() {
-    tgt="target $1 (Job $2/$3)"
+# run_segment INDEX NS NAME UID: returns once the Job is Complete.
+run_segment() {
+    seg="segment $1 (Job $2/$3)"
     patched=0
     while :; do
         observe "$2" "$3"
@@ -163,29 +164,29 @@ run_target() {
             case $OBS_ERR in
             *"Error from server (NotFound)"*) die 3 "Job $2/$3 no longer exists" ;;
             esac
-            warn "warning: cannot observe $tgt; retrying: $OBS_ERR"
+            warn "warning: cannot observe $seg; retrying: $OBS_ERR"
         elif ! parse_state; then
-            warn "warning: unexpected state for $tgt; retrying: $OBS_OUT"
+            warn "warning: unexpected state for $seg; retrying: $OBS_OUT"
         else
             [ "$OBS_UID" = "$4" ] ||
-                die 4 "identity mismatch for $tgt: expected UID $4, found '$OBS_UID'"
+                die 4 "identity mismatch for $seg: expected UID $4, found '$OBS_UID'"
             case $OBS_CONDITIONS in
             *,Complete,*)
-                info "$tgt complete"
+                info "$seg complete"
                 return 0
                 ;;
             *,Failed,*)
-                info "$tgt failed; later targets will not start"
+                info "$seg failed; later segments will not start"
                 exit 0
                 ;;
             esac
             if [ "$OBS_SUSPEND" = true ] && [ "$patched" = 0 ]; then
-                info "starting $tgt"
+                info "starting $seg"
                 if unsuspend "$2" "$3" "$4"; then
                     patched=1
                     continue
                 fi
-                warn "warning: unsuspend of $tgt failed; will re-observe"
+                warn "warning: unsuspend of $seg failed; will re-observe"
             fi
         fi
         patched=0
@@ -196,15 +197,13 @@ run_target() {
 require_commands
 in_range "$POLL" 3600 ||
     die 2 "KUBECTL_SEQUENCER_POLL_SECONDS must be an integer 1..3600: $POLL"
-in_range "$TIMEOUT" 3600 ||
-    die 2 "KUBECTL_SEQUENCER_REQUEST_TIMEOUT_SECONDS must be an integer 1..3600: $TIMEOUT"
 validate_args "$@"
 use_service_account_kubeconfig
 
 index=0
 while [ "$#" -gt 0 ]; do
-    run_target "$index" "$1" "$2" "$3"
+    run_segment "$index" "$1" "$2" "$3"
     index=$((index + 1))
     shift 3
 done
-info "all targets complete"
+info "all segments complete"

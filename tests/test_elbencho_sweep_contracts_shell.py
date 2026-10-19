@@ -104,6 +104,23 @@ def test_cartesian_reification_has_stable_order_and_rotation(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+def test_reification_refuses_more_than_9999_executions(tmp_path):
+    """Plain IO sweeps share the ledger's 9999-execution limit, checked first."""
+    result = _run_bash(f"""
+        source "{_ENV_FUNCTIONS}"
+        source "{_ELBENCHO_FUNCTIONS}"
+        ELBENCHO_SCALE_IO_SIZES=(4K 8K 16K 32K 64K 128K 256K 512K 1M 2M)
+        ELBENCHO_SCALE_THREAD_LIST=($(seq 1 10))
+        ELBENCHO_IODEPTH_LIST=($(seq 1 10))
+        mkdir -p "{tmp_path}/result"
+        reify_all_elbencho_executions \\
+            "{tmp_path}/result" 1-10 dio 0 0 0 0 '' && exit 9
+        [[ ! -e "{tmp_path}/result/executions" ]]
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "exceeds the 9999-execution ledger limit" in result.stderr
+
+
 def test_env_precedence_selects_test_dirs_ssh_and_order_aliases(tmp_path):
     """Populated TEST_DIRS wins and SSH disables otherwise valid Slurm state."""
     hosts = tmp_path / "hosts"

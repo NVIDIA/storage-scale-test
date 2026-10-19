@@ -456,9 +456,8 @@ _elbencho_batch_group_relative() {
 
 # Print the publication keys. Every published group gets
 # "GROUP_<gid>_TARGET=<effective target name>" (mirroring the GROUP_<NNNN>_TARGET
-# status keys). Exactly one group also keeps the historical
-# "GROUP_TARGET=<effective target name>" line. Several groups (one per --target
-# file) add GROUPS; GROUP names the first group and EXECUTIONS spans all of them.
+# status keys). Several groups (one per --target file) add GROUPS; GROUP names
+# the first group and EXECUTIONS spans all of them.
 _elbencho_batch_print_publication() {
     local root="$1" ds="$2" kind="$3" first="$4" last="$5" gid target prefix=STORAGE_SCALE_TEST_BATCH
     shift 5
@@ -466,7 +465,6 @@ _elbencho_batch_print_publication() {
     [[ $# -eq 1 ]] || printf '%s_GROUPS=%s\n' "$prefix" "$(IFS=,; printf '%s' "$*")"
     for gid in "$@"; do
         target=$(_elbencho_batch_group_target "$root/$(_elbencho_batch_group_relative "$gid" "$kind" "$ds")")
-        [[ $# -ne 1 ]] || printf '%s_GROUP_TARGET=%q\n' "$prefix" "$target"
         printf '%s_GROUP_%s_TARGET=%q\n' "$prefix" "$gid" "$target"
     done
     printf '%s_EXECUTIONS=%04d-%04d\n' "$prefix" "$first" "$last"
@@ -611,6 +609,10 @@ _elbencho_batch_prepare() (
     # RESULTS_DIR is initialized by env.sh, not by this helper's caller.
     # shellcheck disable=SC2153
     local base="${SCRIPT_DIR}/../.." root work stage ds token="" rc=0 index
+    [[ -f "$base/env.sh" ]] || {
+        echo "Error: env.sh not found; copy env.sh.template to env.sh and edit it" >&2
+        exit 1
+    }
     source "$base/env.sh" || exit 1
     source "$base/lib/_elbencho_functions.sh" || exit 1
     local -a targets=() stages=()
@@ -732,16 +734,40 @@ _elbencho_batch_print_group_targets() {
     done < "$root/batch-manifest.tsv"
 }
 
+# Print FAILED_EXECUTION=ID, then FAILED_GROUP for a batch and FAILED_LOG when
+# LOG is a file: where to start investigating a failed cell.
+elbencho_print_failed_execution() {
+    local root="$1" id="$2" log="${3:-}" group=""
+    [[ "$id" =~ ^[0-9]{4}$ ]] || return 1
+    printf 'FAILED_EXECUTION=%s\n' "$id"
+    if [[ -f "$root/batch-manifest.tsv" ]]; then
+        group=$(awk -F '\t' -v id="$id" '$1=="execution" && $2==id {print $3; exit}' \
+            "$root/batch-manifest.tsv") || return 1
+        [[ -z "$group" ]] || printf 'FAILED_GROUP=%s\n' "$group"
+    fi
+    [[ -z "$log" || ! -f "$log" ]] || printf 'FAILED_LOG=%q\n' "$log"
+}
+
+# The newest regular file among the arguments (unmatched globs are skipped).
+elbencho_newest_file() {
+    local newest="" candidate
+    for candidate in "$@"; do
+        [[ -f "$candidate" && ! -L "$candidate" ]] || continue
+        [[ -n "$newest" && ! "$candidate" -nt "$newest" ]] || newest="$candidate"
+    done
+    printf '%s' "$newest"
+}
+
 _elbencho_batch_status() {
     local root="$1" batch=DRAFT state=NOT_STARTED next=START id value
-    local pending=0 running=0 success=0 failed=0 active=1
+    local pending=0 running=0 success=0 failed=0 active=1 failed_id=""
     while IFS= read -r id; do
         value=$(< "$root/executions/$id.status") || return 1
         case "$value" in
             PENDING) pending=$((pending + 1)) ;;
             RUNNING) running=$((running + 1)) ;;
             SUCCESS) success=$((success + 1)) ;;
-            FAILED) failed=$((failed + 1)) ;;
+            FAILED) failed=$((failed + 1)); failed_id=${failed_id:-$id} ;;
             *) _elbencho_batch_error "invalid execution status: $id"; return 1 ;;
         esac
     done < <(awk -F '\t' '$1=="execution" {print $2}' "$root/batch-manifest.tsv")
@@ -752,10 +778,6 @@ _elbencho_batch_status() {
         fi
         if (( active == 0 )); then
             state=RUNNING next=WAIT
-            if (( running == 0 )); then
-                state=BETWEEN_EXECUTIONS
-                (( pending > 0 )) || state=AWAITING_COMPLETION
-            fi
         elif (( active == 2 )); then
             state=UNKNOWN next=INSPECT
         elif (( pending + running + failed == 0 )); then
@@ -769,6 +791,9 @@ _elbencho_batch_status() {
         "$((pending + running + success + failed))" "$pending" "$running"
     printf 'EXECUTIONS_SUCCEEDED=%s\nEXECUTIONS_FAILED=%s\n' "$success" "$failed"
     printf 'RESULT_COLLECTION=NOT_REQUIRED\nNEXT_ACTION=%s\n' "$next"
+    # SSH and Slurm dispatch keep each cell's console output beside its status.
+    [[ -z "$failed_id" ]] || elbencho_print_failed_execution "$root" "$failed_id" \
+        "$root/executions/$failed_id.log" || return 1
     _elbencho_batch_print_group_targets "$root"
 }
 
@@ -971,6 +996,7 @@ elbencho_batch_cli_route() {
     while [[ $# -gt 0 ]]; do
         argument="$1"
         case "$argument" in
+            -h|--help) return 2 ;;  # The launcher prints its usage.
             --batch)
                 _elbencho_batch_check_operation "$operation" "$argument" || return 1
                 if [[ $# -gt 1 && -n "$2" && "$2" != -* ]]; then

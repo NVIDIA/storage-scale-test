@@ -60,6 +60,7 @@ body:
       options:
         - Slurm
         - Passwordless SSH
+        - Kubernetes (kubectl)
         - Local analysis or reporting only
         - Not applicable
     validations:
@@ -92,8 +93,8 @@ body:
       description: |
         Include relevant controller and client OS/architecture, Python version,
         client count and topology, storage type, benchmark binary versions, and
-        Slurm version or SSH details. Do not include secrets or internal system
-        identifiers.
+        Slurm version, SSH details, or Kubernetes and CSI driver versions. Do
+        not include secrets or internal system identifiers.
     validations:
       required: true
 

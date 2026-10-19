@@ -46,6 +46,7 @@ if __name__ == "__main__":
     prepare_report_runtime(__file__, summarize_elbencho_parser)
 
 from lib.env_used_yaml import load_env_used_yaml
+from lib.filesystem_batch import is_batch_directory
 from lib.storage_target import storage_target_from_env, test_dirs_target_name
 
 _DS_TAIL_RE = re.compile(r"^elbencho-(\d{8}Z\d{6})$")
@@ -489,6 +490,14 @@ def _summarize_directory(path: str) -> Optional[Tuple[str, str, str]]:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = summarize_elbencho_parser()
     args = parser.parse_args(argv)
+    for path in args.directories:
+        if os.path.isdir(path) and is_batch_directory(path):
+            _eprint(
+                f"Error: {path} is a batch results directory, not one results "
+                "directory; pass a results directory under its groups/ "
+                "subdirectory, or report the batch with utils/extract-filesystem.py"
+            )
+            return 2
     sorted_dirs = sorted(args.directories, key=_sort_key)
     blocks: List[str] = []
     for path in sorted_dirs:

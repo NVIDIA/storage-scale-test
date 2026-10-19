@@ -410,8 +410,8 @@ _elbencho_run_to_completion_target_count
         assert expected in result.stderr
 
 
-def _native_harness(root):
-    return _harness(root) + f"""
+def _native_harness(root, **options):
+    return _harness(root, **options) + f"""
 run_an_elbencho() {{
     local phase=mkdir arg
     for arg in "$@"; do
@@ -454,6 +454,52 @@ def test_native_run_to_completion_write_and_read_complete_exact_dataset(
     )
     assert result.returncode == 0, result.stderr
     _assert_native_totals(tmp_path, 8)
+
+
+def test_buffered_random_write_stays_aligned_but_read_does_not(tmp_path):
+    """Worker directories: only the buffered read keeps --norandalign."""
+    result = _run(
+        _harness(tmp_path, access="bio")
+        + "use_random=1\nrun_elbencho_io_sweep_iteration\n"
+    )
+    assert result.returncode == 0, result.stderr
+    calls = (tmp_path / "calls").read_text().splitlines()
+    write = next(line for line in calls if line.startswith("--write")).split()
+    read = next(line for line in calls if "--read " in line).split()
+    assert "--rand" in write and "--norandalign" not in write
+    assert "--rand" in read and "--norandalign" in read
+
+
+def test_shared_directory_random_write_stays_aligned_but_read_does_not():
+    """Only the read phase keeps buffered IO's --norandalign."""
+    result = _run(f"""
+source {shlex.quote(str(_FUNCTIONS))}
+node_count=1
+_elbencho_shared_build_phase_args mkdir write read 4K 4K 2 w.json r.json 1 1 \\
+    --threads=2 --norandalign
+printf 'write %s\\nread %s\\n' "${{write[*]}}" "${{read[*]}}"
+""")
+    assert result.returncode == 0, result.stderr
+    write, read = result.stdout.splitlines()
+    assert "--rand" in write.split() and "--norandalign" not in write.split()
+    assert "--rand" in read.split() and "--norandalign" in read.split()
+
+
+@_NATIVE_ONLY
+def test_native_buffered_random_write_fills_every_file(tmp_path):
+    """Buffered random writes stay block-aligned, so every file reaches --size.
+
+    Unaligned random offsets can repeat and leave a file short; the random read
+    then fails with an unexpected short read past the file's end.
+    """
+    result = _run(_native_harness(tmp_path, access="bio") + """
+use_random=1 io_size=4K ELBENCHO_FILE_SIZE=256K
+run_elbencho_io_sweep_iteration
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    files = [path for path in (tmp_path / "target").rglob("*") if path.is_file()]
+    assert files
+    assert {path.stat().st_size for path in files} == {256 * 1024}
 
 
 @_NATIVE_ONLY

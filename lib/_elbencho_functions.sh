@@ -1416,6 +1416,22 @@ _elbencho_io_append_rotated_hosts_for_read() {
     fi
 }
 
+# _elbencho_io_aligned_write_args OUT COMMON_ARGS...: COMMON_ARGS without
+# --norandalign. Random writes stay block-aligned even for buffered IO:
+# elbencho's default random algorithm then writes each block of a file exactly
+# once, so the file reaches --size. Unaligned random writes can repeat offsets
+# and leave a file short, and a later random read then fails past its end.
+# Reads keep buffered IO's unaligned offsets.
+_elbencho_io_aligned_write_args() {
+    local -n aligned_ref="$1"
+    shift
+    local arg
+    aligned_ref=()
+    for arg in "$@"; do
+        [[ "$arg" == --norandalign ]] || aligned_ref+=("$arg")
+    done
+}
+
 # Completion-based reads never use a benchmark deadline or wrap around.
 _elbencho_io_append_read_policy() {
     local -n read_policy_args="$1"
@@ -2987,8 +3003,10 @@ _elbencho_shared_build_phase_args() {
     shift 10
     # shellcheck disable=SC2034  # Nameref assignments update runner arrays.
     mkdir_ref=(--mkdirs "$@" --dirs=0 --files="$files_per_worker")
+    local -a write_common_args
+    _elbencho_io_aligned_write_args write_common_args "$@"
     # shellcheck disable=SC2034  # Nameref assignments update runner arrays.
-    write_ref=(--write --block="$write_size" --nocsvlabels "$@"
+    write_ref=(--write --block="$write_size" --nocsvlabels "${write_common_args[@]}"
         --dirs=0 --files="$files_per_worker" --jsonfile="$write_json")
     # shellcheck disable=SC2034  # Nameref assignments update runner arrays.
     read_ref=(--nocsvlabels --read --block="$read_size" "$@"
@@ -3361,11 +3379,13 @@ run_elbencho_io_sweep_iteration() {
         --mkdirs
         "${common_args[@]}"
     )
+    local -a write_common_args
+    _elbencho_io_aligned_write_args write_common_args "${common_args[@]}"
     local elbencho_write_args=(
         --write
         --block="$this_write_size"
         --nocsvlabels
-        "${common_args[@]}"
+        "${write_common_args[@]}"
     )
     # --read-from runs only this read phase; include CSV column labels so extract-elbencho.py
     # can parse (nocsvlabels would emit headerless CSV and break DictReader).
@@ -3761,6 +3781,12 @@ reify_all_elbencho_executions() {
     mapfile -t node_counts <<<"$node_counts_output"
     if [[ ${#node_counts[@]} -eq 0 ]]; then
         echo "Error: Node specification produced no node counts" >&2
+        return 1
+    fi
+    # One cell per node count, IO size, thread count, and IO depth.
+    if (( ${#node_counts[@]} * ${#ELBENCHO_SCALE_IO_SIZES[@]} \
+            * ${#ELBENCHO_SCALE_THREAD_LIST[@]} * ${#ELBENCHO_IODEPTH_LIST[@]} > 9999 )); then
+        echo "Error: sweep exceeds the 9999-execution ledger limit" >&2
         return 1
     fi
 

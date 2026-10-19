@@ -17,28 +17,26 @@
 
 Standard library only: ``--help`` of the reporters must work before any
 third-party dependency is available. ``storage_target_name_default`` in
-``lib/env_functions.sh`` implements the same identity rule; a parity test keeps
-the two in agreement.
+``lib/env_functions.sh`` implements rule 2 below; a parity test keeps the two
+in agreement.
 
 Identity rule, first match wins:
 
 1. ``STORAGE_TARGET_NAME`` is non-empty: that name (a *recorded* name).
-2. kubectl substrate with ``KUBECTL_NAMESPACE`` and ``KUBECTL_PVC`` (a
-   snapshot written before v2.0.0): ``<namespace>/<pvc>``.
-3. ``TEST_DIRS`` keys, trailing ``/`` stripped, deduplicated, sorted by UTF-8
+2. ``TEST_DIRS`` keys, trailing ``/`` stripped, deduplicated, sorted by UTF-8
    bytes, joined with ``,``. On the kubectl substrate, when every key is a
    valid claim-qualified root (``[namespace/]claim:path``), each key is first
    normalized to ``<namespace>/<claim>:<path>``, the namespace defaulting to
    ``KUBECTL_NAMESPACE``.
-4. Otherwise the target is unknown.
+3. Otherwise the target is unknown.
 
 Snapshots written by the current shell tooling always carry the effective name:
-when ``STORAGE_TARGET_NAME`` is unset, the shell derives rules 2 and 3 and
-stores the result in ``STORAGE_TARGET_NAME`` before saving, so those snapshots
-are all *recorded* (rule 1). Rules 2 and 3 are applied here only to snapshots
-that lack the name (written before the feature existed, or edited by hand);
-their names are marked *derived* (``recorded=False``) because the snapshot
-never stated them.
+when ``STORAGE_TARGET_NAME`` is unset, the shell derives it from ``TEST_DIRS``
+(rule 2) and stores it in ``STORAGE_TARGET_NAME`` before saving, so those
+snapshots are *recorded* (rule 1). Rule 2 is applied here only to
+snapshots that lack the name (written before the feature existed, or edited by
+hand); their names are marked *derived* (``recorded=False``) because the
+snapshot never stated them.
 
 Cached-report target cells (the ``storage_target_name`` CSV column) hold:
 
@@ -68,7 +66,6 @@ UNKNOWN_ITEM = UNKNOWN_TARGET
 _SUBSTRATE_KEY = "EXECUTION_SUBSTRATE"
 _KUBECTL = "kubectl"
 _NAMESPACE_KEY = "KUBECTL_NAMESPACE"
-_PVC_KEY = "KUBECTL_PVC"
 _TEST_DIRS_KEY = "TEST_DIRS"
 _SEPARATOR = ", "
 _RESERVED_COMPONENT = ".storage-scale-test"
@@ -101,7 +98,7 @@ def _text(env: Mapping, key: str) -> str:
 
 
 def test_dirs_target_name(env: Mapping) -> str | None:
-    """Name from the TEST_DIRS roots alone (rule 3), or None without roots."""
+    """Name from the TEST_DIRS roots alone (rule 2), or None without roots."""
     test_dirs = env.get(_TEST_DIRS_KEY)
     if not isinstance(test_dirs, Mapping):
         return None
@@ -157,7 +154,7 @@ def qualified_root(key: str, default_namespace: str) -> str | None:
 
 
 def _qualified_roots_name(env: Mapping) -> str | None:
-    """Rule 3 for kubectl: the normalized claim-qualified roots, when all are."""
+    """Rule 2 for kubectl: the normalized claim-qualified roots, when all are."""
     test_dirs = env.get(_TEST_DIRS_KEY)
     if not isinstance(test_dirs, Mapping) or not test_dirs:
         return None
@@ -172,11 +169,7 @@ def default_storage_target_name(env: Mapping | None) -> str | None:
     """Derive the name from the substrate or the roots, ignoring any explicit name."""
     if not isinstance(env, Mapping):
         return None
-    namespace = _text(env, _NAMESPACE_KEY)
-    claim = _text(env, _PVC_KEY)
     if _text(env, _SUBSTRATE_KEY) == _KUBECTL:
-        if namespace and claim:
-            return f"{namespace}/{claim}"
         qualified = _qualified_roots_name(env)
         if qualified is not None:
             return qualified
@@ -222,12 +215,20 @@ def mixed_target_label(names: Iterable[str], include_unknown: bool = False) -> s
     return MIXED_PREFIX + _SEPARATOR.join(items)
 
 
-def _mixed_error(by_name: dict[str, list[str]]) -> MixedStorageTargetsError:
+def _mixed_error(
+    by_name: dict[str, list[str]], derived: set[str]
+) -> MixedStorageTargetsError:
     lines = ["inputs come from different storage targets:"]
     lines.extend(
-        f"  {quote_target_name(name)}: {_SEPARATOR.join(labels)}"
+        f"  {quote_target_name(name)}{' (derived)' if name in derived else ''}: "
+        f"{_SEPARATOR.join(labels)}"
         for name, labels in by_name.items()
     )
+    if derived:
+        lines.append(
+            "(derived: results saved before v2.0.0 have no STORAGE_TARGET_NAME; "
+            "the name comes from their TEST_DIRS)"
+        )
     lines.append(f"report each target separately or pass {ALLOW_MIXED_TARGETS_FLAG}")
     return MixedStorageTargetsError("\n".join(lines))
 
@@ -246,17 +247,20 @@ def resolve_report_target(
     """
     by_name: dict[str, list[str]] = {}
     unknown: list[str] = []
+    derived: set[str] = set()
     for label, value in sources:
         name = _known_name(value)
         if name is None:
             unknown.append(label)
-        else:
-            by_name.setdefault(name, []).append(label)
+            continue
+        by_name.setdefault(name, []).append(label)
+        if isinstance(value, StorageTarget) and not value.recorded:
+            derived.add(name)
     names = sorted(by_name, key=lambda name: name.encode("utf-8"))
     by_name = {name: by_name[name] for name in names}
     if len(names) > 1:
         if not allow_mixed:
-            raise _mixed_error(by_name)
+            raise _mixed_error(by_name, derived)
         shown = mixed_target_label(names)
         detail = _SEPARATOR.join(
             f"{quote_target_name(name)} ({_SEPARATOR.join(labels)})"

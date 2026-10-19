@@ -46,7 +46,7 @@ A few tests build with real Docker BuildKit on the fixture's digest-pinned
 base images. Without Docker, or when a pinned base is not already present
 locally, they skip. `CI_REQUIRE_DOCKER=1` (set by the CI pytest job) makes
 them pull and verify the pinned bases and fail rather than skip.
-On macOS, unit tests require Bash 4.3 or newer and GNU coreutils; install both
+On macOS, unit tests require Homebrew's Bash and GNU coreutils; install both
 with `brew install bash coreutils` and put Homebrew's bin directory first on
 `PATH`.
 

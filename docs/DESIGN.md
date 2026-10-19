@@ -17,7 +17,7 @@ limitations under the License.
 
 # NVIDIA Storage Scale Test — Design Document
 
-**Last Updated**: 2026-10-11\
+**Last Updated**: 2026-10-16\
 **Status**: Documents the design and architecture of the existing implementation.
 
 ---
@@ -182,7 +182,7 @@ compatibility. This design means:
 | Warp | `WARP_THREAD_LIST`, `WARP_OBJ_SIZES`, PUT/GET durations | Object storage sweep parameters |
 | Netbench | `NETBENCH_THREADS`, `NETBENCH_HOST_NIC_GBPS`, `NETBENCH_TARGET_RUNTIME` | Network test parameters |
 | Slurm extras | `SLURM_JOB_NAME_PREFIX`, `SLURM_EXTRA_ARGS`, `SLURM_EXCLUSIVE_USER`, `SLURM_NODE_IGNORES`, `SLURM_NODE_INCLUDES`, `SLURM_JOB_POLL_INTERVAL_SECONDS` | Slurm job customization |
-| Kubernetes | `KUBECTL_NAMESPACE`, `KUBECTL_NODE_SELECTOR`, `KUBECTL_ELBENCHO_IMAGE`, `KUBECTL_RUN_AS_USER`, `KUBECTL_RUN_AS_GROUP`, `KUBECTL_SEQUENCER_IMAGE` | Default namespace for `TEST_DIRS` claims (optional when every key names its namespace), eligible nodes, image (defaults to the pinned elbencho release), workload identity, and an optional digest-pinned override (for a mirror) of the default sequencer image that batches spanning namespaces run |
+| Kubernetes | `KUBECTL_NAMESPACE`, `KUBECTL_NODE_SELECTOR`, `KUBECTL_ELBENCHO_IMAGE`, `KUBECTL_IMAGE_PULL_POLICY`, `KUBECTL_RUN_AS_USER`, `KUBECTL_RUN_AS_GROUP`, `KUBECTL_SEQUENCER_IMAGE`, `KUBECTL_SEQUENCER_PROBE_TIMEOUT_SECONDS` | Default namespace for `TEST_DIRS` claims (optional when every key names its namespace), eligible nodes, image (defaults to the pinned elbencho release) and pull policy, workload identity, an optional digest-pinned override (for a mirror) of the default sequencer image that batches spanning namespaces run, and how long `validate_env.sh` waits for its sequencer checks |
 
 ### 3.3 Defaults and Compatibility
 
@@ -216,14 +216,26 @@ edit-validate loop:
    | Binary architecture match | `file` on binary vs. the probe's `uname -m` (srun's on Slurm, one SSH session's otherwise) |
    | Filesystem paths use storage distinct from `/` | The same probe compares `stat -c %d` device IDs for every root on one node per probe |
    | Filesystem paths are writable | `test -w` in the same probe |
-   | Kubernetes prerequisites | Claim-qualified `TEST_DIRS` keys; API access and Lease permission in the namespace of `env.sh`'s `TEST_DIRS`; per-claim identity (Bound, RWX, Filesystem volume mode; bound PV recorded); Ready nodes matching `KUBECTL_NODE_SELECTOR`; one short-lived Job that mounts all of its claims and checks the image, UID/GID, required tools, and read/write per root; sequencer version, RBAC, and image pull as warnings, and with `--sequencer` the full probe as errors (one namespace needs none of them) |
+   | Kubernetes prerequisites | Claim-qualified `TEST_DIRS` keys; `kubectl`, `flock`, and an active kubectl context; API access and Lease permission in the namespace of `env.sh`'s `TEST_DIRS`, which must carry the `kubernetes.io/metadata.name` label (Kubernetes 1.21+); per-claim identity (Bound, RWX, Filesystem volume mode; reports its bound PV); Ready nodes matching `KUBECTL_NODE_SELECTOR`; one short-lived Job that mounts all of its claims and checks the image, UID/GID, required tools, and read/write per root; sequencer server version (1.24+), RBAC, and image as warnings, and with `--sequencer` the full probe as errors (one namespace needs none of them) |
    | Existing toolset Kubernetes objects | Read-only listing of objects labeled `app.kubernetes.io/name=storage-scale-test`; informational (may warn), never fails validation |
    | S3 credentials and bucket access | `s3test` binary |
    | S3 bucket emptiness | Object count check (warning if non-empty) |
    | Elbencho parameters | Thread list integers, IO sizes valid, duration valid |
 
 3. **Execution-mode-aware.** Validation uses Slurm, SSH, or kubectl to check
-   remote nodes, matching the mode that benchmarks will actually use.
+   remote nodes, matching the mode that benchmarks will actually use: one
+   `sbatch` job and one `srun` step probe on Slurm, one probe session over SSH.
+
+4. **Concise, deterministic output.** Without `--verbose`, passed checks print
+   summary lines, and a failed Kubernetes check saves its full Pod and Job
+   diagnostics under `LOGS_DIR`, printing the path. On Kubernetes the settings
+   and claim identities are checked first, then the owned-object inventory runs
+   alone (so it never lists validation's temporary Jobs), then the sequencer
+   checks and the node and runtime-Job checks run concurrently; their output,
+   errors, and warnings are replayed in a fixed order. The runtime Job stops
+   early when its image cannot start or a claim's mount command fails, and
+   otherwise within about 180 seconds. INT and TERM are forwarded to the
+   concurrent checks, which delete their temporary Jobs before exiting.
 
 **Rationale:** Storage benchmark failures are expensive — a bad configuration
 discovered after a 2-hour run wastes the user's time and Slurm allocation.
@@ -283,10 +295,11 @@ same file given twice.
   and reuses the launcher's concatenated, validated declarations instead of
   re-sourcing the files. Target files are staged the same way with their own
   provenance.
-- **Provenance.** `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILES,SHA256S,FILE_VARIABLES}`
-  arrays record each override file's path, SHA-256, and changed names in
-  application order. The scalars
-  `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}` keep the last file and the union of names. The target file is recorded
+- **Provenance.**
+  `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILES,SHA256S,FILE_VARIABLES}` arrays
+  record each override file's path, SHA-256, and changed names in application
+  order. The scalars `STORAGE_SCALE_TEST_ENV_OVERRIDE_{FILE,SHA256,VARIABLES}`
+  keep the last file and the union of names. The target file is recorded
   separately as `STORAGE_SCALE_TEST_TARGET_FILE{,_SHA256,_VARIABLES}` (§8.1).
 
 ---
@@ -326,10 +339,11 @@ top-level orchestrator (storage-tests/*/nv-*.sh)
     │                       └── source copied libraries and run benchmark phases
     │
     └── kubectl: reserve an attempt on the TEST_DIRS claims and create, per
-                 namespace, owned
+                 namespace segment, owned
                     │
-                    └── worker DaemonSet + coordinator Job; query or collect
-                        the durable asynchronous sweep later
+                    └── worker DaemonSet + coordinator Job (+ one sequencer
+                        Job when segments > 1); query or collect the durable
+                        asynchronous sweep later
 ```
 
 The top-level scripts parse their benchmark-specific flags, validate the
@@ -349,10 +363,12 @@ The number of dispatches is deliberately benchmark-specific:
 | Object storage | One job per node count | One invocation per node count |
 | Network | One job per node count | One invocation per node count |
 
-Kubernetes filesystem IO and metadata each use one asynchronous Job for the
-complete reified sweep; `--status`, `--cancel`, and `--collect` address that
-sweep-level attempt independently of the submitting process lifetime. Object
-and network benchmarks do not use the Kubernetes substrate.
+Kubernetes filesystem IO and metadata submit the complete reified sweep as one
+asynchronous attempt: one coordinator Job per namespace segment (one, unless a
+batch spans namespaces; §4.5), plus a sequencer Job when there are several.
+`--status`, `--cancel`, and `--collect` address that attempt independently of
+the submitting process lifetime. Object and network benchmarks do not use the
+Kubernetes substrate.
 
 ### 4.3 Kubernetes Asynchronous Filesystem IO
 
@@ -411,8 +427,7 @@ sweep can resume the failed cells from the local execution ledger. Coordinator
 loss, endpoint replacement, cancellation, and retry-safe collection are
 treated as recoverable lifecycle events; ownership labels, annotations,
 resource UIDs, and an attempt nonce prevent adopting unrelated objects.
-Attempts started by v1.x use an older identity schema and are not collected by
-v2.0.0; collect them with v1.8.0 before upgrading.
+Attempts started by v1.x use an older identity schema; v2.0.0 refuses them.
 
 A batch whose groups use several namespaces runs one such segment per
 namespace (§4.5).
@@ -461,12 +476,12 @@ is not executable. The existing dispatch-lock ownership checks protect append
 and seal operations.
 
 The common execution environment and host/scheduler-list contents are frozen at
-creation. Group target and workload settings may differ, through `env.sh`
-edits, a `--target` file, or `--env-override` files (§3.5). Start performs
-non-mutating preflight, checks that the manifest revision is unchanged, and
-permanently seals it before external mutation. Submission failure never
-reopens preparation. Every cell restores its own saved configuration in an isolated context. Ordinary
-non-batch layouts and dispatch remain unchanged.
+creation. Group target and workload settings may differ, through `env.sh` edits, a
+`--target` file, or `--env-override` files (§3.5). Start performs non-mutating
+preflight, checks that the manifest revision is unchanged, and permanently
+seals it before external mutation. Submission failure never reopens
+preparation. Every cell restores its own saved configuration in an isolated
+context. Ordinary non-batch layouts and dispatch remain unchanged.
 
 **Storage targets.** A target is one `TEST_DIRS` map, and separate targets
 are separate groups on every substrate. `--target FILE` (§3.5) is the way to
@@ -475,21 +490,25 @@ submit several: N flags publish N groups in command-line order, and
 one dispatch lock with one atomic manifest rename, so a crash never leaves a
 partial target set. Each group's snapshot records a storage target name
 (`STORAGE_TARGET_NAME`, else the sorted `TEST_DIRS` roots joined with `,`,
-normalized to `namespace/claim:path` on Kubernetes; a snapshot written before
-v2.0.0 that records `KUBECTL_PVC` and no name defaults to `<namespace>/<pvc>`).
+normalized to `namespace/claim:path` on Kubernetes).
 `lib/storage_target.py` and `lib/env_functions.sh` share this identity rule,
 and it is metadata only. `--status` reports each group's name as
-`GROUP_<NNNN>_TARGET`. The extractors refuse inputs that name different known
-targets unless `--allow-mixed-targets` is given, and batch reports are per
-group and so per target. See
+`GROUP_<NNNN>_TARGET`. Batch reports are per group and so per target. Only a
+single report whose inputs name different known targets (several results
+directories, or a combined CSV) is refused, unless `--allow-mixed-targets` is
+given. See
 [Testing several filesystems](FILESYSTEM_TESTING.md#testing-several-filesystems).
 
 **Kubernetes segments.** On Kubernetes, `KUBECTL_NAMESPACE` (the default
 namespace for keys), the selector, image, pull policy, UID/GID, and
 sequencer image (as resolved at preparation) are frozen common settings;
 claims vary per group.
-Batch preflight checks every claim. An attempt has one **segment** per
-namespace, in the order each namespace first appears in the batch ledger;
+Batch preflight checks every group's roots and execution paths, and the
+control root; for the namespaces of the cells the next attempt submits, it
+checks claim identity and Lease permission, the 32-claim limit, the sequencer
+settings when they span namespaces, and enough Ready nodes. An attempt has one
+**segment** per namespace (at most 16), in the order each namespace first
+appears in the batch ledger;
 cells run in ledger order within a segment, so execution is namespace-major
 (groups A, B, A, B with A and B in different namespaces run A, A, B, B). A
 segment owns its claims' Leases, one worker DaemonSet and one coordinator Job
@@ -502,27 +521,30 @@ unchanged.
   ServiceAccount, or RBAC.
 - **Several namespaces:** submission creates every segment's Leases, run tree
   and workers, then each coordinator Job suspended, before any cell runs, so a
-  claim that cannot mount fails the submission and rolls back every namespace. A sequencer Job (Kubernetes 1.24 or
-  newer; a pinned default image or a digest-pinned `KUBECTL_SEQUENCER_IMAGE`) unsuspends each Job after
-  its predecessor completes and stops at the first failure. It runs, with its
+  claim that cannot mount fails the submission and rolls back every namespace.
+  A sequencer Job (Kubernetes 1.24 or newer; a pinned default image or a
+  digest-pinned `KUBECTL_SEQUENCER_IMAGE`) unsuspends each Job after its
+  predecessor completes and stops at the first failure. It runs, with its
   ServiceAccount, in the first segment's namespace; its token is the only
   Pod-held API credential, scoped by a Role per namespace (`resourceNames`)
-  and a UID precondition to `get` and `patch` on that attempt's Jobs. The sequencer re-derives progress from Job states, and
-  `--status` performs the same idempotent advance with the user's
-  credentials if the sequencer is lost. `--status` adds `SEGMENT_COUNT`,
-  `SEGMENT_CURRENT`, `SEGMENT_<i>_NAMESPACE`, and `SEGMENT_<i>_STATE`.
-  Worker drift in any unfinished segment fails the whole attempt at once and
-  marks later segments never started; cancellation stops the sequence,
-  acting on the next segment when the running one already succeeded, and
-  never overwrites a finished segment. Collection is refused until the attempt is terminal and
+  and a UID precondition to `get` and `patch` on that attempt's Jobs. The
+  sequencer re-derives progress from Job states, and `--status` performs the
+  same idempotent advance with the user's credentials if the sequencer is
+  lost. `--status` adds `SEGMENT_COUNT`, `SEGMENT_CURRENT`,
+  `SEGMENT_<i>_NAMESPACE`, and `SEGMENT_<i>_STATE` (`i` from 0). Worker drift
+  in any unfinished segment fails the whole attempt at once and marks later
+  segments never started; cancellation stops the sequence, acting on the next
+  segment when the running one already succeeded, and never overwrites a
+  finished segment. Collection is refused until the attempt is terminal and
   publishes an aggregate `run.status` and `run-summary.tsv` at the results
   root beside per-namespace `run-<namespace>.status`,
   `run-summary-<namespace>.tsv`, `startup-error-<namespace>.txt`, and
   `coordinator-loss-<namespace>.tsv`.
   `validate_env.sh` warns when the image does not pull and provide its tools
-  (a short-lived Job, no API call) or the RBAC is missing; `--sequencer` proves
-  the image, token, and RBAC in its namespace by running the real sequencer in
-  a probe Job against absent Jobs, reporting failures as errors.
+  (a short-lived Job, no API call), the server is older than 1.24, or the
+  RBAC is missing; `--sequencer` proves the image, token, and RBAC in its
+  namespace by running the real sequencer in a probe Job against absent Jobs,
+  reporting failures as errors.
 
 The attempt identity lists only segments that own executions, so a resume
 whose remaining cells use one namespace runs without a sequencer. The
@@ -606,7 +628,7 @@ SSH workers are started with `spawn_N_ssh`, and the coordinator is invoked with
 
 | Benchmark | Lifecycle |
 |-----------|-----------|
-| Filesystem IO | Slurm starts elbencho services once on the maximum-sized allocation; SSH starts them once on the usable host pool. Health checks can restart unhealthy services between phases. All services stop when the sweep dispatcher exits. Kubernetes uses an attempt-scoped worker DaemonSet (§4.3). |
+| Filesystem IO | Slurm starts elbencho services once on the maximum-sized allocation; SSH starts them once on the usable host pool. Health checks can restart unhealthy services between phases. All services stop when the sweep dispatcher exits. Kubernetes uses one attempt-scoped worker DaemonSet per namespace segment (§4.3). |
 | Filesystem metadata | Slurm and SSH reuse sweep-wide elbencho services across numbered `(nodes, tasks)` executions; Kubernetes uses an attempt-scoped worker fleet. |
 | Object storage | Each node-count dispatch starts Warp clients, runs the object-size/thread work, then terminates the clients. |
 | Network | Each node-count dispatch starts elbencho services and reuses them for the iteration/thread sweep, checking health between Slurm runs. |
@@ -694,7 +716,8 @@ times `ELBENCHO_FILE_SIZE_MULTIPLIER` (default 1024). The CLI modes are:
   `ELBENCHO_WRITE_ONLY_DATA_DIR`.
 - `--write-no-read`: mkdir → write → cleanup.
 - `--read-from <directory>`: scan or reuse a saved treefile for an existing
-  dataset and run only the read phase.
+  dataset and run only the read phase. On Kubernetes the path is
+  `[namespace/]claim:path` or the Pod path that `--write-only` printed.
 - `--delete-only <directory>`: validate that the path is a strict descendant of
   the configured test root (`TEST_DIRS` from `env.sh` or one `--target`), then remove it on one compute node.
 
@@ -1068,6 +1091,8 @@ software. It operates on systems the user has already been granted access to.
 - Slurm clusters are administered with appropriate access controls.
 - SSH hosts have been configured with key-based authentication by the user.
 - S3 credentials are managed and protected by the user.
+- Kubernetes clusters, namespaces, RBAC, and claims are administered by the
+  user (§11.7).
 
 The tool is designed for an operator-controlled benchmark environment. It does
 not establish an authorization boundary between mutually untrusted users. The
@@ -1151,3 +1176,20 @@ initiate internet connections when downloading source or upstream binaries.
 - Source-level static checks such as ShellCheck and Python tests reduce defects
   in the orchestration code, but they do not validate user-selected third-party
   binaries.
+
+### 11.7 Kubernetes
+
+- The operator owns the kubectl context credentials and the namespace RBAC
+  that every lifecycle command uses; the tool deletes only objects it owns,
+  verified by exact UID and ownership nonce.
+- Anyone who can write a segment's control root (the `.storage-scale-test`
+  subtree on its claim) can change what the coordinator runs, so the claims
+  belong to the trusted operator boundary.
+- The sequencer's ServiceAccount token, present only for batches spanning
+  namespaces (and the temporary `validate_env.sh --sequencer` probe), is the
+  only Pod-held API credential; its Roles allow `get` and `patch` on the
+  attempt's named Jobs. Every other Pod sets
+  `automountServiceAccountToken: false`.
+- Attempt- and segment-scoped NetworkPolicies limit worker ingress and
+  coordinator egress to the elbencho service port between the same segment's
+  Pods, where the CNI enforces NetworkPolicy.
