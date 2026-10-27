@@ -275,7 +275,10 @@ submission to print `GROUP_<gid>_TARGET` and the legacy `GROUP_TARGET` (and no
 groups carry the derived name), each group's `env_used.yaml` to record its name,
 its `target_file` (path, SHA-256 of the file, and the variables it set; `null`
 for groups without one) and the workload override files in order, and the report
-index's Target column to name each group's target.
+index's Target column to name each group's target. The report step also runs
+`extract-filesystem.py --to-json` and requires `results.json` to show a complete
+batch: one group per identity, every execution `success`/`complete`, and
+elbencho first/last rates on each IO execution.
 
 Tests run a real deployment archive: the harness snapshots the tracked source
 once, builds it with the zero-argument `utils/build_tarball.sh`, and caches the

@@ -44,7 +44,7 @@ Warp for S3-compatible object storage) as **separate processes** — they are
 - `utils/` — self-bootstrapping Python result tools (`extract-*.py`) and build helpers (`build_tarball.sh`, `build/`).
 - `tests/` — `pytest` unit tests (Python and shell).
 - `integration-tests/` — kind-based real-infrastructure lifecycle (see its README).
-- `docs/` — user guides (`*_TESTING.md`, `VERSIONING.md`), `KUBERNETES_ELBENCHO_LIFECYCLE.md`, `DESIGN.md`, `REQUIREMENTS.md`, `ARCHITECTURE_DIAGRAMS.md`, `CONTEXT.md`, `CODING_STANDARDS.md`, `plans/` (unimplemented proposals only).
+- `docs/` — user guides (`*_TESTING.md`, `MACHINE_READABLE_RESULTS.md`, `VERSIONING.md`), `KUBERNETES_ELBENCHO_LIFECYCLE.md`, `DESIGN.md`, `REQUIREMENTS.md`, `ARCHITECTURE_DIAGRAMS.md`, `CONTEXT.md`, `CODING_STANDARDS.md`, `plans/` (unimplemented proposals only).
 - Config is environment-driven (`env.sh`); `EXECUTION_SUBSTRATE` explicitly
   selects Slurm, passwordless SSH, or kubectl for filesystem sweeps.
 

@@ -238,6 +238,9 @@ collect before resume.
 - Batch `reports.txt` exists only with at least two eligible owned reports;
   filtered runs rebuild it from fresh and retained owned reports, excluding
   failed or unowned ones.
+- `--to-json` fragments are internal; `report_batch` assembles the document.
+  Filters and failed groups never drop executions. Every execution carries
+  `coordinates` and `coordinate_key`; `dataset`/`results` only when parsed.
 
 Inspect large JSON/JSON.zst without printing complete datasets:
 

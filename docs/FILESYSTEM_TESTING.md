@@ -739,13 +739,15 @@ Results from different storage targets are never combined silently; see
 [reporting per target](#reporting-per-target).
 
 Use `--help` for all options. Single-file parsing requires `--kind io|mdtest`
-and is not a batch-reporting mode.
+and is not a batch-reporting mode. For scripts and gates, see
+[MACHINE_READABLE_RESULTS.md](MACHINE_READABLE_RESULTS.md).
 
 | Scope | Option | Purpose |
 | --- | --- | --- |
 | Both | `--only-nodes LIST`, `--only-threads LIST` | Select counts with comma lists or ranges |
 | Both | `--markdown` | Markdown on stdout; progress on stderr |
 | Both | `--test-parse FILE` | Inspect one raw result without reporting |
+| Both | `--to-json` | Also write `<output-dir>/results.json`, the [machine-readable results document](MACHINE_READABLE_RESULTS.md) |
 | Both | `--allow-mixed-targets` | Combine results from different [storage targets](#reporting-per-target) in one report (a batch never needs it) |
 | IO | `--only-sizes SIZE` | Repeat or separate with `;`; preserve compound-size commas |
 | IO | `--only-iodepths LIST` | Select depths with comma lists or ranges |

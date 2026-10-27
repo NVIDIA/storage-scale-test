@@ -33,8 +33,12 @@ class TestCheckText(unittest.TestCase):
 
         self.assertIsNone(check_text(path, text))
 
-    def test_markdown_and_c_notice_styles(self) -> None:
-        for path in (Path("docs/guide.md"), Path("utils/helper.c")):
+    def test_markdown_c_and_json_notice_styles(self) -> None:
+        for path in (
+            Path("docs/guide.md"),
+            Path("utils/helper.c"),
+            Path("docs/schemas/example.schema.json"),
+        ):
             with self.subTest(path=path):
                 self.assertIsNone(check_text(path, expected_notice(path)))
 

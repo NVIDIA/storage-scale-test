@@ -22,6 +22,7 @@ import errno
 import hashlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -391,12 +392,17 @@ def test_all_analysis_options_share_registration_and_routing(option):
     parser = argparse.ArgumentParser()
     add_analysis_arguments(parser, "all", explicit_only=True)
     value = "3" if "type" in option.settings else "a path,with spaces"
+    if "choices" in option.settings:
+        value = option.settings["choices"][-1]
     arguments = [option.flag]
     if option.settings.get("action") != "store_true":
         arguments.append(value)
-    args = parser.parse_args(arguments)
+    # --require-complete is only valid together with --to-json.
+    prefix = ["--to-json"] if option.flag == "--require-complete" else []
+    args = parser.parse_args([*prefix, *arguments])
     routed = options_by_kind(args, {"io", "mdtest"})
     expected = arguments[:1] if len(arguments) == 1 else [f"{option.flag}={value}"]
+    expected = [*prefix, *expected]
     if option.settings.get("type") is float:
         expected = [f"{option.flag}=3.0"]
     for kind in ("io", "mdtest"):
@@ -1457,6 +1463,68 @@ def test_selected_root_execution_log_preserves_treescan_stats_without_cross_grou
     )
     assert metric.treescan_file_count == 10
     assert metric.treescan_avg_bytes == 8192
+
+
+def test_staging_copies_the_kubernetes_worker_map(tmp_path):
+    manifest = _create_batch(tmp_path / "batch", kinds=("io", "io"))
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+    # Collection publishes the map in the batch root ledger; a group's own
+    # executions/ directory is the fallback.
+    (manifest.root / "executions/0001.workers.tsv").write_text(
+        "node-a\tpod-a\tuid-a\t10.0.0.1\n", encoding="utf-8"
+    )
+    group_two = manifest.group_path(manifest.groups[1])
+    (group_two / "executions/0002.workers.tsv").write_text(
+        "node-b\tpod-b\tuid-b\t10.0.0.2\n", encoding="utf-8"
+    )
+    for group in manifest.groups:
+        destination = tmp_path / f"snapshot {group.group_id}"
+        stage_group_inputs(
+            manifest, group, destination, manifest.group_executions(group.group_id)
+        )
+        name = f"{group.group_id}.workers.tsv"
+        staged = (destination / "executions" / name).read_text(encoding="utf-8")
+        assert f"pod-{'a' if group.group_id == '0001' else 'b'}" in staged
+        assert [p.name for p in (destination / "executions").glob("*.tsv")] == [name]
+
+
+def test_group_whose_executions_are_all_filtered_out_still_succeeds(
+    tmp_path, reporting_checkout
+):
+    from lib.report_cli import extract_filesystem_parser
+    from tests.test_extract_elbencho_results_json import _write_result
+
+    manifest = _create_batch(tmp_path / "batch", kinds=("io",))
+    source = _publish_result(manifest, manifest.groups[0])
+    written = _write_result(tmp_path, nodes=1, io_size="1M", threads=1)
+    for extension in ("csv", "out"):
+        shutil.copyfile(f"{written}.{extension}", source / f"{IO_STEM}.{extension}")
+    # Give the definition the coordinates line real batches carry.
+    definition = manifest.root / "executions/0001.sh"
+    old_digest = _digest(definition)
+    definition.write_text(
+        "# Auto-generated; do not edit. Coords: nodes=1 io_size=1M "
+        "thread_count=1 io_depth=1\n" + definition.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    _replace_manifest(manifest.root, old_digest, _digest(definition))
+    args = extract_filesystem_parser().parse_args(
+        ["--to-json", "--only-nodes", "9", str(manifest.root)]
+    )
+    with (
+        mock.patch.object(batch_module, "_REPO_ROOT", reporting_checkout),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        code = report_batch(
+            manifest.root, args.kind, args.groups, args.output_dir, analysis_args=args
+        )
+    # The engine exits 0 after writing a fragment that reports nothing.
+    assert code == 0
+    document = json.loads((manifest.root / "reports/results.json").read_text("utf-8"))
+    execution = document["executions"][0]
+    assert execution["result_state"] == "not_reported"
+    assert execution["coordinate_key"].startswith("io/c001/s001/d001/")
 
 
 @pytest.mark.parametrize("marker", BATCH_MARKERS)

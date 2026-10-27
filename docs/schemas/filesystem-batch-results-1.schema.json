@@ -1,0 +1,1243 @@
+{
+  "$comment": "SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\nSPDX-License-Identifier: Apache-2.0\n\nLicensed under the Apache License, Version 2.0 (the \"License\");\nyou may not use this file except in compliance with the License.\nYou may obtain a copy of the License at\n\nhttp://www.apache.org/licenses/LICENSE-2.0\n\nUnless required by applicable law or agreed to in writing, software\ndistributed under the License is distributed on an \"AS IS\" BASIS,\nWITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\nSee the License for the specific language governing permissions and\nlimitations under the License.",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "storage-scale-test filesystem batch results",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "generator",
+    "batch",
+    "batch_outcome",
+    "groups",
+    "executions",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema": {
+      "const": "storage-scale-test/filesystem-batch-results"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+$"
+    },
+    "generator": {
+      "$ref": "#/$defs/generator"
+    },
+    "batch": {
+      "$ref": "#/$defs/batch"
+    },
+    "batch_outcome": {
+      "$ref": "#/$defs/batch_outcome"
+    },
+    "groups": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/group"
+      }
+    },
+    "executions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/execution"
+      }
+    },
+    "diagnostics": {
+      "$ref": "#/$defs/problems"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "problem": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "detail": {
+          "type": "string"
+        },
+        "phase": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "detail",
+        "phase"
+      ]
+    },
+    "problems": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/problem"
+      }
+    },
+    "file_record": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "size_bytes"
+      ]
+    },
+    "histogram_us": {
+      "type": "object",
+      "properties": {
+        "buckets_us": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        },
+        "counts": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "required": [
+        "buckets_us",
+        "counts"
+      ]
+    },
+    "latency_us": {
+      "type": "object",
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "ledger_state": {
+      "type": "string",
+      "enum": [
+        "success",
+        "failed",
+        "pending",
+        "running",
+        "cancelled",
+        "interrupted",
+        "unknown"
+      ]
+    },
+    "result_state": {
+      "type": "string",
+      "enum": [
+        "complete",
+        "partial",
+        "missing",
+        "unparseable",
+        "not_run",
+        "not_reported"
+      ]
+    },
+    "ledger_counts": {
+      "type": "object",
+      "properties": {
+        "total": {
+          "type": "integer"
+        },
+        "success": {
+          "type": "integer"
+        },
+        "failed": {
+          "type": "integer"
+        },
+        "pending": {
+          "type": "integer"
+        },
+        "running": {
+          "type": "integer"
+        },
+        "cancelled": {
+          "type": "integer"
+        },
+        "interrupted": {
+          "type": "integer"
+        },
+        "unknown": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "total",
+        "success",
+        "failed",
+        "pending",
+        "running",
+        "cancelled",
+        "interrupted",
+        "unknown"
+      ]
+    },
+    "result_counts": {
+      "type": "object",
+      "properties": {
+        "complete": {
+          "type": "integer"
+        },
+        "partial": {
+          "type": "integer"
+        },
+        "missing": {
+          "type": "integer"
+        },
+        "unparseable": {
+          "type": "integer"
+        },
+        "not_run": {
+          "type": "integer"
+        },
+        "not_reported": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "complete",
+        "partial",
+        "missing",
+        "unparseable",
+        "not_run",
+        "not_reported"
+      ]
+    },
+    "batch_outcome": {
+      "type": "object",
+      "properties": {
+        "complete": {
+          "type": "boolean"
+        },
+        "executions": {
+          "$ref": "#/$defs/ledger_counts"
+        },
+        "results": {
+          "$ref": "#/$defs/result_counts"
+        },
+        "groups_reported": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "groups_not_reported": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "complete",
+        "executions",
+        "results",
+        "groups_reported",
+        "groups_not_reported"
+      ]
+    },
+    "generator": {
+      "type": "object",
+      "properties": {
+        "tool": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "generated_at": {
+          "type": "string"
+        },
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "live_detail": true,
+            "z_threshold": true,
+            "only_nodes": true,
+            "only_threads": true,
+            "only_sizes": true,
+            "only_iodepths": true,
+            "groups": true,
+            "kind": true
+          },
+          "required": []
+        }
+      },
+      "required": [
+        "tool",
+        "version",
+        "generated_at",
+        "command",
+        "options"
+      ]
+    },
+    "batch": {
+      "type": "object",
+      "properties": {
+        "root": {
+          "type": "string"
+        },
+        "datestamp": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "manifest_version": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "manifest_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sealed": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "substrate": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "root",
+        "datestamp",
+        "manifest_version",
+        "manifest_sha256",
+        "sealed",
+        "substrate"
+      ]
+    },
+    "target": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "recorded": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "recorded"
+      ]
+    },
+    "group": {
+      "type": "object",
+      "properties": {
+        "group_id": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "io",
+            "mdtest"
+          ]
+        },
+        "label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "output_relative": {
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "settings_sha256": {
+          "type": "object",
+          "properties": {
+            "env_used_sh": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "env_used_yaml": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "env_used_sh",
+            "env_used_yaml"
+          ]
+        },
+        "env_override": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "settings": {
+          "type": "object"
+        },
+        "execution_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "group_id",
+        "kind",
+        "label",
+        "output_relative",
+        "target",
+        "settings_sha256",
+        "env_override",
+        "settings",
+        "execution_ids"
+      ]
+    },
+    "rate_point": {
+      "type": "object",
+      "properties": {
+        "ops_per_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bytes_per_s": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "elapsed_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "ops_per_s",
+        "bytes_per_s",
+        "elapsed_ms"
+      ]
+    },
+    "work": {
+      "type": "object",
+      "properties": {
+        "expected_files": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "completed_files": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expected_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "completed_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": []
+    },
+    "io_phase": {
+      "type": "object",
+      "required": [
+        "phase"
+      ],
+      "properties": {
+        "phase": {
+          "type": "string"
+        },
+        "completion_state": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "elbencho_first": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/rate_point"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "elbencho_last": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/rate_point"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "latency_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/latency_us"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "histogram_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/histogram_us"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "work": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/work"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "elapsed_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "configured_time_limit_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "live": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/live_or_reason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "io_results": {
+      "type": "object",
+      "properties": {
+        "phases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/io_phase"
+          }
+        },
+        "workload": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "phases"
+      ]
+    },
+    "md_phase": {
+      "type": "object",
+      "required": [
+        "phase"
+      ],
+      "properties": {
+        "phase": {
+          "type": "string"
+        },
+        "ops_per_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "elapsed_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "latency_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/latency_us"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "histogram_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/histogram_us"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "md_iteration": {
+      "type": "object",
+      "properties": {
+        "iteration": {
+          "type": "integer"
+        },
+        "datestamp": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "type": "string"
+        },
+        "problems": {
+          "$ref": "#/$defs/problems"
+        },
+        "phases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/md_phase"
+          }
+        }
+      },
+      "required": [
+        "iteration",
+        "state",
+        "problems",
+        "phases"
+      ]
+    },
+    "md_results": {
+      "type": "object",
+      "properties": {
+        "iterations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/md_iteration"
+          }
+        },
+        "aggregate": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "iterations"
+      ]
+    },
+    "execution": {
+      "type": "object",
+      "properties": {
+        "execution_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "group_id": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "io",
+            "mdtest"
+          ]
+        },
+        "definition_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ledger_state": {
+          "$ref": "#/$defs/ledger_state"
+        },
+        "result_state": {
+          "$ref": "#/$defs/result_state"
+        },
+        "problems": {
+          "$ref": "#/$defs/problems"
+        },
+        "coordinates": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "coordinate_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dataset": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "result_files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/file_record"
+          }
+        },
+        "log": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "results": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/io_results"
+            },
+            {
+              "$ref": "#/$defs/md_results"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "execution_id",
+        "group_id",
+        "kind",
+        "definition_sha256",
+        "ledger_state",
+        "result_state",
+        "problems",
+        "coordinates",
+        "coordinate_key",
+        "dataset",
+        "result_files",
+        "log",
+        "results"
+      ]
+    },
+    "stat_block": {
+      "type": "object",
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "live_source": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "size_bytes"
+      ]
+    },
+    "client_series_inline": {
+      "type": "object",
+      "properties": {
+        "clients": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "elapsed_ms": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "bytes_per_s": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "required": [
+        "clients",
+        "elapsed_ms",
+        "bytes_per_s"
+      ]
+    },
+    "client_series_ref": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "clients": {
+          "type": "integer"
+        },
+        "intervals": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "size_bytes",
+        "clients",
+        "intervals"
+      ]
+    },
+    "live_null": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "enum": [
+            "not_captured",
+            "not_requested",
+            "unreadable"
+          ]
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "live": {
+      "type": "object",
+      "required": [
+        "source",
+        "configured_interval_ms",
+        "client_mode",
+        "domain",
+        "intervals",
+        "clients",
+        "aggregate_series",
+        "fleet_series",
+        "distribution",
+        "clients_summary",
+        "client_series",
+        "diagnostics"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/live_source"
+        },
+        "configured_interval_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_mode": {
+          "enum": [
+            "worker",
+            "service"
+          ]
+        },
+        "domain": {
+          "type": "object",
+          "properties": {
+            "phase": {
+              "type": "string"
+            },
+            "mix_type": {
+              "type": "string"
+            },
+            "occurrence": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "phase",
+            "mix_type",
+            "occurrence"
+          ]
+        },
+        "intervals": {
+          "type": "integer"
+        },
+        "clients": {
+          "type": "integer"
+        },
+        "aggregate_series": {
+          "type": "object",
+          "properties": {
+            "elapsed_ms": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "bytes_per_s": {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "ops_per_s": {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          "required": [
+            "elapsed_ms",
+            "bytes_per_s",
+            "ops_per_s"
+          ]
+        },
+        "fleet_series": {
+          "type": "object",
+          "required": [
+            "elapsed_ms",
+            "client_count"
+          ],
+          "properties": {
+            "elapsed_ms": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            "client_count": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            }
+          },
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        "distribution": {
+          "type": "object"
+        },
+        "clients_summary": {
+          "type": "object",
+          "properties": {
+            "columns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "type": "array"
+              }
+            }
+          },
+          "required": [
+            "columns",
+            "rows"
+          ]
+        },
+        "client_series": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/client_series_inline"
+            },
+            {
+              "$ref": "#/$defs/client_series_ref"
+            }
+          ]
+        },
+        "diagnostics": {
+          "type": "object"
+        }
+      }
+    },
+    "live_or_reason": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/live"
+        },
+        {
+          "$ref": "#/$defs/live_null"
+        }
+      ]
+    }
+  }
+}

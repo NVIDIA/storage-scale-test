@@ -52,9 +52,19 @@ from matplotlib.ticker import FuncFormatter
 from lib.env_used_yaml import (  # pylint: disable=wrong-import-position
     load_env_used_yaml,
 )
+from lib import (  # pylint: disable=wrong-import-position
+    filesystem_results as results_json,
+)
 from lib.filesystem_batch import (
     route_batch_report,
 )  # pylint: disable=wrong-import-position
+from lib.filesystem_coordinates import (  # pylint: disable=wrong-import-position
+    MdtestDefinition,
+    is_mdtest_definition,
+    mdtest_coordinates,
+    optional_int,
+    parse_mdtest_definition,
+)
 from lib.filesystem_report_options import (  # pylint: disable=wrong-import-position
     validate_analysis_arguments,
 )
@@ -208,6 +218,7 @@ class AggregatedMetrics:
 FILENAME_PATTERN = re.compile(
     r"mdtest-elbencho-c_(\d+)-t_(\d+)_(\d{8}Z\d{6})_iter(\d+)\.(csv|out)"
 )
+EXIT_INCOMPLETE = 3
 REQUIRED_OPERATIONS = ("WRITE", "STAT", "RMFILES")
 MDTEST_CONFIG_KEYS = (
     "MDTEST_BRANCH_FACTOR",
@@ -409,7 +420,7 @@ def parse_csv_file(csv_path: str) -> Dict[str, Dict[str, Any]]:
             if rate_str:
                 try:
                     rate = float(rate_str)
-                    rate_valid = True
+                    rate_valid = math.isfinite(rate)
                 except ValueError:
                     pass
 
@@ -420,7 +431,7 @@ def parse_csv_file(csv_path: str) -> Dict[str, Dict[str, Any]]:
             if elapsed_ms_str:
                 try:
                     elapsed_sec = float(elapsed_ms_str) / 1000
-                    elapsed_valid = True
+                    elapsed_valid = math.isfinite(elapsed_sec)
                 except ValueError:
                     pass
 
@@ -428,6 +439,7 @@ def parse_csv_file(csv_path: str) -> Dict[str, Dict[str, Any]]:
             lat_min = 0.0
             lat_avg = 0.0
             lat_max = 0.0
+            lat_valid = 0
 
             lat_min_str = row.get("Ent lat us [min]", "")
             lat_avg_str = row.get("Ent lat us [avg]", "")
@@ -436,16 +448,19 @@ def parse_csv_file(csv_path: str) -> Dict[str, Dict[str, Any]]:
             if lat_min_str:
                 try:
                     lat_min = float(lat_min_str) / 1_000_000
+                    lat_valid += 1
                 except ValueError:
                     pass
             if lat_avg_str:
                 try:
                     lat_avg = float(lat_avg_str) / 1_000_000
+                    lat_valid += 1
                 except ValueError:
                     pass
             if lat_max_str:
                 try:
                     lat_max = float(lat_max_str) / 1_000_000
+                    lat_valid += 1
                 except ValueError:
                     pass
 
@@ -459,6 +474,9 @@ def parse_csv_file(csv_path: str) -> Dict[str, Dict[str, Any]]:
                 "lat_avg": lat_avg,
                 "lat_max": lat_max,
                 "command": command,
+                "rate_valid": rate_valid,
+                "elapsed_valid": elapsed_valid,
+                "lat_valid": lat_valid == 3,
                 "complete": rate_valid and elapsed_valid and bool(command),
             }
 
@@ -584,6 +602,20 @@ def parse_file_pair(
         )
         return None
 
+    return metrics_from_parsed(
+        csv_data, out_data, node_count, thread_count, datestamp, iteration
+    )
+
+
+def metrics_from_parsed(
+    csv_data: Dict[str, Dict[str, Any]],
+    out_data: Dict[str, Dict[float, int]],
+    node_count: int,
+    thread_count: int,
+    datestamp: str,
+    iteration: int,
+) -> IterationMetrics:
+    """Build IterationMetrics from complete parsed CSV and OUT data."""
     # Map operations
     write_data = csv_data.get("WRITE", {})
     stat_data = csv_data.get("STAT", {})
@@ -2121,6 +2153,423 @@ def filter_metrics(
 
 
 # =============================================================================
+# Machine-readable results (JSON fragment / document)
+# =============================================================================
+
+_JSON_PHASES = (("create", "WRITE"), ("stat", "STAT"), ("delete", "RMFILES"))
+
+
+@dataclass(frozen=True)
+class _Slot:
+    """One result slot: a ledger execution, or result files with no ledger entry."""
+
+    execution_id: Optional[str]
+    definition: MdtestDefinition
+
+    @property
+    def nodes(self) -> int:
+        """Node count of the slot."""
+        return self.definition.nodes
+
+    @property
+    def tasks(self) -> int:
+        """Tasks per node of the slot."""
+        return self.definition.tasks
+
+    @property
+    def iterations(self) -> Optional[int]:
+        """Configured iteration count, if known."""
+        return self.definition.iterations
+
+
+@dataclass
+class _IterationFiles:
+    """The result files of one iteration; either file may be missing."""
+
+    datestamp: str
+    iteration: int
+    csv_path: Optional[str] = None
+    out_path: Optional[str] = None
+
+
+def _read_mdtest_ledger(input_dir: str, env: Dict[str, Any]) -> List[_Slot]:
+    """List the metadata executions in executions/NNNN.sh, ordered by id."""
+    executions_dir = os.path.join(input_dir, "executions")
+    if not os.path.isdir(executions_dir):
+        return []
+    slots = []
+    for filename in sorted(os.listdir(executions_dir)):
+        if not re.fullmatch(r"[0-9]+\.sh", filename):
+            continue
+        try:
+            with open(
+                os.path.join(executions_dir, filename), "r", encoding="utf-8"
+            ) as definition:
+                content = definition.read()
+        except OSError as error:
+            eprint(f"Warning: Cannot read execution definition {filename}: {error}")
+            continue
+        if not is_mdtest_definition(content):
+            continue
+        definition = parse_mdtest_definition(content, env)
+        if definition is None:
+            eprint(f"Warning: Invalid metadata execution coordinates in {filename}")
+            continue
+        slots.append(_Slot(filename[:-3], definition))
+    return slots
+
+
+def _scan_result_files(
+    input_dir: str,
+) -> Dict[Tuple[int, int], List[_IterationFiles]]:
+    """Group every result file in a directory by (nodes, tasks) and iteration."""
+    by_iteration: Dict[Tuple[int, int, int, str], _IterationFiles] = {}
+    for filename in sorted(os.listdir(input_dir)):
+        match = FILENAME_PATTERN.fullmatch(filename)
+        if not match:
+            continue
+        iteration = int(match.group(4))
+        key = (int(match.group(1)), int(match.group(2)), iteration, match.group(3))
+        files = by_iteration.setdefault(key, _IterationFiles(match.group(3), iteration))
+        path = os.path.join(input_dir, filename)
+        if match.group(5) == "csv":
+            files.csv_path = path
+        else:
+            files.out_path = path
+    grouped: Dict[Tuple[int, int], List[_IterationFiles]] = {}
+    for key in sorted(by_iteration):
+        grouped.setdefault((key[0], key[1]), []).append(by_iteration[key])
+    return grouped
+
+
+def _load_iteration(
+    files: _IterationFiles,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[float, int]], List[str]]:
+    """Parse whatever result files exist; return (csv, out, reasons it is not whole)."""
+    reasons: List[str] = []
+    csv_data: Dict[str, Dict[str, Any]] = {}
+    out_data: Dict[str, Dict[float, int]] = {}
+    if files.csv_path is None:
+        reasons.append("missing CSV file")
+    else:
+        try:
+            csv_data = parse_csv_file(files.csv_path)
+        except (OSError, ValueError, csv.Error) as error:
+            reasons.append(f"unparseable CSV file: {error}")
+    if files.out_path is None:
+        reasons.append("missing OUT file")
+    else:
+        try:
+            out_data = parse_out_file(files.out_path)
+        except (OSError, ValueError) as error:
+            reasons.append(f"unparseable OUT file: {error}")
+    if not reasons:
+        incomplete = incomplete_result_reason(csv_data, out_data)
+        if incomplete:
+            reasons.append(incomplete)
+    return csv_data, out_data, reasons
+
+
+def _iteration_phase(
+    name: str,
+    csv_row: Optional[Dict[str, Any]],
+    histogram: Dict[float, int],
+) -> Optional[Dict[str, Any]]:
+    """One phase of one iteration, or None when nothing of it was parsed."""
+    if csv_row is None and not histogram:
+        return None
+    row = csv_row or {}
+    latency = None
+    if row.get("lat_valid"):
+        latency = {
+            "min": results_json.seconds_to_us(row["lat_min"]),
+            "avg": results_json.seconds_to_us(row["lat_avg"]),
+            "max": results_json.seconds_to_us(row["lat_max"]),
+        }
+    return {
+        "phase": name,
+        "ops_per_s": (
+            results_json.round_ops(row["rate"]) if row.get("rate_valid") else None
+        ),
+        "elapsed_ms": (
+            int(round(row["elapsed_sec"] * 1000)) if row.get("elapsed_valid") else None
+        ),
+        "latency_us": latency,
+        "histogram_us": results_json.histogram_columnar(histogram),
+    }
+
+
+def _iteration_entry(
+    files: _IterationFiles,
+    csv_data: Dict[str, Dict[str, Any]],
+    out_data: Dict[str, Dict[float, int]],
+    reasons: List[str],
+) -> Dict[str, Any]:
+    """The per-iteration JSON object."""
+    phases = [
+        phase
+        for name, operation in _JSON_PHASES
+        if (
+            phase := _iteration_phase(
+                name, csv_data.get(operation), out_data.get(operation) or {}
+            )
+        )
+    ]
+    problems = (
+        [results_json.problem("iteration_incomplete", "; ".join(reasons))]
+        if reasons
+        else []
+    )
+    return {
+        "iteration": files.iteration,
+        "datestamp": files.datestamp,
+        "state": "incomplete" if reasons else "complete",
+        "problems": problems,
+        "phases": phases,
+    }
+
+
+def _percentile_us(histogram: Dict[float, int], percentile: float) -> Optional[float]:
+    """Pooled-histogram percentile in microseconds (None for an empty histogram)."""
+    if not histogram:
+        return None
+    return results_json.round_latency_us(
+        percentile_from_histogram(histogram, percentile) * 1000.0
+    )
+
+
+def _aggregate_phase(name: str, agg: AggregatedMetrics) -> Dict[str, Any]:
+    """Aggregate one phase over the validated iterations."""
+    histogram = getattr(agg, f"{name}_histogram")
+    return {
+        "phase": name,
+        "ops_per_s": {
+            "mean": results_json.round_ops(getattr(agg, f"{name}_rate_avg")),
+            "stddev": results_json.round_ops(getattr(agg, f"{name}_rate_stddev")),
+            "min": results_json.round_ops(getattr(agg, f"{name}_rate_min")),
+            "max": results_json.round_ops(getattr(agg, f"{name}_rate_max")),
+        },
+        "mean_elapsed_ms": int(round(getattr(agg, f"{name}_elapsed_avg_sec") * 1000)),
+        "latency_us": {
+            f"p{percent}": _percentile_us(histogram, percent)
+            for percent in (0, 50, 90, 99, 100)
+        },
+        "latency_method": "pooled_histogram_bucket",
+    }
+
+
+def _aggregate_json(
+    metrics: List[IterationMetrics], expected: Optional[int]
+) -> Dict[str, Any]:
+    """The aggregate block; only validated iterations contribute."""
+    phases = []
+    if metrics:
+        agg = next(iter(aggregate_metrics(metrics).values()))
+        phases = [_aggregate_phase(name, agg) for name, _ in _JSON_PHASES]
+    return {
+        "iterations_expected": expected,
+        "iterations_used": len(metrics),
+        "phases": phases,
+    }
+
+
+def _result_state(
+    iterations: List[Dict[str, Any]], missing: List[int], found: bool
+) -> str:
+    """complete, partial, missing or unparseable from the iteration outcomes."""
+    if not found:
+        return "missing"
+    if not any(entry["phases"] for entry in iterations):
+        return "unparseable"
+    incomplete = any(entry["state"] != "complete" for entry in iterations)
+    return "partial" if incomplete or missing else "complete"
+
+
+def _missing_iterations(
+    iterations: List[Dict[str, Any]], expected: Optional[int]
+) -> List[int]:
+    """Expected iteration numbers that have no result files at all."""
+    if expected is None:
+        return []
+    present = {entry["iteration"] for entry in iterations}
+    return [number for number in range(1, expected + 1) if number not in present]
+
+
+def _result_file_records(
+    files_list: List[_IterationFiles], input_dir: str
+) -> List[Dict[str, Any]]:
+    """file_record for every result file, relative to the input directory."""
+    paths = sorted(
+        path
+        for files in files_list
+        for path in (files.csv_path, files.out_path)
+        if path is not None
+    )
+    return [
+        results_json.file_record(path, os.path.relpath(path, input_dir))
+        for path in paths
+    ]
+
+
+def _execution_entry(
+    slot: _Slot, files_list: List[_IterationFiles], input_dir: str
+) -> Dict[str, Any]:
+    """The fragment entry of one slot with its result files."""
+    iterations: List[Dict[str, Any]] = []
+    metrics: List[IterationMetrics] = []
+    for files in files_list:
+        csv_data, out_data, reasons = _load_iteration(files)
+        iterations.append(_iteration_entry(files, csv_data, out_data, reasons))
+        if not reasons:
+            metrics.append(
+                metrics_from_parsed(
+                    csv_data,
+                    out_data,
+                    slot.nodes,
+                    slot.tasks,
+                    files.datestamp,
+                    files.iteration,
+                )
+            )
+    missing = _missing_iterations(iterations, slot.iterations)
+    # Execution problems say what made the execution partial; details stay on
+    # each iteration.
+    problems = [
+        results_json.problem(
+            item["code"], f"iteration {iteration['iteration']}: {item['detail']}"
+        )
+        for iteration in iterations
+        for item in iteration["problems"]
+    ]
+    if missing:
+        detail = "missing iterations: " + ", ".join(str(number) for number in missing)
+        problems.append(results_json.problem("iterations_missing", detail))
+    results = None
+    if files_list:
+        results = {
+            "iterations": iterations,
+            "aggregate": _aggregate_json(metrics, slot.iterations),
+        }
+    coordinates, coordinate_key = mdtest_coordinates(slot.definition, len(iterations))
+    return {
+        "execution_id": slot.execution_id,
+        "coordinates": coordinates,
+        "coordinate_key": coordinate_key,
+        "dataset": None,
+        "result_state": _result_state(iterations, missing, bool(files_list)),
+        "problems": problems,
+        "result_files": _result_file_records(files_list, input_dir),
+        "results": results,
+    }
+
+
+def _not_reported_entry(slot: _Slot) -> Dict[str, Any]:
+    """The entry of an execution removed by --only-nodes/--only-threads."""
+    coordinates, coordinate_key = mdtest_coordinates(slot.definition)
+    return {
+        "execution_id": slot.execution_id,
+        "coordinates": coordinates,
+        "coordinate_key": coordinate_key,
+        "dataset": None,
+        "result_state": "not_reported",
+        "problems": [],
+        "result_files": [],
+        "results": None,
+    }
+
+
+def build_results_fragment(
+    input_dir: str,
+    env: Dict[str, Any],
+    only_nodes: Optional[Set[int]] = None,
+    only_threads: Optional[Set[int]] = None,
+) -> Dict[str, Any]:
+    """Describe every ledger execution and result file of one input directory."""
+    scanned = _scan_result_files(input_dir)
+
+    def selected(slot: _Slot) -> bool:
+        return (only_nodes is None or slot.nodes in only_nodes) and (
+            only_threads is None or slot.tasks in only_threads
+        )
+
+    entries = []
+    for slot in _read_mdtest_ledger(input_dir, env):
+        if selected(slot):
+            files_list = scanned.pop((slot.nodes, slot.tasks), [])
+            entries.append(_execution_entry(slot, files_list, input_dir))
+        else:
+            scanned.pop((slot.nodes, slot.tasks), None)
+            entries.append(_not_reported_entry(slot))
+    for (nodes, tasks), files_list in sorted(scanned.items()):
+        slot = _Slot(
+            None,
+            MdtestDefinition(
+                nodes,
+                tasks,
+                optional_int(env.get("MDTEST_ITERATIONS")),
+                optional_int(env.get("MDTEST_BRANCH_FACTOR")),
+                optional_int(env.get("MDTEST_ITEMS_PER_DIR")),
+            ),
+        )
+        if selected(slot):
+            entries.append(_execution_entry(slot, files_list, input_dir))
+    return {
+        "fragment_version": results_json.FRAGMENT_VERSION,
+        "kind": "mdtest",
+        "executions": entries,
+        "diagnostics": [],
+    }
+
+
+def validate_json_arguments(args) -> None:
+    """Reject option combinations the JSON export cannot honor."""
+    if args.require_complete and not args.to_json:
+        raise ValueError("--require-complete requires --to-json")
+    if not args.to_json and not args.results_fragment:
+        return
+    if args.to_json and args.results_fragment:
+        raise ValueError("--to-json and --results-fragment are mutually exclusive")
+    if len(set(args.input_dirs)) != 1:
+        raise ValueError("--to-json and --results-fragment need exactly one input dir")
+
+
+def json_requested(args) -> bool:
+    """True when this run writes a results fragment or document."""
+    return bool(args.to_json or args.results_fragment)
+
+
+def write_json_outputs(args, env: Dict[str, Any]) -> bool:
+    """Write the fragment or document; return whether the results are complete."""
+    input_dir = args.input_dirs[0]
+    fragment = build_results_fragment(
+        input_dir,
+        env,
+        parse_int_values_with_ranges(args.only_nodes) if args.only_nodes else None,
+        parse_int_values_with_ranges(args.only_threads) if args.only_threads else None,
+    )
+    if args.results_fragment:
+        results_json.write_fragment(fragment, args.results_fragment)
+        return True
+    generator = results_json.generator_block(
+        list(sys.argv),
+        {
+            "live_detail": getattr(args, "live_detail", None),
+            "z_threshold": getattr(args, "z_threshold", None),
+            "only_nodes": args.only_nodes,
+            "only_threads": args.only_threads,
+            "kind": "mdtest",
+        },
+    )
+    document = results_json.assemble_ordinary_document(
+        Path(input_dir).resolve(), fragment, None, generator
+    )
+    results_json.write_document(
+        document, os.path.join(args.output_dir or input_dir, "results.json")
+    )
+    return results_json.document_is_complete(document)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -2131,6 +2580,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         validate_analysis_arguments(args)
+        validate_json_arguments(args)
         route_batch_report(args, "mdtest", sys.argv[1:])
     except (OSError, ValueError) as error:
         parser.error(str(error))
@@ -2163,6 +2613,23 @@ def main() -> None:
         input_dir: load_env_used_yaml(input_dir)
         for input_dir in dict.fromkeys(args.input_dirs)
     }
+    complete = True
+    if json_requested(args):
+        complete = write_json_outputs(args, environments[args.input_dirs[0]])
+    try:
+        _run_text_report(args, environments)
+    except SystemExit as exit_request:
+        # With the JSON written, "nothing to plot" (exit 1) is not a failure.
+        if exit_request.code == 1 and json_requested(args):
+            eprint("No text report produced; the JSON export was written")
+        elif not (args.require_complete and not complete):
+            raise
+    if args.require_complete and not complete:
+        sys.exit(EXIT_INCOMPLETE)
+
+
+def _run_text_report(args, environments: Dict[str, dict]) -> None:
+    """Print the table or Markdown report and write the plots."""
     versions: List[Tuple[IterationMetrics, str]] = []
 
     # Refuse results from different storage targets before parsing or writing.
