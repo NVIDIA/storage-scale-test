@@ -26,7 +26,21 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
+
+if TYPE_CHECKING:  # pragma: no cover
+    from lib.elbencho_live_steady import ClientSteady, SteadyAnalysis
 
 MIB = 1024 * 1024
 TOTAL_RANK = "Total"
@@ -36,6 +50,11 @@ INVALID_RATE = None
 SKIPPED_METADATA_PHASES = frozenset({"CREATE", "DELETE", "MKDIR", "STAT"})
 OCCURRENCE_RATE_JUMP_MAX_MS = 100
 OCCURRENCE_RATE_JUMP_FACTOR = 4.0
+IO_LATENCY_COLUMN = "Lat IO us"
+ENTRIES_LATENCY_COLUMN = "Lat Ent us"
+MALFORMED_CLIENT_ROWS = "malformed_client_rows"
+# Malformed client rows named by line number (the rest are only counted).
+MALFORMED_LINES_REPORTED = 5
 
 LIVE_CSV_COLUMNS = [
     "ISO Date",
@@ -50,8 +69,8 @@ LIVE_CSV_COLUMNS = [
     "IOPS",
     "Entries",
     "Entries/s",
-    "Lat Ent us",
-    "Lat IO us",
+    ENTRIES_LATENCY_COLUMN,
+    IO_LATENCY_COLUMN,
     "Active",
     "CPU",
     "Service",
@@ -229,7 +248,7 @@ class P2Median:
 
 
 @dataclass
-class ClientSummary:
+class ClientSummary:  # pylint: disable=too-many-instance-attributes
     """Online summary for one client."""
 
     client: LiveClientId
@@ -239,35 +258,25 @@ class ClientSummary:
     median_estimator: P2Median = field(default_factory=P2Median)
     relative_median_sum: float = 0.0
     relative_median_count: int = 0
-    underperform_count: int = 0
-    longest_underperform_streak: int = 0
-    current_underperform_streak: int = 0
     missing_count: int = 0
     invalid_count: int = 0
-    worst_z_score: float = 0.0
-    worst_interval: int = -1
-    worst_elapsed_sec: float = 0.0
-    worst_iso_timestamp: str = ""
     final_done_bytes: Optional[int] = None
     finish_elapsed_ms: Optional[int] = None
+    first_progress_interval: Optional[int] = None
 
-    def observe_done_bytes(self, done_bytes: int, runtime_ms: int) -> None:
-        """Track the last cumulative DoneBytes and when it was first reached."""
+    def observe_done_bytes(
+        self, done_bytes: int, runtime_ms: int, interval: Optional[int] = None
+    ) -> None:
+        """Track the last cumulative DoneBytes, when it was first reached, and
+        the first interval with any progress."""
         if self.final_done_bytes != done_bytes:
             self.final_done_bytes = done_bytes
             self.finish_elapsed_ms = runtime_ms
+        if self.first_progress_interval is None and done_bytes > 0:
+            self.first_progress_interval = interval
 
-    def add_rate(
-        self,
-        rate_mib_s: float,
-        fleet_median: float,
-        z_score: float,
-        interval: int,
-        elapsed_sec: float,
-        iso_timestamp: str,
-        underperforming: bool,
-    ) -> None:
-        """Update online rate and underperformance statistics."""
+    def add_rate(self, rate_mib_s: float, fleet_median: float) -> None:
+        """Update the online rate statistics."""
         self.sample_count += 1
         delta = rate_mib_s - self.mean_mib_s
         self.mean_mib_s += delta / self.sample_count
@@ -276,30 +285,14 @@ class ClientSummary:
         if fleet_median > 0:
             self.relative_median_sum += rate_mib_s / fleet_median
             self.relative_median_count += 1
-        if underperforming:
-            self.underperform_count += 1
-            self.current_underperform_streak += 1
-            self.longest_underperform_streak = max(
-                self.longest_underperform_streak,
-                self.current_underperform_streak,
-            )
-            if self.worst_interval < 0 or z_score < self.worst_z_score:
-                self.worst_z_score = z_score
-                self.worst_interval = interval
-                self.worst_elapsed_sec = elapsed_sec
-                self.worst_iso_timestamp = iso_timestamp
-        else:
-            self.current_underperform_streak = 0
 
     def mark_missing(self) -> None:
-        """Record a missing interval and break persistence."""
+        """Record a missing interval."""
         self.missing_count += 1
-        self.current_underperform_streak = 0
 
     def mark_invalid(self) -> None:
-        """Record an invalid delta and break persistence."""
+        """Record an unusable delta."""
         self.invalid_count += 1
-        self.current_underperform_streak = 0
 
     @property
     def median_mib_s(self) -> float:
@@ -313,21 +306,9 @@ class ClientSummary:
             return 0.0
         return self.relative_median_sum / self.relative_median_count
 
-    @property
-    def underperform_percent(self) -> float:
-        """Percentage of valid samples flagged as underperforming."""
-        if not self.sample_count:
-            return 0.0
-        return 100.0 * self.underperform_count / self.sample_count
-
-    @property
-    def problem_count(self) -> int:
-        """Intervals that were slow, missing, or unusable."""
-        return self.underperform_count + self.missing_count + self.invalid_count
-
 
 @dataclass(frozen=True)
-class AggregatePoint:
+class AggregatePoint:  # pylint: disable=too-many-instance-attributes
     """Native Rank=Total sample; a missing or invalid value is None."""
 
     interval: int
@@ -335,6 +316,8 @@ class AggregatePoint:
     iso_timestamp: str
     throughput_mib_s: Optional[float]
     iops: Optional[float]
+    io_latency_us: Optional[float] = None
+    entries_latency_us: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -370,6 +353,18 @@ class DomainAnalysis:
         """Whether this domain contains client rows."""
         return bool(self.clients)
 
+    @property
+    def all_started_interval(self) -> Optional[int]:
+        """First interval by which every client that ever progressed had
+        DoneBytes > 0; None when no client progressed. A client that never
+        moves data must not hide the others: it classifies as slow instead."""
+        started = [
+            summary.first_progress_interval
+            for summary in self.clients.values()
+            if summary.first_progress_interval is not None
+        ]
+        return max(started) if started else None
+
 
 @dataclass
 class LiveAnalysis:
@@ -385,7 +380,6 @@ class SelectedClientDetail:
 
     selected: List[LiveClientId]
     rates_by_client: Dict[LiveClientId, List[Optional[float]]]
-    heatmap_by_client: Dict[LiveClientId, List[Optional[float]]]
 
 
 @dataclass
@@ -404,6 +398,8 @@ class _IntervalBuffer:
     client_rows: Dict[LiveClientId, int] = field(default_factory=dict)
     aggregate_mib_s: Optional[float] = None
     aggregate_iops: Optional[float] = None
+    io_latency_us: Optional[float] = None
+    entries_latency_us: Optional[float] = None
 
 
 @dataclass
@@ -432,6 +428,23 @@ class _LiveCSVColumns:
     mib_per_sec: int
     iops: int
     service: int
+    io_latency: Optional[int] = None
+    entries_latency: Optional[int] = None
+
+
+class ParsedRow(NamedTuple):
+    """One parsed live CSV row; only Total rows carry rates and latency."""
+
+    key: LiveDomainKey
+    runtime_ms: int
+    iso_timestamp: str
+    rank: str
+    client: Optional[LiveClientId]
+    done_bytes: Optional[int]
+    mib_s: Optional[float]
+    iops: Optional[float]
+    io_latency_us: Optional[float]
+    entries_latency_us: Optional[float]
 
 
 class _OccurrenceTracker:
@@ -525,10 +538,7 @@ def _total_rate_jump_restarted(
     return implied_mib_s > restart_threshold
 
 
-def analyze_live_csv(
-    metadata: LiveFileMetadata,
-    z_threshold: float = 2.0,
-) -> LiveAnalysis:
+def analyze_live_csv(metadata: LiveFileMetadata) -> LiveAnalysis:
     """Stream a live CSV once and return bounded first-pass analysis."""
     states: Dict[LiveDomainKey, _DomainState] = {}
     with open(metadata.path, "r", encoding="utf-8-sig", newline="") as handle:
@@ -536,99 +546,43 @@ def analyze_live_csv(
         for line_number, parsed in enumerate(
             iter_parsed_rows(reader, columns), start=2
         ):
-            (
-                key,
-                runtime_ms,
-                iso_timestamp,
-                rank,
-                client,
-                done_bytes,
-                mib_s,
-                iops,
-            ) = parsed
-            state = states.setdefault(
-                key,
-                _DomainState(analysis=DomainAnalysis(key=key)),
-            )
-            _advance_buffer(state, runtime_ms, iso_timestamp, z_threshold)
-            if rank == TOTAL_RANK:
-                state.buffer.aggregate_mib_s = mib_s
-                state.buffer.aggregate_iops = iops
+            key = parsed.key
+            state = states.get(key)
+            if state is None:
+                state = states[key] = _DomainState(analysis=DomainAnalysis(key=key))
+            _advance_buffer(state, parsed.runtime_ms, parsed.iso_timestamp)
+            if parsed.rank == TOTAL_RANK:
+                buffer = state.buffer
+                buffer.aggregate_mib_s = parsed.mib_s
+                buffer.aggregate_iops = parsed.iops
+                buffer.io_latency_us = parsed.io_latency_us
+                buffer.entries_latency_us = parsed.entries_latency_us
                 continue
-            if client is None or done_bytes is None:
-                state.analysis.diagnostics["malformed_client_rows"] += 1
-                state.analysis.diagnostics[f"line_{line_number}_invalid"] += 1
+            if parsed.client is None or parsed.done_bytes is None:
+                _record_malformed(state.analysis.diagnostics, line_number)
                 continue
-            state.buffer.client_rows[client] = done_bytes
+            state.buffer.client_rows[parsed.client] = parsed.done_bytes
     for state in states.values():
-        _flush_interval(state, z_threshold)
+        _flush_interval(state)
     return LiveAnalysis(
         metadata=metadata,
         domains={key: state.analysis for key, state in states.items()},
     )
 
 
-def select_clients(
-    domain: DomainAnalysis,
-    min_underperform_segments: int,
-    limit: int,
-) -> List[LiveClientId]:
-    """Select persistent/severe/slow clients deterministically."""
-    candidates = [
-        summary
-        for summary in domain.clients.values()
-        if summary.problem_count >= min_underperform_segments
-    ]
-    ordered = sorted(
-        candidates,
-        key=lambda summary: (
-            -summary.problem_count,
-            -summary.missing_count,
-            -summary.invalid_count,
-            summary.worst_z_score,
-            summary.relative_to_fleet_median,
-            summary.mean_mib_s,
-            summary.client,
-        ),
-    )
-    return [summary.client for summary in ordered[:limit]]
+def _record_malformed(diagnostics: Counter, line_number: int) -> None:
+    """Count a malformed client row; name only the first few lines."""
+    diagnostics[MALFORMED_CLIENT_ROWS] += 1
+    if diagnostics[MALFORMED_CLIENT_ROWS] <= MALFORMED_LINES_REPORTED:
+        diagnostics[f"line_{line_number}_invalid"] += 1
 
 
-def select_heatmap_clients(
-    domain: DomainAnalysis,
-    prioritized: Sequence[LiveClientId],
-    limit: int,
-) -> List[LiveClientId]:
-    """Select anomaly-first rows plus representative clients for fleet context."""
-    available = set(domain.clients)
-    selected = []
-    selected_set = set()
-    for client in prioritized:
-        if client in available and client not in selected_set:
-            selected.append(client)
-            selected_set.add(client)
-        if len(selected) == limit:
-            return selected
-    remaining = sorted(available - selected_set)
-    slots = limit - len(selected)
-    selected.extend(_representative_values(remaining, slots))
-    return selected
-
-
-def _representative_values(
-    values: Sequence[LiveClientId],
-    limit: int,
-) -> List[LiveClientId]:
-    """Return evenly spaced values, including both endpoints when possible."""
-    if limit <= 0 or not values:
-        return []
-    if len(values) <= limit:
-        return list(values)
-    if limit == 1:
-        return [values[len(values) // 2]]
-    last = len(values) - 1
-    indices = [round(index * last / (limit - 1)) for index in range(limit)]
-    return [values[index] for index in indices]
+def client_sort_key(client: LiveClientId) -> Tuple[int, int, str, str]:
+    """Numeric ranks by value first, then other ranks, then service."""
+    try:
+        return (0, int(client.rank), "", client.service)
+    except ValueError:
+        return (1, 0, client.rank, client.service)
 
 
 def collect_selected_client_detail(
@@ -636,7 +590,7 @@ def collect_selected_client_detail(
     domain: DomainAnalysis,
     selected: Sequence[LiveClientId],
 ) -> SelectedClientDetail:
-    """Re-scan one CSV and retain rates only for selected clients."""
+    """Re-scan one CSV and retain one-interval rates only for selected clients."""
     selected_set = set(selected)
     interval_count = len(domain.interval_times)
     rates = {client: [INVALID_RATE] * interval_count for client in selected}
@@ -644,274 +598,202 @@ def collect_selected_client_detail(
     with open(analysis.metadata.path, "r", encoding="utf-8-sig", newline="") as handle:
         reader, columns = live_csv_reader(handle, analysis.metadata.path)
         for parsed in iter_parsed_rows(reader, columns):
-            key, runtime_ms, _, rank, client, done_bytes, _, _ = parsed
-            if key != domain.key or rank == TOTAL_RANK or client not in selected_set:
+            client = parsed.client
+            if client not in selected_set or parsed.key != domain.key:
                 continue
-            if done_bytes is None or runtime_ms not in domain.runtime_to_interval:
+            done_bytes = parsed.done_bytes
+            interval = domain.runtime_to_interval.get(parsed.runtime_ms)
+            if done_bytes is None or interval is None:
                 continue
-            interval = domain.runtime_to_interval[runtime_ms]
             prior = previous.get(client)
-            rate = derive_rate(prior, done_bytes, runtime_ms, interval)
+            rate = derive_rate(prior, done_bytes, parsed.runtime_ms, interval)
             if rate is not None:
                 rates[client][interval] = rate
-            previous[client] = PreviousSample(done_bytes, runtime_ms, interval)
-    fleet_by_interval = {point.interval: point for point in domain.fleet_points}
-    heatmap = {}
-    for client in selected:
-        heatmap[client] = [
-            _heatmap_value(rate, fleet_by_interval.get(interval))
-            for interval, rate in enumerate(rates[client])
-        ]
-    return SelectedClientDetail(list(selected), rates, heatmap)
+            previous[client] = PreviousSample(done_bytes, parsed.runtime_ms, interval)
+    return SelectedClientDetail(list(selected), rates)
+
+
+SUMMARY_COLUMNS = [
+    "client",
+    "mode",
+    "rank",
+    "service",
+    "class",
+    "steady_mean_mib_s",
+    "steady_ratio",
+    "worst_5s_ratio",
+    "worst_5s_elapsed_sec",
+    "worst_30s_ratio",
+    "worst_30s_elapsed_sec",
+    "short_5s_percent",
+    "mean_mib_s",
+    "median_mib_s",
+    "valid_samples",
+    "missing_samples",
+    "invalid_samples",
+]
+SUMMARY_TEXT_HEADER = (
+    "host/worker",
+    "class",
+    "steady MiB/s",
+    "steady/median",
+    "worst 5 s",
+    "worst 30 s",
+    "5 s windows short",
+    "mean MiB/s",
+    "missing",
+    "invalid",
+)
 
 
 def write_client_summaries(
     metadata: LiveFileMetadata,
     domain: DomainAnalysis,
+    steady: Optional["SteadyAnalysis"],
     output_dir: str,
 ) -> Tuple[str, str]:
-    """Write sorted CSV and text summaries; return both paths."""
+    """Write sorted CSV and text client summaries; return both paths."""
     base = f"{metadata.stem}-{domain.key.slug}-client-summary"
     csv_path = os.path.join(output_dir, f"{base}.csv")
     text_path = os.path.join(output_dir, f"{base}.txt")
-    summaries = sorted(
-        domain.clients.values(),
-        key=lambda item: (
-            -item.problem_count,
-            -item.missing_count,
-            -item.invalid_count,
-            item.worst_z_score,
-            item.relative_to_fleet_median,
-            item.client,
-        ),
-    )
-    header = [
-        "client",
-        "mode",
-        "rank",
-        "service",
-        "mean_mib_s",
-        "median_mib_s",
-        "avg_fleet_median_percent",
-        "worst_sample_index",
-        "worst_elapsed_sec",
-        "worst_iso_timestamp",
-        "worst_deviation_sigma",
-        "underperform_intervals",
-        "underperform_percent",
-        "longest_underperform_streak",
-        "valid_samples",
-        "missing_samples",
-        "skipped_delta_samples",
-    ]
+    rows = _summary_rows(domain, steady)
     with open(csv_path, "w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(header)
-        for summary in summaries:
-            writer.writerow(_summary_row(summary))
+        writer.writerow(SUMMARY_COLUMNS)
+        for summary, client_steady in rows:
+            writer.writerow(_summary_csv_row(summary, client_steady))
     with open(text_path, "w", encoding="utf-8") as handle:
         handle.write(f"Elbencho live client summary: {domain.key.label}\n")
-        handle.write(
-            "host/worker\tmean MiB/s\tmedian MiB/s\tavg fleet median %\t"
-            "underperform\tlongest streak\tworst timestamp\tmissing\tskipped deltas\n"
-        )
-        for summary in summaries:
-            handle.write(
-                f"{summary.client.label}\t{summary.mean_mib_s:.3f}\t"
-                f"{summary.median_mib_s:.3f}\t"
-                f"{summary.relative_to_fleet_median * 100:.1f}%\t"
-                f"{summary.underperform_count}/{summary.sample_count} "
-                f"({summary.underperform_percent:.2f}%)\t"
-                f"{summary.longest_underperform_streak}\t"
-                f"{summary.worst_iso_timestamp or '-'}\t"
-                f"{summary.missing_count}\t{summary.invalid_count}\n"
-            )
+        handle.write(_steady_heading(steady) + "\n")
+        handle.write("\t".join(SUMMARY_TEXT_HEADER) + "\n")
+        for summary, client_steady in rows:
+            handle.write("\t".join(_summary_text_row(summary, client_steady)) + "\n")
     return csv_path, text_path
 
 
-def plot_aggregate_timeseries(
-    metadata: LiveFileMetadata,
-    domain: DomainAnalysis,
-    output_dir: str,
-) -> Optional[str]:
-    """Plot native aggregate MiB/s and IOPS against elapsed time."""
-    if not domain.aggregate_points:
-        return None
-    import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
+def _summary_rows(
+    domain: DomainAnalysis, steady: Optional["SteadyAnalysis"]
+) -> List[Tuple[ClientSummary, Optional["ClientSteady"]]]:
+    """Clients with their steady statistics, sorted by class then ratio."""
+    from lib.elbencho_live_steady import (  # pylint: disable=import-outside-toplevel
+        CLASS_ORDER,
+    )
 
-    points = domain.aggregate_points
-    x_values, throughput = _series_with_gap_breaks(
-        [point.elapsed_sec for point in points],
-        [_plottable(point.throughput_mib_s) for point in points],
-    )
-    _, iops = _series_with_gap_breaks(
-        [point.elapsed_sec for point in points],
-        [_plottable(point.iops) for point in points],
-    )
-    figure, throughput_axis = plt.subplots(figsize=(14, 7))
-    iops_axis = throughput_axis.twinx()
-    throughput_axis.plot(x_values, throughput, color="steelblue", label="MiB/s")
-    iops_axis.plot(x_values, iops, color="darkorange", alpha=0.75, label="IOPS")
-    _set_timestamp_ticks(
-        throughput_axis,
-        [point.elapsed_sec for point in points],
-        [point.iso_timestamp for point in points],
-    )
-    throughput_axis.set_xlabel("Sample time (ISO Date)")
-    throughput_axis.set_ylabel("Throughput (MiB/s)", color="steelblue")
-    iops_axis.set_ylabel("IOPS", color="darkorange")
-    throughput_axis.set_title(
-        f"Elbencho Aggregate Live Throughput - {domain.key.label}"
-    )
-    throughput_axis.grid(True, alpha=0.3)
-    figure.tight_layout()
-    path = os.path.join(
-        output_dir,
-        f"{metadata.stem}-{domain.key.slug}-aggregate-timeseries.png",
-    )
-    figure.savefig(path, bbox_inches="tight", dpi=150)
-    plt.close(figure)
-    return path
-
-
-def plot_client_timeseries(
-    metadata: LiveFileMetadata,
-    domain: DomainAnalysis,
-    detail: SelectedClientDetail,
-    line_clients: Sequence[LiveClientId],
-    output_dir: str,
-) -> Optional[str]:
-    """Plot fleet percentile band, median, and selected outlier lines."""
-    if not domain.fleet_points:
-        return None
-    import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
-    from matplotlib import colormaps  # pylint: disable=import-outside-toplevel
-    import numpy as np  # pylint: disable=import-outside-toplevel
-
-    fleet_by_interval = {point.interval: point for point in domain.fleet_points}
-    intervals = list(range(len(domain.interval_times)))
-    x_values = domain.interval_times
-    p10 = [
-        (
-            fleet_by_interval[interval].p10_mib_s
-            if interval in fleet_by_interval
-            else math.nan
-        )
-        for interval in intervals
+    by_client = steady.clients if steady is not None else {}
+    rows = [
+        (summary, by_client.get(client)) for client, summary in domain.clients.items()
     ]
-    p50 = [
-        (
-            fleet_by_interval[interval].p50_mib_s
-            if interval in fleet_by_interval
-            else math.nan
+
+    def sort_key(item):
+        summary, client_steady = item
+        classification = client_steady.classification if client_steady else None
+        ratio = client_steady.steady_ratio if client_steady else None
+        return (
+            (
+                CLASS_ORDER.index(classification)
+                if classification in CLASS_ORDER
+                else len(CLASS_ORDER)
+            ),
+            ratio is None,
+            ratio if ratio is not None else 0.0,
+            client_sort_key(summary.client),
         )
-        for interval in intervals
+
+    return sorted(rows, key=sort_key)
+
+
+def _fmt(value: Optional[float], digits: int, scale: float = 1.0) -> str:
+    """Format a number to fixed digits; None is an empty string."""
+    return "" if value is None else f"{value * scale:.{digits}f}"
+
+
+def _summary_csv_row(
+    summary: ClientSummary, client_steady: Optional["ClientSteady"]
+) -> List[object]:
+    """One client-summary CSV row; missing values are empty cells."""
+    has_samples = summary.sample_count > 0
+    row: List[object] = [
+        summary.client.label,
+        summary.client.mode,
+        summary.client.rank,
+        summary.client.service,
     ]
-    p90 = [
-        (
-            fleet_by_interval[interval].p90_mib_s
-            if interval in fleet_by_interval
-            else math.nan
-        )
-        for interval in intervals
-    ]
-    figure, axis = plt.subplots(figsize=(14, 7))
-    axis.fill_between(x_values, p10, p90, alpha=0.3, color="steelblue", label="p10-p90")
-    axis.plot(x_values, p50, color="steelblue", linewidth=2, label="fleet median")
-    colors = colormaps["Set1"](np.linspace(0, 1, max(1, len(line_clients))))
-    for color, client in zip(colors, line_clients):
-        client_rates = [
-            detail.rates_by_client[client][interval] for interval in intervals
-        ]
-        values = [math.nan if value is None else value for value in client_rates]
-        axis.plot(
-            x_values, values, linewidth=1.3, alpha=0.85, color=color, label=client.label
-        )
-    _set_timestamp_ticks(axis, x_values, domain.interval_iso_timestamps)
-    axis.set_xlabel("Sample time (ISO Date)")
-    axis.set_ylabel("Throughput (MiB/s)")
-    axis.set_ylim(0, None)
-    axis.set_title(f"Elbencho Client Throughput - {domain.key.label}")
-    axis.grid(True, alpha=0.3)
-    axis.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
-    figure.tight_layout()
-    path = os.path.join(
-        output_dir,
-        f"{metadata.stem}-{domain.key.slug}-client-timeseries.png",
-    )
-    figure.savefig(path, bbox_inches="tight", dpi=150)
-    plt.close(figure)
-    return path
-
-
-def plot_underperformance_heatmap(
-    metadata: LiveFileMetadata,
-    domain: DomainAnalysis,
-    detail: SelectedClientDetail,
-    heatmap_clients: Sequence[LiveClientId],
-    output_dir: str,
-) -> Optional[str]:
-    """Plot selected-client throughput relative to each interval's fleet median."""
-    if not heatmap_clients or not domain.interval_times:
-        return None
-    import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
-    import numpy as np  # pylint: disable=import-outside-toplevel
-    from matplotlib import colormaps  # pylint: disable=import-outside-toplevel
-
-    matrix = np.array(
-        [
+    if client_steady is None:
+        row.extend([""] * 8)
+    else:
+        row.extend(
             [
-                np.nan if value is None else value
-                for value in detail.heatmap_by_client[client]
+                client_steady.classification or "",
+                _fmt(client_steady.steady_mean_mib_s, 3),
+                _fmt(client_steady.steady_ratio, 4),
+                _fmt(client_steady.worst_5s_ratio, 4),
+                _fmt(client_steady.worst_5s_ms, 3, 0.001),
+                _fmt(client_steady.worst_30s_ratio, 4),
+                _fmt(client_steady.worst_30s_ms, 3, 0.001),
+                _fmt(client_steady.short_5s_share, 1, 100.0),
             ]
-            for client in heatmap_clients
-        ],
-        dtype=float,
+        )
+    row.extend(
+        [
+            _fmt(summary.mean_mib_s if has_samples else None, 3),
+            _fmt(summary.median_mib_s if has_samples else None, 3),
+            summary.sample_count,
+            summary.missing_count,
+            summary.invalid_count,
+        ]
     )
-    missing_color = "#0072B2"
-    cmap = colormaps["YlOrBr_r"].copy()
-    cmap.set_bad(color=missing_color)
-    figure_height = max(5, 0.3 * len(heatmap_clients))
-    figure, axis = plt.subplots(figsize=(16, figure_height))
-    image = axis.imshow(
-        matrix,
-        aspect="auto",
-        cmap=cmap,
-        vmin=0,
-        vmax=100,
-        interpolation="nearest",
+    return row
+
+
+def _summary_text_row(
+    summary: ClientSummary, client_steady: Optional["ClientSteady"]
+) -> List[str]:
+    """One tab-separated text row; missing values are '-'."""
+
+    def text(value: Optional[float], digits: int) -> str:
+        return _fmt(value, digits) or "-"
+
+    cells = [summary.client.label]
+    if client_steady is None:
+        cells.extend(["-"] * 6)
+    else:
+        short = (
+            f"{client_steady.short_5s}/{client_steady.windows_5s}"
+            if client_steady.windows_5s
+            else "-"
+        )
+        cells.extend(
+            [
+                client_steady.classification or "-",
+                text(client_steady.steady_mean_mib_s, 3),
+                text(client_steady.steady_ratio, 3),
+                text(client_steady.worst_5s_ratio, 3),
+                text(client_steady.worst_30s_ratio, 3),
+                short,
+            ]
+        )
+    cells.extend(
+        [
+            text(summary.mean_mib_s if summary.sample_count else None, 3),
+            str(summary.missing_count),
+            str(summary.invalid_count),
+        ]
     )
-    tick_spacing = max(1, len(domain.interval_times) // 10)
-    ticks = list(range(0, len(domain.interval_times), tick_spacing))
-    axis.set_xticks(ticks)
-    axis.set_xticklabels(
-        [_display_timestamp(domain.interval_iso_timestamps[idx]) for idx in ticks],
-        rotation=30,
-        ha="right",
+    return cells
+
+
+def _steady_heading(steady: Optional["SteadyAnalysis"]) -> str:
+    """The text summary's steady-window line."""
+    if steady is None:
+        return "Steady window unavailable (not analyzed)"
+    window = steady.window
+    if not window.available:
+        return f"Steady window unavailable ({window.reason})"
+    return (
+        f"Steady window: {window.start_ms / 1000:.1f}-{window.end_ms / 1000:.1f} s; "
+        f"shortfall {steady.shortfall_percent:g}%; "
+        f"min slow windows {steady.min_slow_windows}"
     )
-    axis.set_yticks(range(len(heatmap_clients)))
-    axis.set_yticklabels([client.label for client in heatmap_clients], fontsize=8)
-    axis.set_xlabel("Sample time (ISO Date)")
-    axis.set_ylabel("Host / worker")
-    axis.set_title(
-        f"Elbencho Client Throughput vs Fleet Median - {domain.key.label}\n"
-        "light=at/above fleet median, blue=missing/skipped, darker orange=slower"
-    )
-    colorbar = figure.colorbar(
-        image,
-        ax=axis,
-        label="Throughput (% of interval fleet median)",
-    )
-    colorbar.set_ticks([0, 25, 50, 75, 100])
-    colorbar.set_ticklabels(["0%", "25%", "50%", "75%", "≥100% (median or faster)"])
-    figure.tight_layout()
-    path = os.path.join(
-        output_dir,
-        f"{metadata.stem}-{domain.key.slug}-underperformance-heatmap.png",
-    )
-    figure.savefig(path, bbox_inches="tight", dpi=150)
-    plt.close(figure)
-    return path
 
 
 def live_csv_reader(handle, path: str):
@@ -941,24 +823,20 @@ def _columns_from_header(
         mib_per_sec=positions["MiB/s"],
         iops=positions["IOPS"],
         service=positions["Service"],
+        io_latency=positions.get(IO_LATENCY_COLUMN),
+        entries_latency=positions.get(ENTRIES_LATENCY_COLUMN),
     )
 
 
-def _parse_row(
-    row: Sequence[str],
-    columns: _LiveCSVColumns,
-) -> Optional[
-    Tuple[
-        LiveDomainKey,
-        int,
-        str,
-        str,
-        Optional[LiveClientId],
-        Optional[int],
-        Optional[float],
-        Optional[float],
-    ]
-]:
+def _optional_cell(row: Sequence[str], index: Optional[int]) -> Optional[float]:
+    """Parse an optional column's cell; absent columns and cells are None."""
+    if index is None or index >= len(row):
+        return None
+    return _optional_float(row[index])
+
+
+def _parse_row(row: Sequence[str], columns: _LiveCSVColumns) -> Optional[tuple]:
+    """Parse one row into ParsedRow fields (before occurrence numbering)."""
     try:
         phase = row[columns.phase].strip()
         runtime_value = row[columns.runtime_ms]
@@ -971,9 +849,7 @@ def _parse_row(
         service = row[columns.service].strip()
     except IndexError:
         return None
-    if not phase:
-        return None
-    if phase.upper() in SKIPPED_METADATA_PHASES:
+    if not phase or phase.upper() in SKIPPED_METADATA_PHASES:
         return None
     try:
         runtime_ms = int(runtime_value)
@@ -990,43 +866,40 @@ def _parse_row(
             _optional_int(done_bytes_value),
             _optional_float(mib_per_sec_value),
             _optional_float(iops_value),
+            _optional_cell(row, columns.io_latency),
+            _optional_cell(row, columns.entries_latency),
         )
     if not rank:
-        return key, runtime_ms, iso_timestamp, rank, None, None, None, None
-    client = LiveClientId(rank=rank, service=service)
+        return key, runtime_ms, iso_timestamp, rank, None, None, None, None, None, None
     return (
         key,
         runtime_ms,
         iso_timestamp,
         rank,
-        client,
+        LiveClientId(rank=rank, service=service),
         _optional_int(done_bytes_value),
         None,
         None,
+        _optional_cell(row, columns.io_latency),
+        _optional_cell(row, columns.entries_latency),
     )
 
 
 def iter_parsed_rows(
     reader: Iterable[Sequence[str]],
     columns: _LiveCSVColumns,
-):
+) -> Iterator[ParsedRow]:
     """Yield parsed rows while separating repeated phase/runtime occurrences."""
     tracker = _OccurrenceTracker()
     for row in reader:
         parsed = _parse_row(row, columns)
         if parsed is None:
             continue
-        key, runtime_ms, iso_timestamp, rank, client, done_bytes, mib_s, iops = parsed
+        key, runtime_ms, _, rank, client, done_bytes, mib_s = parsed[:7]
         identity = TOTAL_RANK if rank == TOTAL_RANK else client
-        yield (
+        yield ParsedRow(
             tracker.domain_key(key, runtime_ms, identity, done_bytes, mib_s),
-            runtime_ms,
-            iso_timestamp,
-            rank,
-            client,
-            done_bytes,
-            mib_s,
-            iops,
+            *parsed[1:],
         )
 
 
@@ -1046,26 +919,20 @@ def _optional_float(value: Optional[str]) -> Optional[float]:
     return parsed if parsed is not None and math.isfinite(parsed) else None
 
 
-def _plottable(value: Optional[float]) -> float:
-    """A missing sample plots as a gap."""
-    return math.nan if value is None else value
-
-
 def _advance_buffer(
     state: _DomainState,
     runtime_ms: int,
     iso_timestamp: str,
-    z_threshold: float,
 ) -> None:
     if state.buffer is None:
         state.buffer = _IntervalBuffer(runtime_ms, iso_timestamp)
         return
     if state.buffer.runtime_ms != runtime_ms:
-        _flush_interval(state, z_threshold)
+        _flush_interval(state)
         state.buffer = _IntervalBuffer(runtime_ms, iso_timestamp)
 
 
-def _flush_interval(state: _DomainState, z_threshold: float) -> None:
+def _flush_interval(state: _DomainState) -> None:
     buffer = state.buffer
     if buffer is None:
         return
@@ -1084,7 +951,6 @@ def _flush_interval(state: _DomainState, z_threshold: float) -> None:
         interval,
         elapsed_sec,
         buffer.iso_timestamp,
-        z_threshold,
     )
     state.buffer = None
 
@@ -1095,7 +961,15 @@ def _record_aggregate(
     interval: int,
     elapsed_sec: float,
 ) -> None:
-    if buffer.aggregate_mib_s is None and buffer.aggregate_iops is None:
+    io_latency = buffer.io_latency_us
+    if io_latency == 0 and not buffer.aggregate_iops:
+        io_latency = None  # elbencho prints 0 for an interval without IOs
+    entries_latency = buffer.entries_latency_us or None
+    if (
+        buffer.aggregate_mib_s is None
+        and buffer.aggregate_iops is None
+        and io_latency is None
+    ):
         return
     domain.aggregate_points.append(
         AggregatePoint(
@@ -1104,6 +978,8 @@ def _record_aggregate(
             iso_timestamp=buffer.iso_timestamp,
             throughput_mib_s=buffer.aggregate_mib_s,
             iops=buffer.aggregate_iops,
+            io_latency_us=io_latency,
+            entries_latency_us=entries_latency,
         )
     )
 
@@ -1130,7 +1006,7 @@ def _derive_interval_rates(
             state.analysis.diagnostics["missing_samples"] += interval
         else:
             summary = state.analysis.clients[client]
-        summary.observe_done_bytes(done_bytes, buffer.runtime_ms)
+        summary.observe_done_bytes(done_bytes, buffer.runtime_ms, interval)
         prior = state.previous.get(client)
         rate = derive_rate(prior, done_bytes, buffer.runtime_ms, interval)
         if prior is not None and prior.interval != interval - 1:
@@ -1184,7 +1060,6 @@ def _record_fleet_statistics(
     interval: int,
     elapsed_sec: float,
     iso_timestamp: str,
-    z_threshold: float,
 ) -> None:
     if not rates:
         return
@@ -1211,28 +1086,7 @@ def _record_fleet_statistics(
         )
     )
     for client, rate in rates.items():
-        z_score = (rate - mean) / stddev if stddev > 0 else 0.0
-        underperforming = z_score < -z_threshold
-        domain.clients[client].add_rate(
-            rate,
-            median,
-            z_score,
-            interval,
-            elapsed_sec,
-            iso_timestamp,
-            underperforming,
-        )
-
-
-def _heatmap_value(
-    rate_mib_s: Optional[float],
-    fleet: Optional[FleetPoint],
-) -> Optional[float]:
-    if rate_mib_s is None or fleet is None:
-        return None
-    if fleet.p50_mib_s <= 0:
-        return 0.0 if rate_mib_s <= 0 else 100.0
-    return 100.0 * rate_mib_s / fleet.p50_mib_s
+        domain.clients[client].add_rate(rate, median)
 
 
 def _percentile(values: Iterable[float], percentile: float) -> float:
@@ -1253,77 +1107,3 @@ def percentile_from_sorted(ordered: Sequence[float], percentile: float) -> float
         return ordered[lower]
     fraction = position - lower
     return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
-
-
-def _summary_row(summary: ClientSummary) -> List[object]:
-    return [
-        summary.client.label,
-        summary.client.mode,
-        summary.client.rank,
-        summary.client.service,
-        f"{summary.mean_mib_s:.6f}",
-        f"{summary.median_mib_s:.6f}",
-        f"{summary.relative_to_fleet_median * 100:.3f}",
-        summary.worst_interval,
-        f"{summary.worst_elapsed_sec:.3f}",
-        summary.worst_iso_timestamp,
-        f"{summary.worst_z_score:.6f}",
-        summary.underperform_count,
-        f"{summary.underperform_percent:.3f}",
-        summary.longest_underperform_streak,
-        summary.sample_count,
-        summary.missing_count,
-        summary.invalid_count,
-    ]
-
-
-def _display_timestamp(iso_timestamp: str) -> str:
-    """Wrap an ISO timestamp for readable plot ticks without changing its value."""
-    return iso_timestamp.replace("T", "\n", 1) if iso_timestamp else "unknown"
-
-
-def _set_timestamp_ticks(
-    axis,
-    x_values: Sequence[float],
-    iso_timestamps: Sequence[str],
-    max_ticks: int = 10,
-) -> None:
-    """Label a numeric elapsed-time axis with corresponding ISO timestamps."""
-    count = min(len(x_values), len(iso_timestamps))
-    if not count:
-        return
-    spacing = max(1, math.ceil(count / max_ticks))
-    indices = list(range(0, count, spacing))
-    if indices[-1] != count - 1:
-        indices.append(count - 1)
-    axis.set_xticks([x_values[index] for index in indices])
-    axis.set_xticklabels(
-        [_display_timestamp(iso_timestamps[index]) for index in indices],
-        rotation=30,
-        ha="right",
-    )
-
-
-def _series_with_gap_breaks(
-    x_values: Sequence[float],
-    y_values: Sequence[float],
-) -> Tuple[List[float], List[float]]:
-    if len(x_values) < 3:
-        return list(x_values), list(y_values)
-    deltas = [
-        current - previous
-        for previous, current in zip(x_values, x_values[1:])
-        if current > previous
-    ]
-    expected = _percentile(deltas, 50)
-    if expected <= 0:
-        return list(x_values), list(y_values)
-    out_x: List[float] = [x_values[0]]
-    out_y: List[float] = [y_values[0]]
-    for previous, current, value in zip(x_values, x_values[1:], y_values[1:]):
-        if current - previous > expected * 1.5:
-            out_x.append((previous + current) / 2.0)
-            out_y.append(math.nan)
-        out_x.append(current)
-        out_y.append(value)
-    return out_x, out_y

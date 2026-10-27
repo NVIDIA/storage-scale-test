@@ -41,6 +41,8 @@ class ReportOption:
 TO_JSON_FLAG = "--to-json"
 REQUIRE_COMPLETE_FLAG = "--require-complete"
 LIVE_DETAIL_FLAG = "--live-detail"
+SHORTFALL_FLAG = "--client-shortfall-percent"
+SHORTFALL_LIMIT_PERCENT = 50
 RESULTS_FRAGMENT_FLAG = "--results-fragment"
 RESULTS_LIVE_DIR_FLAG = "--results-live-dir"
 # Mirrors lib.filesystem_results.LIVE_DETAIL_LEVELS, which this dependency-free
@@ -117,20 +119,20 @@ REPORT_OPTIONS = (
     ReportOption(
         "--per-client-plots",
         "io",
-        "Analyze live client imbalance and outliers.",
+        "Write per-client live summaries and plots.",
         {"action": "store_true"},
     ),
     ReportOption(
-        "--client-outlier-threshold",
+        SHORTFALL_FLAG,
         "io",
-        "Underperforming-client z-score magnitude.",
-        {"type": float, "default": 2.0, "metavar": "Z"},
+        "Slow client shortfall below the fleet median, percent.",
+        {"type": float, "default": 5.0, "metavar": "PCT"},
     ),
     ReportOption(
-        "--client-min-underperform-segments",
+        "--client-min-slow-windows",
         "io",
-        "Minimum underperforming live intervals.",
-        {"type": int, "default": 1, "metavar": "N"},
+        "Minimum 5 s windows at twice the shortfall for a transient client.",
+        {"type": int, "default": 3, "metavar": "N"},
     ),
     ReportOption(
         "--client-max-timeseries-lines",
@@ -221,6 +223,11 @@ def validate_analysis_arguments(args: argparse.Namespace) -> None:
             if option.flag == "--normalize-to":
                 raise ValueError("--normalize-to must be a positive integer")
             raise ValueError(f"{option.flag} must be greater than zero")
+    shortfall = getattr(args, SHORTFALL_FLAG[2:].replace("-", "_"), None)
+    if shortfall is not None and shortfall >= SHORTFALL_LIMIT_PERCENT:
+        raise ValueError(
+            f"{SHORTFALL_FLAG} must be less than {SHORTFALL_LIMIT_PERCENT}"
+        )
 
 
 def options_by_kind(args: argparse.Namespace, kinds: set[str]) -> dict[str, list[str]]:

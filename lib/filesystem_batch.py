@@ -481,9 +481,9 @@ def _results_request(
     options["live_detail"] = getattr(args, "live_detail", None) or _option_default(
         LIVE_DETAIL_FLAG
     )
-    options["z_threshold"] = getattr(
-        args, "client_outlier_threshold", None
-    ) or _option_default("--client-outlier-threshold")
+    for key in ("shortfall_percent", "min_slow_windows"):
+        flag = "--client-" + key.replace("_", "-")
+        options[key] = getattr(args, f"client_{key}", None) or _option_default(flag)
     options.update(groups=groups, kind=kind)
     return ResultsRequest(
         bool(getattr(args, "require_complete", False)),

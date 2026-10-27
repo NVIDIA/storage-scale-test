@@ -39,13 +39,25 @@ from lib.elbencho_live_report import (
     LiveFileMetadata,
     PreviousSample,
     analyze_live_csv,
+    client_sort_key,
     collect_selected_client_detail,
     derive_rate,
     iter_parsed_rows,
     live_csv_reader,
     percentile_from_sorted,
-    select_clients,
-    select_heatmap_clients,
+)
+from lib.elbencho_live_steady import (
+    CLASS_PERSISTENT,
+    CLASS_TRANSIENT,
+    END_SOURCE_FIRST,
+    REASON_NO_FIRST_TIME,
+    WINDOW_LABELS,
+    ClientSteady,
+    PhaseContext,
+    SteadyAnalysis,
+    analyze_steady,
+    classified_clients,
+    select_heatmap_rows,
 )
 from lib.filesystem_results import (
     LIVE_SCHEMA,
@@ -53,6 +65,7 @@ from lib.filesystem_results import (
     SidecarWriter,
     file_record,
     mib_s_to_bytes_per_s,
+    round_latency_us,
     round_ops,
 )
 
@@ -64,21 +77,26 @@ CLIENT_COLUMNS = [
     "service",
     "kubernetes_node",
     "kubernetes_pod",
+    "class",
     "mean_bytes_per_s",
     "median_bytes_per_s",
     "mean_ratio_to_fleet_median",
+    "steady_bytes_per_s",
+    "steady_ratio",
+    "worst_5s_ratio",
+    "worst_5s_elapsed_ms",
+    "worst_30s_ratio",
+    "worst_30s_elapsed_ms",
+    "short_5s_share",
     "final_done_bytes",
     "finish_elapsed_ms",
-    "underperform_intervals",
-    "longest_underperform_streak",
-    "worst_z",
-    "worst_elapsed_ms",
     "valid_samples",
     "missing_samples",
     "invalid_samples",
 ]
 DEFAULT_DIAGNOSTICS = ("missing_samples", "counter_resets", "non_adjacent_samples")
 ADDITIONAL_DOMAINS = "additional_domains"
+NO_CONTEXT = PhaseContext(None, None, None, None)
 
 
 class LiveCSVError(Exception):
@@ -110,20 +128,21 @@ def build_live_objects(  # pylint: disable=too-many-arguments,too-many-positiona
     relative_source_path: str,
     level: str,
     configured_interval_ms: Optional[int],
-    z_threshold: float,
+    contexts: Mapping[str, PhaseContext],
+    classification: Tuple[float, int],
     selection_limits: Tuple[int, int],
-    min_underperform_segments: int,
     sidecar_dir: Optional[str],
     sidecar_prefix: str,
     execution_id: Optional[str],
     workers: Optional[Mapping[str, Tuple[str, str]]],
 ) -> Dict[str, dict]:
-    """Analyze one live CSV and return live objects keyed by lowercase phase."""
+    """Analyze one live CSV and return live objects keyed by lowercase phase.
+
+    ``classification`` is (shortfall percent, minimum slow 5 s windows).
+    """
     try:
         source = file_record(live_csv_path, relative_source_path)
-        analysis = analyze_live_csv(
-            LiveFileMetadata(live_csv_path, "", 0, 0, 0, ""), z_threshold
-        )
+        analysis = analyze_live_csv(LiveFileMetadata(live_csv_path, "", 0, 0, 0, ""))
     except (OSError, ValueError, csv.Error, UnicodeError) as exc:
         raise LiveCSVError(f"cannot read live CSV {live_csv_path}: {exc}") from exc
     by_phase: Dict[str, List[DomainAnalysis]] = {}
@@ -132,14 +151,20 @@ def build_live_objects(  # pylint: disable=too-many-arguments,too-many-positiona
             by_phase.setdefault(domain.key.phase.lower(), []).append(domain)
     result: Dict[str, dict] = {}
     for phase, domains in by_phase.items():
+        try:
+            steady = analyze_steady(
+                analysis,
+                domains[0],
+                contexts.get(phase) or NO_CONTEXT,
+                configured_interval_ms,
+                *classification,
+            )
+        except (OSError, ValueError, csv.Error, UnicodeError) as exc:
+            raise LiveCSVError(f"cannot read live CSV {live_csv_path}: {exc}") from exc
         live = _build_live_object(
-            analysis,
-            domains[0],
+            (analysis, domains[0], steady),
             source,
-            level,
-            configured_interval_ms,
-            selection_limits,
-            min_underperform_segments,
+            (level, configured_interval_ms, selection_limits),
             (sidecar_dir, sidecar_prefix, execution_id),
             workers or {},
         )
@@ -150,17 +175,15 @@ def build_live_objects(  # pylint: disable=too-many-arguments,too-many-positiona
     return result
 
 
-def _build_live_object(  # pylint: disable=too-many-arguments,too-many-positional-arguments
-    analysis: LiveAnalysis,
-    domain: DomainAnalysis,
+def _build_live_object(
+    analyzed: Tuple[LiveAnalysis, DomainAnalysis, SteadyAnalysis],
     source: dict,
-    level: str,
-    configured_interval_ms: Optional[int],
-    selection_limits: Tuple[int, int],
-    min_underperform_segments: int,
+    detail: Tuple[str, Optional[int], Tuple[int, int]],
     sidecar: Tuple[Optional[str], str, Optional[str]],
     workers: Mapping[str, Tuple[str, str]],
 ) -> dict:
+    analysis, domain, steady = analyzed
+    level, configured_interval_ms, selection_limits = detail
     ordered = _ordered_clients(domain)
     summaries = [domain.clients[client] for client in ordered]
     diagnostics = {name: 0 for name in DEFAULT_DIAGNOSTICS}
@@ -178,38 +201,37 @@ def _build_live_object(  # pylint: disable=too-many-arguments,too-many-positiona
         },
         "intervals": len(domain.interval_times),
         "clients": len(ordered),
+        "steady": _steady_object(steady),
         "aggregate_series": _aggregate_series(domain),
         "fleet_series": _fleet_series(domain),
-        "distribution": _distribution(summaries),
+        "fairness": _fairness(steady),
+        "latency": _latency(steady),
+        "distribution": _distribution(summaries, steady),
         "clients_summary": {
             "columns": list(CLIENT_COLUMNS),
-            "rows": [_client_row(item, workers) for item in summaries],
+            "rows": [_client_row(item, steady, workers) for item in summaries],
         },
         "client_series": _client_series(
-            analysis,
-            domain,
-            ordered,
-            level,
-            selection_limits,
-            min_underperform_segments,
-            sidecar,
+            analysis, domain, steady, ordered, level, selection_limits, sidecar
         ),
         "diagnostics": dict(sorted(diagnostics.items())),
     }
 
 
-def _rank_key(client: LiveClientId) -> tuple:
-    numeric = client.rank.isdigit()
-    return (
-        0 if numeric else 1,
-        int(client.rank) if numeric else 0,
-        client.rank,
-        client.service,
-    )
+def _steady_object(steady: SteadyAnalysis) -> dict:
+    window = steady.window
+    return {
+        "start_ms": window.start_ms,
+        "end_ms": window.end_ms,
+        "end_source": (
+            None if window.reason == REASON_NO_FIRST_TIME else END_SOURCE_FIRST
+        ),
+        "reason": window.reason,
+    }
 
 
 def _ordered_clients(domain: DomainAnalysis) -> List[LiveClientId]:
-    return sorted(domain.clients, key=_rank_key)
+    return sorted(domain.clients, key=client_sort_key)
 
 
 def _ms(seconds: float) -> int:
@@ -226,6 +248,9 @@ def _aggregate_series(domain: DomainAnalysis) -> dict:
         "elapsed_ms": [_ms(point.elapsed_sec) for point in points],
         "bytes_per_s": [_bytes(point.throughput_mib_s) for point in points],
         "ops_per_s": [round_ops(point.iops) for point in points],
+        "io_latency_avg_us": [
+            round_latency_us(point.io_latency_us) for point in points
+        ],
     }
 
 
@@ -239,6 +264,59 @@ def _fleet_series(domain: DomainAnalysis) -> dict:
         "bytes_per_s_p90": [_bytes(point.p90_mib_s) for point in points],
         "bytes_per_s_mean": [_bytes(point.mean_mib_s) for point in points],
         "bytes_per_s_stddev": [_bytes(point.stddev_mib_s) for point in points],
+    }
+
+
+def _rounded(value: Optional[float], digits: int) -> Optional[float]:
+    return None if value is None else round(value, digits)
+
+
+def _window_object(steady: SteadyAnalysis, label: str) -> Optional[dict]:
+    summary = steady.summary(label)
+    if summary is None:
+        return None
+    series = steady.series[label]
+    kept = [index for index, inside in enumerate(series.in_steady) if inside]
+    return {
+        "window_ms": summary.window_ms,
+        "windows": summary.windows,
+        "jain": {
+            "min": _rounded(summary.jain_min, 6),
+            "p10": _rounded(summary.jain_p10, 6),
+            "p50": _rounded(summary.jain_p50, 6),
+        },
+        "jain_min_at_ms": summary.jain_min_at_ms,
+        "share_below_0_95": _rounded(summary.share_below_0_95, 4),
+        "min_over_median_p10": _rounded(summary.min_over_median_p10, 6),
+        "floor_p50": _rounded(summary.floor_p50, 6),
+        "series": {
+            "end_ms": [series.end_ms[index] for index in kept],
+            "clients": [series.clients[index] for index in kept],
+            "jain": [_rounded(series.jain[index], 6) for index in kept],
+        },
+    }
+
+
+def _fairness(steady: SteadyAnalysis) -> Optional[dict]:
+    if not steady.window.available:
+        return None
+    return {label: _window_object(steady, label) for label in WINDOW_LABELS}
+
+
+def _latency(steady: SteadyAnalysis) -> Optional[dict]:
+    value = steady.latency
+    if value is None:
+        return None
+    return {
+        "p50_us": round_latency_us(value.p50_us),
+        "p90_us": round_latency_us(value.p90_us),
+        "max_us": round_latency_us(value.max_us),
+        "max_over_p50": _rounded(value.max_over_p50, 4),
+        "cv": _rounded(value.cv, 6),
+        "steady_mean_us": round_latency_us(value.steady_mean_us),
+        "final_avg_us": round_latency_us(value.final_avg_us),
+        "rho_jain_latency": _rounded(value.rho_jain_latency, 4),
+        "rho_latency_throughput": _rounded(value.rho_latency_throughput, 4),
     }
 
 
@@ -273,7 +351,7 @@ def _whole(value: Optional[float]) -> Optional[int]:
     return None if value is None else int(round(value))
 
 
-def _distribution(summaries: Sequence[ClientSummary]) -> dict:
+def _distribution(summaries: Sequence[ClientSummary], steady: SteadyAnalysis) -> dict:
     means = [item.mean_mib_s * MIB for item in summaries if item.sample_count]
     low, p10, p50, p90, high = _spread(means, (10, 50, 90))
     done = [
@@ -286,6 +364,7 @@ def _distribution(summaries: Sequence[ClientSummary]) -> dict:
         if item.finish_elapsed_ms is not None
     ]
     fin_min, fin_p50, fin_max = _spread(finish, (50,))
+    counts = steady.class_counts() if steady.window.available else {}
     return {
         "client_mean_bytes_per_s": {
             "min": _whole(low),
@@ -308,9 +387,8 @@ def _distribution(summaries: Sequence[ClientSummary]) -> dict:
             "p50": _whole(fin_p50),
             "max": _whole(fin_max),
         },
-        "underperforming_clients": sum(
-            1 for item in summaries if item.underperform_count > 0
-        ),
+        "persistent_clients": counts.get(CLASS_PERSISTENT),
+        "transient_clients": counts.get(CLASS_TRANSIENT),
     }
 
 
@@ -328,17 +406,22 @@ def _kubernetes_names(
     return node_pod if node_pod else (None, None)
 
 
-def _client_row(summary: ClientSummary, workers: Mapping[str, Tuple[str, str]]) -> list:
+def _client_row(
+    summary: ClientSummary,
+    steady: SteadyAnalysis,
+    workers: Mapping[str, Tuple[str, str]],
+) -> list:
     client = summary.client
     node, pod = _kubernetes_names(client.service, workers)
     has_samples = summary.sample_count > 0
-    has_worst = summary.worst_interval >= 0
+    detail = steady.clients.get(client) or ClientSteady(client)
     return [
         client.label,
         _rank_value(client.rank),
         client.service or None,
         node,
         pod,
+        detail.classification,
         _bytes(summary.mean_mib_s) if has_samples else None,
         _bytes(summary.median_mib_s) if has_samples else None,
         (
@@ -346,12 +429,15 @@ def _client_row(summary: ClientSummary, workers: Mapping[str, Tuple[str, str]]) 
             if summary.relative_median_count
             else None
         ),
+        _bytes(detail.steady_mean_mib_s),
+        _rounded(detail.steady_ratio, 6),
+        _rounded(detail.worst_5s_ratio, 6),
+        detail.worst_5s_ms,
+        _rounded(detail.worst_30s_ratio, 6),
+        detail.worst_30s_ms,
+        _rounded(detail.short_5s_share, 4),
         summary.final_done_bytes,
         summary.finish_elapsed_ms,
-        summary.underperform_count,
-        summary.longest_underperform_streak,
-        round(summary.worst_z_score, 4) if has_worst else None,
-        _ms(summary.worst_elapsed_sec) if has_worst else None,
         summary.sample_count,
         summary.missing_count,
         summary.invalid_count,
@@ -361,16 +447,14 @@ def _client_row(summary: ClientSummary, workers: Mapping[str, Tuple[str, str]]) 
 def _client_series(
     analysis: LiveAnalysis,
     domain: DomainAnalysis,
+    steady: SteadyAnalysis,
     ordered: Sequence[LiveClientId],
     level: str,
     selection_limits: Tuple[int, int],
-    min_underperform_segments: int,
     sidecar: Tuple[Optional[str], str, Optional[str]],
 ) -> Optional[dict]:
     if level == LEVEL_SELECTED:
-        return _selected_series(
-            analysis, domain, selection_limits, min_underperform_segments
-        )
+        return _selected_series(analysis, domain, steady, selection_limits)
     if level == LEVEL_FULL:
         return _write_sidecar(analysis, domain, ordered, *sidecar)
     return None
@@ -379,15 +463,18 @@ def _client_series(
 def _selected_series(
     analysis: LiveAnalysis,
     domain: DomainAnalysis,
+    steady: SteadyAnalysis,
     selection_limits: Tuple[int, int],
-    min_underperform_segments: int,
 ) -> dict:
     max_lines, max_rows = selection_limits
-    prioritized = select_clients(
-        domain, min_underperform_segments, max(max_lines, max_rows)
+    chosen = list(
+        dict.fromkeys(
+            [
+                *classified_clients(steady, max_lines),
+                *select_heatmap_rows(steady, max_rows),
+            ]
+        )
     )
-    heatmap = select_heatmap_clients(domain, prioritized, max_rows)
-    chosen = list(dict.fromkeys([*prioritized[:max_lines], *heatmap]))
     detail = collect_selected_client_detail(analysis, domain, chosen)
     return {
         "clients": [client.label for client in chosen],
@@ -457,10 +544,16 @@ def _iter_interval_rates(
     with open(analysis.metadata.path, "r", encoding="utf-8-sig", newline="") as handle:
         reader, columns = live_csv_reader(handle, analysis.metadata.path)
         for parsed in iter_parsed_rows(reader, columns):
-            key, runtime_ms, _, rank, client, done_bytes, _, _ = parsed
-            if key != domain.key or rank == TOTAL_RANK or client not in index:
+            runtime_ms, client, done_bytes = (
+                parsed.runtime_ms,
+                parsed.client,
+                parsed.done_bytes,
+            )
+            if parsed.key != domain.key or parsed.rank == TOTAL_RANK:
                 continue
-            if done_bytes is None or runtime_ms not in domain.runtime_to_interval:
+            if client not in index or done_bytes is None:
+                continue
+            if runtime_ms not in domain.runtime_to_interval:
                 continue
             interval = domain.runtime_to_interval[runtime_ms]
             while pending < interval:

@@ -27,12 +27,22 @@ section below.
 
 - The report caches are removed: `--to-csv`/`--from-csv` (filesystem and
   netbench) and `--to-json`/`--from-json` (Warp). Reports read raw results.
+- Live-client analysis compares clients with the fleet median over a steady
+  window instead of z-scores. `--client-shortfall-percent` and
+  `--client-min-slow-windows` replace `--client-outlier-threshold` and
+  `--client-min-underperform-segments`; the heatmap is now
+  `client-ratio-heatmap.png`, and the client summary and `results.json`
+  z-score fields are replaced.
 
 ### Added
 
 - `--to-json` writes a versioned, schema-validated results document for a
   filesystem batch or result directory, with optional live-client detail. See
   [docs/MACHINE_READABLE_RESULTS.md](docs/MACHINE_READABLE_RESULTS.md).
+- Live CSV reports add a fairness plot, a fleet latency panel, and "Live
+  fairness" lines in `report.txt`; `results.json` adds `steady`, `fairness`,
+  and `latency`. See
+  [docs/FILESYSTEM_TESTING.md](docs/FILESYSTEM_TESTING.md#live-client-and-latency-reports).
 
 ## [2.0.0] - 2026-10-19
 

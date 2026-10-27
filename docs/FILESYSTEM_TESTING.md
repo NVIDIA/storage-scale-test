@@ -752,9 +752,9 @@ and is not a batch-reporting mode. For scripts and gates, see
 | IO | `--only-sizes SIZE` | Repeat or separate with `;`; preserve compound-size commas |
 | IO | `--only-iodepths LIST` | Select depths with comma lists or ranges |
 | IO | `--no-dual-y-axis` | Separate throughput and latency axes |
-| IO | `--per-client-plots` | Analyze extended live client capture |
-| IO | `--client-outlier-threshold Z` | Underperformance z-score magnitude (default 2.0) |
-| IO | `--client-min-underperform-segments N` | Require N underperforming live intervals (default 1) |
+| IO | `--per-client-plots` | Write per-client live summaries and plots |
+| IO | `--client-shortfall-percent PCT` | Slow-client shortfall below the fleet median, percent (default 5) |
+| IO | `--client-min-slow-windows N` | Minimum 5 s windows at twice the shortfall for a transient client (default 3) |
 | IO | `--client-max-timeseries-lines N` | Limit client lines per plot (default 10) |
 | IO | `--client-max-heatmap-rows N` | Limit clients per heatmap (default 50) |
 | Metadata | `--normalize-to N` | Scale rates/stddev to N nodes, not latency |
@@ -766,10 +766,49 @@ latency by operation, size, thread count, node count, and I/O depth. Metadata
 reports show create/stat/delete rates, elapsed times, latency distributions,
 variance, and scaling efficiency.
 
-For per-client filesystem I/O diagnostics, set
-`ELBENCHO_LIVE_CSV_EXTENDED=1` before the run and analyze with
-`utils/extract-elbencho.py --per-client-plots`. Extended capture can generate
-large files at scale; tune `ELBENCHO_LIVEINT` deliberately.
+### Live client and latency reports
+
+Set `ELBENCHO_LIVE_CSV_EXTENDED=1` before the run, then report as usual.
+Extended capture grows large at scale; choose `ELBENCHO_LIVEINT` deliberately.
+
+Each phase is judged over a **steady window**: from the first interval where
+every client has progressed and aggregate MiB/s reaches 75% of its steady
+median, to elbencho's `time ms [first]` (the first client finishing). Ramp-up
+and the straggler tail are excluded. Without a window (`no_first_time`,
+`too_short` under 10 s, or `no_steady_state`), summaries give the reason.
+
+**Sliding windows** of one interval, 5 s, and 30 s compare each client's bytes
+in the window with the fleet median. Each window gives Jain's index (1.0 is
+even), the slowest client's ratio to the median, and an expected Jain floor,
+`k / (k + 1)` for `k` blocks per client, which counting noise alone allows.
+
+**Slow clients**, with S = `--client-shortfall-percent`:
+
+| Class | Rule |
+| --- | --- |
+| `persistent` | Below `1 - S` of the median over the steady window, or in at least half of the 30 s windows |
+| `transient` | Otherwise, below `1 - 2S` in at least twice the median client's share of 5 s windows, and in at least `--client-min-slow-windows` of them |
+| `ok` | Neither |
+
+Clients take turns dipping, so `transient` means dipping more often than the
+fleet, not dipping at all. Missing and invalid samples are counted separately
+and do not affect the class.
+In multi-node runs each client is a host, so imbalance between threads inside
+a host is invisible.
+
+Outputs, named `<stem>-<phase slug>-*` in the report directory:
+
+| Output | When | Content |
+| --- | --- | --- |
+| "Live fairness" lines | always | Per phase: steady span, Jain p50/min per window, 5 s slowest/median p10, slow-client counts, latency p50, p90, and max/p50. In `report.txt` and stdout (stdout only with `--markdown`) |
+| `aggregate-timeseries.png` | always | Total MiB/s and IOPS, plus a fleet IO latency panel; warmup and tail shaded, `[first]`/`[last]` marked |
+| `fairness-timeseries.png` | always | Jain per window with the 5 s floor; below, the 5 s slowest/median ratio against `1 - S` and `1 - 2S` |
+| `client-summary.csv` / `.txt` | `--per-client-plots` | Per client: class, steady MiB/s and ratio, worst 5 s and 30 s ratios and times, percent of 5 s windows short, whole-run mean and median, sample counts |
+| `client-timeseries.png` | `--per-client-plots` | 5 s client rates against the fleet p10-p90 band; slow clients first |
+| `client-ratio-heatmap.png` | `--per-client-plots` | Clients by 5 s windows, percent of the fleet median on a 50-150% scale; slow clients, then representatives |
+
+Fleet latency is the Total rows' `Lat IO us`, an op-weighted mean per
+interval; captures without that column have no latency panel.
 
 ## Advanced node selection and Slurm options
 

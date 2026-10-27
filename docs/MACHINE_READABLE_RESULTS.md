@@ -85,7 +85,7 @@ recorded `sha256` and `size_bytes` describes the stored bytes.
 | Field | Content |
 | --- | --- |
 | `schema`, `schema_version` | `storage-scale-test/filesystem-batch-results`, `"MAJOR.MINOR"` (currently `"1.0"`). |
-| `generator` | `tool`, `version`, `generated_at` (UTC), `command`, `options` (`live_detail`, `z_threshold`, `only_nodes`, `only_threads`, `only_sizes`, `only_iodepths`, `groups`, `kind`; `null` when unused). |
+| `generator` | `tool`, `version`, `generated_at` (UTC), `command`, `options` (`live_detail`, `shortfall_percent`, `min_slow_windows`, `only_nodes`, `only_threads`, `only_sizes`, `only_iodepths`, `groups`, `kind`; `null` when unused). |
 | `batch` | `root`, `datestamp`, `manifest_version`, `manifest_sha256`, `sealed`, `substrate`. |
 | `batch_outcome` | `complete`; `executions` counts (`total` plus one per `ledger_state`); `results` counts (one per `result_state`); `groups_reported`; `groups_not_reported`. |
 | `groups` | One object per batch group. |
@@ -224,7 +224,7 @@ Live data comes from elbencho live CSVs, captured only for IO sweeps with
 | --- | --- |
 | `none` | `live` is `{"reason": "not_requested"}`. |
 | `summary` | Aggregate and fleet series, distribution statistics, every client's summary, diagnostics. |
-| `selected` | `summary`, plus inline rates for the clients the existing selector picks (bounded by `--client-max-timeseries-lines` and `--client-max-heatmap-rows`). |
+| `selected` | `summary`, plus inline one-interval rates for the clients the report selects: persistent and transient slow clients, then representatives (bounded by `--client-max-timeseries-lines` and `--client-max-heatmap-rows`). |
 | `full` | `summary`, plus every client's rates in a sidecar. |
 
 Without an analysis, `live` is `{"reason": R}` with `R` one of `not_captured`,
@@ -239,12 +239,22 @@ Without an analysis, `live` is `{"reason": R}` with `R` one of `not_captured`,
 | `client_mode` | `worker` or `service`; see below. |
 | `domain` | `phase`, `mix_type`, `occurrence`. Further domains of a phase are counted in `diagnostics.additional_domains`. |
 | `intervals`, `clients` | Counts. |
-| `aggregate_series` | Columnar: `elapsed_ms`, `bytes_per_s`, `ops_per_s`; `null` is a missing or invalid sample. |
+| `steady` | `start_ms`, `end_ms`, `end_source` (`elbencho_first`), and `reason` (`null`, `no_first_time`, `too_short`, or `no_steady_state`). See [live reports](FILESYSTEM_TESTING.md#live-client-and-latency-reports). |
+| `aggregate_series` | Columnar: `elapsed_ms`, `bytes_per_s`, `ops_per_s`, `io_latency_avg_us` (fleet mean IO latency); `null` is a missing or invalid sample. |
 | `fleet_series` | Columnar per-interval client statistics: `elapsed_ms`, `client_count`, `bytes_per_s_p10`, `_p50`, `_p90`, `_mean`, `_stddev`. |
-| `distribution` | Imbalance without per-client data: `client_mean_bytes_per_s` (`min`, `p10`, `p50`, `p90`, `max`, `cv`), `min_over_median`, `max_over_median`, `final_done_bytes` (`min`, `p50`, `max`, `cv`), `finish_elapsed_ms` (`min`, `p50`, `max`), `underperforming_clients`. |
-| `clients_summary` | `{"columns": [...], "rows": [[...]]}`, one row per client: `client`, `rank`, `service`, `kubernetes_node`, `kubernetes_pod`, `mean_bytes_per_s`, `median_bytes_per_s`, `mean_ratio_to_fleet_median`, `final_done_bytes`, `finish_elapsed_ms`, `underperform_intervals`, `longest_underperform_streak`, `worst_z`, `worst_elapsed_ms`, `valid_samples`, `missing_samples`, `invalid_samples`. |
+| `fairness` | `null` without a steady window; else `interval`, `5s`, and `30s`, each `null` or `{window_ms, windows, jain {min, p10, p50}, jain_min_at_ms, share_below_0_95, min_over_median_p10, floor_p50, series {end_ms, clients, jain}}` over the windows inside the steady window. `min_over_median_p10` is the p10 of each window's slowest-client ratio; `floor_p50` is the expected Jain floor. |
+| `latency` | `null` without steady latency; else `p50_us`, `p90_us`, `max_us`, `max_over_p50`, `cv`, `steady_mean_us` (op-weighted), `final_avg_us` (from `.out`), and Spearman `rho_jain_latency` and `rho_latency_throughput` over 5 s windows (`null` under 6). |
+| `distribution` | Imbalance without per-client data: `client_mean_bytes_per_s` (`min`, `p10`, `p50`, `p90`, `max`, `cv`), `min_over_median`, `max_over_median`, `final_done_bytes` (`min`, `p50`, `max`, `cv`), `finish_elapsed_ms` (`min`, `p50`, `max`), `persistent_clients`, `transient_clients` (`null` when the steady window is unavailable). |
+| `clients_summary` | `{"columns": [...], "rows": [[...]]}`, one row per client: `client`, `rank`, `service`, `kubernetes_node`, `kubernetes_pod`, `class`, `mean_bytes_per_s`, `median_bytes_per_s`, `mean_ratio_to_fleet_median`, `steady_bytes_per_s`, `steady_ratio`, `worst_5s_ratio`, `worst_5s_elapsed_ms`, `worst_30s_ratio`, `worst_30s_elapsed_ms`, `short_5s_share`, `final_done_bytes`, `finish_elapsed_ms`, `valid_samples`, `missing_samples`, `invalid_samples`. |
 | `client_series` | `null` at `summary`; at `selected`, inline `clients`, `elapsed_ms`, and `bytes_per_s` (one list per client); at `full`, a sidecar reference `{"path", "sha256", "size_bytes", "clients", "intervals"}`. |
 | `diagnostics` | `missing_samples`, `counter_resets`, `non_adjacent_samples`, and possibly `additional_domains`. |
+
+### Slow-client classes
+
+`class` is `persistent`, `transient`, or `ok`, by the rules in
+[live reports](FILESYSTEM_TESTING.md#live-client-and-latency-reports); it and
+the steady and worst-window columns are `null` without steady data.
+`short_5s_share` is the share of steady 5 s windows below 1 - S.
 
 `final_done_bytes` is a client's last cumulative `DoneBytes` (its work share
 in time-bounded runs). `finish_elapsed_ms` is the first interval at which it
@@ -404,12 +414,13 @@ Live coverage, then client balance per analyzed phase:
 ```bash
 jq -r '.executions[] | (.results.phases // [])[] | select(.phase != "delete")
   | .live.reason // "analyzed"' "$R" | sort | uniq -c
-jq -r '(["id","phase","mode","clients","min/median","cv","underperforming"]),
+jq -r '(["id","phase","mode","clients","min/median","cv","persistent","transient","jain5s_p50","jain5s_min"]),
   (.executions[] | .execution_id as $id | (.results.phases // [])[]
    | select(.live.distribution?)
    | [$id, .phase, .live.client_mode, .live.clients, .live.distribution.min_over_median,
       .live.distribution.client_mean_bytes_per_s.cv,
-      .live.distribution.underperforming_clients])
+      .live.distribution.persistent_clients, .live.distribution.transient_clients,
+      .live.fairness["5s"].jain.p50, .live.fairness["5s"].jain.min])
   | @tsv' "$R" | cols
 ```
 
@@ -419,9 +430,9 @@ The five slowest clients of one phase:
 jq -r --arg id 0001 --arg phase write '.executions[] | select(.execution_id == $id)
   | .results.phases[] | select(.phase == $phase) | .live.clients_summary
   | .columns as $c | .rows | map([$c, .] | transpose | map({(.[0]): .[1]}) | add)
-  | sort_by(.mean_bytes_per_s) | .[:5][]
-  | [.client, (.kubernetes_node // "-"), .mean_bytes_per_s,
-     .mean_ratio_to_fleet_median, .finish_elapsed_ms] | @tsv' "$R" | cols
+  | map(select(.steady_ratio != null)) | sort_by(.steady_ratio) | .[:5][]
+  | [.client, (.kubernetes_node // "-"), (.class // "-"), .steady_ratio,
+     .worst_5s_ratio, .finish_elapsed_ms] | @tsv' "$R" | cols
 ```
 
 A `full` sidecar: its header, then the slowest client per interval.

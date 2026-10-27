@@ -39,12 +39,22 @@ from lib.elbencho_live_report import (  # pylint: disable=wrong-import-position
     LiveDomainKey,
     LiveFileMetadata,
     analyze_live_csv,
-    collect_selected_client_detail,
-    plot_aggregate_timeseries,
-    plot_client_timeseries,
-    plot_underperformance_heatmap,
-    select_clients,
     write_client_summaries,
+)
+from lib.elbencho_live_plots import (  # pylint: disable=wrong-import-position
+    plot_aggregate_timeseries,
+    plot_client_ratio_heatmap,
+    plot_client_timeseries,
+    plot_fairness_timeseries,
+)
+from lib.elbencho_live_steady import (  # pylint: disable=wrong-import-position
+    CLASS_PERSISTENT,
+    PhaseContext,
+    WindowedClientDetail,
+    analyze_steady,
+    classified_clients,
+    collect_windowed_client_detail,
+    select_heatmap_rows,
 )
 
 BASE_RATE_MIB_S = 100
@@ -123,32 +133,34 @@ def run_analysis(
         datestamp="20260729Z120000",
     )
     started = time.perf_counter()
-    analysis = analyze_live_csv(metadata, z_threshold=2.0)
+    analysis = analyze_live_csv(metadata)
     pass_one_seconds = time.perf_counter() - started
     domain = analysis.domains[LiveDomainKey("READ", "")]
-    selected = select_clients(domain, min_underperform_segments=1, limit=50)
-    detail = collect_selected_client_detail(analysis, domain, selected)
-    _validate_results(domain, selected, client_count)
+    # The synthetic clients all run to the last interval, so [first] is the
+    # last interval's runtime; block size matches the r64K file name.
+    end_ms = int(domain.interval_times[-1] * 1000)
+    context = PhaseContext(end_ms, end_ms, 64 * 1024, None)
+    steady = analyze_steady(analysis, domain, context, 1000)
+    selected = classified_clients(steady, 50)
+    heatmap_rows = select_heatmap_rows(steady, 50)
+    union = list(dict.fromkeys(selected + heatmap_rows))
+    detail = collect_windowed_client_detail(analysis, domain, steady, union)
+    _validate_results(domain, steady, selected, client_count)
     output_dir.mkdir(parents=True, exist_ok=True)
-    outputs = list(write_client_summaries(metadata, domain, str(output_dir)))
+    outputs = list(write_client_summaries(metadata, domain, steady, str(output_dir)))
     if create_plots:
+        line_detail = _subset_detail(detail, selected[:10])
+        heatmap_detail = _subset_detail(detail, heatmap_rows)
         outputs.extend(
             path
             for path in (
-                plot_aggregate_timeseries(metadata, domain, str(output_dir)),
+                plot_aggregate_timeseries(metadata, domain, steady, str(output_dir)),
+                plot_fairness_timeseries(metadata, domain, steady, str(output_dir)),
                 plot_client_timeseries(
-                    metadata,
-                    domain,
-                    detail,
-                    selected[:10],
-                    str(output_dir),
+                    metadata, domain, steady, line_detail, str(output_dir)
                 ),
-                plot_underperformance_heatmap(
-                    metadata,
-                    domain,
-                    detail,
-                    selected[:50],
-                    str(output_dir),
+                plot_client_ratio_heatmap(
+                    metadata, domain, steady, heatmap_detail, str(output_dir)
                 ),
             )
             if path
@@ -162,6 +174,15 @@ def run_analysis(
     print(f"intervals_analyzed={len(domain.interval_times)}")
     print(f"retained_fleet_points={len(domain.fleet_points)}")
     print(f"selected_clients={','.join(client.label for client in selected[:10])}")
+
+
+def _subset_detail(detail: WindowedClientDetail, clients) -> WindowedClientDetail:
+    """Restrict a windowed detail to ``clients`` (kept in the given order)."""
+    return WindowedClientDetail(
+        list(clients),
+        {client: detail.rates_mib_s[client] for client in clients},
+        {client: detail.ratios[client] for client in clients},
+    )
 
 
 def _rate_for_client(client: int, interval: int, interval_count: int) -> int:
@@ -217,7 +238,7 @@ def _live_row(
     ]
 
 
-def _validate_results(domain, selected, client_count: int) -> None:
+def _validate_results(domain, steady, selected, client_count: int) -> None:
     if len(domain.clients) != client_count:
         raise RuntimeError(
             f"Expected {client_count} clients, analyzed {len(domain.clients)}"
@@ -227,6 +248,8 @@ def _validate_results(domain, selected, client_count: int) -> None:
     normal = LiveClientId(str(normal_rank), f"client-{normal_rank:05d}")
     if persistent not in selected:
         raise RuntimeError("Persistent synthetic underperformer was not selected")
+    if steady.clients[persistent].classification != CLASS_PERSISTENT:
+        raise RuntimeError("Persistent synthetic underperformer was misclassified")
     if abs(domain.clients[persistent].mean_mib_s - PERSISTENT_RATE_MIB_S) >= 0.01:
         raise RuntimeError("Persistent synthetic throughput was derived incorrectly")
     if abs(domain.clients[normal].mean_mib_s - BASE_RATE_MIB_S) >= 0.01:

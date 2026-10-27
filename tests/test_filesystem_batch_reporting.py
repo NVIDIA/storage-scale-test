@@ -423,8 +423,10 @@ def test_all_analysis_options_share_registration_and_routing(option):
         (["--kind", "io", "--groups", "0002"], "No batch groups match"),
         (["--normalize-to", "0"], "positive integer"),
         (["--client-max-heatmap-rows", "0"], "greater than zero"),
-        (["--client-outlier-threshold", "nan"], "greater than zero"),
-        (["--client-outlier-threshold", "inf"], "greater than zero"),
+        (["--client-shortfall-percent", "nan"], "greater than zero"),
+        (["--client-shortfall-percent", "inf"], "greater than zero"),
+        (["--client-shortfall-percent", "50"], "less than 50"),
+        (["--client-min-slow-windows", "0"], "greater than zero"),
         (["--test-parse", "result.csv"], "cannot report a prepared batch"),
     ],
 )

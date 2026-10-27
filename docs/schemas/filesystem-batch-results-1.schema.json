@@ -287,7 +287,8 @@
           "type": "object",
           "properties": {
             "live_detail": true,
-            "z_threshold": true,
+            "shortfall_percent": true,
+            "min_slow_windows": true,
             "only_nodes": true,
             "only_threads": true,
             "only_sizes": true,
@@ -1059,8 +1060,11 @@
         "domain",
         "intervals",
         "clients",
+        "steady",
         "aggregate_series",
         "fleet_series",
+        "fairness",
+        "latency",
         "distribution",
         "clients_summary",
         "client_series",
@@ -1111,6 +1115,9 @@
         "clients": {
           "type": "integer"
         },
+        "steady": {
+          "$ref": "#/$defs/live_steady"
+        },
         "aggregate_series": {
           "type": "object",
           "properties": {
@@ -1145,12 +1152,26 @@
                   }
                 ]
               }
+            },
+            "io_latency_avg_us": {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
             }
           },
           "required": [
             "elapsed_ms",
             "bytes_per_s",
-            "ops_per_s"
+            "ops_per_s",
+            "io_latency_avg_us"
           ]
         },
         "fleet_series": {
@@ -1187,8 +1208,40 @@
             }
           }
         },
+        "fairness": {
+          "$ref": "#/$defs/live_fairness"
+        },
+        "latency": {
+          "$ref": "#/$defs/live_latency"
+        },
         "distribution": {
-          "type": "object"
+          "type": "object",
+          "required": [
+            "persistent_clients",
+            "transient_clients"
+          ],
+          "properties": {
+            "persistent_clients": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "transient_clients": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
         },
         "clients_summary": {
           "type": "object",
@@ -1236,6 +1289,343 @@
         },
         {
           "$ref": "#/$defs/live_null"
+        }
+      ]
+    },
+    "live_steady": {
+      "type": "object",
+      "required": [
+        "start_ms",
+        "end_ms",
+        "end_source",
+        "reason"
+      ],
+      "properties": {
+        "start_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "end_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "end_source": {
+          "anyOf": [
+            {
+              "const": "elbencho_first"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "no_first_time",
+                "too_short",
+                "no_steady_state"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "live_fairness_window": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "window_ms",
+            "windows",
+            "jain",
+            "jain_min_at_ms",
+            "share_below_0_95",
+            "min_over_median_p10",
+            "floor_p50",
+            "series"
+          ],
+          "properties": {
+            "window_ms": {
+              "type": "integer"
+            },
+            "windows": {
+              "type": "integer"
+            },
+            "jain": {
+              "type": "object",
+              "required": [
+                "min",
+                "p10",
+                "p50"
+              ],
+              "properties": {
+                "min": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "p10": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "p50": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            },
+            "jain_min_at_ms": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "share_below_0_95": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "min_over_median_p10": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "floor_p50": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "series": {
+              "type": "object",
+              "required": [
+                "end_ms",
+                "clients",
+                "jain"
+              ],
+              "properties": {
+                "end_ms": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  }
+                },
+                "clients": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  }
+                },
+                "jain": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "live_fairness": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "interval",
+            "5s",
+            "30s"
+          ],
+          "properties": {
+            "interval": {
+              "$ref": "#/$defs/live_fairness_window"
+            },
+            "5s": {
+              "$ref": "#/$defs/live_fairness_window"
+            },
+            "30s": {
+              "$ref": "#/$defs/live_fairness_window"
+            }
+          }
+        }
+      ]
+    },
+    "live_latency": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "p50_us",
+            "p90_us",
+            "max_us",
+            "max_over_p50",
+            "cv",
+            "steady_mean_us",
+            "final_avg_us",
+            "rho_jain_latency",
+            "rho_latency_throughput"
+          ],
+          "properties": {
+            "p50_us": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "p90_us": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max_us": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max_over_p50": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "cv": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "steady_mean_us": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "final_avg_us": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "rho_jain_latency": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "rho_latency_throughput": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
         }
       ]
     }
