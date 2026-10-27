@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +28,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _EXEMPT_PATHS = {Path("LICENSE")}
 _MARKDOWN_SUFFIXES = {".md"}
 _C_SUFFIXES = {".c", ".h"}
+_JSON_SUFFIXES = {".json"}
 _NOTICE_LINES = (
     "SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
     "SPDX-License-Identifier: Apache-2.0",
@@ -58,6 +60,11 @@ def _c_notice() -> str:
     return f"/*\n{body}\n */"
 
 
+def _json_notice() -> str:
+    # JSON has no comments; JSON Schema files carry the notice as "$comment".
+    return '"$comment": ' + json.dumps("\n".join(_NOTICE_LINES))
+
+
 def _readme_notice() -> str:
     return "\n".join("" if not line else f"    {line}" for line in _NOTICE_LINES)
 
@@ -75,6 +82,8 @@ def expected_notice(path: Path) -> str:
         return _markdown_notice()
     if path.suffix.lower() in _C_SUFFIXES:
         return _c_notice()
+    if path.suffix.lower() in _JSON_SUFFIXES:
+        return _json_notice()
     return _hash_notice()
 
 

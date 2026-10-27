@@ -23,7 +23,6 @@ iterations, and generates performance reports and visualizations.
 """
 
 import csv
-import json
 import math
 import os
 import re
@@ -53,9 +52,19 @@ from matplotlib.ticker import FuncFormatter
 from lib.env_used_yaml import (  # pylint: disable=wrong-import-position
     load_env_used_yaml,
 )
+from lib import (  # pylint: disable=wrong-import-position
+    filesystem_results as results_json,
+)
 from lib.filesystem_batch import (
     route_batch_report,
 )  # pylint: disable=wrong-import-position
+from lib.filesystem_coordinates import (  # pylint: disable=wrong-import-position
+    MdtestDefinition,
+    is_mdtest_definition,
+    mdtest_coordinates,
+    optional_int,
+    parse_mdtest_definition,
+)
 from lib.filesystem_report_options import (  # pylint: disable=wrong-import-position
     validate_analysis_arguments,
 )
@@ -74,10 +83,7 @@ from lib.reporting_common import (  # pylint: disable=wrong-import-position
 )
 from lib.storage_target import (  # pylint: disable=wrong-import-position
     MIXED_PREFIX,
-    cached_target_sources,
-    exported_target_cell,
     guarded_report_target,
-    has_unverified_source,
     storage_target_from_env,
 )
 from lib.stdout_report_file import (  # pylint: disable=wrong-import-position
@@ -203,9 +209,6 @@ class AggregatedMetrics:
     stat_command: str = ""
     delete_command: str = ""
 
-    # Storage target recorded in a cached CSV ("" when unknown or computed fresh)
-    storage_target_name: str = ""
-
 
 # =============================================================================
 # File Discovery and Parsing
@@ -215,6 +218,7 @@ class AggregatedMetrics:
 FILENAME_PATTERN = re.compile(
     r"mdtest-elbencho-c_(\d+)-t_(\d+)_(\d{8}Z\d{6})_iter(\d+)\.(csv|out)"
 )
+EXIT_INCOMPLETE = 3
 REQUIRED_OPERATIONS = ("WRITE", "STAT", "RMFILES")
 MDTEST_CONFIG_KEYS = (
     "MDTEST_BRANCH_FACTOR",
@@ -416,7 +420,7 @@ def parse_csv_file(csv_path: str) -> Dict[str, Dict[str, Any]]:
             if rate_str:
                 try:
                     rate = float(rate_str)
-                    rate_valid = True
+                    rate_valid = math.isfinite(rate)
                 except ValueError:
                     pass
 
@@ -427,7 +431,7 @@ def parse_csv_file(csv_path: str) -> Dict[str, Dict[str, Any]]:
             if elapsed_ms_str:
                 try:
                     elapsed_sec = float(elapsed_ms_str) / 1000
-                    elapsed_valid = True
+                    elapsed_valid = math.isfinite(elapsed_sec)
                 except ValueError:
                     pass
 
@@ -435,6 +439,7 @@ def parse_csv_file(csv_path: str) -> Dict[str, Dict[str, Any]]:
             lat_min = 0.0
             lat_avg = 0.0
             lat_max = 0.0
+            lat_valid = 0
 
             lat_min_str = row.get("Ent lat us [min]", "")
             lat_avg_str = row.get("Ent lat us [avg]", "")
@@ -443,16 +448,19 @@ def parse_csv_file(csv_path: str) -> Dict[str, Dict[str, Any]]:
             if lat_min_str:
                 try:
                     lat_min = float(lat_min_str) / 1_000_000
+                    lat_valid += 1
                 except ValueError:
                     pass
             if lat_avg_str:
                 try:
                     lat_avg = float(lat_avg_str) / 1_000_000
+                    lat_valid += 1
                 except ValueError:
                     pass
             if lat_max_str:
                 try:
                     lat_max = float(lat_max_str) / 1_000_000
+                    lat_valid += 1
                 except ValueError:
                     pass
 
@@ -466,6 +474,9 @@ def parse_csv_file(csv_path: str) -> Dict[str, Dict[str, Any]]:
                 "lat_avg": lat_avg,
                 "lat_max": lat_max,
                 "command": command,
+                "rate_valid": rate_valid,
+                "elapsed_valid": elapsed_valid,
+                "lat_valid": lat_valid == 3,
                 "complete": rate_valid and elapsed_valid and bool(command),
             }
 
@@ -591,6 +602,20 @@ def parse_file_pair(
         )
         return None
 
+    return metrics_from_parsed(
+        csv_data, out_data, node_count, thread_count, datestamp, iteration
+    )
+
+
+def metrics_from_parsed(
+    csv_data: Dict[str, Dict[str, Any]],
+    out_data: Dict[str, Dict[float, int]],
+    node_count: int,
+    thread_count: int,
+    datestamp: str,
+    iteration: int,
+) -> IterationMetrics:
+    """Build IterationMetrics from complete parsed CSV and OUT data."""
     # Map operations
     write_data = csv_data.get("WRITE", {})
     stat_data = csv_data.get("STAT", {})
@@ -1506,218 +1531,6 @@ def print_markdown_report(
 
 
 # =============================================================================
-# CSV Import/Export
-# =============================================================================
-
-
-def write_csv_export(
-    csv_path: str,
-    metrics: List[AggregatedMetrics],
-    test_configuration: Optional[Dict[str, str]] = None,
-    storage_target: str = "",
-) -> None:
-    """Write aggregated metrics, configuration provenance and target to CSV."""
-    if not metrics:
-        return
-
-    # Define fields to export (excluding histograms which we'll JSON-encode)
-    fieldnames = [
-        "node_count",
-        "thread_count",
-        "datestamps",
-        "iteration_count",
-        *MDTEST_CONFIG_KEYS,
-        "create_rate_avg",
-        "create_rate_stddev",
-        "create_rate_min",
-        "create_rate_max",
-        "stat_rate_avg",
-        "stat_rate_stddev",
-        "stat_rate_min",
-        "stat_rate_max",
-        "delete_rate_avg",
-        "delete_rate_stddev",
-        "delete_rate_min",
-        "delete_rate_max",
-        "create_elapsed_avg_sec",
-        "stat_elapsed_avg_sec",
-        "delete_elapsed_avg_sec",
-        "create_lat_p0",
-        "create_lat_p50",
-        "create_lat_p90",
-        "create_lat_p99",
-        "create_lat_p100",
-        "stat_lat_p0",
-        "stat_lat_p50",
-        "stat_lat_p90",
-        "stat_lat_p99",
-        "stat_lat_p100",
-        "delete_lat_p0",
-        "delete_lat_p50",
-        "delete_lat_p90",
-        "delete_lat_p99",
-        "delete_lat_p100",
-        "create_histogram",
-        "stat_histogram",
-        "delete_histogram",
-        "create_command",
-        "stat_command",
-        "delete_command",
-        "storage_target_name",
-    ]
-
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
-        writer.writeheader()
-
-        for m in metrics:
-            row = {
-                "node_count": m.node_count,
-                "thread_count": m.thread_count,
-                "datestamps": ",".join(sorted(m.datestamps)),
-                "iteration_count": m.iteration_count,
-                "create_rate_avg": m.create_rate_avg,
-                "create_rate_stddev": m.create_rate_stddev,
-                "create_rate_min": m.create_rate_min,
-                "create_rate_max": m.create_rate_max,
-                "stat_rate_avg": m.stat_rate_avg,
-                "stat_rate_stddev": m.stat_rate_stddev,
-                "stat_rate_min": m.stat_rate_min,
-                "stat_rate_max": m.stat_rate_max,
-                "delete_rate_avg": m.delete_rate_avg,
-                "delete_rate_stddev": m.delete_rate_stddev,
-                "delete_rate_min": m.delete_rate_min,
-                "delete_rate_max": m.delete_rate_max,
-                "create_elapsed_avg_sec": m.create_elapsed_avg_sec,
-                "stat_elapsed_avg_sec": m.stat_elapsed_avg_sec,
-                "delete_elapsed_avg_sec": m.delete_elapsed_avg_sec,
-                "create_lat_p0": m.create_lat_p0,
-                "create_lat_p50": m.create_lat_p50,
-                "create_lat_p90": m.create_lat_p90,
-                "create_lat_p99": m.create_lat_p99,
-                "create_lat_p100": m.create_lat_p100,
-                "stat_lat_p0": m.stat_lat_p0,
-                "stat_lat_p50": m.stat_lat_p50,
-                "stat_lat_p90": m.stat_lat_p90,
-                "stat_lat_p99": m.stat_lat_p99,
-                "stat_lat_p100": m.stat_lat_p100,
-                "delete_lat_p0": m.delete_lat_p0,
-                "delete_lat_p50": m.delete_lat_p50,
-                "delete_lat_p90": m.delete_lat_p90,
-                "delete_lat_p99": m.delete_lat_p99,
-                "delete_lat_p100": m.delete_lat_p100,
-                "create_histogram": json.dumps(m.create_histogram),
-                "stat_histogram": json.dumps(m.stat_histogram),
-                "delete_histogram": json.dumps(m.delete_histogram),
-                "create_command": m.create_command,
-                "stat_command": m.stat_command,
-                "delete_command": m.delete_command,
-                "storage_target_name": storage_target,
-            }
-            row.update(
-                {
-                    key: (test_configuration or {}).get(key, "")
-                    for key in MDTEST_CONFIG_KEYS
-                }
-            )
-            writer.writerow(row)
-
-
-def read_csv_import(
-    csv_path: str,
-) -> Tuple[List[AggregatedMetrics], Dict[str, str]]:
-    """Read aggregated metrics and configuration provenance from CSV."""
-    metrics = []
-    configuration_values: Dict[str, List[str]] = {key: [] for key in MDTEST_CONFIG_KEYS}
-
-    with open(csv_path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f, quoting=csv.QUOTE_ALL)
-        for row in reader:
-            _collect_configuration_values(configuration_values, row)
-            m = AggregatedMetrics(
-                node_count=int(row["node_count"]),
-                thread_count=int(row["thread_count"]),
-                datestamps={*row["datestamps"].split(",")},
-                iteration_count=int(row["iteration_count"]),
-                create_rate_avg=float(row["create_rate_avg"]),
-                create_rate_stddev=float(row["create_rate_stddev"]),
-                create_rate_min=float(row["create_rate_min"]),
-                create_rate_max=float(row["create_rate_max"]),
-                stat_rate_avg=float(row["stat_rate_avg"]),
-                stat_rate_stddev=float(row["stat_rate_stddev"]),
-                stat_rate_min=float(row["stat_rate_min"]),
-                stat_rate_max=float(row["stat_rate_max"]),
-                delete_rate_avg=float(row["delete_rate_avg"]),
-                delete_rate_stddev=float(row["delete_rate_stddev"]),
-                delete_rate_min=float(row["delete_rate_min"]),
-                delete_rate_max=float(row["delete_rate_max"]),
-                create_elapsed_avg_sec=float(row.get("create_elapsed_avg_sec", 0.0)),
-                stat_elapsed_avg_sec=float(row.get("stat_elapsed_avg_sec", 0.0)),
-                delete_elapsed_avg_sec=float(row.get("delete_elapsed_avg_sec", 0.0)),
-                create_lat_p0=float(row["create_lat_p0"]),
-                create_lat_p50=float(row["create_lat_p50"]),
-                create_lat_p90=float(row["create_lat_p90"]),
-                create_lat_p99=float(row["create_lat_p99"]),
-                create_lat_p100=float(row["create_lat_p100"]),
-                stat_lat_p0=float(row["stat_lat_p0"]),
-                stat_lat_p50=float(row["stat_lat_p50"]),
-                stat_lat_p90=float(row["stat_lat_p90"]),
-                stat_lat_p99=float(row["stat_lat_p99"]),
-                stat_lat_p100=float(row["stat_lat_p100"]),
-                delete_lat_p0=float(row["delete_lat_p0"]),
-                delete_lat_p50=float(row["delete_lat_p50"]),
-                delete_lat_p90=float(row["delete_lat_p90"]),
-                delete_lat_p99=float(row["delete_lat_p99"]),
-                delete_lat_p100=float(row["delete_lat_p100"]),
-                create_histogram=_read_histogram_json(row["create_histogram"]),
-                stat_histogram=_read_histogram_json(row["stat_histogram"]),
-                delete_histogram=_read_histogram_json(row["delete_histogram"]),
-                create_command=row.get("create_command", row.get("command", "")),
-                stat_command=row.get("stat_command", ""),
-                delete_command=row.get("delete_command", ""),
-                storage_target_name=row.get("storage_target_name") or "",
-            )
-            metrics.append(m)
-
-    configuration = _render_configuration_values(
-        configuration_values, "cached metric rows"
-    )
-    return metrics, configuration
-
-
-def _read_histogram_json(value: str) -> Dict[float, int]:
-    """Decode a JSON histogram, restoring and validating its numeric types."""
-
-    def reject_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-        """Reject duplicate literal keys before JSON can discard their values."""
-        result: Dict[str, Any] = {}
-        for key, item in pairs:
-            if key in result:
-                raise ValueError(f"Duplicate histogram JSON key: {key!r}")
-            result[key] = item
-        return result
-
-    decoded = json.loads(value, object_pairs_hook=reject_duplicate_keys)
-    if not isinstance(decoded, dict):
-        raise ValueError("Histogram JSON must be an object")
-
-    histogram: Dict[float, int] = {}
-    for raw_bucket, count in decoded.items():
-        try:
-            bucket = float(raw_bucket)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Invalid histogram bucket: {raw_bucket!r}") from exc
-        if not math.isfinite(bucket) or bucket < 0:
-            raise ValueError(f"Invalid histogram bucket: {raw_bucket!r}")
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-            raise ValueError(f"Invalid histogram count for bucket {raw_bucket!r}")
-        if bucket in histogram:
-            raise ValueError(f"Duplicate normalized histogram bucket: {raw_bucket!r}")
-        histogram[bucket] = count
-    return histogram
-
-
-# =============================================================================
 # Plotting
 # =============================================================================
 
@@ -2340,6 +2153,423 @@ def filter_metrics(
 
 
 # =============================================================================
+# Machine-readable results (JSON fragment / document)
+# =============================================================================
+
+_JSON_PHASES = (("create", "WRITE"), ("stat", "STAT"), ("delete", "RMFILES"))
+
+
+@dataclass(frozen=True)
+class _Slot:
+    """One result slot: a ledger execution, or result files with no ledger entry."""
+
+    execution_id: Optional[str]
+    definition: MdtestDefinition
+
+    @property
+    def nodes(self) -> int:
+        """Node count of the slot."""
+        return self.definition.nodes
+
+    @property
+    def tasks(self) -> int:
+        """Tasks per node of the slot."""
+        return self.definition.tasks
+
+    @property
+    def iterations(self) -> Optional[int]:
+        """Configured iteration count, if known."""
+        return self.definition.iterations
+
+
+@dataclass
+class _IterationFiles:
+    """The result files of one iteration; either file may be missing."""
+
+    datestamp: str
+    iteration: int
+    csv_path: Optional[str] = None
+    out_path: Optional[str] = None
+
+
+def _read_mdtest_ledger(input_dir: str, env: Dict[str, Any]) -> List[_Slot]:
+    """List the metadata executions in executions/NNNN.sh, ordered by id."""
+    executions_dir = os.path.join(input_dir, "executions")
+    if not os.path.isdir(executions_dir):
+        return []
+    slots = []
+    for filename in sorted(os.listdir(executions_dir)):
+        if not re.fullmatch(r"[0-9]+\.sh", filename):
+            continue
+        try:
+            with open(
+                os.path.join(executions_dir, filename), "r", encoding="utf-8"
+            ) as definition:
+                content = definition.read()
+        except OSError as error:
+            eprint(f"Warning: Cannot read execution definition {filename}: {error}")
+            continue
+        if not is_mdtest_definition(content):
+            continue
+        definition = parse_mdtest_definition(content, env)
+        if definition is None:
+            eprint(f"Warning: Invalid metadata execution coordinates in {filename}")
+            continue
+        slots.append(_Slot(filename[:-3], definition))
+    return slots
+
+
+def _scan_result_files(
+    input_dir: str,
+) -> Dict[Tuple[int, int], List[_IterationFiles]]:
+    """Group every result file in a directory by (nodes, tasks) and iteration."""
+    by_iteration: Dict[Tuple[int, int, int, str], _IterationFiles] = {}
+    for filename in sorted(os.listdir(input_dir)):
+        match = FILENAME_PATTERN.fullmatch(filename)
+        if not match:
+            continue
+        iteration = int(match.group(4))
+        key = (int(match.group(1)), int(match.group(2)), iteration, match.group(3))
+        files = by_iteration.setdefault(key, _IterationFiles(match.group(3), iteration))
+        path = os.path.join(input_dir, filename)
+        if match.group(5) == "csv":
+            files.csv_path = path
+        else:
+            files.out_path = path
+    grouped: Dict[Tuple[int, int], List[_IterationFiles]] = {}
+    for key in sorted(by_iteration):
+        grouped.setdefault((key[0], key[1]), []).append(by_iteration[key])
+    return grouped
+
+
+def _load_iteration(
+    files: _IterationFiles,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[float, int]], List[str]]:
+    """Parse whatever result files exist; return (csv, out, reasons it is not whole)."""
+    reasons: List[str] = []
+    csv_data: Dict[str, Dict[str, Any]] = {}
+    out_data: Dict[str, Dict[float, int]] = {}
+    if files.csv_path is None:
+        reasons.append("missing CSV file")
+    else:
+        try:
+            csv_data = parse_csv_file(files.csv_path)
+        except (OSError, ValueError, csv.Error) as error:
+            reasons.append(f"unparseable CSV file: {error}")
+    if files.out_path is None:
+        reasons.append("missing OUT file")
+    else:
+        try:
+            out_data = parse_out_file(files.out_path)
+        except (OSError, ValueError) as error:
+            reasons.append(f"unparseable OUT file: {error}")
+    if not reasons:
+        incomplete = incomplete_result_reason(csv_data, out_data)
+        if incomplete:
+            reasons.append(incomplete)
+    return csv_data, out_data, reasons
+
+
+def _iteration_phase(
+    name: str,
+    csv_row: Optional[Dict[str, Any]],
+    histogram: Dict[float, int],
+) -> Optional[Dict[str, Any]]:
+    """One phase of one iteration, or None when nothing of it was parsed."""
+    if csv_row is None and not histogram:
+        return None
+    row = csv_row or {}
+    latency = None
+    if row.get("lat_valid"):
+        latency = {
+            "min": results_json.seconds_to_us(row["lat_min"]),
+            "avg": results_json.seconds_to_us(row["lat_avg"]),
+            "max": results_json.seconds_to_us(row["lat_max"]),
+        }
+    return {
+        "phase": name,
+        "ops_per_s": (
+            results_json.round_ops(row["rate"]) if row.get("rate_valid") else None
+        ),
+        "elapsed_ms": (
+            int(round(row["elapsed_sec"] * 1000)) if row.get("elapsed_valid") else None
+        ),
+        "latency_us": latency,
+        "histogram_us": results_json.histogram_columnar(histogram),
+    }
+
+
+def _iteration_entry(
+    files: _IterationFiles,
+    csv_data: Dict[str, Dict[str, Any]],
+    out_data: Dict[str, Dict[float, int]],
+    reasons: List[str],
+) -> Dict[str, Any]:
+    """The per-iteration JSON object."""
+    phases = [
+        phase
+        for name, operation in _JSON_PHASES
+        if (
+            phase := _iteration_phase(
+                name, csv_data.get(operation), out_data.get(operation) or {}
+            )
+        )
+    ]
+    problems = (
+        [results_json.problem("iteration_incomplete", "; ".join(reasons))]
+        if reasons
+        else []
+    )
+    return {
+        "iteration": files.iteration,
+        "datestamp": files.datestamp,
+        "state": "incomplete" if reasons else "complete",
+        "problems": problems,
+        "phases": phases,
+    }
+
+
+def _percentile_us(histogram: Dict[float, int], percentile: float) -> Optional[float]:
+    """Pooled-histogram percentile in microseconds (None for an empty histogram)."""
+    if not histogram:
+        return None
+    return results_json.round_latency_us(
+        percentile_from_histogram(histogram, percentile) * 1000.0
+    )
+
+
+def _aggregate_phase(name: str, agg: AggregatedMetrics) -> Dict[str, Any]:
+    """Aggregate one phase over the validated iterations."""
+    histogram = getattr(agg, f"{name}_histogram")
+    return {
+        "phase": name,
+        "ops_per_s": {
+            "mean": results_json.round_ops(getattr(agg, f"{name}_rate_avg")),
+            "stddev": results_json.round_ops(getattr(agg, f"{name}_rate_stddev")),
+            "min": results_json.round_ops(getattr(agg, f"{name}_rate_min")),
+            "max": results_json.round_ops(getattr(agg, f"{name}_rate_max")),
+        },
+        "mean_elapsed_ms": int(round(getattr(agg, f"{name}_elapsed_avg_sec") * 1000)),
+        "latency_us": {
+            f"p{percent}": _percentile_us(histogram, percent)
+            for percent in (0, 50, 90, 99, 100)
+        },
+        "latency_method": "pooled_histogram_bucket",
+    }
+
+
+def _aggregate_json(
+    metrics: List[IterationMetrics], expected: Optional[int]
+) -> Dict[str, Any]:
+    """The aggregate block; only validated iterations contribute."""
+    phases = []
+    if metrics:
+        agg = next(iter(aggregate_metrics(metrics).values()))
+        phases = [_aggregate_phase(name, agg) for name, _ in _JSON_PHASES]
+    return {
+        "iterations_expected": expected,
+        "iterations_used": len(metrics),
+        "phases": phases,
+    }
+
+
+def _result_state(
+    iterations: List[Dict[str, Any]], missing: List[int], found: bool
+) -> str:
+    """complete, partial, missing or unparseable from the iteration outcomes."""
+    if not found:
+        return "missing"
+    if not any(entry["phases"] for entry in iterations):
+        return "unparseable"
+    incomplete = any(entry["state"] != "complete" for entry in iterations)
+    return "partial" if incomplete or missing else "complete"
+
+
+def _missing_iterations(
+    iterations: List[Dict[str, Any]], expected: Optional[int]
+) -> List[int]:
+    """Expected iteration numbers that have no result files at all."""
+    if expected is None:
+        return []
+    present = {entry["iteration"] for entry in iterations}
+    return [number for number in range(1, expected + 1) if number not in present]
+
+
+def _result_file_records(
+    files_list: List[_IterationFiles], input_dir: str
+) -> List[Dict[str, Any]]:
+    """file_record for every result file, relative to the input directory."""
+    paths = sorted(
+        path
+        for files in files_list
+        for path in (files.csv_path, files.out_path)
+        if path is not None
+    )
+    return [
+        results_json.file_record(path, os.path.relpath(path, input_dir))
+        for path in paths
+    ]
+
+
+def _execution_entry(
+    slot: _Slot, files_list: List[_IterationFiles], input_dir: str
+) -> Dict[str, Any]:
+    """The fragment entry of one slot with its result files."""
+    iterations: List[Dict[str, Any]] = []
+    metrics: List[IterationMetrics] = []
+    for files in files_list:
+        csv_data, out_data, reasons = _load_iteration(files)
+        iterations.append(_iteration_entry(files, csv_data, out_data, reasons))
+        if not reasons:
+            metrics.append(
+                metrics_from_parsed(
+                    csv_data,
+                    out_data,
+                    slot.nodes,
+                    slot.tasks,
+                    files.datestamp,
+                    files.iteration,
+                )
+            )
+    missing = _missing_iterations(iterations, slot.iterations)
+    # Execution problems say what made the execution partial; details stay on
+    # each iteration.
+    problems = [
+        results_json.problem(
+            item["code"], f"iteration {iteration['iteration']}: {item['detail']}"
+        )
+        for iteration in iterations
+        for item in iteration["problems"]
+    ]
+    if missing:
+        detail = "missing iterations: " + ", ".join(str(number) for number in missing)
+        problems.append(results_json.problem("iterations_missing", detail))
+    results = None
+    if files_list:
+        results = {
+            "iterations": iterations,
+            "aggregate": _aggregate_json(metrics, slot.iterations),
+        }
+    coordinates, coordinate_key = mdtest_coordinates(slot.definition, len(iterations))
+    return {
+        "execution_id": slot.execution_id,
+        "coordinates": coordinates,
+        "coordinate_key": coordinate_key,
+        "dataset": None,
+        "result_state": _result_state(iterations, missing, bool(files_list)),
+        "problems": problems,
+        "result_files": _result_file_records(files_list, input_dir),
+        "results": results,
+    }
+
+
+def _not_reported_entry(slot: _Slot) -> Dict[str, Any]:
+    """The entry of an execution removed by --only-nodes/--only-threads."""
+    coordinates, coordinate_key = mdtest_coordinates(slot.definition)
+    return {
+        "execution_id": slot.execution_id,
+        "coordinates": coordinates,
+        "coordinate_key": coordinate_key,
+        "dataset": None,
+        "result_state": "not_reported",
+        "problems": [],
+        "result_files": [],
+        "results": None,
+    }
+
+
+def build_results_fragment(
+    input_dir: str,
+    env: Dict[str, Any],
+    only_nodes: Optional[Set[int]] = None,
+    only_threads: Optional[Set[int]] = None,
+) -> Dict[str, Any]:
+    """Describe every ledger execution and result file of one input directory."""
+    scanned = _scan_result_files(input_dir)
+
+    def selected(slot: _Slot) -> bool:
+        return (only_nodes is None or slot.nodes in only_nodes) and (
+            only_threads is None or slot.tasks in only_threads
+        )
+
+    entries = []
+    for slot in _read_mdtest_ledger(input_dir, env):
+        if selected(slot):
+            files_list = scanned.pop((slot.nodes, slot.tasks), [])
+            entries.append(_execution_entry(slot, files_list, input_dir))
+        else:
+            scanned.pop((slot.nodes, slot.tasks), None)
+            entries.append(_not_reported_entry(slot))
+    for (nodes, tasks), files_list in sorted(scanned.items()):
+        slot = _Slot(
+            None,
+            MdtestDefinition(
+                nodes,
+                tasks,
+                optional_int(env.get("MDTEST_ITERATIONS")),
+                optional_int(env.get("MDTEST_BRANCH_FACTOR")),
+                optional_int(env.get("MDTEST_ITEMS_PER_DIR")),
+            ),
+        )
+        if selected(slot):
+            entries.append(_execution_entry(slot, files_list, input_dir))
+    return {
+        "fragment_version": results_json.FRAGMENT_VERSION,
+        "kind": "mdtest",
+        "executions": entries,
+        "diagnostics": [],
+    }
+
+
+def validate_json_arguments(args) -> None:
+    """Reject option combinations the JSON export cannot honor."""
+    if args.require_complete and not args.to_json:
+        raise ValueError("--require-complete requires --to-json")
+    if not args.to_json and not args.results_fragment:
+        return
+    if args.to_json and args.results_fragment:
+        raise ValueError("--to-json and --results-fragment are mutually exclusive")
+    if len(set(args.input_dirs)) != 1:
+        raise ValueError("--to-json and --results-fragment need exactly one input dir")
+
+
+def json_requested(args) -> bool:
+    """True when this run writes a results fragment or document."""
+    return bool(args.to_json or args.results_fragment)
+
+
+def write_json_outputs(args, env: Dict[str, Any]) -> bool:
+    """Write the fragment or document; return whether the results are complete."""
+    input_dir = args.input_dirs[0]
+    fragment = build_results_fragment(
+        input_dir,
+        env,
+        parse_int_values_with_ranges(args.only_nodes) if args.only_nodes else None,
+        parse_int_values_with_ranges(args.only_threads) if args.only_threads else None,
+    )
+    if args.results_fragment:
+        results_json.write_fragment(fragment, args.results_fragment)
+        return True
+    generator = results_json.generator_block(
+        list(sys.argv),
+        {
+            "live_detail": getattr(args, "live_detail", None),
+            "z_threshold": getattr(args, "z_threshold", None),
+            "only_nodes": args.only_nodes,
+            "only_threads": args.only_threads,
+            "kind": "mdtest",
+        },
+    )
+    document = results_json.assemble_ordinary_document(
+        Path(input_dir).resolve(), fragment, None, generator
+    )
+    results_json.write_document(
+        document, os.path.join(args.output_dir or input_dir, "results.json")
+    )
+    return results_json.document_is_complete(document)
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -2350,6 +2580,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         validate_analysis_arguments(args)
+        validate_json_arguments(args)
         route_batch_report(args, "mdtest", sys.argv[1:])
     except (OSError, ValueError) as error:
         parser.error(str(error))
@@ -2378,69 +2609,70 @@ def main() -> None:
                 eprint(f"  {op}: {len(hist)} buckets, total count={sum(hist.values())}")
         return
 
-    # Validate args
-    if not args.input_dirs and not args.from_csv:
-        parser.error("At least one input directory required (or use --from-csv)")
-
-    # Load metrics
     environments = {
         input_dir: load_env_used_yaml(input_dir)
         for input_dir in dict.fromkeys(args.input_dirs)
     }
-    aggregated_metrics: List[AggregatedMetrics] = []
-    test_configuration: Dict[str, str] = {}
+    complete = True
+    if json_requested(args):
+        complete = write_json_outputs(args, environments[args.input_dirs[0]])
+    try:
+        _run_text_report(args, environments)
+    except SystemExit as exit_request:
+        # With the JSON written, "nothing to plot" (exit 1) is not a failure.
+        if exit_request.code == 1 and json_requested(args):
+            eprint("No text report produced; the JSON export was written")
+        elif not (args.require_complete and not complete):
+            raise
+    if args.require_complete and not complete:
+        sys.exit(EXIT_INCOMPLETE)
+
+
+def _run_text_report(args, environments: Dict[str, dict]) -> None:
+    """Print the table or Markdown report and write the plots."""
     versions: List[Tuple[IterationMetrics, str]] = []
 
-    if args.from_csv:
-        eprint(f"Loading metrics from {args.from_csv}")
-        aggregated_metrics, test_configuration = read_csv_import(args.from_csv)
-        eprint(f"Loaded {len(aggregated_metrics)} aggregated metrics")
-        target_sources = cached_target_sources(
-            args.from_csv, (m.storage_target_name for m in aggregated_metrics)
+    # Refuse results from different storage targets before parsing or writing.
+    target_sources = [
+        (input_dir, storage_target_from_env(env))
+        for input_dir, env in environments.items()
+    ]
+    target_label = guarded_report_target(target_sources, args.allow_mixed_targets)
+    # Mixing was explicitly allowed: keep same-coordinate results per target.
+    target_groups = (
+        _directories_by_target(environments)
+        if target_label.startswith(MIXED_PREFIX)
+        else None
+    )
+    # Discover and parse files
+    file_pairs = discover_files(args.input_dirs, target_groups)
+    eprint(f"Found {len(file_pairs)} file pairs")
+
+    if not file_pairs:
+        eprint("No valid file pairs found")
+        sys.exit(1)
+
+    # Parse all file pairs
+    iterations: List[IterationMetrics] = []
+    for key, (csv_path, out_path) in file_pairs.items():
+        node_count, thread_count, datestamp, iteration = key[:4]
+        m = parse_file_pair(
+            csv_path, out_path, node_count, thread_count, datestamp, iteration
         )
-        target_label = guarded_report_target(target_sources, args.allow_mixed_targets)
-    else:
-        # Refuse results from different storage targets before parsing or writing.
-        target_sources = [
-            (input_dir, storage_target_from_env(env))
-            for input_dir, env in environments.items()
-        ]
-        target_label = guarded_report_target(target_sources, args.allow_mixed_targets)
-        # Mixing was explicitly allowed: keep same-coordinate results per target.
-        target_groups = (
-            _directories_by_target(environments)
-            if target_label.startswith(MIXED_PREFIX)
-            else None
-        )
-        # Discover and parse files
-        file_pairs = discover_files(args.input_dirs, target_groups)
-        eprint(f"Found {len(file_pairs)} file pairs")
+        if m:
+            iterations.append(m)
+            versions.append((m, result_version(out_path)))
 
-        if not file_pairs:
-            eprint("No valid file pairs found")
-            sys.exit(1)
+    eprint(f"Parsed {len(iterations)} iterations")
 
-        # Parse all file pairs
-        iterations: List[IterationMetrics] = []
-        for key, (csv_path, out_path) in file_pairs.items():
-            node_count, thread_count, datestamp, iteration = key[:4]
-            m = parse_file_pair(
-                csv_path, out_path, node_count, thread_count, datestamp, iteration
-            )
-            if m:
-                iterations.append(m)
-                versions.append((m, result_version(out_path)))
+    if not iterations:
+        eprint("No valid iterations parsed")
+        sys.exit(1)
 
-        eprint(f"Parsed {len(iterations)} iterations")
-
-        if not iterations:
-            eprint("No valid iterations parsed")
-            sys.exit(1)
-
-        # Aggregate
-        aggregated_dict = aggregate_metrics(iterations)
-        aggregated_metrics = list(aggregated_dict.values())
-        eprint(f"Aggregated into {len(aggregated_metrics)} (node, thread) groups")
+    # Aggregate
+    aggregated_dict = aggregate_metrics(iterations)
+    aggregated_metrics = list(aggregated_dict.values())
+    eprint(f"Aggregated into {len(aggregated_metrics)} (node, thread) groups")
 
     # Apply filters
     if args.only_nodes or args.only_threads:
@@ -2462,38 +2694,10 @@ def main() -> None:
         sys.exit(1)
 
     # Determine output directory
-    output_dir = "."
-    if args.input_dirs:
-        output_dir = args.input_dirs[0]
-    elif args.from_csv:
-        output_dir = os.path.dirname(os.path.abspath(args.from_csv)) or "."
-    output_dir = args.output_dir or output_dir
+    output_dir = args.output_dir or args.input_dirs[0]
     os.makedirs(output_dir, exist_ok=True)
 
-    if not test_configuration:
-        configuration_dirs = args.input_dirs or [
-            os.path.dirname(os.path.abspath(args.from_csv)) or "."
-        ]
-        test_configuration = load_mdtest_configuration(configuration_dirs, environments)
-
-    # Export to CSV if requested
-    if args.to_csv:
-        all_datestamps: Set[str] = set()
-        for m in aggregated_metrics:
-            all_datestamps.update(m.datestamps)
-        csv_filename = (
-            "mdtest-elbencho-metrics-"
-            f"{join_datestamps_for_filename(all_datestamps, prefix='mdtest-elbencho-metrics-', suffix='.csv', sep='+')}"
-            ".csv"
-        )
-        csv_path = os.path.join(output_dir, csv_filename)
-        write_csv_export(
-            csv_path,
-            aggregated_metrics,
-            test_configuration,
-            exported_target_cell(target_label, has_unverified_source(target_sources)),
-        )
-        eprint(f"Wrote metrics to {csv_path}")
+    test_configuration = load_mdtest_configuration(args.input_dirs, environments)
 
     # Print output
     produced_by = selected_versions(

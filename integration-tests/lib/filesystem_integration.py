@@ -5894,9 +5894,68 @@ def _mixed_batch_report(
     """
     rows = _mixed_batch_group_rows(fixture, runtime)
     reports = _batch_report(
-        runner, report_workspace, result, log_dir, tuple(row[0] for row in rows)
+        runner,
+        report_workspace,
+        result,
+        log_dir,
+        tuple(row[0] for row in rows),
+        results_json=True,
     )
     assert_report_index_targets((reports / "index.md").read_text("utf-8"), rows)
+    _assert_batch_results_json(reports / "results.json", rows)
+
+
+def _assert_batch_results_json(path: Path, rows: tuple[GroupRow, ...]) -> None:
+    """The machine-readable document must show a complete, fully successful batch.
+
+    The integration environment has no ``jsonschema``, so this checks only the
+    contract's essentials with plain Python.
+    """
+    if not path.is_file():
+        raise IntegrationTestError("mixed batch reporting wrote no results.json")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    problems = []
+    if document.get("schema") != "storage-scale-test/filesystem-batch-results":
+        problems.append(f"schema {document.get('schema')!r}")
+    if document.get("schema_version") != "1.0":
+        problems.append(f"schema_version {document.get('schema_version')!r}")
+    if document.get("batch_outcome", {}).get("complete") is not True:
+        problems.append("batch_outcome.complete is not true")
+    groups = sorted(group["group_id"] for group in document.get("groups", ()))
+    if groups != sorted(row[0] for row in rows):
+        problems.append(f"groups {groups}")
+    io_groups = {row[0] for row in rows if row[1] == "io"}
+    for execution in document.get("executions", ()):
+        label = f"execution {execution.get('execution_id')}"
+        if execution.get("ledger_state") != "success":
+            problems.append(f"{label} ledger_state {execution.get('ledger_state')!r}")
+        if execution.get("result_state") != "complete":
+            problems.append(f"{label} result_state {execution.get('result_state')!r}")
+        if execution.get("group_id") in io_groups and not _has_elbencho_rates(
+            execution
+        ):
+            problems.append(f"{label} lacks elbencho_first/elbencho_last numbers")
+    if not document.get("executions"):
+        problems.append("no executions")
+    if problems:
+        raise IntegrationTestError(
+            "mixed batch results.json is not a complete success: " + "; ".join(problems)
+        )
+
+
+def _has_elbencho_rates(execution: dict[str, Any]) -> bool:
+    """True if every transfer phase carries numeric elbencho first/last rates."""
+    phases = [
+        phase
+        for phase in (execution.get("results") or {}).get("phases", ())
+        if "elbencho_first" in phase
+    ]
+    return bool(phases) and all(
+        isinstance(phase.get(key), dict)
+        and any(isinstance(value, (int, float)) for value in phase[key].values())
+        for phase in phases
+        for key in ("elbencho_first", "elbencho_last")
+    )
 
 
 def _batch_report(
@@ -5906,8 +5965,13 @@ def _batch_report(
     log_dir: Path,
     identities: tuple[str, ...],
     output_name: str = "reports-mixed-batch",
+    *,
+    results_json: bool = False,
 ) -> Path:
-    """Run the unified report front door and require one report per group."""
+    """Run the unified report front door and require one report per group.
+
+    *results_json* also writes ``results.json`` into the report directory.
+    """
     reports = log_dir / output_name
     completed = runner.run(
         [
@@ -5915,6 +5979,7 @@ def _batch_report(
             result,
             "--output-dir",
             reports,
+            *(("--to-json",) if results_json else ()),
         ],
         timeout=600,
         check=False,

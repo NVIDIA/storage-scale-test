@@ -43,7 +43,7 @@ def extract_filesystem_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         usage="%(prog)s [OPTIONS] [RESULTS_DIR]",
         description="Report filesystem results; options apply only to matching groups.",
-        epilog="Cached input or parse-only mode requires --kind io|mdtest; not valid for batches.",
+        epilog="Parse-only mode requires --kind io|mdtest; not valid for batches.",
         allow_abbrev=False,
     )
     parser.add_argument(
@@ -70,7 +70,7 @@ def extract_elbencho_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "input_dirs",
         nargs="*",
-        help="Directories containing elbencho output files (optional if --from-csv is provided)",
+        help="Directories containing elbencho output files",
     )
     add_analysis_arguments(parser, "io")
     add_report_destination_arguments(parser)
@@ -106,11 +106,6 @@ def extract_netbench_parser() -> argparse.ArgumentParser:
         nargs="*",
         help="Directories containing netbench result files",
     )
-    parser.add_argument(
-        "--to-csv",
-        metavar="FILE",
-        help="Write aggregated metrics to CSV file",
-    )
     add_common_report_arguments(parser)
     parser.add_argument(
         "--only-mode",
@@ -136,16 +131,7 @@ def extract_warp_parser() -> argparse.ArgumentParser:
 
     Usage:
       # Parse benchmark files in a directory
-      %(prog)s /path/to/results [--to-json]
-
-      # Read from analyzed JSON (with relative path - directory required)
-      %(prog)s /path/to/results --from-json 20251029Z194526-analyzed
-
-      # Read from analyzed JSON (with absolute path - directory optional)
-      %(prog)s --from-json /path/to/results/20251029Z194526-analyzed.json.zst
-
-      # Read from analyzed JSON (directory - finds first analyzed file)
-      %(prog)s --from-json /path/to/results
+      %(prog)s /path/to/results
 
       # Specify different output directory for plots
       %(prog)s /path/to/results --output-dir /path/to/plots
@@ -154,33 +140,12 @@ def extract_warp_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "directory",
-        nargs="?",
-        help="Directory containing Warp benchmark files. "
-        "Required when parsing benchmarks or using relative paths with --from-json. "
-        "Optional when using --from-json with absolute path.",
+        help="Directory containing Warp benchmark files.",
     )
     parser.add_argument(
         "--output-dir",
         metavar="DIR",
-        help="Directory to save plots and reports. "
-        "Defaults to: input directory when parsing, JSON's directory with --from-json, "
-        "or current directory if neither is available.",
-    )
-    parser.add_argument(
-        "--to-json",
-        action="store_true",
-        help="Write analyzed results to <datestamp>-analyzed.json.zst in the output directory. "
-        "Includes complete data for all analysis including per-client metrics and histograms.",
-    )
-    parser.add_argument(
-        "--from-json",
-        metavar="PATH",
-        type=str,
-        help="Read metrics from a previously analyzed JSON file. "
-        "Accepts absolute file path (/path/to/file.json.zst), "
-        "directory path (will find first analyzed file), "
-        "relative path (file.json.zst), "
-        "or just datestamp (20251029Z194526). Will try .json.zst and .json extensions.",
+        help="Directory to save plots and reports (default: the input directory).",
     )
     parser.add_argument(
         "--only-sizes",

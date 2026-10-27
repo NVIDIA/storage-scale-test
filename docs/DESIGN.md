@@ -998,7 +998,7 @@ This provides low-toil shareable reports without requiring dedicated reporting
 infrastructure. The Markdown includes tables, section headers, and inline plot
 references.
 
-### 9.4 Filtering and Re-Analysis
+### 9.4 Filtering
 
 All analysis scripts support filtering to reduce clutter:
 
@@ -1007,12 +1007,8 @@ All analysis scripts support filtering to reduce clutter:
 ./utils/extract-warp.py --only-sizes 16MiB --only-threads 64,128 results/
 ```
 
-Intermediate data can be cached (`--to-csv`, `--to-json`) and reloaded
-(`--from-csv`, `--from-json`) to avoid re-parsing raw files, enabling fast
-iterative report refinement. For Elbencho, `--from-csv` is an alternative input
-source and cannot be combined with raw result directories. Malformed filters
-and filters that match neither aggregate nor live metrics fail instead of
-silently producing an unfiltered or empty report.
+Malformed filters and filters that match neither aggregate nor live metrics
+fail instead of silently producing an unfiltered or empty report.
 
 Reports begin with the project versions that produced their results and the
 reporter's version; see [VERSIONING.md](VERSIONING.md).

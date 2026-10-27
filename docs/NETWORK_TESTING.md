@@ -50,5 +50,5 @@ Analyze `$RESULTS_DIR/netbench-{half|bidir}-<datestamp>/` with:
 ```
 
 The analyzer reports throughput, latency distributions, variance, and scaling
-efficiency in terminal tables and plots. It also supports Markdown, CSV
-export/import, and scale filters; see `--help`.
+efficiency in terminal tables and plots. It also supports Markdown
+output and scale filters; see `--help`.

@@ -30,21 +30,22 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
-import json
 import math
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 import traceback
 from collections import defaultdict
-from dataclasses import dataclass, fields, asdict, field
+from dataclasses import dataclass, field
 from functools import partial
 from itertools import chain
 from typing import (
     Any,
     DefaultDict,
     Dict,
+    FrozenSet,
     Iterable,
     List,
     Optional,
@@ -54,7 +55,6 @@ from typing import (
     TypedDict,
     Union,
     cast,
-    get_type_hints,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -80,6 +80,20 @@ from lib.filesystem_batch import route_batch_report
 from lib.filesystem_report_options import (
     validate_analysis_arguments,
 )
+from lib import filesystem_results as results_json
+from lib import filesystem_coordinates as fs_coordinates
+from lib.filesystem_coordinates import (
+    ENV_SWEEP_READ_FROM,
+    PHASE_READ,
+    PHASE_WRITE,
+    PLAN_READ_FROM,
+    IoDefinition,
+    parse_io_definition,
+    phase_plan,
+    plan_runs_phase,
+)
+from lib.elbencho_live_results import LiveCSVError, build_live_objects
+from lib.elbencho_live_results import load_workers_tsv, null_live
 from lib.elbencho_live_report import (
     DomainAnalysis,
     LiveAnalysis,
@@ -102,7 +116,6 @@ from lib.stdout_report_file import (  # pylint: disable=wrong-import-position
 )
 from lib.storage_target import (
     StorageTarget,
-    cached_target_sources,
     guarded_report_target,
     storage_target_from_env,
 )
@@ -138,6 +151,8 @@ CSV_COL_IO_LAT_US_AVG = _IO_LAT_US_COL_PREFIX + "[avg]"
 CSV_COL_IO_LAT_US_MAX = _IO_LAT_US_COL_PREFIX + "[max]"
 CSV_COL_TIME_MS_FIRST = "time ms [first]"
 CSV_COL_TIME_MS_LAST = "time ms [last]"
+CSV_COL_IOPS_LAST = "IOPS [last]"
+CSV_COL_MIB_S_LAST = "MiB/s [last]"
 
 # Labeled CSV uses "ISO date" in the first column; --nocsvlabels read-only runs omit the header.
 _ELBE_CSV_LABEL_FIRST_CELL = "ISO date"
@@ -194,9 +209,7 @@ class ElbenchoMetrics:
     # Throughput metrics
     iops: float  # IOPS [first] value
     throughput_mib_s: float  # MiB/s [first] value
-    throughput_mb_s: (
-        float  # Converted to MB/s (kept for CSV compatibility, display as GB/s)
-    )
+    throughput_mb_s: float  # Converted to MB/s (the tables display it as GB/s)
     throughput_gbps: float  # Converted to Gb/s
 
     # Latency metrics (from .out file "IO latency" lines)
@@ -218,6 +231,25 @@ class ElbenchoMetrics:
     phase_first_duration_ms: int = 0
     # Completion-based sweep phases selected by --run-to-completion.
     sweep_run_to_completion_option: bool = False
+    # The [first] rates as found: None when the cell is absent, empty or
+    # malformed (iops/throughput_mib_s default to 0 for the text reports).
+    # Used by the results JSON only.
+    iops_first: Optional[float] = None
+    throughput_mib_s_first: Optional[float] = None
+    # CSV time ms [first]/[last] as found: 0 is a measured submillisecond
+    # phase, None an absent or malformed cell (the *_duration_ms fields above
+    # use 0 for both). Used by the results JSON only.
+    time_ms_first: Optional[int] = None
+    time_ms_last: Optional[int] = None
+    # elbencho [last] columns (aggregate until the slowest worker finished);
+    # None when the CSV row has no such column. Used by the results JSON only.
+    iops_last: Optional[float] = None
+    throughput_mib_s_last: Optional[float] = None
+    # Unmodified CSV command column (strip_hosts_from_command keeps --hosts
+    # out of the tables but the results JSON records the argv as run).
+    raw_command: str = ""
+    # Which of "1", "50", "75", "99" the .out "IO lat % us" line provided.
+    lat_pct_found: FrozenSet[str] = frozenset()
 
     # Optional sweep log annotations (from nv-elbencho-sweep / _elbencho_functions.sh .out text)
     write_only_data_dir: str = ""  # path from ELBENCHO_WRITE_ONLY_DATA_DIR=
@@ -284,13 +316,6 @@ class ElbenchoMetrics:
     # Histogram data (optional, for visualization); latency histogram data
     # as {time_sec: count}
     histogram: Dict[float, int] = field(default_factory=dict)
-
-    # Storage target name from the snapshot ("" when unknown). Keep last: it is
-    # the newest column, and older CSVs without it still load.
-    storage_target_name: str = ""
-
-
-_ELBENCHO_METRIC_FIELD_TYPES = get_type_hints(ElbenchoMetrics)
 
 
 @dataclass(frozen=True)
@@ -386,14 +411,6 @@ _RE_TREESCAN_FIRST_FILE_NUM = re.compile(
 # nv-elbencho-sweep SLURM log: elbencho-<DS>-<max_nodes>-<nodes>-<io_size>-<jobid>.out
 _SLURM_ELBENCHO_JOB_OUT_RE = re.compile(
     r"^elbencho-(\d{8}Z\d{6})-\d+-\d+-(.+)-\d+\.out$"
-)
-_REIFIED_COORDS_RE = re.compile(
-    r"^# Auto-generated; do not edit\. Coords: "
-    r"nodes=(\d+) io_size=(\S+) thread_count=(\d+) io_depth=(\d+)$",
-    re.MULTILINE,
-)
-_REIFIED_LAYOUT_RE = re.compile(
-    r"^export ELBENCHO_FILE_LAYOUT=(['\"]?)([a-z-]+)\1$", re.MULTILINE
 )
 _WORKLOAD_METADATA_KEYS = (
     "dataset_count_source",
@@ -513,26 +530,33 @@ _WORKLOAD_ENUM_VALUES = {
 _CANONICAL_DECIMAL_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
 
 
-def _parse_reified_execution(path: Path) -> Optional[ExecutionCoordinates]:
-    """Read the coordinate tuple and configured layout from one NNNN.sh."""
+def _read_io_definition(path: Path) -> Optional[IoDefinition]:
+    """Read the coordinates, layout and exports of one NNNN.sh."""
     try:
         content = path.read_text(encoding="utf-8")
     except OSError as exc:
         eprint(f"Warning: Failed to load reified execution {path}: {exc}")
         return None
-    coords_match = _REIFIED_COORDS_RE.search(content)
-    if not coords_match:
+    definition = parse_io_definition(content)
+    if definition is None:
         eprint(f"Warning: Missing execution coordinates in {path}")
-        return None
-    layout_match = _REIFIED_LAYOUT_RE.search(content)
-    configured_layout = layout_match.group(2) if layout_match else ""
+    return definition
+
+
+def _execution_coordinates(definition: IoDefinition) -> ExecutionCoordinates:
     return ExecutionCoordinates(
-        nodes=int(coords_match.group(1)),
-        io_size=coords_match.group(2),
-        threads=int(coords_match.group(3)),
-        io_depth=int(coords_match.group(4)),
-        configured_layout=configured_layout,
+        nodes=definition.nodes,
+        io_size=definition.io_size,
+        threads=definition.threads,
+        io_depth=definition.io_depth,
+        configured_layout=definition.configured_layout,
     )
+
+
+def _parse_reified_execution(path: Path) -> Optional[ExecutionCoordinates]:
+    """Read the coordinate tuple and configured layout from one NNNN.sh."""
+    definition = _read_io_definition(path)
+    return None if definition is None else _execution_coordinates(definition)
 
 
 def _parse_workload_metadata(path: Path) -> Optional[Dict[str, str]]:
@@ -1147,7 +1171,7 @@ def normalize_time(time_str: str) -> float:
 def normalize_throughput_to_mb(mib_per_sec: float) -> float:
     """Convert MiB/s to MB/s (1 MiB = 1.048576 MB).
 
-    Note: This value is stored in MB/s for CSV compatibility but displayed as GB/s.
+    Note: This value is stored in MB/s but displayed as GB/s.
     """
     return mib_per_sec * 1.048576
 
@@ -2612,200 +2636,6 @@ def plot_metrics(
                     )
 
 
-def write_csv(csv_file: str, metrics: List[ElbenchoMetrics]) -> None:
-    """Write metrics to a CSV file.
-
-    Args:
-        csv_file: Path to the CSV file
-        metrics: List of ElbenchoMetrics objects
-    """
-    if not metrics:
-        return
-
-    field_names = [f.name for f in fields(ElbenchoMetrics)]
-
-    try:
-        with open(csv_file, "w", newline="", encoding="utf-8") as f:
-            # Use QUOTE_ALL to ensure all fields are quoted, including booleans and numbers
-            writer = csv.DictWriter(f, fieldnames=field_names, quoting=csv.QUOTE_ALL)
-            writer.writeheader()
-
-            for metric in metrics:
-                # Convert histogram dictionary to string representation
-                metric_dict = asdict(metric)
-                if metric_dict["histogram"]:
-                    metric_dict["histogram"] = json.dumps(metric_dict["histogram"])
-
-                # If command field is None, set it to empty string to avoid None in CSV
-                if metric_dict["command"] is None:
-                    metric_dict["command"] = ""
-
-                writer.writerow(metric_dict)
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        eprint(f"Error writing to CSV: {e}")
-        traceback.print_exc()
-        raise IOError(f"Error writing to CSV: {e}") from e
-
-
-_TREESCAN_CSV_KEYS = (
-    "treescan_file_count",
-    "treescan_avg_bytes",
-    "treescan_min_bytes",
-    "treescan_max_bytes",
-    "treescan_first_file_bytes",
-)
-_WORKLOAD_STRING_CSV_KEYS = (
-    "configured_file_layout",
-    "configured_files_per_node",
-    "configured_file_size",
-    "workload_layout",
-    *_WORKLOAD_METADATA_KEYS,
-)
-
-
-def _csv_row_set_if_absent_or_empty(
-    row: Dict[str, Any], key: str, default: str
-) -> None:
-    """Set row[key] to default when missing or blank."""
-    if key not in row or row.get(key) in (None, ""):
-        row[key] = default
-
-
-def _elbencho_csv_parse_histogram_cell(row: Dict[str, Any]) -> None:
-    """Replace JSON histogram string with a dict (or {})."""
-    if "histogram" in row and row["histogram"]:
-        try:
-            row["histogram"] = json.loads(
-                row["histogram"], object_pairs_hook=_elbencho_histogram_pairs
-            )
-        except json.JSONDecodeError:
-            row["histogram"] = {}
-    else:
-        row["histogram"] = {}
-
-
-def _elbencho_histogram_pairs(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-    """Reject JSON histogram keys that normalize to the same latency bucket."""
-    normalized_keys = set()
-    result = {}
-    for key, value in pairs:
-        try:
-            normalized = float(key)
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"Invalid histogram bucket: {key}") from error
-        if not math.isfinite(normalized):
-            raise ValueError(f"Invalid histogram bucket: {key}")
-        if normalized in normalized_keys:
-            raise ValueError(f"Duplicate histogram bucket: {key}")
-        normalized_keys.add(normalized)
-        result[key] = value
-    return result
-
-
-def _elbencho_csv_apply_backward_compat_defaults(row: Dict[str, Any]) -> None:
-    """Fill optional / legacy CSV columns with safe string defaults."""
-    if "io_depth" not in row or not row.get("io_depth"):
-        row["io_depth"] = "1"
-    if "random_io" not in row or not row.get("random_io"):
-        row["random_io"] = "0"
-    _csv_row_set_if_absent_or_empty(row, "io_duration_sec", "0")
-    _csv_row_set_if_absent_or_empty(row, "phase_wall_duration_ms", "0")
-    _csv_row_set_if_absent_or_empty(row, "phase_first_duration_ms", "0")
-    _csv_row_set_if_absent_or_empty(row, "sweep_run_to_completion_option", "False")
-    _csv_row_set_if_absent_or_empty(row, "write_only_data_dir", "")
-    _csv_row_set_if_absent_or_empty(row, "treescan_size_stats_line", "")
-    _csv_row_set_if_absent_or_empty(row, "sweep_read_from_path", "")
-    for _ts_key in _TREESCAN_CSV_KEYS:
-        _csv_row_set_if_absent_or_empty(row, _ts_key, "0")
-    _csv_row_set_if_absent_or_empty(row, "is_single_big_file", "False")
-    _csv_row_set_if_absent_or_empty(row, "all_nodes_all_data", "False")
-    for workload_key in _WORKLOAD_STRING_CSV_KEYS:
-        _csv_row_set_if_absent_or_empty(row, workload_key, "")
-    _csv_row_set_if_absent_or_empty(row, "storage_target_name", "")
-    _elbencho_csv_parse_histogram_cell(row)
-
-
-def _elbencho_csv_coerce_field_types(row: Dict[str, Any]) -> None:
-    """Coerce string DictReader values to ElbenchoMetrics field types in place."""
-    for a_field in fields(ElbenchoMetrics):
-        field_name = a_field.name
-        field_value = row[field_name]
-        field_type = _ELBENCHO_METRIC_FIELD_TYPES[field_name]
-
-        if field_type is bool:
-            if isinstance(field_value, str):
-                row[field_name] = field_value.lower() == "true"
-        elif field_type is int:
-            row[field_name] = int(float(field_value)) if field_value else 0
-        elif field_type is float:
-            row[field_name] = float(field_value) if field_value else 0.0
-
-
-def read_csv(csv_file: str) -> List[ElbenchoMetrics]:
-    """Read metrics from a CSV file.
-
-    Args:
-        csv_file: Path to the CSV file
-
-    Returns:
-        List of ElbenchoMetrics objects
-    """
-    metrics = []
-
-    try:
-        with open(csv_file, "r", newline="", encoding="utf-8") as f:
-            # Use QUOTE_ALL since we're now writing all fields with quotes
-            reader = csv.DictReader(f, quoting=csv.QUOTE_ALL)
-
-            # Verify required fields are present (except io_depth for backward compatibility)
-            required_fields = [
-                f.name
-                for f in fields(ElbenchoMetrics)
-                if f.name
-                not in (
-                    "io_depth",
-                    "io_duration_sec",
-                    "phase_wall_duration_ms",
-                    "phase_first_duration_ms",
-                    "sweep_run_to_completion_option",
-                    "write_only_data_dir",
-                    "sweep_read_from_path",
-                    "treescan_size_stats_line",
-                    "treescan_file_count",
-                    "treescan_avg_bytes",
-                    "treescan_min_bytes",
-                    "treescan_max_bytes",
-                    "treescan_first_file_bytes",
-                    "is_single_big_file",
-                    "all_nodes_all_data",
-                    "storage_target_name",
-                    *_WORKLOAD_STRING_CSV_KEYS,
-                )
-            ]
-            fieldnames = reader.fieldnames
-            if fieldnames is None:
-                raise ValueError(f"CSV has no header row: {csv_file}")
-            missing_fields = [
-                field for field in required_fields if field not in fieldnames
-            ]
-
-            if missing_fields:
-                raise ValueError(
-                    f"CSV is missing required fields: {', '.join(missing_fields)}"
-                )
-
-            for row in reader:
-                _elbencho_csv_apply_backward_compat_defaults(row)
-                _elbencho_csv_coerce_field_types(row)
-                metrics.append(ElbenchoMetrics(**cast(Any, row)))
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        eprint(f"Error reading from CSV: {e}")
-        traceback.print_exc()
-        raise IOError(f"Error reading from CSV: {e}") from e
-
-    return metrics
-
-
 def filter_metrics(
     metrics: List[ElbenchoMetrics],
     only_sizes: Optional[Set[str]] = None,
@@ -3857,16 +3687,20 @@ def _elbencho_apply_out_section_histogram_and_percentiles(
     if lat_pct_match:
         percentiles_str = lat_pct_match.group(1)
 
-        def extract_percentile(pattern: str, default: float = 0) -> float:
-            match = re.search(pattern, percentiles_str)
+        found: Set[str] = set()
+
+        def extract_percentile(name: str, default: float = 0) -> float:
+            match = re.search(rf"(?<![0-9]){name}%<=(\d+)", percentiles_str)
             if match:
+                found.add(name)
                 return float(match.group(1)) / 1_000_000
             return default
 
-        metric.lat_pct_1 = extract_percentile(r"1%<=(\d+)")
-        metric.lat_pct_50 = extract_percentile(r"50%<=(\d+)")
-        metric.lat_pct_75 = extract_percentile(r"75%<=(\d+)")
-        metric.lat_pct_99 = extract_percentile(r"99%<=(\d+)")
+        metric.lat_pct_1 = extract_percentile("1")
+        metric.lat_pct_50 = extract_percentile("50")
+        metric.lat_pct_75 = extract_percentile("75")
+        metric.lat_pct_99 = extract_percentile("99")
+        metric.lat_pct_found = frozenset(found)
 
     hist_match = re.search(r"IO lat hist\s+:\s+\[ ([^\]]+) \]", op_text)
     if hist_match:
@@ -3993,8 +3827,8 @@ def _elbencho_headerless_row_to_dict(row: List[str]) -> Optional[Dict[str, str]]
     }
     # IOPS/MiB [last] sit at +1 past [first] in the phase block (see comment on offsets).
     if len(row) >= op_idx + 9:
-        out["IOPS [last]"] = row[op_idx + 6]
-        out["MiB/s [last]"] = row[op_idx + 8]
+        out[CSV_COL_IOPS_LAST] = row[op_idx + 6]
+        out[CSV_COL_MIB_S_LAST] = row[op_idx + 8]
     return out
 
 
@@ -4039,6 +3873,27 @@ def _elbencho_csv_parse_float_field(row: Dict[str, str], key: str) -> float:
         return float(row.get(key, 0) or 0)
     except (ValueError, TypeError):
         return 0.0
+
+
+def _elbencho_csv_parse_optional_float(
+    row: Dict[str, str], key: str
+) -> Optional[float]:
+    """Return a CSV cell as float, or None when absent, empty, malformed or
+    non-finite."""
+    raw = row.get(key, "")
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        value = float(raw)
+    except (ValueError, TypeError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _elbencho_csv_parse_optional_ms(row: Dict[str, str], key: str) -> Optional[int]:
+    """Return a CSV millisecond cell, keeping a measured 0; None if unusable."""
+    value = _elbencho_csv_parse_optional_float(row, key)
+    return int(value) if value is not None and value >= 0 else None
 
 
 def _elbencho_csv_parse_io_lat_us_to_sec(row: Dict[str, str], key: str) -> float:
@@ -4144,6 +3999,15 @@ def _try_append_elbencho_metric_from_csv_row(
         io_duration_sec=io_duration_sec,
         phase_wall_duration_ms=phase_wall_duration_ms,
         phase_first_duration_ms=phase_first_duration_ms,
+        time_ms_first=_elbencho_csv_parse_optional_ms(row, CSV_COL_TIME_MS_FIRST),
+        time_ms_last=_elbencho_csv_parse_optional_ms(row, CSV_COL_TIME_MS_LAST),
+        iops_first=_elbencho_csv_parse_optional_float(row, "IOPS [first]"),
+        throughput_mib_s_first=_elbencho_csv_parse_optional_float(row, "MiB/s [first]"),
+        iops_last=_elbencho_csv_parse_optional_float(row, CSV_COL_IOPS_LAST),
+        throughput_mib_s_last=_elbencho_csv_parse_optional_float(
+            row, CSV_COL_MIB_S_LAST
+        ),
+        raw_command=row.get("command", "") or "",
         write_only_data_dir="",
         sweep_read_from_path="",
         treescan_size_stats_line="",
@@ -4484,24 +4348,660 @@ def print_markdown_metrics_table_and_command(
         print("\n*Command information not available*")
 
 
+# --- Machine-readable results (fragment / document) --------------------------
+
+PHASE_DELETE = "delete"
+STATE_COMPLETE = "complete"
+STATE_PARTIAL = "partial"
+STATE_MISSING = "missing"
+STATE_UNPARSEABLE = "unparseable"
+STATE_NOT_REPORTED = "not_reported"
+WORKLOAD_NULL = "null"
+WORKLOAD_NOT_APPLICABLE = "not_applicable"
+WORKLOAD_INCOMPLETE = "incomplete"
+ENV_LIVEINT = "ELBENCHO_LIVEINT"
+LIVE_NOT_CAPTURED = "not_captured"
+LIVE_NOT_REQUESTED = "not_requested"
+LIVE_UNREADABLE = "unreadable"
+LIVE_SUFFIX = ".live.csv"
+LIVE_LEVEL_NONE = "none"
+RESULT_EXTENSIONS = (".csv", ".out", LIVE_SUFFIX)
+RESULTS_LIVE_DIRNAME = "results.live"
+RESULTS_DEFAULT_FILENAME = "results.json"
+EXIT_INCOMPLETE = 3
+PHASE_ORDER = (PHASE_WRITE, PHASE_READ, PHASE_DELETE)
+PERCENTILE_FIELDS = (("1", "p1"), ("50", "p50"), ("75", "p75"), ("99", "p99"))
+
+
+@dataclass(frozen=True)
+class ReportFilters:
+    """The --only-* sets that restrict which executions a report covers."""
+
+    sizes: Optional[Set[str]] = None
+    threads: Optional[Set[int]] = None
+    nodes: Optional[Set[int]] = None
+    iodepths: Optional[Set[int]] = None
+
+    def allows(self, nodes: int, io_size: str, threads: int, io_depth: int) -> bool:
+        """Apply the same truthiness semantics as ``filter_metrics``."""
+        return all(
+            (
+                not self.sizes or io_size in self.sizes,
+                not self.threads or threads in self.threads,
+                not self.nodes or nodes in self.nodes,
+                not self.iodepths or io_depth in self.iodepths,
+            )
+        )
+
+
+@dataclass(frozen=True)
+class LiveRequest:
+    """Live CSV analysis settings for the results export."""
+
+    level: str
+    z_threshold: float
+    selection_limits: Tuple[int, int]
+    min_underperform_segments: int
+    sidecar_dir: Optional[str]
+    configured_interval_ms: Optional[int]
+
+
+@dataclass(frozen=True)
+class LedgerExecution:
+    """One executions/NNNN.sh definition (execution_id None: no ledger entry)."""
+
+    execution_id: Optional[str]
+    coordinates: ExecutionCoordinates
+    exports: Dict[str, str]
+
+
+@dataclass
+class IoResultsInput:
+    """Everything the IO fragment builder needs from one input directory."""
+
+    input_dir: str
+    env: dict
+    filters: ReportFilters
+    live: LiveRequest
+    pairs: Dict[str, List[ElbenchoMetrics]]
+
+
+def load_io_ledger(input_dir: str) -> List[LedgerExecution]:
+    """Read every executions/NNNN.sh of one result directory, in ID order."""
+    ledger: List[LedgerExecution] = []
+    for path in sorted((Path(input_dir) / "executions").glob("[0-9]*.sh")):
+        if not path.stem.isdigit():
+            continue
+        definition = _read_io_definition(path)
+        if definition is not None:
+            ledger.append(
+                LedgerExecution(
+                    path.stem,
+                    _execution_coordinates(definition),
+                    dict(definition.exports),
+                )
+            )
+    return ledger
+
+
+def io_coordinates(ledger: LedgerExecution) -> Tuple[dict, str]:
+    """Build the coordinates object and coordinate_key of one IO execution."""
+    coords = ledger.coordinates
+    return fs_coordinates.io_coordinates(
+        IoDefinition(
+            coords.nodes,
+            coords.io_size,
+            coords.threads,
+            coords.io_depth,
+            coords.configured_layout,
+            ledger.exports,
+        )
+    )
+
+
+def _workload_int(metadata: Optional[Dict[str, str]], key: str) -> Optional[int]:
+    """Return a workload.tsv decimal, or None for null/pending/absent."""
+    value = (metadata or {}).get(key, WORKLOAD_NULL)
+    return int(value) if _CANONICAL_DECIMAL_RE.fullmatch(value) else None
+
+
+def _workload_enum(metadata: Optional[Dict[str, str]], key: str) -> Optional[str]:
+    if metadata is None:
+        return None
+    value = metadata.get(key, WORKLOAD_NULL)
+    return None if value == WORKLOAD_NULL else value
+
+
+def _scanned_file_sizes(metric: Optional[ElbenchoMetrics]) -> Optional[dict]:
+    if metric is None or metric.treescan_file_count <= 0:
+        return None
+    return {
+        "count": metric.treescan_file_count,
+        "avg_bytes": metric.treescan_avg_bytes,
+        "min_bytes": metric.treescan_min_bytes,
+        "max_bytes": metric.treescan_max_bytes,
+    }
+
+
+def _dataset_object(
+    ledger: LedgerExecution,
+    env: dict,
+    metadata: Optional[Dict[str, str]],
+    metrics: List[ElbenchoMetrics],
+) -> dict:
+    """Build the dataset object from the ledger, workload.tsv and .out lines."""
+    plan = phase_plan(ledger.exports)
+    mapped = env.get("KUBECTL_MAPPED_READ_FROM")
+    first = metrics[0] if metrics else None
+    write_only_dir = next(
+        (m.write_only_data_dir for m in metrics if m.write_only_data_dir), ""
+    )
+    layout = ledger.coordinates.configured_layout
+    if metadata is not None:
+        layout = _execution_workload_layout(ledger.coordinates, metadata)
+    return {
+        "source": "read_from" if plan == PLAN_READ_FROM else "generated",
+        "read_from": ledger.exports.get(ENV_SWEEP_READ_FROM) or None,
+        "kubernetes_mapped_read_from": str(mapped) if mapped else None,
+        "write_only_data_dir": write_only_dir or None,
+        "layout": layout or None,
+        "files_total": _workload_int(metadata, "dataset_files_total"),
+        "bytes_total": _workload_int(metadata, "dataset_bytes_total"),
+        "treefile_source": _workload_enum(metadata, "treefile_source"),
+        "scanned_file_sizes": _scanned_file_sizes(
+            next((m for m in metrics if m.treescan_file_count > 0), first)
+        ),
+    }
+
+
+def _rate_object(
+    ops: Optional[float], mib_s: Optional[float], elapsed_ms: Optional[int]
+) -> dict:
+    return {
+        "ops_per_s": results_json.round_ops(ops),
+        "bytes_per_s": results_json.mib_s_to_bytes_per_s(mib_s),
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+def _argv(command: str) -> List[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
+def _phase_work(metadata: Optional[Dict[str, str]], phase: str) -> Optional[dict]:
+    if metadata is None:
+        return None
+    return {
+        "expected_files": _workload_int(metadata, f"{phase}_expected_files"),
+        "completed_files": _workload_int(metadata, f"{phase}_completed_files"),
+        "expected_bytes": _workload_int(metadata, f"{phase}_expected_bytes"),
+        "completed_bytes": _workload_int(metadata, f"{phase}_completed_bytes"),
+    }
+
+
+def _latency_object(metric: ElbenchoMetrics) -> dict:
+    latency = {
+        "min": results_json.seconds_to_us(metric.min_lat_sec),
+        "avg": results_json.seconds_to_us(metric.avg_lat_sec),
+        "max": results_json.seconds_to_us(metric.max_lat_sec),
+    }
+    for name, label in PERCENTILE_FIELDS:
+        seconds = getattr(metric, f"lat_pct_{name}")
+        latency[label] = (
+            results_json.seconds_to_us(seconds)
+            if name in metric.lat_pct_found
+            else None
+        )
+    return latency
+
+
+def _metric_phase(metric: ElbenchoMetrics, metadata: Optional[Dict[str, str]]) -> dict:
+    """Encode one elbencho CSV/.out phase (the live value is filled later)."""
+    phase = metric.operation.lower()
+    return {
+        "phase": phase,
+        "completion_state": _workload_enum(metadata, f"{phase}_completion_state"),
+        "elbencho_first": _rate_object(
+            metric.iops_first,
+            metric.throughput_mib_s_first,
+            metric.time_ms_first,
+        ),
+        "elbencho_last": _rate_object(
+            metric.iops_last,
+            metric.throughput_mib_s_last,
+            metric.time_ms_last,
+        ),
+        "latency_us": _latency_object(metric),
+        "histogram_us": results_json.histogram_columnar(metric.histogram, 1e6),
+        "work": _phase_work(metadata, phase),
+        "configured_time_limit_s": metric.io_duration_sec or None,
+        "command": _argv(metric.raw_command or metric.command),
+        "live": None,
+    }
+
+
+def _delete_phase(metadata: Dict[str, str]) -> dict:
+    return {
+        "phase": PHASE_DELETE,
+        "completion_state": _workload_enum(metadata, "delete_completion_state"),
+        "work": {
+            "expected_files": _workload_int(metadata, "delete_expected_files"),
+            "completed_files": _workload_int(metadata, "delete_completed_files"),
+            "expected_bytes": None,
+            "completed_bytes": None,
+        },
+        "elapsed_ms": _workload_int(metadata, "delete_elapsed_time_ms"),
+    }
+
+
+def _workload_object(metadata: Optional[Dict[str, str]]) -> Optional[dict]:
+    if metadata is None:
+        return None
+    return {
+        "termination_mode": _workload_enum(metadata, "termination_mode"),
+        "completion_state": _workload_enum(metadata, "completion_state"),
+        "failure_cleanup_state": _workload_enum(metadata, "failure_cleanup_state"),
+        "lifecycle_elapsed_ms": _workload_int(metadata, "lifecycle_elapsed_time_ms"),
+    }
+
+
+def _expected_phases(plan: str, metadata: Optional[Dict[str, str]]) -> List[str]:
+    phases = [p for p in (PHASE_WRITE, PHASE_READ) if plan_runs_phase(plan, p)]
+    delete_state = (metadata or {}).get(
+        "delete_completion_state", WORKLOAD_NOT_APPLICABLE
+    )
+    if metadata is not None and delete_state != WORKLOAD_NOT_APPLICABLE:
+        phases.append(PHASE_DELETE)
+    return phases
+
+
+def _rate_problems(entry: dict) -> List[dict]:
+    """Flag [first] rates the CSV lacked; they are null, never a default zero."""
+    first = entry.get("elbencho_first")
+    if first is None:
+        return []
+    missing = [key for key in ("ops_per_s", "bytes_per_s") if first[key] is None]
+    if not missing:
+        return []
+    return [
+        results_json.problem(
+            results_json.RATES_MISSING,
+            "elbencho_first rates missing from the CSV: " + ", ".join(missing),
+            entry["phase"],
+        )
+    ]
+
+
+def _phase_problems(
+    plan: str, metadata: Optional[Dict[str, str]], phases: List[dict]
+) -> List[dict]:
+    """Report absent expected phases, incomplete phases and absent percentiles."""
+    problems = []
+    present = {entry["phase"] for entry in phases}
+    for phase in _expected_phases(plan, metadata):
+        if phase not in present:
+            problems.append(
+                results_json.problem(
+                    results_json.PHASE_MISSING,
+                    f"{phase} phase expected by phase plan {plan} has no result",
+                    phase,
+                )
+            )
+    for entry in phases:
+        if entry.get("completion_state") == WORKLOAD_INCOMPLETE:
+            problems.append(
+                results_json.problem(
+                    results_json.COMPLETION_INCOMPLETE,
+                    f"{entry['phase']} phase did not complete all work",
+                    entry["phase"],
+                )
+            )
+        problems.extend(_rate_problems(entry))
+        missing = [
+            label
+            for label, value in entry.get("latency_us", {}).items()
+            if label.startswith("p") and value is None
+        ]
+        if missing:
+            problems.append(
+                results_json.problem(
+                    results_json.PERCENTILES_MISSING,
+                    "latency percentiles not found in the .out file: "
+                    + ", ".join(missing),
+                    entry["phase"],
+                )
+            )
+    return problems
+
+
+def _live_objects(
+    base_filename: str,
+    execution_id: Optional[str],
+    data: IoResultsInput,
+) -> Tuple[Dict[str, dict], Optional[str], List[dict]]:
+    """Return (live object per phase, default reason when absent, problems)."""
+    live = data.live
+    if live.level == LIVE_LEVEL_NONE:
+        return {}, LIVE_NOT_REQUESTED, []
+    live_path = base_filename + LIVE_SUFFIX
+    if not os.path.isfile(live_path):
+        return {}, LIVE_NOT_CAPTURED, []
+    workers_path = os.path.join(
+        data.input_dir, "executions", f"{execution_id}.workers.tsv"
+    )
+    try:
+        objects = build_live_objects(
+            live_path,
+            os.path.relpath(live_path, data.input_dir),
+            live.level,
+            live.configured_interval_ms,
+            live.z_threshold,
+            live.selection_limits,
+            live.min_underperform_segments,
+            live.sidecar_dir,
+            execution_id or os.path.basename(base_filename),
+            execution_id,
+            load_workers_tsv(workers_path) if execution_id else None,
+        )
+    except LiveCSVError as exc:
+        detail = f"live CSV could not be analyzed: {exc}"
+        return (
+            {},
+            LIVE_UNREADABLE,
+            [results_json.problem(results_json.LIVE_CSV_UNREADABLE, detail)],
+        )
+    return objects, LIVE_NOT_CAPTURED, []
+
+
+def _results_object(
+    ledger: LedgerExecution,
+    base_filename: str,
+    metrics: List[ElbenchoMetrics],
+    metadata: Optional[Dict[str, str]],
+    data: IoResultsInput,
+) -> Tuple[dict, List[dict]]:
+    objects, reason, problems = _live_objects(base_filename, ledger.execution_id, data)
+    phases = []
+    for metric in sorted(metrics, key=lambda m: PHASE_ORDER.index(m.operation.lower())):
+        entry = _metric_phase(metric, metadata)
+        entry["live"] = objects.get(entry["phase"]) or null_live(reason or "")
+        phases.append(entry)
+    plan = phase_plan(ledger.exports)
+    if PHASE_DELETE in _expected_phases(plan, metadata):
+        phases.append(_delete_phase(metadata or {}))
+    problems = _phase_problems(plan, metadata, phases) + problems
+    return {"phases": phases, "workload": _workload_object(metadata)}, problems
+
+
+def _result_files(base_filename: str, input_dir: str) -> List[dict]:
+    records = []
+    for extension in RESULT_EXTENSIONS:
+        path = base_filename + extension
+        if os.path.isfile(path):
+            relative = os.path.relpath(path, input_dir)
+            records.append(results_json.file_record(path, relative))
+    return sorted(records, key=lambda record: record["path"])
+
+
+def _entry_state(problems: List[dict]) -> str:
+    gating = {
+        results_json.PHASE_MISSING,
+        results_json.COMPLETION_INCOMPLETE,
+        results_json.PERCENTILES_MISSING,
+        results_json.RATES_MISSING,
+    }
+    return (
+        STATE_PARTIAL
+        if any(item["code"] in gating for item in problems)
+        else STATE_COMPLETE
+    )
+
+
+def _execution_entry(
+    ledger: LedgerExecution,
+    pair: Optional[Tuple[str, List[ElbenchoMetrics]]],
+    metadata: Optional[Dict[str, str]],
+    data: IoResultsInput,
+) -> dict:
+    """Build one fragment execution entry (see the results contract)."""
+    coordinates, key = io_coordinates(ledger)
+    base_filename, metrics = pair if pair else ("", [])
+    entry: Dict[str, Any] = {
+        "execution_id": ledger.execution_id,
+        "coordinates": coordinates,
+        "coordinate_key": key,
+        "dataset": _dataset_object(ledger, data.env, metadata, metrics),
+        "result_state": STATE_MISSING,
+        "problems": [],
+        "result_files": [],
+        "results": None,
+    }
+    coords = ledger.coordinates
+    if ledger.execution_id and not data.filters.allows(
+        coords.nodes, coords.io_size, coords.threads, coords.io_depth
+    ):
+        entry["result_state"] = STATE_NOT_REPORTED
+        return entry
+    if pair is None:
+        return entry
+    entry["result_files"] = _result_files(base_filename, data.input_dir)
+    if not metrics:
+        entry["result_state"] = STATE_UNPARSEABLE
+        entry["problems"] = [
+            results_json.problem(
+                results_json.PHASE_UNPARSEABLE,
+                "result files exist but no phase could be parsed",
+            )
+        ]
+        return entry
+    entry["results"], entry["problems"] = _results_object(
+        ledger, base_filename, metrics, metadata, data
+    )
+    entry["result_state"] = _entry_state(entry["problems"])
+    return entry
+
+
+def _pair_key_from_name(base_filename: str) -> Optional[Tuple[int, str, int, int]]:
+    params = parse_benchmark_filename(os.path.basename(base_filename))
+    if params is None:
+        return None
+    return _execution_coordinate_key(
+        params["nodes"], params["io_size"], params["threads"], params["io_depth"]
+    )
+
+
+def _match_pairs(
+    ledger: List[LedgerExecution], pairs: Dict[str, List[ElbenchoMetrics]]
+) -> Tuple[Dict[str, str], List[str]]:
+    """Map execution_id -> base_filename (newest datestamp wins) and the leftovers."""
+    by_key = {
+        _execution_coordinate_key(
+            item.coordinates.nodes,
+            item.coordinates.io_size,
+            item.coordinates.threads,
+            item.coordinates.io_depth,
+        ): item.execution_id
+        for item in ledger
+    }
+    matched: Dict[str, str] = {}
+    unmatched: List[str] = []
+    for base_filename in sorted(pairs, key=lambda name: (_datestamp(name), name)):
+        identifier = by_key.get(_pair_key_from_name(base_filename))
+        if identifier is None:
+            unmatched.append(base_filename)
+            continue
+        if identifier in matched:
+            unmatched.append(matched[identifier])
+        matched[identifier] = base_filename
+    return matched, sorted(unmatched)
+
+
+def _datestamp(base_filename: str) -> str:
+    params = parse_benchmark_filename(os.path.basename(base_filename))
+    return params["datestamp"] if params else ""
+
+
+def _synthetic_ledger(
+    base_filename: str, metrics: List[ElbenchoMetrics]
+) -> Optional[LedgerExecution]:
+    """Describe a result pair that matches no ledger execution."""
+    params = parse_benchmark_filename(os.path.basename(base_filename))
+    if params is None:
+        return None
+    operations = {metric.operation.upper() for metric in metrics}
+    exports = {"dio_or_bio": "dio"}
+    if metrics:
+        exports["dio_or_bio"] = "dio" if metrics[0].direct_io else "bio"
+    if operations == {"WRITE"}:
+        exports["ELBENCHO_SWEEP_WRITE_ONLY"] = "1"
+    if metrics and all(metric.random_io for metric in metrics):
+        exports["use_random"] = "1"
+    if operations == {"READ"}:
+        exports[ENV_SWEEP_READ_FROM] = next(
+            (m.sweep_read_from_path for m in metrics if m.sweep_read_from_path),
+            "unknown",
+        )
+    coordinates = ExecutionCoordinates(
+        params["nodes"], params["io_size"], params["threads"], params["io_depth"], ""
+    )
+    return LedgerExecution(None, coordinates, exports)
+
+
+def build_io_fragment(data: IoResultsInput) -> dict:
+    """Build the fragment (one entry per ledger execution plus unmatched pairs)."""
+    ledger = load_io_ledger(data.input_dir)
+    workloads = load_execution_workloads(data.input_dir)
+    matched, unmatched = _match_pairs(ledger, data.pairs)
+    executions = []
+    for item in ledger:
+        key = _execution_coordinate_key(
+            item.coordinates.nodes,
+            item.coordinates.io_size,
+            item.coordinates.threads,
+            item.coordinates.io_depth,
+        )
+        metadata = workloads[key][1] if key in workloads else None
+        base_filename = matched.get(item.execution_id)
+        pair = (base_filename, data.pairs[base_filename]) if base_filename else None
+        executions.append(_execution_entry(item, pair, metadata, data))
+    for base_filename in unmatched:
+        metrics = data.pairs[base_filename]
+        synthetic = _synthetic_ledger(base_filename, metrics)
+        if synthetic is None:
+            continue
+        coords = synthetic.coordinates
+        if data.filters.allows(
+            coords.nodes, coords.io_size, coords.threads, coords.io_depth
+        ):
+            executions.append(
+                _execution_entry(synthetic, (base_filename, metrics), None, data)
+            )
+    return {
+        "fragment_version": results_json.FRAGMENT_VERSION,
+        "kind": "io",
+        "executions": executions,
+        "diagnostics": [],
+    }
+
+
+def _report_output_dir(args: argparse.Namespace) -> str:
+    """Directory that receives plots, report.txt and the default results path."""
+    return args.output_dir or (args.input_dirs[0] if args.input_dirs else ".")
+
+
+def results_requested(args: argparse.Namespace) -> bool:
+    """True when a results fragment or document was asked for."""
+    return bool(getattr(args, "results_fragment", None)) or getattr(
+        args, "to_json", False
+    )
+
+
+def _configured_interval_ms(env: dict) -> Optional[int]:
+    try:
+        value = int(str(env.get(ENV_LIVEINT, "")).strip())
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _live_request(args: argparse.Namespace, env: dict, output_dir: str) -> LiveRequest:
+    sidecar_dir = getattr(args, "results_live_dir", None) or os.path.join(
+        output_dir, RESULTS_LIVE_DIRNAME
+    )
+    return LiveRequest(
+        level=getattr(args, "live_detail", "summary"),
+        z_threshold=args.client_outlier_threshold,
+        selection_limits=(
+            args.client_max_timeseries_lines,
+            args.client_max_heatmap_rows,
+        ),
+        min_underperform_segments=args.client_min_underperform_segments,
+        sidecar_dir=sidecar_dir,
+        configured_interval_ms=_configured_interval_ms(env),
+    )
+
+
+def _generator_options(args: argparse.Namespace) -> dict:
+    return {
+        "live_detail": getattr(args, "live_detail", "summary"),
+        "z_threshold": args.client_outlier_threshold,
+        "only_nodes": args.only_nodes or None,
+        "only_threads": args.only_threads or None,
+        "only_sizes": args.only_sizes or None,
+        "only_iodepths": args.only_iodepths or None,
+        "kind": "io",
+    }
+
+
+def emit_io_results(
+    args: argparse.Namespace, data: IoResultsInput, output_dir: str
+) -> int:
+    """Write the fragment or results document; return the process exit status."""
+    live = data.live
+    if live.level == "full" and live.sidecar_dir:
+        os.makedirs(live.sidecar_dir, exist_ok=True)
+    fragment = build_io_fragment(data)
+    fragment_path = getattr(args, "results_fragment", None)
+    if fragment_path:
+        results_json.write_fragment(fragment, fragment_path)
+        return 0
+    live_dir = (
+        Path(live.sidecar_dir) if live.level == "full" and live.sidecar_dir else None
+    )
+    document = results_json.assemble_ordinary_document(
+        Path(data.input_dir),
+        fragment,
+        live_dir,
+        results_json.generator_block(
+            ["utils/extract-elbencho.py", *sys.argv[1:]], _generator_options(args)
+        ),
+    )
+    results_json.write_document(
+        document, os.path.join(output_dir, RESULTS_DEFAULT_FILENAME)
+    )
+    if getattr(
+        args, "require_complete", False
+    ) and not results_json.document_is_complete(document):
+        return EXIT_INCOMPLETE
+    return 0
+
+
 def _load_input_environments(input_dirs: List[str]) -> Dict[str, dict]:
     """Read each input directory's env_used.yaml once, keyed by the given path."""
     return {input_dir: load_env_used_yaml(input_dir) for input_dir in input_dirs}
 
 
 def _target_sources(
-    environments: Dict[str, dict], csv_file: Optional[str], metrics: List[Any]
+    environments: Dict[str, dict],
 ) -> List[Tuple[str, Union[StorageTarget, str, None]]]:
     """Label every report input with its storage target, or None when unknown."""
-    sources: List[Tuple[str, Union[StorageTarget, str, None]]] = [
+    return [
         (input_dir, storage_target_from_env(env))
         for input_dir, env in environments.items()
     ]
-    if csv_file:
-        sources.extend(
-            cached_target_sources(csv_file, (m.storage_target_name for m in metrics))
-        )
-    return sources
 
 
 def main() -> None:
@@ -4513,44 +5013,31 @@ def main() -> None:
         route_batch_report(args, "io", sys.argv[1:])
     except (OSError, ValueError) as error:
         parser.error(str(error))
-    if args.from_csv and args.input_dirs:
-        parser.error("--from-csv cannot be combined with input directories")
-
-    # Check if input_dir is required but not provided
-    if not args.input_dirs and not args.from_csv and not args.test_parse:
+    if not args.input_dirs and not args.test_parse:
         parser.error(
-            "at least one input directory is required when not using --from-csv or --test-parse"
+            "at least one input directory is required unless using --test-parse"
         )
+    if results_requested(args) and len(args.input_dirs) != 1:
+        parser.error("--to-json requires exactly one input directory")
 
     # Handle test-parse mode
     if args.test_parse:
         test_parse(args.test_parse)
         return
 
-    # Read from CSV if input provided
     metrics = []
     versions = ResultVersions()
-
-    csv_loaded_count = 0
-    if args.from_csv:
-        try:
-            # Read the metrics
-            metrics = read_csv(args.from_csv)
-            eprint(f"Loaded {len(metrics)} metrics from {args.from_csv}")
-            csv_loaded_count = len(metrics)
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            eprint(f"Error reading CSV: {e}")
-            sys.exit(1)
 
     # Refuse results from different storage targets before parsing or writing.
     environments = _load_input_environments(args.input_dirs)
     target_label = guarded_report_target(
-        _target_sources(environments, args.from_csv, metrics),
+        _target_sources(environments),
         args.allow_mixed_targets,
     )
 
     # Parse elbencho files from input directories (if any)
     live_files = []
+    result_pairs: Dict[str, List[ElbenchoMetrics]] = {}
     for input_dir in args.input_dirs:
         discovered_live_files = discover_live_csv_files(input_dir)
         live_files.extend(discovered_live_files)
@@ -4573,8 +5060,10 @@ def main() -> None:
         )
 
         for base_filename in base_filenames:
+            result_pairs[base_filename] = []
             try:
                 file_metrics = parse_elbencho_files(base_filename)
+                result_pairs[base_filename] = file_metrics
                 dir_metrics.extend(file_metrics)
                 versions.add(file_metrics, result_version(base_filename + ".out"))
             except Exception as e:  # pylint: disable=broad-exception-caught
@@ -4593,11 +5082,15 @@ def main() -> None:
     # Print summary of metrics extracted from directories
     if args.input_dirs:
         eprint(
-            f"Extracted {len(metrics)-csv_loaded_count} metrics from all files in the input directories"
+            f"Extracted {len(metrics)} metrics from all files in the input directories"
         )
 
     had_aggregate_metrics = bool(metrics)
     had_live_files = bool(live_files)
+
+    # With --to-json the results export is still written instead (the ledger
+    # then reports every execution as missing, pending or not reported).
+    deferred_error = False
 
     # Verify that all metrics have a datestamp
     if metrics:
@@ -4608,13 +5101,16 @@ def main() -> None:
             sys.exit(1)
     elif not live_files:
         eprint("ERROR: No metrics found")
-        sys.exit(1)
+        if not results_requested(args):
+            sys.exit(1)
+        deferred_error = True
 
     # Filter metrics based on command-line options
     thread_filter = None
     node_filter = None
     size_filter = None
     iodepth_filter = None
+    filters = ReportFilters()
     filter_requested = bool(
         args.only_threads or args.only_sizes or args.only_nodes or args.only_iodepths
     )
@@ -4660,34 +5156,54 @@ def main() -> None:
         ]
         eprint(f"After filtering, {len(live_files)} live CSV files remain")
 
+        filters = ReportFilters(size_filter, thread_filter, node_filter, iodepth_filter)
         if had_aggregate_metrics and not metrics:
             eprint("ERROR: Filters matched no aggregate metrics")
-            sys.exit(1)
-        if had_live_files and not live_files:
+            deferred_error = True
+        elif had_live_files and not live_files:
             eprint("ERROR: Filters matched no live CSV files")
+            deferred_error = True
+        if deferred_error and not results_requested(args):
             sys.exit(1)
-
-    # Write to CSV if requested
-    if args.to_csv:
-        # Use the first input directory or current directory if none provided
-        output_dir = args.output_dir or (args.input_dirs[0] if args.input_dirs else ".")
-        os.makedirs(output_dir, exist_ok=True)
-        csv_filename = "elbencho-metrics.csv"
-        csv_path = os.path.join(output_dir, csv_filename)
-        try:
-            write_csv(csv_path, metrics)
-            eprint(f"Wrote {len(metrics)} metrics to {csv_path}")
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            eprint(f"Error writing CSV: {e}")
 
     # Match plot output directory (used for report.txt and plots)
-    output_dir = "."
-    if args.input_dirs:
-        output_dir = args.input_dirs[0]
-    elif args.from_csv:
-        output_dir = os.path.dirname(os.path.abspath(args.from_csv))
-    output_dir = args.output_dir or output_dir
+    output_dir = _report_output_dir(args)
+
+    exit_status = 0
+    if results_requested(args):
+        input_dir = args.input_dirs[0]
+        exit_status = emit_io_results(
+            args,
+            IoResultsInput(
+                input_dir,
+                environments[input_dir],
+                filters,
+                _live_request(args, environments[input_dir], output_dir),
+                result_pairs,
+            ),
+            output_dir,
+        )
+    if deferred_error and not getattr(args, "results_fragment", None):
+        # The written document records why nothing was reported, so its
+        # completeness, not the empty text report, decides the exit status.
+        eprint("No text report produced; the JSON export was written")
+        sys.exit(exit_status)
     os.makedirs(output_dir, exist_ok=True)
+
+    _emit_reports(args, metrics, live_files, output_dir, versions, target_label)
+    if exit_status:
+        sys.exit(exit_status)
+
+
+def _emit_reports(
+    args: argparse.Namespace,
+    metrics: List[ElbenchoMetrics],
+    live_files: List[LiveFileMetadata],
+    output_dir: str,
+    versions: ResultVersions,
+    target_label: Any,
+) -> None:
+    """Print the tables, generate the plots and the live reports."""
 
     if metrics:
         if args.markdown:

@@ -248,6 +248,14 @@ class ClientSummary:
     worst_interval: int = -1
     worst_elapsed_sec: float = 0.0
     worst_iso_timestamp: str = ""
+    final_done_bytes: Optional[int] = None
+    finish_elapsed_ms: Optional[int] = None
+
+    def observe_done_bytes(self, done_bytes: int, runtime_ms: int) -> None:
+        """Track the last cumulative DoneBytes and when it was first reached."""
+        if self.final_done_bytes != done_bytes:
+            self.final_done_bytes = done_bytes
+            self.finish_elapsed_ms = runtime_ms
 
     def add_rate(
         self,
@@ -320,13 +328,13 @@ class ClientSummary:
 
 @dataclass(frozen=True)
 class AggregatePoint:
-    """Native Rank=Total sample."""
+    """Native Rank=Total sample; a missing or invalid value is None."""
 
     interval: int
     elapsed_sec: float
     iso_timestamp: str
-    throughput_mib_s: float
-    iops: float
+    throughput_mib_s: Optional[float]
+    iops: Optional[float]
 
 
 @dataclass(frozen=True)
@@ -381,7 +389,9 @@ class SelectedClientDetail:
 
 
 @dataclass
-class _PreviousSample:
+class PreviousSample:
+    """The prior live row of one client, for deriving an interval rate."""
+
     done_bytes: int
     runtime_ms: int
     interval: int
@@ -399,7 +409,7 @@ class _IntervalBuffer:
 @dataclass
 class _DomainState:
     analysis: DomainAnalysis
-    previous: Dict[LiveClientId, _PreviousSample] = field(default_factory=dict)
+    previous: Dict[LiveClientId, PreviousSample] = field(default_factory=dict)
     buffer: Optional[_IntervalBuffer] = None
 
 
@@ -522,9 +532,9 @@ def analyze_live_csv(
     """Stream a live CSV once and return bounded first-pass analysis."""
     states: Dict[LiveDomainKey, _DomainState] = {}
     with open(metadata.path, "r", encoding="utf-8-sig", newline="") as handle:
-        reader, columns = _live_csv_reader(handle, metadata.path)
+        reader, columns = live_csv_reader(handle, metadata.path)
         for line_number, parsed in enumerate(
-            _iter_parsed_rows(reader, columns), start=2
+            iter_parsed_rows(reader, columns), start=2
         ):
             (
                 key,
@@ -630,10 +640,10 @@ def collect_selected_client_detail(
     selected_set = set(selected)
     interval_count = len(domain.interval_times)
     rates = {client: [INVALID_RATE] * interval_count for client in selected}
-    previous: Dict[LiveClientId, _PreviousSample] = {}
+    previous: Dict[LiveClientId, PreviousSample] = {}
     with open(analysis.metadata.path, "r", encoding="utf-8-sig", newline="") as handle:
-        reader, columns = _live_csv_reader(handle, analysis.metadata.path)
-        for parsed in _iter_parsed_rows(reader, columns):
+        reader, columns = live_csv_reader(handle, analysis.metadata.path)
+        for parsed in iter_parsed_rows(reader, columns):
             key, runtime_ms, _, rank, client, done_bytes, _, _ = parsed
             if key != domain.key or rank == TOTAL_RANK or client not in selected_set:
                 continue
@@ -641,10 +651,10 @@ def collect_selected_client_detail(
                 continue
             interval = domain.runtime_to_interval[runtime_ms]
             prior = previous.get(client)
-            rate = _derive_rate(prior, done_bytes, runtime_ms, interval)
+            rate = derive_rate(prior, done_bytes, runtime_ms, interval)
             if rate is not None:
                 rates[client][interval] = rate
-            previous[client] = _PreviousSample(done_bytes, runtime_ms, interval)
+            previous[client] = PreviousSample(done_bytes, runtime_ms, interval)
     fleet_by_interval = {point.interval: point for point in domain.fleet_points}
     heatmap = {}
     for client in selected:
@@ -732,11 +742,11 @@ def plot_aggregate_timeseries(
     points = domain.aggregate_points
     x_values, throughput = _series_with_gap_breaks(
         [point.elapsed_sec for point in points],
-        [point.throughput_mib_s for point in points],
+        [_plottable(point.throughput_mib_s) for point in points],
     )
     _, iops = _series_with_gap_breaks(
         [point.elapsed_sec for point in points],
-        [point.iops for point in points],
+        [_plottable(point.iops) for point in points],
     )
     figure, throughput_axis = plt.subplots(figsize=(14, 7))
     iops_axis = throughput_axis.twinx()
@@ -904,7 +914,7 @@ def plot_underperformance_heatmap(
     return path
 
 
-def _live_csv_reader(handle, path: str):
+def live_csv_reader(handle, path: str):
     """Return an indexed CSV reader and validated column positions."""
     reader = csv.reader(handle)
     header = next(reader, None)
@@ -996,7 +1006,7 @@ def _parse_row(
     )
 
 
-def _iter_parsed_rows(
+def iter_parsed_rows(
     reader: Iterable[Sequence[str]],
     columns: _LiveCSVColumns,
 ):
@@ -1028,10 +1038,17 @@ def _optional_int(value: Optional[str]) -> Optional[int]:
 
 
 def _optional_float(value: Optional[str]) -> Optional[float]:
+    """Parse a cell; empty, malformed, NaN and infinite values are missing."""
     try:
-        return float(value) if value not in (None, "") else None
+        parsed = float(value) if value not in (None, "") else None
     except (TypeError, ValueError):
         return None
+    return parsed if parsed is not None and math.isfinite(parsed) else None
+
+
+def _plottable(value: Optional[float]) -> float:
+    """A missing sample plots as a gap."""
+    return math.nan if value is None else value
 
 
 def _advance_buffer(
@@ -1085,8 +1102,8 @@ def _record_aggregate(
             interval=interval,
             elapsed_sec=elapsed_sec,
             iso_timestamp=buffer.iso_timestamp,
-            throughput_mib_s=buffer.aggregate_mib_s or 0.0,
-            iops=buffer.aggregate_iops or 0.0,
+            throughput_mib_s=buffer.aggregate_mib_s,
+            iops=buffer.aggregate_iops,
         )
     )
 
@@ -1113,8 +1130,9 @@ def _derive_interval_rates(
             state.analysis.diagnostics["missing_samples"] += interval
         else:
             summary = state.analysis.clients[client]
+        summary.observe_done_bytes(done_bytes, buffer.runtime_ms)
         prior = state.previous.get(client)
-        rate = _derive_rate(prior, done_bytes, buffer.runtime_ms, interval)
+        rate = derive_rate(prior, done_bytes, buffer.runtime_ms, interval)
         if prior is not None and prior.interval != interval - 1:
             state.analysis.diagnostics["non_adjacent_samples"] += 1
         elif prior is not None and rate is None:
@@ -1125,18 +1143,17 @@ def _derive_interval_rates(
             state.analysis.diagnostics[reason] += 1
         if rate is not None:
             rates[client] = rate
-        state.previous[client] = _PreviousSample(
-            done_bytes, buffer.runtime_ms, interval
-        )
+        state.previous[client] = PreviousSample(done_bytes, buffer.runtime_ms, interval)
     return rates
 
 
-def _derive_rate(
-    prior: Optional[_PreviousSample],
+def derive_rate(
+    prior: Optional[PreviousSample],
     done_bytes: int,
     runtime_ms: int,
     interval: int,
 ) -> Optional[float]:
+    """MiB/s since the immediately preceding interval, or None when unusable."""
     if prior is None or prior.interval != interval - 1:
         return None
     elapsed_ms = runtime_ms - prior.runtime_ms
@@ -1147,7 +1164,7 @@ def _derive_rate(
 
 
 def _invalid_rate_reason(
-    prior: _PreviousSample,
+    prior: PreviousSample,
     done_bytes: int,
     runtime_ms: int,
     interval: int,
@@ -1177,7 +1194,7 @@ def _record_fleet_statistics(
     stddev = math.sqrt(variance)
     ordered_values = sorted(values)
     p10, median, p90 = (
-        _percentile_from_sorted(ordered_values, percentile)
+        percentile_from_sorted(ordered_values, percentile)
         for percentile in (10, 50, 90)
     )
     domain.fleet_points.append(
@@ -1220,10 +1237,10 @@ def _heatmap_value(
 
 def _percentile(values: Iterable[float], percentile: float) -> float:
     ordered = sorted(values)
-    return _percentile_from_sorted(ordered, percentile)
+    return percentile_from_sorted(ordered, percentile)
 
 
-def _percentile_from_sorted(ordered: Sequence[float], percentile: float) -> float:
+def percentile_from_sorted(ordered: Sequence[float], percentile: float) -> float:
     """Calculate one linearly interpolated percentile from sorted values."""
     if not ordered:
         return 0.0

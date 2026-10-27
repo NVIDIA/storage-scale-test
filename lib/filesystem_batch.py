@@ -30,7 +30,15 @@ import sys
 import tempfile
 from urllib.parse import quote
 
-from lib.filesystem_report_options import options_by_kind
+from lib.filesystem_report_options import (
+    BATCH_CONSUMED_FLAGS,
+    LIVE_DETAIL_FLAG,
+    REPORT_OPTIONS,
+    RESULTS_FRAGMENT_FLAG,
+    RESULTS_LIVE_DIR_FLAG,
+    TO_JSON_FLAG,
+    options_by_kind,
+)
 from lib.filesystem_snapshot_summary import format_io_snapshot_summary
 from lib.report_provenance import VERSION_SUFFIX
 from lib.storage_target import (
@@ -53,6 +61,11 @@ ENV_YAML = "env_used.yaml"
 SUCCESS = "SUCCESS"
 REPORT_IDENTITY_FILENAME = ".report-identity"
 COMBINED_REPORT_FILENAME = "reports.txt"
+RESULTS_FILENAME = "results.json"
+RESULTS_FRAGMENT_FILENAME = "results.fragment.json"
+RESULTS_LIVE_DIRNAME = "results.live"
+EXIT_INCOMPLETE = 3
+NO_MATCHING_RESULTS_TEXT = "No results matched the report filters.\n"
 KINDS = ("all", "io", "mdtest")
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
@@ -280,7 +293,8 @@ def read_batch_manifest(path: str | Path) -> BatchManifest:
     )
 
 
-def _execution_status(manifest: BatchManifest, execution: BatchExecution) -> str:
+def execution_status(manifest: BatchManifest, execution: BatchExecution) -> str:
+    """Read one execution's ledger status; invalid or missing is UNKNOWN."""
     path = _contained_path(manifest.root, f"executions/{execution.execution_id}.status")
     if not path.exists():
         return "UNKNOWN"
@@ -393,14 +407,28 @@ def _stage_execution(
     )
     if workload.exists():
         _copy_published(workload, ledger / workload.name)
-    log = _contained_path(manifest.root, f"executions/{execution.execution_id}.log")
-    if not log.exists():
-        log = _contained_path(
-            manifest.root,
-            f"{group.output_relative}/executions/{execution.execution_id}.log",
+    for suffix in ("log", "workers.tsv"):
+        _stage_ledger_file(
+            manifest, group, f"{execution.execution_id}.{suffix}", ledger
         )
-    if log.exists():
-        _copy_published(log, ledger / log.name)
+
+
+def _stage_ledger_file(
+    manifest: BatchManifest, group: BatchGroup, name: str, ledger: Path
+) -> None:
+    """Copy an optional ledger file, from the batch root or the group output.
+
+    Kubernetes collection publishes ``executions/<id>.workers.tsv`` (the
+    Pod/node map the live export joins) and logs in the batch root ledger.
+    """
+    for relative in (
+        f"executions/{name}",
+        f"{group.output_relative}/executions/{name}",
+    ):
+        source = _contained_path(manifest.root, relative)
+        if source.exists():
+            _copy_published(source, ledger / name)
+            return
 
 
 def _selected_groups(
@@ -424,7 +452,65 @@ def _markdown_link(label: str, target: Path, output: Path) -> str:
     return f"[{label}]({quote(os.path.relpath(target, output), safe='/')})"
 
 
-def report_batch(
+@dataclass(frozen=True)
+class ResultsRequest:
+    """A requested ``--to-json`` document for a batch report."""
+
+    require_complete: bool
+    options: dict
+    command: tuple[str, ...]
+
+
+def _option_default(flag: str):
+    for option in REPORT_OPTIONS:
+        if option.flag == flag:
+            return option.settings.get("default")
+    return None
+
+
+def _results_request(
+    args: argparse.Namespace | None, kind: str, groups: str | None
+) -> ResultsRequest | None:
+    """Describe the document requested by parsed arguments; None when absent."""
+    if not getattr(args, "to_json", False):
+        return None
+    options = {
+        key: getattr(args, key, None)
+        for key in ("only_nodes", "only_threads", "only_sizes", "only_iodepths")
+    }
+    options["live_detail"] = getattr(args, "live_detail", None) or _option_default(
+        LIVE_DETAIL_FLAG
+    )
+    options["z_threshold"] = getattr(
+        args, "client_outlier_threshold", None
+    ) or _option_default("--client-outlier-threshold")
+    options.update(groups=groups, kind=kind)
+    return ResultsRequest(
+        bool(getattr(args, "require_complete", False)),
+        options,
+        tuple(sys.argv),
+    )
+
+
+def _engine_results_options(
+    request: ResultsRequest | None, report_dir: Path, live_dir: Path, kind: str
+) -> list[str]:
+    if request is None:
+        return []
+    options = [f"{RESULTS_FRAGMENT_FLAG}={report_dir / RESULTS_FRAGMENT_FILENAME}"]
+    if kind == "io":
+        options.append(f"{RESULTS_LIVE_DIR_FLAG}={live_dir}")
+    return options
+
+
+def _without_consumed(options: list[str]) -> list[str]:
+    """Drop the flags the batch router consumes; engines never see them."""
+    return [
+        item for item in options if item.split("=", 1)[0] not in BATCH_CONSUMED_FLAGS
+    ]
+
+
+def report_batch(  # pylint: disable=too-many-locals
     path: str | Path,
     kind: str = "all",
     groups: str | None = None,
@@ -432,33 +518,62 @@ def report_batch(
     engine_options: list[str] | None = None,
     *,
     analysis_args: argparse.Namespace | None = None,
+    results_args: argparse.Namespace | None = None,
 ) -> int:
-    """Generate independent group reports and an index; retain partial successes."""
+    """Generate independent group reports and an index; retain partial successes.
+
+    ``results_args`` names a parsed namespace whose ``--to-json`` family selects
+    the results document when ``engine_options`` are forwarded verbatim.
+    """
     manifest = read_batch_manifest(path)
     selected = _selected_groups(manifest, kind, groups)
     if not selected:
         raise ValueError("No batch groups match --kind and --groups")
-    if analysis_args is not None and (
-        hasattr(analysis_args, "from_csv") or hasattr(analysis_args, "test_parse")
-    ):
-        raise ValueError("--from-csv and --test-parse cannot report a prepared batch")
+    if analysis_args is not None and hasattr(analysis_args, "test_parse"):
+        raise ValueError("--test-parse cannot report a prepared batch")
+    request = _results_request(results_args or analysis_args, kind, groups)
     routed = (
-        options_by_kind(analysis_args, {group.kind for group in selected})
+        {
+            k: _without_consumed(v)
+            for k, v in options_by_kind(
+                analysis_args, {group.kind for group in selected}
+            ).items()
+        }
         if analysis_args is not None
         else {}
     )
     output = Path(output_dir).resolve() if output_dir else manifest.root / "reports"
     output.mkdir(parents=True, exist_ok=True)
+    live_dir = output / RESULTS_LIVE_DIRNAME
+    if request is not None:
+        _clear_live_sidecars(live_dir)
     outcomes = {}
     generated = 0
     failed = False
+    fragments: dict[str, dict | None] = {}
+    report_failed: set[str] = set()
     for group in selected:
+        report_dir = output / "groups" / group.group_id
+        base = routed.get(group.kind, engine_options or [])
         result, group_generated, group_failed = _generate_group_report(
-            manifest, group, output, routed.get(group.kind, engine_options or [])
+            manifest,
+            group,
+            output,
+            [
+                *base,
+                *_engine_results_options(request, report_dir, live_dir, group.kind),
+            ],
+            reset_fragment=request is not None,
         )
         generated += group_generated
         failed = failed or group_failed
         outcomes[group.group_id] = result
+        if request is not None:
+            fragment, broken = _collect_fragment(report_dir, group_generated)
+            fragments[group.group_id] = fragment
+            if group_failed or broken:
+                report_failed.add(group.group_id)
+                failed = failed or broken
     combined = (
         output / COMBINED_REPORT_FILENAME
         if output_dir
@@ -471,17 +586,85 @@ def report_batch(
         failed = True
         combined = None
     _write_report_index(manifest, output, outcomes, combined)
-    return int(failed or not generated)
+    if request is None:
+        return int(failed or not generated)
+    complete = _write_results_document(
+        manifest, selected, fragments, report_failed, output, request
+    )
+    # With a document, nothing successful yet is incompleteness, not failure.
+    if failed or complete is None:
+        return 1
+    return EXIT_INCOMPLETE if request.require_complete and not complete else 0
 
 
-def _generate_group_report(
-    manifest: BatchManifest, group: BatchGroup, output: Path, options: list[str]
+def _clear_live_sidecars(live_dir: Path) -> None:
+    """Remove sidecars of an earlier export; this run rewrites the document."""
+    if live_dir.is_dir():
+        for stale in live_dir.glob("*.jsonl.zst"):
+            stale.unlink(missing_ok=True)
+
+
+def _collect_fragment(report_dir: Path, generated: bool) -> tuple[dict | None, bool]:
+    """Read a group's fragment; the flag is True if one was owed but unusable."""
+    from lib.filesystem_results import (  # pylint: disable=import-outside-toplevel
+        read_fragment,
+    )
+
+    if not generated:
+        return None, False
+    try:
+        return read_fragment(report_dir / RESULTS_FRAGMENT_FILENAME), False
+    except (OSError, ValueError) as error:
+        print(f"Group {report_dir.name}: results fragment: {error}", file=sys.stderr)
+        return None, True
+
+
+def _write_results_document(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    manifest: BatchManifest,
+    selected: tuple[BatchGroup, ...],
+    fragments: dict[str, dict | None],
+    report_failed: set[str],
+    output: Path,
+    request: ResultsRequest,
+) -> bool | None:
+    """Assemble and write the document; return completeness, None on failure."""
+    from lib import filesystem_results  # pylint: disable=import-outside-toplevel
+
+    destination = output / RESULTS_FILENAME
+    try:
+        document = filesystem_results.assemble_batch_document(
+            manifest,
+            selected,
+            fragments,
+            report_failed,
+            output / RESULTS_LIVE_DIRNAME,
+            filesystem_results.generator_block(list(request.command), request.options),
+        )
+        filesystem_results.write_document(document, destination)
+    except (OSError, ValueError) as error:
+        print(f"Results document: {error}", file=sys.stderr)
+        return None
+    return filesystem_results.document_is_complete(document)
+
+
+def _generate_group_report(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    manifest: BatchManifest,
+    group: BatchGroup,
+    output: Path,
+    options: list[str],
+    *,
+    reset_fragment: bool = False,
 ) -> tuple[str, bool, bool]:
     """Report one successful subset without abandoning other selected groups."""
+    if reset_fragment:
+        # A stale fragment must never stand in for this run's evidence.
+        (output / "groups" / group.group_id / RESULTS_FRAGMENT_FILENAME).unlink(
+            missing_ok=True
+        )
     successful = tuple(
         execution
         for execution in manifest.group_executions(group.group_id)
-        if _execution_status(manifest, execution) == SUCCESS
+        if execution_status(manifest, execution) == SUCCESS
     )
     if not successful:
         return "No successful results", False, False
@@ -493,6 +676,10 @@ def _generate_group_report(
         report = report_dir / "report.txt"
         report.unlink(missing_ok=True)
         _report_group(manifest, group, successful, report_dir, options)
+        if reset_fragment and not report.exists():
+            # An engine whose filters matched nothing exits 0 with only a
+            # fragment; the group still needs a report to bind its identity to.
+            _publish_report_text(report, NO_MATCHING_RESULTS_TEXT)
         _publish_report_text(
             report_dir / REPORT_IDENTITY_FILENAME,
             _report_identity(manifest, group, report),
@@ -548,7 +735,7 @@ def _write_report_index(
         lines[4:4] = [_markdown_link("Combined report", combined, output), ""]
     for group in manifest.groups:
         counts = Counter(
-            _execution_status(manifest, execution)
+            execution_status(manifest, execution)
             for execution in manifest.group_executions(group.group_id)
         )
         report = output / "groups" / group.group_id / "report.txt"
@@ -703,13 +890,14 @@ def _publish_report_text(destination: Path, content: str) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def _report_group(
+def _report_group(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     manifest: BatchManifest,
     group: BatchGroup,
     successful: tuple[BatchExecution, ...],
     output: Path,
     engine_options: list[str],
 ) -> None:
+    """Run one group's engine against staged successful inputs."""
     with tempfile.TemporaryDirectory(prefix="filesystem-report-") as temporary:
         inputs = Path(temporary) / manifest.group_path(group).name
         stage_group_inputs(manifest, group, inputs, successful)
@@ -746,7 +934,7 @@ def route_batch_report(args: argparse.Namespace, kind: str, argv: list[str]) -> 
         if args.groups:
             raise ValueError("--groups requires a prepared batch input")
         return False
-    if len(args.input_dirs) != 1 or args.from_csv:
+    if len(args.input_dirs) != 1:
         raise ValueError("A prepared batch must be the sole raw reporting input")
     if getattr(args, "test_parse", None):
         raise ValueError("--test-parse cannot report a prepared batch")
@@ -757,14 +945,16 @@ def route_batch_report(args: argparse.Namespace, kind: str, argv: list[str]) -> 
         if argument in ("--groups", "--output-dir"):
             index += 2
             continue
-        if (
-            argument.startswith(("--groups=", "--output-dir="))
-            or argument == batches[0]
+        if argument.startswith(("--groups=", "--output-dir=")) or argument in (
+            TO_JSON_FLAG,
+            "--require-complete",
+            batches[0],
         ):
             index += 1
             continue
         options.append(argument)
         index += 1
+    extra = {"results_args": args} if getattr(args, "to_json", False) else {}
     raise SystemExit(
-        report_batch(batches[0], kind, args.groups, args.output_dir, options)
+        report_batch(batches[0], kind, args.groups, args.output_dir, options, **extra)
     )

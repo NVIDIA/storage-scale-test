@@ -880,129 +880,6 @@ def print_markdown_report(metrics: List[AggregatedMetrics]) -> None:
 
 
 # =============================================================================
-# CSV Import/Export
-# =============================================================================
-
-
-def encode_histogram(hist: Dict[int, int]) -> str:
-    """Encode histogram as a single string for CSV storage."""
-    if not hist:
-        return ""
-    # Sort by bucket for deterministic output
-    pairs = sorted(hist.items())
-    # Use semicolon as pair separator (CSV uses comma)
-    # Use colon as key:value separator
-    return ";".join(f"{bucket}:{count}" for bucket, count in pairs)
-
-
-def decode_histogram(encoded: str) -> Dict[int, int]:
-    """Decode histogram from CSV string."""
-    if not encoded:
-        return {}
-    hist = {}
-    seen = set()
-    for pair in encoded.split(";"):
-        if ":" not in pair:
-            continue
-        bucket_str, count_str = pair.split(":", 1)
-        try:
-            bucket = int(bucket_str)
-            count = int(count_str)
-        except ValueError:
-            continue
-        if bucket in seen:
-            raise ValueError(f"Duplicate histogram bucket in CSV cache: {bucket}")
-        seen.add(bucket)
-        hist[bucket] = count
-    return hist
-
-
-def write_csv_export(csv_path: str, metrics: List[AggregatedMetrics]) -> None:
-    """Write aggregated metrics to CSV file."""
-    if not metrics:
-        return
-
-    fieldnames = [
-        "mode",
-        "node_count",
-        "thread_count",
-        "sample_count",
-        "datestamps",
-        "mib_s_write_avg",
-        "mib_s_write_stddev",
-        "mib_s_total_avg",
-        "mib_s_total_stddev",
-        "lat_p0_ms",
-        "lat_p50_ms",
-        "lat_p90_ms",
-        "lat_p99_ms",
-        "lat_p100_ms",
-        "histogram",
-        "command",
-    ]
-
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
-        writer.writeheader()
-
-        for m in metrics:
-            row = {
-                "mode": m.mode,
-                "node_count": m.node_count,
-                "thread_count": m.thread_count,
-                "sample_count": m.sample_count,
-                "datestamps": "|".join(sorted(m.datestamps)),
-                "mib_s_write_avg": m.mib_s_write_avg,
-                "mib_s_write_stddev": m.mib_s_write_stddev,
-                "mib_s_total_avg": m.mib_s_total_avg,
-                "mib_s_total_stddev": m.mib_s_total_stddev,
-                "lat_p0_ms": m.lat_p0_ms,
-                "lat_p50_ms": m.lat_p50_ms,
-                "lat_p90_ms": m.lat_p90_ms,
-                "lat_p99_ms": m.lat_p99_ms,
-                "lat_p100_ms": m.lat_p100_ms,
-                "histogram": encode_histogram(m.histogram),
-                "command": m.command,
-            }
-            writer.writerow(row)
-
-
-def read_csv_import(csv_path: str) -> List[AggregatedMetrics]:
-    """Read aggregated metrics from CSV file."""
-    metrics = []
-
-    with open(csv_path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f, quoting=csv.QUOTE_ALL)
-        for row in reader:
-            # Handle backward compatibility: if write values missing, use total
-            mib_s_write_avg = float(row.get("mib_s_write_avg", row["mib_s_total_avg"]))
-            mib_s_write_stddev = float(
-                row.get("mib_s_write_stddev", row["mib_s_total_stddev"])
-            )
-            m = AggregatedMetrics(
-                mode=row["mode"],
-                node_count=int(row["node_count"]),
-                thread_count=int(row["thread_count"]),
-                sample_count=int(row["sample_count"]),
-                datestamps={*row["datestamps"].split("|")},
-                mib_s_write_avg=mib_s_write_avg,
-                mib_s_write_stddev=mib_s_write_stddev,
-                mib_s_total_avg=float(row["mib_s_total_avg"]),
-                mib_s_total_stddev=float(row["mib_s_total_stddev"]),
-                lat_p0_ms=float(row["lat_p0_ms"]),
-                lat_p50_ms=float(row["lat_p50_ms"]),
-                lat_p90_ms=float(row["lat_p90_ms"]),
-                lat_p99_ms=float(row["lat_p99_ms"]),
-                lat_p100_ms=float(row["lat_p100_ms"]),
-                histogram=decode_histogram(row["histogram"]),
-                command=row.get("command", ""),
-            )
-            metrics.append(m)
-
-    return metrics
-
-
-# =============================================================================
 # Plotting
 # =============================================================================
 
@@ -1427,54 +1304,45 @@ def main() -> None:
         return
 
     # Validate args
-    if not args.input_dirs and not args.from_csv:
-        parser.error("At least one input directory required (or use --from-csv)")
+    if not args.input_dirs:
+        parser.error("At least one input directory required")
 
-    # Load metrics
-    aggregated_metrics: List[AggregatedMetrics] = []
+    # Discover and parse files
     versions: List[Tuple[IterationMetrics, str]] = []
+    file_pairs = discover_files(args.input_dirs)
+    eprint(f"Found {len(file_pairs)} file pairs")
 
-    if args.from_csv:
-        eprint(f"Loading metrics from {args.from_csv}")
-        aggregated_metrics = read_csv_import(args.from_csv)
-        eprint(f"Loaded {len(aggregated_metrics)} aggregated metrics")
-    else:
-        # Discover and parse files
-        file_pairs = discover_files(args.input_dirs)
-        eprint(f"Found {len(file_pairs)} file pairs")
+    if not file_pairs:
+        eprint("No valid file pairs found")
+        sys.exit(1)
 
-        if not file_pairs:
-            eprint("No valid file pairs found")
-            sys.exit(1)
+    # Parse all file pairs
+    iterations: List[IterationMetrics] = []
+    for key, (csv_path, out_path) in file_pairs.items():
+        mode, node_count, thread_count, datestamp, iteration, direction = key
+        m = parse_file_pair(
+            csv_path,
+            out_path,
+            mode,
+            node_count,
+            thread_count,
+            datestamp,
+            iteration,
+            direction,
+        )
+        if m:
+            iterations.append(m)
+            versions.append((m, result_version(out_path)))
 
-        # Parse all file pairs
-        iterations: List[IterationMetrics] = []
-        for key, (csv_path, out_path) in file_pairs.items():
-            mode, node_count, thread_count, datestamp, iteration, direction = key
-            m = parse_file_pair(
-                csv_path,
-                out_path,
-                mode,
-                node_count,
-                thread_count,
-                datestamp,
-                iteration,
-                direction,
-            )
-            if m:
-                iterations.append(m)
-                versions.append((m, result_version(out_path)))
+    eprint(f"Parsed {len(iterations)} iterations")
 
-        eprint(f"Parsed {len(iterations)} iterations")
+    if not iterations:
+        eprint("No valid iterations parsed")
+        sys.exit(1)
 
-        if not iterations:
-            eprint("No valid iterations parsed")
-            sys.exit(1)
-
-        # Aggregate
-        aggregated_dict = aggregate_metrics(iterations)
-        aggregated_metrics = list(aggregated_dict.values())
-        eprint(f"Aggregated into {len(aggregated_metrics)} (mode, node, thread) groups")
+    # Aggregate
+    aggregated_metrics = list(aggregate_metrics(iterations).values())
+    eprint(f"Aggregated into {len(aggregated_metrics)} (mode, node, thread) groups")
 
     # Apply filters
     if args.only_nodes or args.only_threads or args.only_mode:
@@ -1495,17 +1363,7 @@ def main() -> None:
         eprint("No metrics remaining after filtering")
         sys.exit(1)
 
-    # Determine output directory
-    output_dir = "."
-    if args.input_dirs:
-        output_dir = args.input_dirs[0]
-    elif args.from_csv:
-        output_dir = os.path.dirname(os.path.abspath(args.from_csv)) or "."
-
-    # Export to CSV if requested
-    if args.to_csv:
-        write_csv_export(args.to_csv, aggregated_metrics)
-        eprint(f"Wrote metrics to {args.to_csv}")
+    output_dir = args.input_dirs[0]
 
     # Print output
     produced_by = selected_versions(

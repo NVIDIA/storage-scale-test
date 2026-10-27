@@ -95,7 +95,7 @@ jobs:
           python -m pip install --no-compile
           -c requirements-ci.txt
           -r requirements.txt
-          pytest pytest-xdist
+          jsonschema pytest pytest-xdist
       # Real-BuildKit regressions must run here, not skip: the tests pull
       # and verify the fixture's digest-pinned bases instead of trusting
       # whatever mutable tag the runner happens to cache.

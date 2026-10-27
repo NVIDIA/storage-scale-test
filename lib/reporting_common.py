@@ -208,12 +208,7 @@ def filter_metrics_by_scale(
 
 
 def add_common_report_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add report-input, scale-filter, and Markdown arguments shared by analyzers."""
-    parser.add_argument(
-        "--from-csv",
-        metavar="FILE",
-        help="Read metrics from previously saved CSV file",
-    )
+    """Add scale-filter and Markdown arguments shared by analyzers."""
     parser.add_argument(
         "--only-threads",
         metavar="THREADS",

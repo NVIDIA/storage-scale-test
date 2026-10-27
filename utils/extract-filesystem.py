@@ -67,17 +67,14 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _report_ordinary(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
-    """Delegate existing raw, cached, and parse-only interfaces without rewriting metrics."""
-    from_csv = getattr(args, "from_csv", None)
+    """Delegate existing raw and parse-only interfaces without rewriting metrics."""
     test_parse = getattr(args, "test_parse", None)
-    if from_csv and (args.results_dir or test_parse):
-        parser.error("--from-csv cannot be combined with raw inputs or --test-parse")
-    if not args.results_dir and not (from_csv or test_parse):
-        parser.error("results_dir is required unless using --from-csv or --test-parse")
+    if not args.results_dir and not test_parse:
+        parser.error("results_dir is required unless using --test-parse")
     kind = args.kind
     if kind == "all":
-        if from_csv or test_parse:
-            parser.error("--from-csv/--test-parse requires --kind io or mdtest")
+        if test_parse:
+            parser.error("--test-parse requires --kind io or mdtest")
         kind = (
             "mdtest"
             if Path(args.results_dir).resolve().name.startswith("mdtest-elbencho-")

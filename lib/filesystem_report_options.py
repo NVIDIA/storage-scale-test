@@ -38,16 +38,18 @@ class ReportOption:
         return self.flag[2:].replace("-", "_")
 
 
+TO_JSON_FLAG = "--to-json"
+REQUIRE_COMPLETE_FLAG = "--require-complete"
+LIVE_DETAIL_FLAG = "--live-detail"
+RESULTS_FRAGMENT_FLAG = "--results-fragment"
+RESULTS_LIVE_DIR_FLAG = "--results-live-dir"
+# Mirrors lib.filesystem_results.LIVE_DETAIL_LEVELS, which this dependency-free
+# module cannot import.
+LIVE_DETAIL_LEVELS = ("none", "summary", "selected", "full")
+# Flags the batch router consumes itself instead of forwarding to engines.
+BATCH_CONSUMED_FLAGS = (TO_JSON_FLAG, REQUIRE_COMPLETE_FLAG)
+
 REPORT_OPTIONS = (
-    ReportOption(
-        "--to-csv", "common", "Export metrics to CSV.", {"action": "store_true"}
-    ),
-    ReportOption(
-        "--from-csv",
-        "common",
-        "Read cached metrics instead of raw results.",
-        {"metavar": "FILE"},
-    ),
     ReportOption(
         ALLOW_MIXED_TARGETS_FLAG,
         "common",
@@ -79,6 +81,20 @@ REPORT_OPTIONS = (
         "common",
         "Inspect one raw result without reporting.",
         {"metavar": "FILE"},
+    ),
+    ReportOption(
+        TO_JSON_FLAG,
+        "common",
+        "Also write the machine-readable results document to "
+        "<output-dir>/results.json.",
+        {"action": "store_true"},
+    ),
+    ReportOption(
+        REQUIRE_COMPLETE_FLAG,
+        "common",
+        "After writing the --to-json document, exit 3 if any execution is "
+        "not complete.",
+        {"action": "store_true"},
     ),
     ReportOption(
         "--only-sizes",
@@ -129,10 +145,33 @@ REPORT_OPTIONS = (
         {"type": int, "default": 50, "metavar": "N"},
     ),
     ReportOption(
+        "--live-detail",
+        "io",
+        "Live CSV detail in the --to-json document (summary by default).",
+        {"choices": LIVE_DETAIL_LEVELS, "default": "summary", "metavar": "LEVEL"},
+    ),
+    ReportOption(
         "--normalize-to",
         "mdtest",
         "Scale metadata rates/stddev to N nodes; not latency.",
         {"type": int, "metavar": "N"},
+    ),
+)
+
+
+# Engine-only options: batch assembly passes them; users never see them.
+INTERNAL_OPTIONS = (
+    ReportOption(
+        RESULTS_FRAGMENT_FLAG,
+        "common",
+        argparse.SUPPRESS,
+        {"metavar": "PATH"},
+    ),
+    ReportOption(
+        RESULTS_LIVE_DIR_FLAG,
+        "io",
+        argparse.SUPPRESS,
+        {"metavar": "DIR"},
     ),
 )
 
@@ -149,7 +188,9 @@ def add_analysis_arguments(
         if scope not in ("common", kind) and kind != "all":
             continue
         group = parser.add_argument_group(title)
-        for option in REPORT_OPTIONS:
+        # Engines (a concrete kind) also accept the internal options.
+        internal = INTERNAL_OPTIONS if kind != "all" else ()
+        for option in (*REPORT_OPTIONS, *internal):
             if option.scope != scope:
                 continue
             settings = dict(option.settings)
@@ -168,6 +209,8 @@ def add_report_destination_arguments(parser: argparse.ArgumentParser) -> None:
 
 def validate_analysis_arguments(args: argparse.Namespace) -> None:
     """Reject invalid numeric controls before creating any reports."""
+    if getattr(args, "require_complete", False) and not getattr(args, "to_json", False):
+        raise ValueError(f"{REQUIRE_COMPLETE_FLAG} requires {TO_JSON_FLAG}")
     for option in REPORT_OPTIONS:
         value = getattr(args, option.destination, None)
         if (

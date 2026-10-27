@@ -24,7 +24,7 @@ import re
 import sys
 from pathlib import Path
 from collections import defaultdict
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -67,7 +67,6 @@ except ImportError:
 # File extensions
 _JSON_EXT = ".json"
 _JSON_ZST_EXT = ".json.zst"
-_JSON_EXTENSIONS_TRY_ORDER = (_JSON_ZST_EXT, _JSON_EXT)
 
 # Datestamp patterns / formats
 _DATESTAMP_CAPTURE_PATTERN = r"(\d{8}Z\d{6})"
@@ -78,36 +77,6 @@ _ZST_INSTALL_HINT = (
     "Install with: pip install -r requirements.txt "
     "(or run via ./utils/extract-warp.py)"
 )
-
-
-def _json_object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict:
-    """Build a JSON object while rejecting repeated literal keys."""
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"Duplicate JSON object key: {key}")
-        result[key] = value
-    return result
-
-
-def _decode_cached_histogram(histogram_data: dict[str, Any]) -> dict[float, int]:
-    """Decode a cached histogram without collapsing equivalent float keys."""
-    histogram = {}
-    for bucket, count in histogram_data.items():
-        try:
-            numeric_bucket = float(bucket)
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"Invalid histogram bucket: {bucket}") from error
-        if not math.isfinite(numeric_bucket) or numeric_bucket < 0:
-            raise ValueError(f"Invalid histogram bucket: {bucket}")
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-            raise ValueError(f"Invalid histogram count for bucket {bucket}")
-        if numeric_bucket in histogram:
-            raise ValueError(
-                f"Duplicate histogram bucket after normalization: {bucket}"
-            )
-        histogram[numeric_bucket] = int(count)
-    return histogram
 
 
 def _decode_warp_histogram_buckets(buckets: list[dict[str, Any]]) -> dict[float, int]:
@@ -831,7 +800,7 @@ def parse_warp_json(filepath: str) -> Optional[WarpMetrics]:
     """
     basename = os.path.basename(filepath)
 
-    # Skip files written by this tool (our own analyzed output)
+    # Skip analyzed caches left by older versions of this tool
     if basename.endswith("-analyzed.json.zst") or basename.endswith("-analyzed.json"):
         return None
 
@@ -842,12 +811,6 @@ def parse_warp_json(filepath: str) -> Optional[WarpMetrics]:
         raise ValueError(f"Failed to read/parse JSON file: {e}") from e
 
     try:
-        # Skip files written by this tool - detect by checking JSON structure
-        # Our analyzed output has {"version": 1, "datestamp": ..., "metrics": [...]}
-        # Warp's output has {"v": 3, "final": true, "total": {...}, ...}
-        if isinstance(data, dict) and "version" in data and "metrics" in data:
-            return None
-
         # Verify this is a final Warp benchmark result (not intermediate)
         if not data.get("final", False):
             return None
@@ -3292,208 +3255,6 @@ def calculate_scaling_efficiency(
     return [0] * len(scale_values)
 
 
-def write_json(metrics: List[WarpMetrics], output_path: str, datestamp: str) -> None:
-    """Write metrics to zstandard-compressed JSON file.
-
-    Args:
-        metrics: List of WarpMetrics objects
-        output_path: Path to output .json.zst file
-        datestamp: Datestamp string for this analysis run
-
-    Serializes complete metrics including all per-client data and histograms.
-    Output is compressed with zstandard for space efficiency.
-    The JSON structure is an object with metadata and metrics array.
-    """
-    if not metrics:
-        raise ValueError("No metrics to write to JSON")
-
-    if zstd is None:
-        raise ImportError(
-            "zstandard library is required to write .json.zst files. "
-            + _ZST_INSTALL_HINT
-        )
-
-    # Convert metrics to serializable format
-    serializable_metrics = []
-    for metric in metrics:
-        metric_dict = asdict(metric)
-
-        # Convert histogram float keys to strings for JSON compatibility
-        metric_dict["ttfb_histogram"] = {
-            str(k): v for k, v in metric.ttfb_histogram.items()
-        }
-
-        metric_dict["ttfb_histograms_by_client"] = {
-            client: {str(k): v for k, v in hist.items()}
-            for client, hist in metric.ttfb_histograms_by_client.items()
-        }
-
-        serializable_metrics.append(metric_dict)
-
-    # Wrap in metadata container
-    output_data = {
-        "version": 1,  # Format version for future compatibility
-        "datestamp": datestamp,
-        "metrics": serializable_metrics,
-    }
-
-    # Serialize to JSON string with pretty printing
-    json_str = json.dumps(output_data, indent=2)
-
-    # Compress and write
-    cctx = zstd.ZstdCompressor(level=3)  # Level 3: good balance of speed/compression
-    compressed_data = cctx.compress(json_str.encode("utf-8"))
-
-    with open(output_path, "wb") as f:
-        f.write(compressed_data)
-
-
-def read_json(filepath: str) -> tuple[List[WarpMetrics], str]:
-    """Read metrics from zstandard-compressed JSON file.
-
-    Args:
-        filepath: Path to .json.zst file
-
-    Returns:
-        Tuple of (List of WarpMetrics objects, datestamp string)
-
-    Deserializes complete metrics including all per-client data and histograms.
-    Handles zstandard-compressed files transparently.
-    """
-    if zstd is None:
-        raise ImportError(
-            "zstandard library is required to read .json.zst files. "
-            + _ZST_INSTALL_HINT
-        )
-
-    # Read and decompress
-    with open(filepath, "rb") as f:
-        dctx = zstd.ZstdDecompressor()
-        decompressed_data = dctx.decompress(f.read())
-        json_str = decompressed_data.decode("utf-8")
-
-    # Parse JSON
-    data = json.loads(json_str, object_pairs_hook=_json_object_without_duplicate_keys)
-
-    # Check format - should be object with metadata
-    if not isinstance(data, dict) or "metrics" not in data:
-        raise ValueError(
-            "Invalid JSON format: expected object with 'metrics' key. "
-            "This may be an old format file or not an analyzed JSON file."
-        )
-
-    # Extract metadata and metrics
-    metrics_data = data["metrics"]
-    datestamp = data.get("datestamp")
-
-    metrics = []
-    for metric_dict in metrics_data:
-        # Reconstruct per-client request metrics
-        requests_by_host = {
-            client: ClientRequestMetrics(**req_dict)
-            for client, req_dict in metric_dict.get("requests_by_host", {}).items()
-        }
-
-        # Reconstruct per-client throughput metrics
-        throughput_by_host = {
-            client: ClientThroughputMetrics(**tp_dict)
-            for client, tp_dict in metric_dict.get("throughput_by_host", {}).items()
-        }
-
-        # Reconstruct TTFB histogram (convert string keys back to floats)
-        ttfb_histogram = _decode_cached_histogram(metric_dict.get("ttfb_histogram", {}))
-
-        # Reconstruct per-client TTFB histograms
-        ttfb_histograms_by_client = {
-            client: _decode_cached_histogram(hist)
-            for client, hist in metric_dict.get("ttfb_histograms_by_client", {}).items()
-        }
-
-        # Create WarpMetrics object
-        metrics.append(
-            WarpMetrics(
-                nodes=int(metric_dict["nodes"]),
-                obj_size=metric_dict["obj_size"],
-                threads=int(metric_dict["threads"]),
-                med_lat_ms=float(metric_dict["med_lat_ms"]),
-                p99_lat_ms=float(metric_dict["p99_lat_ms"]),
-                max_lat_ms=float(metric_dict["max_lat_ms"]),
-                max_bw_mib=float(metric_dict["max_bw_mib"]),
-                med_bw_mib=float(metric_dict["med_bw_mib"]),
-                med_bw_gbps=float(metric_dict["med_bw_gbps"]),
-                min_bw_mib=float(metric_dict["min_bw_mib"]),
-                avg_bw_mib=float(
-                    metric_dict.get("avg_bw_mib", metric_dict["med_bw_mib"])
-                ),
-                avg_bw_gbps=float(
-                    metric_dict.get("avg_bw_gbps", metric_dict["med_bw_gbps"])
-                ),
-                max_bw_gbps=float(metric_dict.get("max_bw_gbps", 0)),
-                min_bw_gbps=float(metric_dict.get("min_bw_gbps", 0)),
-                stddev_bw_mib=float(metric_dict.get("stddev_bw_mib", 0.0)),
-                stddev_bw_gbps=float(metric_dict.get("stddev_bw_gbps", 0.0)),
-                avg_rate_obj=float(metric_dict["avg_rate_obj"]),
-                med_rate_obj=float(metric_dict["med_rate_obj"]),
-                window_size=metric_dict.get("window_size", "1s"),
-                requests_by_host=requests_by_host,
-                throughput_by_host=throughput_by_host,
-                ttfb_histogram=ttfb_histogram,
-                ttfb_histograms_by_client=ttfb_histograms_by_client,
-            )
-        )
-
-    if not metrics:
-        raise ValueError("No data found in JSON file")
-
-    return metrics, datestamp
-
-
-def find_analyzed_file(directory: str, base_filename: str) -> Optional[str]:
-    """Find analyzed file with flexible extension matching.
-
-    Args:
-        directory: Directory to search
-        base_filename: Filename with or without extensions (e.g., "20251029Z194526-analyzed"
-                      or "20251029Z194526-analyzed.json.zst")
-
-    Returns:
-        Full path to the file if found, None otherwise
-
-    Tries multiple extension patterns:
-    1. Exact filename as provided
-    2. base + ".json.zst"
-    3. base + ".json"
-    4. Extracts datestamp and looks for <datestamp>-analyzed.json.zst
-    """
-    # Try exact filename first
-    full_path = os.path.join(directory, base_filename)
-    if os.path.isfile(full_path):
-        return full_path
-
-    # Strip any extensions to get base
-    base = base_filename
-    for ext in (_JSON_ZST_EXT, _JSON_EXT, ".zst"):
-        if base.endswith(ext):
-            base = base[: -len(ext)]
-
-    # Try common extensions
-    for ext in _JSON_EXTENSIONS_TRY_ORDER:
-        candidate = os.path.join(directory, base + ext)
-        if os.path.isfile(candidate):
-            return candidate
-
-    # Try to extract datestamp and find standard filename
-    datestamp_match = re.search(_DATESTAMP_CAPTURE_PATTERN, base)
-    if datestamp_match:
-        datestamp = datestamp_match.group(1)
-        for ext in _JSON_EXTENSIONS_TRY_ORDER:
-            candidate = os.path.join(directory, f"{datestamp}-analyzed{ext}")
-            if os.path.isfile(candidate):
-                return candidate
-
-    return None
-
-
 def plot_metrics(
     metrics: List[WarpMetrics],
     datestamp: str,
@@ -3912,219 +3673,107 @@ def main():
         {int(t) for t in args.only_threads.split(",")} if args.only_threads else None
     )
 
-    # Determine input directory and output directory based on arguments
-    input_dir = None
-    output_dir = None
-    # Analyzed JSON caches carry no versions; their results report as unknown.
+    # Result files carry versions in their own provenance.
     versions = ResultVersions()
 
-    if args.from_json:
-        # Reading from analyzed JSON file
-        # Check if it's a directory
-        if os.path.isdir(args.from_json):
-            # Directory provided - search for first analyzed JSON file
-            found_file = None
-            input_dir = args.from_json
+    # Directory is required
+    if not args.directory:
+        parser.error(
+            f"Directory argument required when parsing benchmark files.\n"
+            f"Usage: {parser.prog} /path/to/results"
+        )
 
-            # Look for files with our analyzed format
-            for filename in sorted(os.listdir(input_dir)):
-                if filename.endswith(_JSON_ZST_EXT) or filename.endswith(_JSON_EXT):
-                    filepath = os.path.join(input_dir, filename)
-                    try:
-                        # Try to open and check if it's our format
-                        data = open_json_file(filepath)
-                        if (
-                            isinstance(data, dict)
-                            and "version" in data
-                            and "metrics" in data
-                        ):
-                            found_file = filepath
-                            print(f"Found analyzed file: {filename}")
-                            break
-                    except (IOError, OSError, json.JSONDecodeError):
-                        continue
+    if not os.path.isdir(args.directory):
+        parser.error(f"Directory does not exist: {args.directory}")
 
-            if found_file is None:
-                parser.error(
-                    f"No analyzed JSON file found in directory: {args.from_json}\n"
-                    f"Looking for files with 'version' and 'metrics' keys."
-                )
-        # Check if it's an absolute path to a file
-        elif os.path.isabs(args.from_json):
-            # Absolute path - can work without directory argument
-            if os.path.isfile(args.from_json):
-                found_file = args.from_json
-                input_dir = os.path.dirname(args.from_json)
-            else:
-                parser.error(f"JSON file not found: {args.from_json}")
+    input_dir = args.directory
+    output_dir = args.output_dir if args.output_dir else args.directory
+
+    # Detect file format
+    file_format = detect_warp_file_format(input_dir)
+
+    if file_format == "none":
+        parser.error("No GET benchmark files found with valid datestamp")
+
+    # Extract datestamp based on format
+    # Try to find a datestamp from any file (used only for output filenames)
+    datestamp = None
+    if file_format == "json":
+        # Look for datestamp pattern in .json or .json.zst files
+        # This is ONLY for output filename generation, not for parsing
+        for filename in os.listdir(input_dir):
+            if _JSON_EXT in filename:
+                match = re.search(_DATESTAMP_CAPTURE_PATTERN, filename)
+                if match:
+                    datestamp = match.group(1)
+                    break
+    else:  # file_format == 'text'
+        # Existing logic for .out files
+        for filename in os.listdir(input_dir):
+            if filename.startswith("warp-GET") and filename.endswith(".out"):
+                match = re.search(_DATESTAMP_AFTER_UNDERSCORE_PATTERN, filename)
+                if match:
+                    datestamp = match.group(1)
+                    break
+
+    if datestamp is None:
+        # Generate datestamp from earliest file modification time
+        # pylint: disable=import-outside-toplevel
+        from datetime import datetime, timezone
+
+        earliest_mtime = None
+        for filename in os.listdir(input_dir):
+            if not _should_include_file_for_earliest_mtime(filename, file_format):
+                continue
+            filepath = os.path.join(input_dir, filename)
+            mtime = os.path.getmtime(filepath)
+            if earliest_mtime is None or mtime < earliest_mtime:
+                earliest_mtime = mtime
+
+        if earliest_mtime:
+            datestamp = datetime.fromtimestamp(
+                earliest_mtime, tz=timezone.utc
+            ).strftime(_DATESTAMP_STRFTIME)
+            print(
+                f"Warning: No datestamp found in filenames, using earliest file modification time: {datestamp}"
+            )
         else:
-            # Relative path - need directory argument
-            if not args.directory:
-                parser.error(
-                    "Directory argument required when using --from-json with relative path.\n"
-                    f"Either provide directory: {parser.prog} /path/to/dir --from-json {args.from_json}\n"
-                    f"Or use absolute path: {parser.prog} --from-json /absolute/path/to/{args.from_json}"
-                )
-            if not os.path.isdir(args.directory):
-                parser.error(f"Directory does not exist: {args.directory}")
-
-            input_dir = args.directory
-            found_file = find_analyzed_file(input_dir, args.from_json)
-
-            if found_file is None:
-                parser.error(
-                    f"Could not find analyzed JSON file matching '{args.from_json}' in {input_dir}\n"
-                    f"Tried: {args.from_json}, {args.from_json}.json.zst, {args.from_json}.json"
-                )
-
-        print(f"Reading metrics from {found_file}...")
-        try:
-            metrics, json_datestamp = read_json(found_file)
-            # Use datestamp from JSON if available, otherwise extract from filename, otherwise use mtime
-            if json_datestamp:
-                datestamp = json_datestamp
-            else:
-                datestamp_match = re.search(
-                    _DATESTAMP_CAPTURE_PATTERN, os.path.basename(found_file)
-                )
-                if datestamp_match:
-                    datestamp = datestamp_match.group(1)
-                else:
-                    # Use file modification time as datestamp
-                    # pylint: disable=import-outside-toplevel
-                    from datetime import datetime, timezone
-
-                    mtime = os.path.getmtime(found_file)
-                    datestamp = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime(
-                        _DATESTAMP_STRFTIME
-                    )
-                    print(
-                        f"Warning: No datestamp in JSON or filename, using file modification time: {datestamp}"
-                    )
-        except (ValueError, OSError, ImportError) as e:
-            parser.error(f"Error reading JSON: {e}")
-
-        # Determine output directory
-        if args.output_dir:
-            output_dir = args.output_dir
-        elif args.directory:
-            output_dir = args.directory
-        else:
-            # Use JSON file's directory
-            output_dir = os.path.dirname(found_file) or "."
-
-    else:
-        # Parsing benchmark files - directory is required
-        if not args.directory:
-            parser.error(
-                f"Directory argument required when parsing benchmark files.\n"
-                f"Usage: {parser.prog} /path/to/results"
+            # Fallback to current time if no files found
+            datestamp = datetime.now(timezone.utc).strftime(_DATESTAMP_STRFTIME)
+            print(
+                f"Warning: No benchmark files found for datestamp, using current time: {datestamp}"
             )
 
-        if not os.path.isdir(args.directory):
-            parser.error(f"Directory does not exist: {args.directory}")
-
-        input_dir = args.directory
-        output_dir = args.output_dir if args.output_dir else args.directory
-
-        # Detect file format
-        file_format = detect_warp_file_format(input_dir)
-
-        if file_format == "none":
-            parser.error("No GET benchmark files found with valid datestamp")
-
-        # Extract datestamp based on format
-        # Try to find a datestamp from any file (used only for output filenames)
-        datestamp = None
-        if file_format == "json":
-            # Look for datestamp pattern in .json or .json.zst files
-            # This is ONLY for output filename generation, not for parsing
-            for filename in os.listdir(input_dir):
-                if _JSON_EXT in filename:
-                    match = re.search(_DATESTAMP_CAPTURE_PATTERN, filename)
-                    if match:
-                        datestamp = match.group(1)
-                        break
-        else:  # file_format == 'text'
-            # Existing logic for .out files
-            for filename in os.listdir(input_dir):
-                if filename.startswith("warp-GET") and filename.endswith(".out"):
-                    match = re.search(_DATESTAMP_AFTER_UNDERSCORE_PATTERN, filename)
-                    if match:
-                        datestamp = match.group(1)
-                        break
-
-        if datestamp is None:
-            # Generate datestamp from earliest file modification time
-            # pylint: disable=import-outside-toplevel
-            from datetime import datetime, timezone
-
-            earliest_mtime = None
-            for filename in os.listdir(input_dir):
-                if not _should_include_file_for_earliest_mtime(filename, file_format):
-                    continue
+    # Parse files based on format
+    metrics = []
+    if file_format == "json":
+        # Parse JSON files - accept any .json/.json.zst file that parses successfully
+        for filename in os.listdir(input_dir):
+            if filename.endswith(_JSON_EXT) or filename.endswith(_JSON_ZST_EXT):
                 filepath = os.path.join(input_dir, filename)
-                mtime = os.path.getmtime(filepath)
-                if earliest_mtime is None or mtime < earliest_mtime:
-                    earliest_mtime = mtime
+                try:
+                    metric = parse_warp_json(filepath)
+                    if metric:
+                        metrics.append(metric)
+                        versions.add([metric], result_version(filepath))
+                        print(f"  Parsed: {filename}")
+                except (KeyError, ValueError) as e:
+                    print(f"  Skipping {filename}: {e}")
+    else:  # file_format == 'text'
+        # Existing logic for .out files
+        for filename in os.listdir(input_dir):
+            if filename.endswith(".out"):
+                filepath = os.path.join(input_dir, filename)
+                try:
+                    metric = parse_warp_file(filepath)
+                    if metric:
+                        metrics.append(metric)
+                        versions.add([metric], result_version(filepath))
+                except ValueError as e:
+                    print(f"Warning: Skipping {filename}: {e}")
 
-            if earliest_mtime:
-                datestamp = datetime.fromtimestamp(
-                    earliest_mtime, tz=timezone.utc
-                ).strftime(_DATESTAMP_STRFTIME)
-                print(
-                    f"Warning: No datestamp found in filenames, using earliest file modification time: {datestamp}"
-                )
-            else:
-                # Fallback to current time if no files found
-                datestamp = datetime.now(timezone.utc).strftime(_DATESTAMP_STRFTIME)
-                print(
-                    f"Warning: No benchmark files found for datestamp, using current time: {datestamp}"
-                )
-
-        # Parse files based on format
-        metrics = []
-        if file_format == "json":
-            # Parse JSON files - accept any .json/.json.zst file that parses successfully
-            for filename in os.listdir(input_dir):
-                if filename.endswith(_JSON_EXT) or filename.endswith(_JSON_ZST_EXT):
-                    filepath = os.path.join(input_dir, filename)
-                    try:
-                        metric = parse_warp_json(filepath)
-                        if metric:
-                            metrics.append(metric)
-                            versions.add([metric], result_version(filepath))
-                            print(f"  Parsed: {filename}")
-                    except (KeyError, ValueError) as e:
-                        print(f"  Skipping {filename}: {e}")
-        else:  # file_format == 'text'
-            # Existing logic for .out files
-            for filename in os.listdir(input_dir):
-                if filename.endswith(".out"):
-                    filepath = os.path.join(input_dir, filename)
-                    try:
-                        metric = parse_warp_file(filepath)
-                        if metric:
-                            metrics.append(metric)
-                            versions.add([metric], result_version(filepath))
-                    except ValueError as e:
-                        print(f"Warning: Skipping {filename}: {e}")
-
-        if not metrics:
-            parser.error("No valid GET benchmark files found")
-
-        # Write JSON if requested
-        if args.to_json:
-            json_path = os.path.join(output_dir, f"{datestamp}-analyzed.json.zst")
-            try:
-                write_json(metrics, json_path, datestamp)
-                print(f"Wrote analyzed metrics to {json_path}")
-
-                # Report file size
-                file_size_mb = os.path.getsize(json_path) / (1024 * 1024)
-                print(f"  File size: {file_size_mb:.2f} MB")
-            except (ValueError, OSError, ImportError) as e:
-                print(f"Warning: Failed to write JSON: {e}")
+    if not metrics:
+        parser.error("No valid GET benchmark files found")
 
     # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)

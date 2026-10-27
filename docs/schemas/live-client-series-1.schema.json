@@ -1,0 +1,80 @@
+{
+  "$comment": "SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\nSPDX-License-Identifier: Apache-2.0\n\nLicensed under the Apache License, Version 2.0 (the \"License\");\nyou may not use this file except in compliance with the License.\nYou may obtain a copy of the License at\n\nhttp://www.apache.org/licenses/LICENSE-2.0\n\nUnless required by applicable law or agreed to in writing, software\ndistributed under the License is distributed on an \"AS IS\" BASIS,\nWITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\nSee the License for the specific language governing permissions and\nlimitations under the License.",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "storage-scale-test live client series (JSON Lines)",
+  "description": "Each decompressed line of a sidecar validates against exactly one of: header (first line) or interval.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/header"
+    },
+    {
+      "$ref": "#/$defs/interval"
+    }
+  ],
+  "$defs": {
+    "header": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": "storage-scale-test/live-client-series"
+        },
+        "schema_version": {
+          "type": "string",
+          "pattern": "^1\\.[0-9]+$"
+        },
+        "execution_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "phase": {
+          "type": "string"
+        },
+        "clients": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "execution_id",
+        "phase",
+        "clients"
+      ]
+    },
+    "interval": {
+      "type": "object",
+      "properties": {
+        "elapsed_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bytes_per_s": {
+          "type": "array",
+          "items": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "required": [
+        "elapsed_ms",
+        "bytes_per_s"
+      ]
+    }
+  }
+}
