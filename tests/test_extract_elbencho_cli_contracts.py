@@ -19,9 +19,11 @@
 
 import sys
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
+from lib.elbencho_live_report import LIVE_CSV_COLUMNS
 from tests.extract_elbencho_test_support import load_extract_elbencho_module
 
 _EXTRACT = load_extract_elbencho_module("extract_elbencho_cli_contracts")
@@ -210,8 +212,8 @@ def test_cli_default_terminal_report_is_mirrored_to_a_text_file(monkeypatch, tmp
 @pytest.mark.parametrize(
     "option",
     [
-        "--client-outlier-threshold",
-        "--client-min-underperform-segments",
+        "--client-shortfall-percent",
+        "--client-min-slow-windows",
         "--client-max-timeseries-lines",
         "--client-max-heatmap-rows",
     ],
@@ -388,3 +390,142 @@ def test_mixed_label_with_a_quote_in_a_name_is_not_split(
         '- Storage target: mixed: "x\\", \\"y", "z"'
     ]
     assert stubbed_report
+
+
+@pytest.mark.parametrize("value", ["50", "75", "nan", "-1"])
+def test_shortfall_percent_must_be_below_fifty(monkeypatch, tmp_path, value):
+    """The shortfall is a percent strictly between 0 and 50."""
+    with pytest.raises(SystemExit) as raised:
+        _run_main(monkeypatch, str(tmp_path), "--client-shortfall-percent=" + value)
+    assert raised.value.code == 2
+
+
+def test_removed_outlier_options_are_rejected(monkeypatch, tmp_path):
+    """The z-score options no longer exist."""
+    for option in ("--client-outlier-threshold", "--client-min-underperform-segments"):
+        with pytest.raises(SystemExit) as raised:
+            _run_main(monkeypatch, str(tmp_path), option, "2")
+        assert raised.value.code == 2
+
+
+def _io_metric(**changes):
+    """A metric with a [first]/[last] time and a latency."""
+    values = {"time_ms_first": 320, "time_ms_last": 430, "avg_lat_sec": 0.0025}
+    values.update(changes)
+    return replace(_metric(), **values)
+
+
+def test_phase_contexts_use_first_last_block_size_and_latency():
+    """Contexts are keyed by lowercase phase with per-phase block sizes."""
+    write = _io_metric(io_size="r4K,1M", operation="WRITE")
+    read = _io_metric(io_size="r4K,1M", operation="READ", avg_lat_sec=0.0)
+    contexts = _EXTRACT.phase_contexts([write, read])
+    assert set(contexts) == {"write", "read"}
+    assert contexts["write"].first_ms == 320
+    assert contexts["write"].last_ms == 430
+    assert contexts["write"].block_size_bytes == 4096
+    assert contexts["write"].final_avg_latency_us == 2500.0
+    assert contexts["read"].block_size_bytes == 1 << 20
+    assert contexts["read"].final_avg_latency_us is None
+
+
+def test_phase_contexts_tolerate_missing_times():
+    """Absent CSV times leave the context times None."""
+    contexts = _EXTRACT.phase_contexts([_metric()])
+    assert contexts["write"].first_ms is None
+    assert contexts["write"].block_size_bytes == 4096
+
+
+def test_live_contexts_match_by_coordinates():
+    """Only metrics sharing the live CSV's coordinates contribute."""
+    live = SimpleNamespace(
+        io_size="4K", nodes=1, threads=1, io_depth=1, datestamp="20260101Z000000"
+    )
+    other = replace(_io_metric(), threads=2, operation="READ")
+    contexts = _EXTRACT.live_phase_contexts(live, [_io_metric(), other])
+    assert set(contexts) == {"write"}
+
+
+def _steady_stub(reason=None, latency=None):
+    """A duck-typed SteadyAnalysis for the formatter."""
+    window = SimpleNamespace(
+        available=reason is None, reason=reason, start_ms=2000, end_ms=31500
+    )
+    summaries = {
+        "interval": SimpleNamespace(
+            jain_p50=0.9281, jain_min=0.5, min_over_median_p10=None
+        ),
+        "5s": SimpleNamespace(jain_p50=0.977, jain_min=0.9, min_over_median_p10=0.95),
+    }
+    return SimpleNamespace(
+        window=window,
+        latency=latency,
+        summary=summaries.get,
+        class_counts=lambda: {"persistent": 1, "transient": 2, "ok": 61},
+    )
+
+
+def test_fairness_line_available_window():
+    """Every field is formatted; missing windows print dashes."""
+    latency = SimpleNamespace(p50_us=812.4, p90_us=1500.0, max_over_p50=2.3)
+    line = _EXTRACT.format_live_fairness_line(
+        "stem", "WRITE", _steady_stub(latency=latency)
+    )
+    assert line == (
+        "stem WRITE: steady 2.0-31.5 s; Jain p50/min interval 0.928/0.500, "
+        "5 s 0.977/0.900, 30 s -/-; slowest/median p10 (5 s) 0.950; "
+        "slow clients persistent 1, transient 2 of 64; "
+        "latency p50 812 us, p90 1500 us, max/p50 2.300"
+    )
+
+
+def test_fairness_line_unavailable_window():
+    """An unavailable window names its reason; latency is appended if known."""
+    bare = _EXTRACT.format_live_fairness_line(
+        "stem", "READ", _steady_stub(reason="too_short")
+    )
+    assert bare == "stem READ: steady window unavailable (too_short)"
+    latency = SimpleNamespace(p50_us=10.0, p90_us=20.0, max_over_p50=1.0)
+    with_latency = _EXTRACT.format_live_fairness_line(
+        "stem", "READ", _steady_stub(reason="no_first_time", latency=latency)
+    )
+    assert with_latency == (
+        "stem READ: steady window unavailable (no_first_time); "
+        "latency p50 10 us, p90 20 us, max/p50 1.000"
+    )
+
+
+def test_live_fairness_block_prints_and_appends_to_report(tmp_path, capsys):
+    """The block goes to stdout and, outside markdown, to report.txt."""
+    report = tmp_path / _EXTRACT.REPORT_TXT_FILENAME
+    report.write_text("table\n", encoding="utf-8")
+    _EXTRACT.emit_live_fairness(["line one"], False, str(tmp_path))
+    assert "Live fairness\nline one" in capsys.readouterr().out
+    text = report.read_text(encoding="utf-8")
+    assert text.startswith("table\n") and "Live fairness\nline one" in text
+    _EXTRACT.emit_live_fairness(["line two"], True, str(tmp_path))
+    assert "line two" not in report.read_text(encoding="utf-8")
+    _EXTRACT.emit_live_fairness([], False, str(tmp_path))
+
+
+def test_fairness_lines_skip_phases_without_data(monkeypatch, tmp_path):
+    """SYNC moves no data and has no aggregate row, so it gets no line."""
+    columns = LIVE_CSV_COLUMNS
+    path = tmp_path / "elbencho-1M-c_001-s_002-d_001_20261026Z120000.live.csv"
+    lines = [",".join(columns)]
+    for phase, done in (("SYNC", 0), ("WRITE", 1048576)):
+        for second in range(1, 4):
+            for rank in ("Total", "0", "1"):
+                row = dict.fromkeys(columns, "")
+                row.update(Phase=phase, RuntimeMS=str(second * 1000), Rank=rank)
+                row["DoneBytes"] = str(second * done)
+                lines.append(",".join(row[name] for name in columns))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    monkeypatch.setattr(_EXTRACT, "_report_live_domain", lambda *_args: None)
+    metadata = _EXTRACT.LiveFileMetadata(str(path), "1M", 1, 2, 1, "20261026Z120000")
+    options = _EXTRACT.LiveReportOptions(False, 5.0, 3, 10, 50)
+    collected = []
+    assert _EXTRACT._report_one_live_file(  # pylint: disable=protected-access
+        metadata, str(tmp_path), options, 1000, {}, collected
+    )
+    assert len(collected) == 1 and " WRITE: " in collected[0]

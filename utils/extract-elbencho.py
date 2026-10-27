@@ -97,16 +97,29 @@ from lib.elbencho_live_results import load_workers_tsv, null_live
 from lib.elbencho_live_report import (
     DomainAnalysis,
     LiveAnalysis,
+    LiveClientId,
     LiveDomainKey,
     LiveFileMetadata,
     analyze_live_csv,
-    collect_selected_client_detail,
-    plot_aggregate_timeseries,
-    plot_client_timeseries,
-    plot_underperformance_heatmap,
-    select_clients,
-    select_heatmap_clients,
     write_client_summaries,
+)
+from lib.elbencho_live_plots import (
+    plot_aggregate_timeseries,
+    plot_client_ratio_heatmap,
+    plot_client_timeseries,
+    plot_fairness_timeseries,
+)
+from lib.elbencho_live_steady import (
+    PhaseContext,
+    SteadyAnalysis,
+    WindowedClientDetail,
+    WINDOW_30S,
+    WINDOW_5S,
+    WINDOW_INTERVAL,
+    analyze_steady,
+    classified_clients,
+    collect_windowed_client_detail,
+    select_heatmap_rows,
 )
 from lib.join_datestamps import join_datestamps, join_datestamps_for_filename
 from lib.reporting_common import histogram_axis_ranges
@@ -3544,82 +3557,200 @@ def _live_metadata_matches_filters(
     return all(checks)
 
 
-def _report_one_live_file(
+@dataclass(frozen=True)
+class LiveReportOptions:
+    """Per-client report controls for one live CSV."""
+
+    per_client_plots: bool
+    shortfall_percent: float
+    min_slow_windows: int
+    max_timeseries_lines: int
+    max_heatmap_rows: int
+
+
+LIVE_FAIRNESS_HEADING = "Live fairness"
+NO_VALUE = "-"
+
+
+def _size_token_bytes(io_size: str, operation: str) -> Optional[int]:
+    """Block size of one phase: write = first token, read = last token."""
+    tokens = io_size.split(",")
+    token = tokens[0] if operation == "write" else tokens[-1]
+    return fs_coordinates.elbencho_size_bytes(token.removeprefix("r"))
+
+
+def phase_contexts(metrics: Sequence[ElbenchoMetrics]) -> Dict[str, PhaseContext]:
+    """Phase contexts of one result base, keyed by lowercase phase name."""
+    contexts: Dict[str, PhaseContext] = {}
+    for metric in metrics:
+        phase = metric.operation.lower()
+        latency_us = metric.avg_lat_sec * 1e6
+        contexts[phase] = PhaseContext(
+            first_ms=metric.time_ms_first,
+            last_ms=metric.time_ms_last,
+            block_size_bytes=_size_token_bytes(metric.io_size, phase),
+            final_avg_latency_us=latency_us if latency_us > 0 else None,
+        )
+    return contexts
+
+
+def _live_metrics_key(item: Any) -> Tuple[Any, ...]:
+    return (item.io_size, item.nodes, item.threads, item.io_depth, item.datestamp)
+
+
+def live_phase_contexts(
+    metadata: LiveFileMetadata, metrics: Sequence[ElbenchoMetrics]
+) -> Dict[str, PhaseContext]:
+    """Contexts of the metrics that belong to one live CSV."""
+    key = _live_metrics_key(metadata)
+    return phase_contexts([m for m in metrics if _live_metrics_key(m) == key])
+
+
+def _fmt(value: Optional[float], spec: str) -> str:
+    return NO_VALUE if value is None else format(value, spec)
+
+
+def _jain_text(label: str, steady: SteadyAnalysis, name: str) -> str:
+    summary = steady.summary(label)
+    p50 = _fmt(summary.jain_p50 if summary else None, ".3f")
+    low = _fmt(summary.jain_min if summary else None, ".3f")
+    return f"{name} {p50}/{low}"
+
+
+def _latency_text(steady: SteadyAnalysis) -> str:
+    latency = steady.latency
+    return (
+        f"latency p50 {_fmt(latency.p50_us if latency else None, '.0f')} us, "
+        f"p90 {_fmt(latency.p90_us if latency else None, '.0f')} us, "
+        f"max/p50 {_fmt(latency.max_over_p50 if latency else None, '.3f')}"
+    )
+
+
+def format_live_fairness_line(stem: str, label: str, steady: SteadyAnalysis) -> str:
+    """One report.txt line summarizing a domain's steady-state fairness."""
+    window = steady.window
+    prefix = f"{stem} {label}:"
+    if not window.available:
+        line = f"{prefix} steady window unavailable ({window.reason})"
+        return f"{line}; {_latency_text(steady)}" if steady.latency else line
+    summary_5s = steady.summary(WINDOW_5S)
+    counts = steady.class_counts()
+    jain = ", ".join(
+        _jain_text(window_label, steady, name)
+        for window_label, name in (
+            (WINDOW_INTERVAL, "interval"),
+            (WINDOW_5S, "5 s"),
+            (WINDOW_30S, "30 s"),
+        )
+    )
+    return (
+        f"{prefix} steady {_fmt(window.start_ms / 1000, '.1f')}-"
+        f"{_fmt(window.end_ms / 1000, '.1f')} s; Jain p50/min {jain}; "
+        "slowest/median p10 (5 s) "
+        f"{_fmt(summary_5s.min_over_median_p10 if summary_5s else None, '.3f')}; "
+        f"slow clients persistent {counts.get('persistent', 0)}, "
+        f"transient {counts.get('transient', 0)} of {sum(counts.values())}; "
+        f"{_latency_text(steady)}"
+    )
+
+
+def _env_for_live(environments: Dict[str, dict], path: str) -> dict:
+    directory = os.path.normpath(os.path.dirname(path))
+    for input_dir, env in environments.items():
+        if os.path.normpath(input_dir) == directory:
+            return env
+    return {}
+
+
+def _report_one_live_file(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     metadata: LiveFileMetadata,
     output_dir: str,
-    per_client_plots: bool,
-    z_threshold: float,
-    min_underperform_segments: int,
-    max_timeseries_lines: int,
-    max_heatmap_rows: int,
+    options: LiveReportOptions,
+    configured_interval_ms: Optional[int],
+    contexts: Dict[str, PhaseContext],
+    fairness_lines: List[str],
 ) -> bool:
-    """Analyze one live CSV and generate aggregate and optional client reports."""
-    analysis = analyze_live_csv(metadata, z_threshold)
+    """Analyze one live CSV; write the live reports and collect fairness lines."""
+    analysis = analyze_live_csv(metadata)
     eprint(f"Analyzed live CSV: {metadata.path}")
     if not analysis.domains:
         eprint(f"Warning: No valid live domains found in {metadata.path}")
         return False
     for domain_key in sorted(analysis.domains):
         domain = analysis.domains[domain_key]
-        _report_live_domain(
+        context = contexts.get(domain_key.phase.lower()) or PhaseContext(
+            None, None, None, None
+        )
+        steady = analyze_steady(
             analysis,
-            metadata,
-            domain_key,
             domain,
-            output_dir,
-            per_client_plots,
-            min_underperform_segments,
-            max_timeseries_lines,
-            max_heatmap_rows,
+            context,
+            configured_interval_ms,
+            options.shortfall_percent,
+            options.min_slow_windows,
+        )
+        # Phases such as SYNC move no data and have no aggregate CSV row.
+        if domain_key.phase.lower() in contexts or domain_key.phase.upper() in (
+            "WRITE",
+            "READ",
+        ):
+            fairness_lines.append(
+                format_live_fairness_line(metadata.stem, domain_key.label, steady)
+            )
+        _report_live_domain(
+            analysis, metadata, domain_key, domain, steady, output_dir, options
         )
     return True
 
 
-def _report_live_domain(
+def _report_live_domain(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     analysis: LiveAnalysis,
     metadata: LiveFileMetadata,
     domain_key: LiveDomainKey,
     domain: DomainAnalysis,
+    steady: SteadyAnalysis,
     output_dir: str,
-    per_client_plots: bool,
-    min_underperform_segments: int,
-    max_timeseries_lines: int,
-    max_heatmap_rows: int,
+    options: LiveReportOptions,
 ) -> None:
-    """Generate aggregate and optional client reports for one live domain."""
-    aggregate_path = plot_aggregate_timeseries(metadata, domain, output_dir)
+    """Generate aggregate, fairness and optional client reports for one domain."""
+    aggregate_path = plot_aggregate_timeseries(metadata, domain, steady, output_dir)
     if aggregate_path:
         eprint(f"Generated live aggregate plot: {aggregate_path}")
     elif not domain.aggregate_points:
         eprint(f"No Rank=Total rows for {metadata.stem} {domain_key.label}")
+    fairness_path = plot_fairness_timeseries(metadata, domain, steady, output_dir)
+    if fairness_path:
+        eprint(f"Generated live fairness plot: {fairness_path}")
     if domain.diagnostics:
         diagnostics = ", ".join(
             f"{name}={count}" for name, count in sorted(domain.diagnostics.items())
         )
         eprint(f"Live CSV diagnostics for {domain_key.label}: {diagnostics}")
-    if not per_client_plots:
-        return
-    _report_live_client_domain(
-        analysis,
-        metadata,
-        domain_key,
-        domain,
-        output_dir,
-        min_underperform_segments,
-        max_timeseries_lines,
-        max_heatmap_rows,
+    if options.per_client_plots:
+        _report_live_client_domain(
+            analysis, metadata, domain_key, domain, steady, output_dir, options
+        )
+
+
+def _detail_subset(
+    detail: WindowedClientDetail, clients: Sequence[LiveClientId]
+) -> WindowedClientDetail:
+    """The windowed detail of ``clients`` only, in their order."""
+    return WindowedClientDetail(
+        list(clients),
+        {client: detail.rates_mib_s[client] for client in clients},
+        {client: detail.ratios[client] for client in clients},
     )
 
 
-def _report_live_client_domain(
+def _report_live_client_domain(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     analysis: LiveAnalysis,
     metadata: LiveFileMetadata,
     domain_key: LiveDomainKey,
     domain: DomainAnalysis,
+    steady: SteadyAnalysis,
     output_dir: str,
-    min_underperform_segments: int,
-    max_timeseries_lines: int,
-    max_heatmap_rows: int,
+    options: LiveReportOptions,
 ) -> None:
     """Generate bounded-detail client reports for one extended live domain."""
     if not domain.has_extended_rows:
@@ -3628,42 +3759,50 @@ def _report_live_client_domain(
             f"{domain_key.label}; skipping per-client reports"
         )
         return
-    summary_paths = write_client_summaries(metadata, domain, output_dir)
+    summary_paths = write_client_summaries(metadata, domain, steady, output_dir)
     eprint(f"Generated live client summaries: {', '.join(summary_paths)}")
-    prioritized = select_clients(
-        domain,
-        min_underperform_segments,
-        max(max_timeseries_lines, max_heatmap_rows),
-    )
-    timeseries_clients = prioritized[:max_timeseries_lines]
-    heatmap_clients = select_heatmap_clients(domain, prioritized, max_heatmap_rows)
-    if not prioritized:
+    timeseries_clients = classified_clients(steady, options.max_timeseries_lines)
+    heatmap_clients = select_heatmap_rows(steady, options.max_heatmap_rows)
+    if not timeseries_clients:
         eprint(
-            f"No clients met the underperformance threshold for "
+            f"No slow clients in the steady window for "
             f"{metadata.stem} {domain_key.label}; "
-            "generating a representative fleet heatmap"
+            "plotting representative clients"
         )
+        timeseries_clients = heatmap_clients[: options.max_timeseries_lines]
     detail_clients = list(dict.fromkeys([*timeseries_clients, *heatmap_clients]))
-    detail = collect_selected_client_detail(analysis, domain, detail_clients)
+    detail = collect_windowed_client_detail(analysis, domain, steady, detail_clients)
     report_paths = (
         plot_client_timeseries(
             metadata,
             domain,
-            detail,
-            timeseries_clients,
+            steady,
+            _detail_subset(detail, timeseries_clients),
             output_dir,
         ),
-        plot_underperformance_heatmap(
+        plot_client_ratio_heatmap(
             metadata,
             domain,
-            detail,
-            heatmap_clients,
+            steady,
+            _detail_subset(detail, heatmap_clients),
             output_dir,
         ),
     )
     for report_path in report_paths:
         if report_path:
             eprint(f"Generated live per-client plot: {report_path}")
+
+
+def emit_live_fairness(lines: List[str], markdown: bool, output_dir: str) -> None:
+    """Print the Live fairness block; append it to report.txt outside markdown."""
+    if not lines:
+        return
+    block = "\n".join(["", LIVE_FAIRNESS_HEADING, *lines, ""])
+    print(block)
+    if not markdown:
+        report_path = os.path.join(output_dir, REPORT_TXT_FILENAME)
+        with open(report_path, "a", encoding="utf-8") as handle:
+            handle.write(block + "\n")
 
 
 def _elbencho_find_last_operation_section(
@@ -4399,9 +4538,9 @@ class LiveRequest:
     """Live CSV analysis settings for the results export."""
 
     level: str
-    z_threshold: float
+    shortfall_percent: float
+    min_slow_windows: int
     selection_limits: Tuple[int, int]
-    min_underperform_segments: int
     sidecar_dir: Optional[str]
     configured_interval_ms: Optional[int]
 
@@ -4698,9 +4837,9 @@ def _live_objects(
             os.path.relpath(live_path, data.input_dir),
             live.level,
             live.configured_interval_ms,
-            live.z_threshold,
+            phase_contexts(data.pairs.get(base_filename, [])),
+            (live.shortfall_percent, live.min_slow_windows),
             live.selection_limits,
-            live.min_underperform_segments,
             live.sidecar_dir,
             execution_id or os.path.basename(base_filename),
             execution_id,
@@ -4933,12 +5072,12 @@ def _live_request(args: argparse.Namespace, env: dict, output_dir: str) -> LiveR
     )
     return LiveRequest(
         level=getattr(args, "live_detail", "summary"),
-        z_threshold=args.client_outlier_threshold,
+        shortfall_percent=args.client_shortfall_percent,
+        min_slow_windows=args.client_min_slow_windows,
         selection_limits=(
             args.client_max_timeseries_lines,
             args.client_max_heatmap_rows,
         ),
-        min_underperform_segments=args.client_min_underperform_segments,
         sidecar_dir=sidecar_dir,
         configured_interval_ms=_configured_interval_ms(env),
     )
@@ -4947,7 +5086,8 @@ def _live_request(args: argparse.Namespace, env: dict, output_dir: str) -> LiveR
 def _generator_options(args: argparse.Namespace) -> dict:
     return {
         "live_detail": getattr(args, "live_detail", "summary"),
-        "z_threshold": args.client_outlier_threshold,
+        "shortfall_percent": args.client_shortfall_percent,
+        "min_slow_windows": args.client_min_slow_windows,
         "only_nodes": args.only_nodes or None,
         "only_threads": args.only_threads or None,
         "only_sizes": args.only_sizes or None,
@@ -5190,7 +5330,9 @@ def main() -> None:
         sys.exit(exit_status)
     os.makedirs(output_dir, exist_ok=True)
 
-    _emit_reports(args, metrics, live_files, output_dir, versions, target_label)
+    _emit_reports(
+        args, metrics, live_files, output_dir, versions, (target_label, environments)
+    )
     if exit_status:
         sys.exit(exit_status)
 
@@ -5201,9 +5343,10 @@ def _emit_reports(
     live_files: List[LiveFileMetadata],
     output_dir: str,
     versions: ResultVersions,
-    target_label: Any,
+    target_and_environments: Tuple[Any, Dict[str, dict]],
 ) -> None:
     """Print the tables, generate the plots and the live reports."""
+    target_label, environments = target_and_environments
 
     if metrics:
         if args.markdown:
@@ -5231,22 +5374,30 @@ def _emit_reports(
         plot_metrics(metrics, output_dir, args.no_dual_y_axis)
         eprint(f"Generated plots saved in {output_dir}")
 
+    options = LiveReportOptions(
+        args.per_client_plots,
+        args.client_shortfall_percent,
+        args.client_min_slow_windows,
+        args.client_max_timeseries_lines,
+        args.client_max_heatmap_rows,
+    )
+    fairness_lines: List[str] = []
     successful_live_reports = 0
     for metadata in live_files:
         try:
             if _report_one_live_file(
                 metadata,
                 output_dir,
-                args.per_client_plots,
-                args.client_outlier_threshold,
-                args.client_min_underperform_segments,
-                args.client_max_timeseries_lines,
-                args.client_max_heatmap_rows,
+                options,
+                _configured_interval_ms(_env_for_live(environments, metadata.path)),
+                live_phase_contexts(metadata, metrics),
+                fairness_lines,
             ):
                 successful_live_reports += 1
         except Exception as exc:  # pylint: disable=broad-exception-caught
             eprint(f"Error reporting live CSV {metadata.path}: {exc}")
             traceback.print_exc()
+    emit_live_fairness(fairness_lines, args.markdown, output_dir)
     if live_files and not successful_live_reports:
         eprint("ERROR: No live CSV reports were generated")
         sys.exit(1)

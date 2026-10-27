@@ -181,7 +181,14 @@ def _live_csv(path, clients=3, intervals=4, phase="WRITE"):
 
 
 def _live_request(level="summary", sidecar=None):
-    return _EXTRACT.LiveRequest(level, 2.0, (8, 8), 3, sidecar, 500)
+    return _EXTRACT.LiveRequest(
+        level=level,
+        shortfall_percent=5.0,
+        min_slow_windows=3,
+        selection_limits=(8, 8),
+        sidecar_dir=sidecar,
+        configured_interval_ms=500,
+    )
 
 
 def _fragment(result_dir, *, filters=None, level="summary", sidecar=None):

@@ -2554,7 +2554,8 @@ def write_json_outputs(args, env: Dict[str, Any]) -> bool:
         list(sys.argv),
         {
             "live_detail": getattr(args, "live_detail", None),
-            "z_threshold": getattr(args, "z_threshold", None),
+            "shortfall_percent": None,
+            "min_slow_windows": None,
             "only_nodes": args.only_nodes,
             "only_threads": args.only_threads,
             "kind": "mdtest",

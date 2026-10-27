@@ -2650,7 +2650,7 @@ def _assert_scenario_report(
         command.extend(
             (
                 "--per-client-plots",
-                "--client-min-underperform-segments",
+                "--client-min-slow-windows",
                 "2",
                 "--client-max-timeseries-lines",
                 "2",

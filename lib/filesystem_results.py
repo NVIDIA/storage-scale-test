@@ -80,7 +80,8 @@ RESULT_STATES = (
 )
 GENERATOR_OPTION_KEYS = (
     "live_detail",
-    "z_threshold",
+    "shortfall_percent",
+    "min_slow_windows",
     "only_nodes",
     "only_threads",
     "only_sizes",

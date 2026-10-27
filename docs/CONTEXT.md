@@ -241,6 +241,9 @@ collect before resume.
 - `--to-json` fragments are internal; `report_batch` assembles the document.
   Filters and failed groups never drop executions. Every execution carries
   `coordinates` and `coordinate_key`; `dataset`/`results` only when parsed.
+- Live fairness ends the steady window at elbencho `[first]` and compares
+  clients by ratio to the fleet median, not z-scores; analysis streams the
+  live CSV in at most three passes.
 
 Inspect large JSON/JSON.zst without printing complete datasets:
 

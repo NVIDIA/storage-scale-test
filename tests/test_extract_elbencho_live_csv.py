@@ -32,11 +32,20 @@ from lib.elbencho_live_report import (
     LiveDomainKey,
     LiveFileMetadata,
     P2Median,
+    ParsedRow,
     analyze_live_csv,
+    client_sort_key,
     collect_selected_client_detail,
-    select_clients,
-    select_heatmap_clients,
+    iter_parsed_rows,
+    live_csv_reader,
     write_client_summaries,
+)
+from lib.elbencho_live_steady import (
+    CLASS_OK,
+    CLASS_PERSISTENT,
+    CLASS_TRANSIENT,
+    PhaseContext,
+    analyze_steady,
 )
 from utils.benchmark_elbencho_live_csv import generate_live_csv
 
@@ -52,6 +61,8 @@ def _row(
     mib_s="",
     iops="",
     entries_s="",
+    lat_io="",
+    lat_ent="",
 ):
     iso_timestamp = (
         datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
@@ -70,8 +81,8 @@ def _row(
         "IOPS": str(iops),
         "Entries": "0",
         "Entries/s": str(entries_s),
-        "Lat Ent us": "",
-        "Lat IO us": "",
+        "Lat Ent us": str(lat_ent),
+        "Lat IO us": str(lat_io),
         "Active": "",
         "CPU": "",
         "Service": service,
@@ -90,10 +101,10 @@ class LiveCSVTestCase(unittest.TestCase):
             / "elbencho-r64K-c_004-s_008-d_002_20260729Z120000.live.csv"
         )
 
-    def _analyze(self, rows, threshold=2.0, columns=None):
+    def _analyze(self, rows, columns=None):
         fieldnames = columns or LIVE_CSV_COLUMNS
         with self.path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames)
+            writer = csv.DictWriter(handle, fieldnames, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
         metadata = LiveFileMetadata(
@@ -104,7 +115,7 @@ class LiveCSVTestCase(unittest.TestCase):
             io_depth=2,
             datestamp="20260729Z120000",
         )
-        return analyze_live_csv(metadata, threshold)
+        return analyze_live_csv(metadata)
 
 
 class TestLiveAggregateAnalysis(LiveCSVTestCase):
@@ -298,10 +309,6 @@ class TestLiveClientRates(LiveCSVTestCase):
         self.assertEqual(missing.missing_count, 1)
         self.assertEqual(missing.invalid_count, 0)
         self.assertEqual(domain.diagnostics["non_adjacent_samples"], 1)
-        self.assertEqual(
-            select_clients(domain, 1, 10),
-            [LiveClientId("1", "")],
-        )
 
     def test_counter_reset_is_invalid_then_new_baseline(self):
         analysis = self._analyze(
@@ -318,10 +325,6 @@ class TestLiveClientRates(LiveCSVTestCase):
         self.assertAlmostEqual(summary.mean_mib_s, 2.0)
         self.assertEqual(summary.invalid_count, 1)
         self.assertEqual(domain.diagnostics["counter_resets"], 1)
-        self.assertEqual(
-            select_clients(domain, 1, 10),
-            [LiveClientId("0", "")],
-        )
 
     def test_client_first_seen_late_counts_leading_missing_samples(self):
         analysis = self._analyze(
@@ -349,45 +352,38 @@ class TestLiveClientRates(LiveCSVTestCase):
         self.assertEqual(domain.diagnostics["non_positive_elapsed_time"], 1)
 
 
-class TestLiveUnderperformance(LiveCSVTestCase):
-    """Fleet statistics, persistence, selection, and second pass."""
-
-    def _outlier_rows(self):
-        rows = []
-        counters = {str(rank): 0 for rank in range(5)}
-        for runtime_ms in (1000, 2000, 3000, 4000):
-            for rank in range(5):
-                rate = 10 if rank == 0 else 100
-                counters[str(rank)] += rate * MIB
-                rows.append(_row(runtime_ms, rank, counters[str(rank)]))
-        return rows
-
-    def test_z_scores_streaks_and_selection(self):
-        analysis = self._analyze(self._outlier_rows(), threshold=1.5)
-        domain = analysis.domains[LiveDomainKey("READ", "")]
-        slow = domain.clients[LiveClientId("0", "")]
-        self.assertEqual(slow.underperform_count, 3)
-        self.assertEqual(slow.longest_underperform_streak, 3)
-        self.assertAlmostEqual(slow.mean_mib_s, 10.0)
-        self.assertEqual(
-            select_clients(domain, 2, 10),
-            [LiveClientId("0", "")],
+def _outlier_rows(intervals=4, slow_rate=10, fast_rate=100, clients=5):
+    """One slow worker (rank 0) among fast ones, one row per second."""
+    rows = []
+    counters = [0] * clients
+    for index in range(intervals):
+        runtime_ms = (index + 1) * 1000
+        rows.append(
+            _row(
+                runtime_ms,
+                "Total",
+                sum(counters),
+                mib_s=slow_rate + fast_rate * (clients - 1),
+            )
         )
-        self.assertEqual(select_clients(domain, 4, 10), [])
+        for rank in range(clients):
+            counters[rank] += (slow_rate if rank == 0 else fast_rate) * MIB
+            rows.append(_row(runtime_ms, rank, counters[rank]))
+    return rows
+
+
+class TestLiveSecondPassAndSummaries(LiveCSVTestCase):
+    """Selected-client rates and the client summary files."""
 
     def test_second_pass_retains_only_selected_client(self):
-        analysis = self._analyze(self._outlier_rows(), threshold=1.5)
+        analysis = self._analyze(_outlier_rows())
         domain = analysis.domains[LiveDomainKey("READ", "")]
-        selected = select_clients(domain, 1, 1)
+        selected = [LiveClientId("0", "")]
         detail = collect_selected_client_detail(analysis, domain, selected)
-        self.assertEqual(list(detail.rates_by_client), [LiveClientId("0", "")])
+        self.assertEqual(list(detail.rates_by_client), selected)
         self.assertEqual(detail.rates_by_client[selected[0]], [None, 10.0, 10.0, 10.0])
-        self.assertEqual(detail.heatmap_by_client[selected[0]][0], None)
-        self.assertTrue(
-            all(value == 10.0 for value in detail.heatmap_by_client[selected[0]][1:])
-        )
 
-    def test_zero_rate_remains_valid_when_fleet_median_is_zero(self):
+    def test_zero_rate_remains_valid(self):
         analysis = self._analyze(
             [
                 _row(1000, 0, 100 * MIB),
@@ -402,43 +398,191 @@ class TestLiveUnderperformance(LiveCSVTestCase):
         client = LiveClientId("0", "")
         detail = collect_selected_client_detail(analysis, domain, [client])
         self.assertEqual(detail.rates_by_client[client], [None, 100.0, 0.0])
-        self.assertEqual(detail.heatmap_by_client[client][2], 0.0)
 
-    def test_heatmap_adds_representative_fleet_clients(self):
-        analysis = self._analyze(self._outlier_rows(), threshold=1.5)
+    def test_client_summary_without_z_scores(self):
+        analysis = self._analyze(_outlier_rows())
+        summary = analysis.domains[LiveDomainKey("READ", "")].clients[
+            LiveClientId("0", "")
+        ]
+        self.assertAlmostEqual(summary.mean_mib_s, 10.0)
+        self.assertAlmostEqual(summary.relative_to_fleet_median, 0.1)
+        self.assertEqual(summary.first_progress_interval, 0)
+        for removed in ("underperform_count", "worst_z_score", "problem_count"):
+            self.assertFalse(hasattr(summary, removed), removed)
+
+    def test_summary_files_contain_steady_columns(self):
+        analysis = self._analyze(_outlier_rows(intervals=15))
         domain = analysis.domains[LiveDomainKey("READ", "")]
-        prioritized = select_clients(domain, 1, 5)
-        all_clients = select_heatmap_clients(domain, prioritized, 5)
-        self.assertEqual(all_clients[0], LiveClientId("0", ""))
-        self.assertEqual(set(all_clients), set(domain.clients))
-        sampled = select_heatmap_clients(domain, prioritized, 3)
-        self.assertEqual(
-            sampled,
-            [
-                LiveClientId("0", ""),
-                LiveClientId("1", ""),
-                LiveClientId("4", ""),
-            ],
+        steady = analyze_steady(
+            analysis, domain, PhaseContext(15000, 15000, None, None), 1000
         )
-
-    def test_summary_files_contain_required_fields(self):
-        analysis = self._analyze(self._outlier_rows(), threshold=1.5)
-        domain = analysis.domains[LiveDomainKey("READ", "")]
         csv_path, text_path = write_client_summaries(
-            analysis.metadata,
-            domain,
-            self.temp_dir.name,
+            analysis.metadata, domain, steady, self.temp_dir.name
         )
-        self.assertTrue(Path(csv_path).is_file())
-        self.assertTrue(Path(text_path).is_file())
+        self.assertTrue(csv_path.endswith("-read-client-summary.csv"))
+        with Path(csv_path).open(encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+        pinned_columns = (
+            "client mode rank service class steady_mean_mib_s steady_ratio "
+            "worst_5s_ratio worst_5s_elapsed_sec worst_30s_ratio "
+            "worst_30s_elapsed_sec short_5s_percent mean_mib_s median_mib_s "
+            "valid_samples missing_samples invalid_samples"
+        )
+        self.assertEqual(reader.fieldnames, pinned_columns.split())
+        self.assertEqual(
+            [row["client"] for row in rows],
+            ["worker-0", "worker-1", "worker-2", "worker-3", "worker-4"],
+        )
+        slow = rows[0]
+        self.assertEqual(slow["class"], CLASS_PERSISTENT)
+        self.assertEqual(slow["steady_mean_mib_s"], "10.000")
+        self.assertEqual(slow["steady_ratio"], "0.1000")
+        self.assertEqual(slow["worst_5s_ratio"], "0.1000")
+        self.assertEqual(slow["worst_5s_elapsed_sec"], "7.000")
+        self.assertEqual(slow["worst_30s_ratio"], "")
+        self.assertEqual(slow["short_5s_percent"], "100.0")
+        self.assertEqual(slow["mean_mib_s"], "10.000")
+        self.assertEqual(slow["valid_samples"], "14")
+        self.assertEqual(rows[1]["class"], CLASS_OK)
+        text = Path(text_path).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(text[0], "Elbencho live client summary: READ")
+        self.assertEqual(
+            text[1], "Steady window: 2.0-15.0 s; shortfall 5%; min slow windows 3"
+        )
+        self.assertTrue(text[2].startswith("host/worker\tclass\tsteady MiB/s"))
+        self.assertTrue(text[3].startswith("worker-0\tpersistent\t10.000\t0.100"))
+
+    def test_summary_files_without_steady_window(self):
+        analysis = self._analyze(_outlier_rows())
+        domain = analysis.domains[LiveDomainKey("READ", "")]
+        steady = analyze_steady(
+            analysis, domain, PhaseContext(4000, 4000, None, None), 1000
+        )
+        csv_path, text_path = write_client_summaries(
+            analysis.metadata, domain, steady, self.temp_dir.name
+        )
         with Path(csv_path).open(encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
-        self.assertEqual(rows[0]["client"], "worker-0")
-        self.assertEqual(rows[0]["underperform_intervals"], "3")
-        self.assertEqual(rows[0]["avg_fleet_median_percent"], "10.000")
+        self.assertEqual(rows[0]["class"], "")
+        self.assertEqual(rows[0]["steady_ratio"], "")
+        self.assertEqual(rows[0]["mean_mib_s"], "10.000")
+        text = Path(text_path).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(text[1], "Steady window unavailable (too_short)")
+
+
+class TestLiveLatencyAndDiagnostics(LiveCSVTestCase):
+    """Total-row latency parsing, optional columns, and diagnostic caps."""
+
+    def test_total_row_latency_parsing(self):
+        analysis = self._analyze(
+            [
+                _row(1000, "Total", MIB, mib_s=1, iops=16, lat_io=250, lat_ent=0),
+                _row(2000, "Total", MIB, mib_s=0, iops=0, lat_io=0, lat_ent=7.5),
+                _row(3000, "Total", 2 * MIB, mib_s=1, iops="", lat_io=0),
+                _row(4000, "Total", 3 * MIB, mib_s=0, iops=5, lat_io=0),
+                _row(5000, "Total", 4 * MIB, iops="", lat_io=90),
+                _row(6000, "Total", 4 * MIB, lat_io="nan"),
+            ]
+        )
+        points = analysis.domains[LiveDomainKey("READ", "")].aggregate_points
         self.assertEqual(
-            rows[0]["worst_iso_timestamp"],
-            "2026-07-29T12:00:02.000+00:00",
+            [point.io_latency_us for point in points], [250.0, None, None, 0.0, 90.0]
+        )
+        self.assertEqual(
+            [point.entries_latency_us for point in points],
+            [None, 7.5, None, None, None],
+        )
+        self.assertEqual([point.interval for point in points], [0, 1, 2, 3, 4])
+
+    def test_latency_columns_are_optional(self):
+        columns = [
+            name for name in LIVE_CSV_COLUMNS if name not in ("Lat IO us", "Lat Ent us")
+        ]
+        analysis = self._analyze(
+            [
+                _row(1000, "Total", MIB, mib_s=1, iops=16),
+                _row(1000, 0, MIB),
+            ],
+            columns=columns,
+        )
+        point = analysis.domains[LiveDomainKey("READ", "")].aggregate_points[0]
+        self.assertIsNone(point.io_latency_us)
+        self.assertIsNone(point.entries_latency_us)
+        self.assertEqual(point.throughput_mib_s, 1.0)
+
+    def test_parsed_rows_are_named(self):
+        self._analyze(
+            [
+                _row(1000, "Total", MIB, mib_s=1, iops=16, lat_io=12),
+                _row(1000, 0, MIB, service="node-a"),
+            ]
+        )
+        with self.path.open(encoding="utf-8", newline="") as handle:
+            reader, columns = live_csv_reader(handle, str(self.path))
+            rows = list(iter_parsed_rows(reader, columns))
+        self.assertIsInstance(rows[0], ParsedRow)
+        self.assertEqual(rows[0].io_latency_us, 12.0)
+        self.assertIsNone(rows[0].client)
+        self.assertEqual(rows[1].client, LiveClientId("0", "node-a"))
+        self.assertEqual(rows[1].done_bytes, MIB)
+        self.assertIsNone(rows[1].io_latency_us)
+        self.assertIsNone(rows[1].mib_s)
+
+    def test_malformed_line_diagnostics_are_capped(self):
+        rows = [_row(1000, 0, MIB)]
+        rows.extend(_row(1000, 1, "bad") for _ in range(8))
+        analysis = self._analyze(rows)
+        diagnostics = analysis.domains[LiveDomainKey("READ", "")].diagnostics
+        self.assertEqual(diagnostics["malformed_client_rows"], 8)
+        named = sorted(key for key in diagnostics if key.startswith("line_"))
+        self.assertEqual(named, [f"line_{number}_invalid" for number in range(3, 8)])
+
+    def test_all_started_interval(self):
+        analysis = self._analyze(
+            [
+                _row(1000, 0, MIB),
+                _row(1000, 1, 0),
+                _row(2000, 0, 2 * MIB),
+                _row(2000, 1, 0),
+                _row(3000, 0, 3 * MIB),
+                _row(3000, 1, MIB),
+            ]
+        )
+        domain = analysis.domains[LiveDomainKey("READ", "")]
+        self.assertEqual(
+            domain.clients[LiveClientId("0", "")].first_progress_interval, 0
+        )
+        self.assertEqual(domain.all_started_interval, 2)
+        # A client that never moves data does not hold back the others.
+        stalled = self._analyze([_row(1000, 0, MIB), _row(1000, 1, 0)])
+        self.assertEqual(
+            stalled.domains[LiveDomainKey("READ", "")].all_started_interval, 0
+        )
+        idle = self._analyze([_row(1000, 0, 0), _row(1000, 1, 0)])
+        self.assertIsNone(idle.domains[LiveDomainKey("READ", "")].all_started_interval)
+        aggregate_only = self._analyze([_row(1000, "Total", MIB, mib_s=1)])
+        self.assertIsNone(
+            aggregate_only.domains[LiveDomainKey("READ", "")].all_started_interval
+        )
+
+    def test_client_sort_key_orders_ranks_numerically(self):
+        clients = [
+            LiveClientId("10", ""),
+            LiveClientId("b", ""),
+            LiveClientId("2", "node-b"),
+            LiveClientId("2", "node-a"),
+            LiveClientId("a", ""),
+        ]
+        self.assertEqual(
+            sorted(clients, key=client_sort_key),
+            [
+                LiveClientId("2", "node-a"),
+                LiveClientId("2", "node-b"),
+                LiveClientId("10", ""),
+                LiveClientId("a", ""),
+                LiveClientId("b", ""),
+            ],
         )
 
 
@@ -468,7 +612,7 @@ class TestSyntheticBenchmarkGenerator(LiveCSVTestCase):
                 "--clients",
                 str(client_count),
                 "--intervals",
-                "6",
+                "15",
                 "--work-dir",
                 self.temp_dir.name,
                 "--no-plots",
@@ -479,7 +623,7 @@ class TestSyntheticBenchmarkGenerator(LiveCSVTestCase):
         )
 
     def test_generated_fixture_exercises_anomalies(self):
-        generate_live_csv(self.path, client_count=50, interval_count=18)
+        generate_live_csv(self.path, client_count=50, interval_count=60)
         metadata = LiveFileMetadata(
             path=str(self.path),
             io_size="r64K",
@@ -488,16 +632,27 @@ class TestSyntheticBenchmarkGenerator(LiveCSVTestCase):
             io_depth=1,
             datestamp="20260729Z120000",
         )
-        analysis = analyze_live_csv(metadata, z_threshold=1.5)
+        analysis = analyze_live_csv(metadata)
         domain = analysis.domains[LiveDomainKey("READ", "")]
         self.assertEqual(len(domain.clients), 50)
         self.assertGreater(domain.diagnostics["missing_samples"], 0)
         self.assertGreater(domain.diagnostics["counter_resets"], 0)
-        persistent = domain.clients[LiveClientId("0", "client-00000")]
-        self.assertGreater(persistent.underperform_count, 0)
-        selected = select_clients(domain, min_underperform_segments=1, limit=50)
-        self.assertIn(LiveClientId("20", "client-00020"), selected)
-        self.assertIn(LiveClientId("30", "client-00030"), selected)
+        steady = analyze_steady(
+            analysis, domain, PhaseContext(60000, 60000, None, None), 1000
+        )
+        self.assertTrue(steady.window.available)
+        classes = {
+            client.rank: stats.classification
+            for client, stats in steady.clients.items()
+        }
+        self.assertEqual(classes["0"], CLASS_PERSISTENT)
+        self.assertIn(classes["15"], (CLASS_PERSISTENT, CLASS_TRANSIENT))
+        self.assertEqual(classes["45"], CLASS_OK)
+        # A counter reset inside the steady window voids the steady ratio.
+        reset = steady.clients[LiveClientId("35", "client-00035")]
+        self.assertIsNone(reset.steady_ratio)
+        self.assertEqual(reset.windows_30s, 0)
+        self.assertEqual(reset.classification, CLASS_OK)
 
     def test_benchmark_cli_rejects_fleets_too_small_for_validation(self):
         result = self._run_benchmark(50)
