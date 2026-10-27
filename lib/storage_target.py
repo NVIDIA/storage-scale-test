@@ -37,16 +37,6 @@ snapshots are *recorded* (rule 1). Rule 2 is applied here only to
 snapshots that lack the name (written before the feature existed, or edited by
 hand); their names are marked *derived* (``recorded=False``) because the
 snapshot never stated them.
-
-Cached-report target cells (the ``storage_target_name`` CSV column) hold:
-
-* empty: the target is unknown;
-* a bare name: one known target;
-* ``mixed: ITEM, ITEM, ...``: a label written for several inputs, where each
-  ITEM is a JSON string (a known name, ``json.dumps(name,
-  ensure_ascii=False)``) or the bare token ``unknown`` (an input whose target
-  could not be verified). Older caches wrote the same layout with names
-  between plain double quotes and no ``unknown`` item; they remain readable.
 """
 
 from __future__ import annotations
@@ -61,7 +51,6 @@ STORAGE_TARGET_KEY = "STORAGE_TARGET_NAME"
 UNKNOWN_TARGET = "unknown"
 ALLOW_MIXED_TARGETS_FLAG = "--allow-mixed-targets"
 MIXED_PREFIX = "mixed: "
-UNKNOWN_ITEM = UNKNOWN_TARGET
 
 _SUBSTRATE_KEY = "EXECUTION_SUBSTRATE"
 _KUBECTL = "kubectl"
@@ -207,11 +196,9 @@ def quote_target_name(name: str) -> str:
     return json.dumps(name, ensure_ascii=False)
 
 
-def mixed_target_label(names: Iterable[str], include_unknown: bool = False) -> str:
-    """The ``mixed: ...`` label for ``names``, ending ``unknown`` when requested."""
+def mixed_target_label(names: Iterable[str]) -> str:
+    """The ``mixed: ...`` label for ``names``."""
     items = [quote_target_name(name) for name in names]
-    if include_unknown:
-        items.append(UNKNOWN_ITEM)
     return MIXED_PREFIX + _SEPARATOR.join(items)
 
 
@@ -240,7 +227,7 @@ def resolve_report_target(
 ) -> str:
     """Return the report's target label, or refuse inputs from several targets.
 
-    ``sources`` pairs a label (an input directory or CSV) with its target.
+    ``sources`` pairs a label (an input directory) with its target.
     Distinct known names raise ``MixedStorageTargetsError`` unless
     ``allow_mixed``, which warns and labels the report ``mixed: "a", "b"``.
     Inputs of unknown target beside a known one only warn.
@@ -277,92 +264,6 @@ def resolve_report_target(
             f"{_SEPARATOR.join(unknown)}"
         )
     return shown
-
-
-_QUOTED_NAME = re.compile(r'"([^"]*)"')
-_DECODER = json.JSONDecoder()
-
-
-def _parse_mixed_items(body: str) -> tuple[list[str], bool] | None:
-    """Decode ``ITEM, ITEM, ...``; None when the body is not that grammar."""
-    names: list[str] = []
-    unknown = False
-    position = 0
-    while position < len(body):
-        if body.startswith('"', position):
-            try:
-                name, position = _DECODER.raw_decode(body, position)
-            except ValueError:
-                return None
-            names.append(name)
-        elif body.startswith(UNKNOWN_ITEM, position):
-            unknown = True
-            position += len(UNKNOWN_ITEM)
-        else:
-            return None
-        if position < len(body):
-            if not body.startswith(_SEPARATOR, position):
-                return None
-            position += len(_SEPARATOR)
-    return names, unknown
-
-
-def parse_target_cell(value: str) -> tuple[list[str], bool]:
-    """Known names in one cached cell, and whether it includes an unknown target.
-
-    A cell is empty (unknown), a bare name, or a ``mixed:`` label (see the module
-    docstring). A ``mixed:`` body that is not the JSON-item grammar is read as
-    the older layout of plain double-quoted names.
-    """
-    if not value:
-        return [], True
-    if not value.startswith(MIXED_PREFIX):
-        return [value], False
-    body = value[len(MIXED_PREFIX) :]
-    parsed = _parse_mixed_items(body)
-    if parsed is None:
-        return _QUOTED_NAME.findall(body), False
-    return parsed
-
-
-def cached_target_sources(
-    csv_file: str, values: Iterable[str]
-) -> list[tuple[str, str | None]]:
-    """Guard sources for a cached report: one per distinct name, plus unknown rows.
-
-    ``values`` holds the target column of every cached row; an empty cell, or a
-    ``mixed:`` label that includes ``unknown``, contributes an unverified source.
-    """
-    parsed = [parse_target_cell(cell) for cell in values]
-    names = sorted({name for known, _ in parsed for name in known})
-    sources: list[tuple[str, str | None]] = [
-        (f"{csv_file} rows", name) for name in names
-    ]
-    if any(unknown for _, unknown in parsed):
-        sources.append((f"{csv_file} rows without a target", None))
-    return sources
-
-
-def has_unverified_source(
-    sources: Iterable[tuple[str, StorageTarget | str | None]],
-) -> bool:
-    """True when any guard source has no known target."""
-    return any(_known_name(value) is None for _, value in sources)
-
-
-def exported_target_cell(label: str, unverified: bool) -> str:
-    """The CSV cell for a report ``label`` that must not launder unknown inputs.
-
-    A fully unknown report exports empty. A verified one exports its label. When
-    some inputs were unverified the cell is a ``mixed:`` label ending ``unknown``,
-    so a later ``--from-csv`` sees the uncertainty and warns again.
-    """
-    if label == UNKNOWN_TARGET:
-        return ""
-    if not unverified:
-        return label
-    names, _ = parse_target_cell(label)
-    return mixed_target_label(names, include_unknown=True)
 
 
 def guarded_report_target(

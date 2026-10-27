@@ -56,8 +56,7 @@ Produced by storage-scale-test: v1.2.3, v1.3.0
 Reported by storage-scale-test: v1.4.0
 ```
 
-`unknown` covers results recorded before versioning and metrics loaded from
-reporter CSV files or Warp analyzed JSON.
+`unknown` covers results recorded before versioning.
 
 ## Releasing
 

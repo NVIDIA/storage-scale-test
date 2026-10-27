@@ -144,7 +144,7 @@ These requirements are driven by the primary use cases of an **NVIDIA Storage Sc
 | UC-8.3 | The tool shall support Markdown report output for elbencho filesystem results. | Yes |
 | UC-8.4 | The tool shall support Markdown report output for mdtest-elbencho metadata results. | Yes |
 | UC-8.5 | The tool shall support Markdown report output for netbench network results. | Yes |
-| UC-8.7 | The tool shall support re-analysis from cached/serialized intermediate data (CSV or JSON), avoiding re-parsing raw benchmark output. | Yes |
+| UC-8.7 | Removed after v2.0.0: re-analysis from cached CSV/JSON intermediate data. Reports always read raw results. | N/A |
 | UC-8.8 | The tool shall support filtering reports by node count, thread count, IO size, IO depth, or object size. | Yes |
 | UC-8.9 | Reporting shall clearly separate and label write vs. read results, sequential vs. random IO, and direct IO vs. buffered IO in all tables and plots. | Yes |
 | UC-8.10 | Plot colors shall use colorblind-accessible palettes. | Yes |

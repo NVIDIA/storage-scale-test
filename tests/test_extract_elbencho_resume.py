@@ -32,10 +32,7 @@ add_elbencho_out_file_metrics = _EXTRACT_MOD.add_elbencho_out_file_metrics
 apply_execution_workloads = _EXTRACT_MOD.apply_execution_workloads
 parse_elbencho_csv_file = _EXTRACT_MOD.parse_elbencho_csv_file
 print_workload_metadata_for_metrics = _EXTRACT_MOD.print_workload_metadata_for_metrics
-read_csv = _EXTRACT_MOD.read_csv
-write_csv = _EXTRACT_MOD.write_csv
 parse_io_histogram = getattr(_EXTRACT_MOD, "_parse_op_hist_fragment")
-parse_csv_histogram = getattr(_EXTRACT_MOD, "_elbencho_csv_parse_histogram_cell")
 
 _DS = "20260722Z030114"
 _BASE = f"elbencho-r64K-c_600-s_004-d_001_{_DS}"
@@ -362,15 +359,6 @@ class TestExecutionWorkloadMetadata(unittest.TestCase):
             self.assertEqual(metric.write_completion_state, "incomplete")
             self.assertEqual(metric.write_completed_bytes, huge_bytes)
 
-            extracted_csv = Path(tmp) / "extracted.csv"
-            write_csv(str(extracted_csv), [metric])
-            reloaded = read_csv(str(extracted_csv))[0]
-            self.assertEqual(reloaded.dataset_bytes_total, huge_bytes)
-            self.assertEqual(reloaded.write_completed_bytes, huge_bytes)
-            self.assertEqual(reloaded.write_completion_state, "incomplete")
-            self.assertEqual(reloaded.delete_elapsed_time_ms, "null")
-            self.assertEqual(reloaded.lifecycle_elapsed_time_ms, "null")
-
     def test_duplicate_or_noncanonical_metadata_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             _write_execution_metadata(Path(tmp), "0001")
@@ -525,16 +513,11 @@ class TestResumeOutLastSection(unittest.TestCase):
 
 
 class TestHistogramBucketCollisions(unittest.TestCase):
-    """Duplicate raw buckets combine; malformed cache collisions fail."""
+    """Duplicate raw buckets combine."""
 
     def test_raw_histogram_sums_equivalent_time_buckets(self) -> None:
         histogram = parse_io_histogram("2400: 5, 2400.0: 7")
         self.assertEqual(histogram, {0.0024: 12})
-
-    def test_cached_histogram_rejects_normalized_key_collision(self) -> None:
-        row = {"histogram": '{"2.4": 5, "2.40": 7}'}
-        with self.assertRaisesRegex(ValueError, "Duplicate histogram bucket"):
-            parse_csv_histogram(row)
 
 
 if __name__ == "__main__":

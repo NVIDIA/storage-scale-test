@@ -97,9 +97,8 @@ latency, and scaling efficiency. Markdown output is not implemented.
 | `--only-sizes SIZE` | Select object sizes; repeat or separate with `;`, not commas |
 | `--only-threads LIST` | Select comma-separated thread counts |
 | `--output-dir DIR` | Choose the report/plot directory |
-| `--to-json` / `--from-json PATH` | Export/reload analyzed metrics, including client data |
 | `--per-client-plots` | Compare clients and flag underperformance |
 | `--client-outlier-threshold Z` | Underperformance z-score magnitude (default 2.0) |
 | `--client-min-underperform-segments N` | Require N underperforming segments (default 1) |
 
-Use `--help` for cached-input path forms and defaults.
+Use `--help` for defaults.

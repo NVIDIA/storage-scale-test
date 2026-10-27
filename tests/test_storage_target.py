@@ -15,28 +15,23 @@
 
 """Storage target identity, labelling, and the mixed-target guard."""
 
+import json
 from pathlib import Path
 import shlex
 import subprocess
 import sys
-from types import SimpleNamespace
 
 import pytest
 
-from lib.env_used_yaml import apply_env_used_to_metrics
 from lib.storage_target import (
     ALLOW_MIXED_TARGETS_FLAG,
     UNKNOWN_TARGET,
     MixedStorageTargetsError,
     StorageTarget,
-    cached_target_sources,
     default_storage_target_name,
     describe_storage_target,
-    exported_target_cell,
     guarded_report_target,
-    has_unverified_source,
     mixed_target_label,
-    parse_target_cell,
     resolve_report_target,
     storage_target_from_env,
 )
@@ -161,19 +156,6 @@ def test_guard_mixed_names_allowed_warn_and_label():
     assert "cannot verify storage target of 1 input(s): d3" in warnings[1]
 
 
-def test_cached_sources_expand_mixed_labels_and_flag_unknown_rows():
-    sources = cached_target_sources("m.csv", ['mixed: "a", "b"', "a", ""])
-    assert sources == [
-        ("m.csv rows", "a"),
-        ("m.csv rows", "b"),
-        ("m.csv rows without a target", None),
-    ]
-    assert cached_target_sources("m.csv", ["", ""]) == [
-        ("m.csv rows without a target", None)
-    ]
-    assert cached_target_sources("m.csv", []) == []
-
-
 def test_guarded_report_target_exits_one_with_error(capsys):
     with pytest.raises(SystemExit) as raised:
         guarded_report_target([("d1", "a"), ("d2", "b")], False)
@@ -187,68 +169,23 @@ AWKWARD_NAMES = ['a"b', "back\\slash", "line\nbreak", 'x", "y', "comma, space", 
 
 
 @pytest.mark.parametrize("name", AWKWARD_NAMES)
-def test_mixed_label_round_trips_any_name(name):
-    label = mixed_target_label(["plain", name], include_unknown=True)
-    assert parse_target_cell(label) == (["plain", name], True)
-    assert parse_target_cell(mixed_target_label([name])) == ([name], False)
-    resolved, _ = _resolve([("d1", name), ("d2", "plain")], True)
-    assert parse_target_cell(resolved) == (sorted([name, "plain"]), False)
-
-
-def test_older_mixed_labels_without_escapes_remain_readable():
-    assert parse_target_cell('mixed: "lustre-a", "weka-b"') == (
-        ["lustre-a", "weka-b"],
-        False,
+def test_mixed_label_quotes_any_name_as_a_json_string(name):
+    label, _ = _resolve([("d1", name), ("d2", "plain")], True)
+    names = sorted([name, "plain"], key=lambda item: item.encode("utf-8"))
+    assert label == mixed_target_label(names)
+    assert label == "mixed: " + ", ".join(
+        json.dumps(n, ensure_ascii=False) for n in names
     )
-    assert parse_target_cell("mixed: ") == ([], False)
-    # Not the JSON-item grammar: fall back to plain double-quoted names.
-    assert parse_target_cell('mixed: "a" "b"') == (["a", "b"], False)
-    assert parse_target_cell('mixed: "a", bogus') == (["a"], False)
-
-
-def test_parse_target_cell_plain_and_empty_cells():
-    assert parse_target_cell("lustre-a") == (["lustre-a"], False)
-    assert parse_target_cell("") == ([], True)
+    assert "\n" not in label
 
 
 def test_name_with_a_quote_is_not_split_by_the_guard():
     quoted = 'x", "y'
     label, _ = _resolve([("d1", quoted), ("d2", "z")], True)
     assert label == 'mixed: "x\\", \\"y", "z"'
-    sources = cached_target_sources("m.csv", [label])
-    assert [name for _, name in sources] == [quoted, "z"]
     with pytest.raises(MixedStorageTargetsError) as raised:
         resolve_report_target([("d1", quoted), ("d2", "z")], False, print)
     assert '"x\\", \\"y": d1' in str(raised.value)
-
-
-@pytest.mark.parametrize(
-    "label, unverified, expected",
-    [
-        (UNKNOWN_TARGET, False, ""),
-        (UNKNOWN_TARGET, True, ""),
-        ("a", False, "a"),
-        ("a", True, 'mixed: "a", unknown'),
-        ('mixed: "a", "b"', False, 'mixed: "a", "b"'),
-        ('mixed: "a", "b"', True, 'mixed: "a", "b", unknown'),
-    ],
-)
-def test_exported_cell_never_launders_unverified_inputs(label, unverified, expected):
-    assert exported_target_cell(label, unverified) == expected
-
-
-def test_unverified_cell_makes_a_later_read_warn_again():
-    cell = exported_target_cell("a", True)
-    sources = cached_target_sources("m.csv", [cell, cell])
-    assert sources == [("m.csv rows", "a"), ("m.csv rows without a target", None)]
-    assert has_unverified_source(sources)
-    label, warnings = _resolve(sources)
-    assert label == "a"
-    assert warnings == [
-        "cannot verify storage target of 1 input(s): m.csv rows without a target"
-    ]
-    assert not has_unverified_source([("d", "a"), ("e", StorageTarget("a", True))])
-    assert has_unverified_source([("d", "a"), ("e", None)])
 
 
 def test_current_snapshots_record_the_name_and_display_it_bare():
@@ -353,17 +290,3 @@ def test_identity_and_batch_modules_import_without_third_party_packages():
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
-
-
-@pytest.mark.parametrize(
-    "env, expected",
-    [
-        ({"STORAGE_TARGET_NAME": "lustre-a"}, "lustre-a"),
-        ({"TEST_DIRS": {"/mnt/a/": 1}}, "/mnt/a"),
-        ({}, ""),
-    ],
-)
-def test_snapshots_set_the_name_on_every_metric(env, expected):
-    metrics = [SimpleNamespace(storage_target_name="stale") for _ in range(2)]
-    apply_env_used_to_metrics(env, metrics)
-    assert [metric.storage_target_name for metric in metrics] == [expected] * 2

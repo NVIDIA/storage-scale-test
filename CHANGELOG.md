@@ -21,6 +21,13 @@ Notable changes in each release. Versions follow [Semantic Versioning](https://s
 see [docs/VERSIONING.md](docs/VERSIONING.md). Each release's notes are its
 section below.
 
+## Unreleased
+
+### Breaking
+
+- The report caches are removed: `--to-csv`/`--from-csv` (filesystem and
+  netbench) and `--to-json`/`--from-json` (Warp). Reports read raw results.
+
 ## [2.0.0] - 2026-10-19
 
 ### Breaking

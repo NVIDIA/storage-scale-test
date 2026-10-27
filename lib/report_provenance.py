@@ -16,8 +16,7 @@
 """Project versions shown in reports: those that produced the results, and ours.
 
 Benchmark runs record their version beside each native result file as
-``<name>.out.project-version``. Versions stay out of metric models, so metrics
-loaded from reporter CSV or Warp JSON caches report an unknown version.
+``<name>.out.project-version``. Versions stay out of metric models.
 """
 
 from pathlib import Path
@@ -27,7 +26,8 @@ from typing import Callable, Iterable, List
 from lib.project_version import UNKNOWN, project_version
 
 VERSION_SUFFIX = ".project-version"
-_CACHE_SUFFIXES = (".json.zst", ".json")
+# Warp results are JSON; their version file is named after the matching .out.
+_JSON_RESULT_SUFFIXES = (".json.zst", ".json")
 # Display guard only; lib/project_version.sh defines version syntax.
 _DISPLAYABLE = re.compile(r"[0-9A-Za-z.+-]{1,128}")
 
@@ -36,7 +36,7 @@ def result_version(result_file) -> str:
     """Return the version recorded beside a native result file."""
     path = Path(result_file)
     name = path.name
-    for suffix in _CACHE_SUFFIXES:
+    for suffix in _JSON_RESULT_SUFFIXES:
         if name.endswith(suffix):
             name = name.removesuffix(suffix) + ".out"
             break
@@ -60,7 +60,7 @@ class ResultVersions:
             self._by_id[id(metric)] = (metric, version)
 
     def of(self, metrics: Iterable) -> List[str]:
-        """Versions of the given metrics; copies and cached metrics are unknown."""
+        """Versions of the given metrics; copies are unknown."""
         versions = []
         for metric in metrics:
             entry = self._by_id.get(id(metric))

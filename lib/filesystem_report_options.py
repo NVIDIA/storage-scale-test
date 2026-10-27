@@ -40,15 +40,6 @@ class ReportOption:
 
 REPORT_OPTIONS = (
     ReportOption(
-        "--to-csv", "common", "Export metrics to CSV.", {"action": "store_true"}
-    ),
-    ReportOption(
-        "--from-csv",
-        "common",
-        "Read cached metrics instead of raw results.",
-        {"metavar": "FILE"},
-    ),
-    ReportOption(
         ALLOW_MIXED_TARGETS_FLAG,
         "common",
         "Combine results from different storage targets in one report, "

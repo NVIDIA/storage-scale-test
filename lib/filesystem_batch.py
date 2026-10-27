@@ -438,10 +438,8 @@ def report_batch(
     selected = _selected_groups(manifest, kind, groups)
     if not selected:
         raise ValueError("No batch groups match --kind and --groups")
-    if analysis_args is not None and (
-        hasattr(analysis_args, "from_csv") or hasattr(analysis_args, "test_parse")
-    ):
-        raise ValueError("--from-csv and --test-parse cannot report a prepared batch")
+    if analysis_args is not None and hasattr(analysis_args, "test_parse"):
+        raise ValueError("--test-parse cannot report a prepared batch")
     routed = (
         options_by_kind(analysis_args, {group.kind for group in selected})
         if analysis_args is not None
@@ -746,7 +744,7 @@ def route_batch_report(args: argparse.Namespace, kind: str, argv: list[str]) -> 
         if args.groups:
             raise ValueError("--groups requires a prepared batch input")
         return False
-    if len(args.input_dirs) != 1 or args.from_csv:
+    if len(args.input_dirs) != 1:
         raise ValueError("A prepared batch must be the sole raw reporting input")
     if getattr(args, "test_parse", None):
         raise ValueError("--test-parse cannot report a prepared batch")

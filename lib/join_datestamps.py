@@ -15,9 +15,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Join run datestamps for titles and filesystem-safe plot/CSV basenames.
+"""Join run datestamps for titles and filesystem-safe plot basenames.
 
-Plot PNG and CSV basenames are a single path component and must stay within
+Plot PNG basenames are a single path component and must stay within
 NAME_MAX (255 on ext4/APFS/XFS). Joining every run datestamp into that
 component fails when many result directories are combined. Use ``max_len`` (or
 ``join_datestamps_for_filename``) for path components; keep the full join for
@@ -28,6 +28,7 @@ from typing import Optional, Set
 
 # Single path-component limit on ext4/APFS/XFS (NAME_MAX).
 MAX_FILENAME_LEN = 255
+_PLOT_SUFFIX = ".png"
 
 
 def join_datestamps(
@@ -59,15 +60,14 @@ def join_datestamps_for_filename(
     datestamps: Set[str],
     *,
     prefix: str,
-    suffix: str = ".png",
     sep: str = "-",
     max_filename_len: int = MAX_FILENAME_LEN,
 ) -> str:
-    """Join datestamps so ``prefix + result + suffix`` stays within NAME_MAX."""
-    budget = max_filename_len - len(prefix) - len(suffix)
+    """Join datestamps so ``prefix + result + ".png"`` stays within NAME_MAX."""
+    budget = max_filename_len - len(prefix) - len(_PLOT_SUFFIX)
     if budget < 1:
         raise ValueError(
-            f"prefix {prefix!r} and suffix {suffix!r} leave no room for datestamps "
+            f"prefix {prefix!r} and {_PLOT_SUFFIX!r} leave no room for datestamps "
             f"within {max_filename_len} characters"
         )
     return join_datestamps(datestamps, sep=sep, max_len=budget)

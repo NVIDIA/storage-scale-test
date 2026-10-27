@@ -676,20 +676,15 @@ cross-target report.
   after the version lines, and the IO settings summary leads its Targets row
   with `name=` (a long row is shortened with an ellipsis or `(+K more)`).
 - **Combining separate results.** One report given results from different
-  targets (several results directories on one command line, or a combined CSV
-  via `--from-csv`) exits 1 before writing anything, because IO tables would
-  merge and metadata results would be averaged. Sweeps of different `TEST_DIRS`
+  targets (several results directories on one command line) exits 1 before
+  writing anything, because IO tables would merge and metadata results would
+  be averaged. Sweeps of different `TEST_DIRS`
   roots are different targets unless they share a `STORAGE_TARGET_NAME`; this
   includes results saved before v2.0.0, whose name is derived from their roots.
   Inputs without a saved `env_used.yaml` are unknown and only warn.
   `--allow-mixed-targets` combines them anyway, with a warning and a
   `Storage target: mixed: "a", "b"` header; aggregate tables then average
   across targets.
-- **Stitching.** `--to-csv` adds a `storage_target_name` column (empty or a
-  name; metadata rows may also hold `mixed: ...`), so per-target CSVs can be
-  concatenated and filtered outside the tool. Reloading such a combined CSV
-  with `--from-csv` needs `--allow-mixed-targets`. v1.x checkouts cannot
-  reload the new IO CSVs.
 
 ## Filesystem reporting
 
@@ -743,13 +738,12 @@ is removed:
 Results from different storage targets are never combined silently; see
 [reporting per target](#reporting-per-target).
 
-Use `--help` for all options. Cached CSV input and single-file parsing require
-`--kind io|mdtest` and are not batch-reporting modes.
+Use `--help` for all options. Single-file parsing requires `--kind io|mdtest`
+and is not a batch-reporting mode.
 
 | Scope | Option | Purpose |
 | --- | --- | --- |
 | Both | `--only-nodes LIST`, `--only-threads LIST` | Select counts with comma lists or ranges |
-| Both | `--to-csv`, `--from-csv FILE` | Export/reload analyzed metrics |
 | Both | `--markdown` | Markdown on stdout; progress on stderr |
 | Both | `--test-parse FILE` | Inspect one raw result without reporting |
 | Both | `--allow-mixed-targets` | Combine results from different [storage targets](#reporting-per-target) in one report (a batch never needs it) |
@@ -764,8 +758,8 @@ Use `--help` for all options. Cached CSV input and single-file parsing require
 | Metadata | `--normalize-to N` | Scale rates/stddev to N nodes, not latency |
 
 For several result directories at once, use `extract-elbencho.py` or
-`extract-mdtest-elbencho.py`, which accept the same filters, CSV
-export/import, and `--markdown`. IO reports show IOPS or throughput and
+`extract-mdtest-elbencho.py`, which accept the same filters
+and `--markdown`. IO reports show IOPS or throughput and
 latency by operation, size, thread count, node count, and I/O depth. Metadata
 reports show create/stat/delete rates, elapsed times, latency distributions,
 variance, and scaling efficiency.

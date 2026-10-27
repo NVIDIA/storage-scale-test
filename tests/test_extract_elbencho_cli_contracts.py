@@ -19,8 +19,6 @@
 
 import sys
 from dataclasses import replace
-from pathlib import Path
-import subprocess
 
 import pytest
 
@@ -30,7 +28,7 @@ _EXTRACT = load_extract_elbencho_module("extract_elbencho_cli_contracts")
 
 
 def _metric():
-    """Return one valid metric suitable for a CSV-only report invocation."""
+    """Return one valid metric suitable for a stubbed report invocation."""
     return _EXTRACT.ElbenchoMetrics(
         nodes=1,
         io_size="4K",
@@ -63,57 +61,6 @@ def _run_main(monkeypatch, *arguments):
     return _EXTRACT.main()
 
 
-def test_from_csv_rejects_raw_result_directories(monkeypatch, tmp_path):
-    """CSV input is an alternative source, never a second source to merge."""
-    with pytest.raises(SystemExit) as raised:
-        _run_main(
-            monkeypatch,
-            "--from-csv",
-            str(tmp_path / "metrics.csv"),
-            str(tmp_path / "raw-results"),
-        )
-    assert raised.value.code == 2
-
-
-def test_unified_front_door_reports_real_cached_io_metrics(tmp_path):
-    """Verify native IO filters, CSV export, and plotting through the front door."""
-    source = tmp_path / "cached.csv"
-    _EXTRACT.write_csv(str(source), [_metric()])
-    output = tmp_path / "reports"
-    entry = Path(__file__).resolve().parents[1] / "utils/extract-filesystem.py"
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(entry),
-            "--kind",
-            "io",
-            "--from-csv",
-            str(source),
-            "--only-nodes",
-            "1",
-            "--only-threads",
-            "1",
-            "--only-sizes",
-            "4K",
-            "--only-iodepths",
-            "1",
-            "--to-csv",
-            "--markdown",
-            "--no-dual-y-axis",
-            "--output-dir",
-            str(output),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "WRITE" in completed.stdout
-    assert "- Produced by storage-scale-test: unknown\n" in completed.stdout
-    assert (output / "elbencho-metrics.csv").is_file()
-    assert list(output.glob("*.png"))
-
-
 @pytest.mark.parametrize(
     "option, value",
     [
@@ -136,14 +83,13 @@ def test_filter_parser_rejects_malformed_syntax(option, value):
 
 def test_valid_filter_matching_no_metrics_is_an_error(monkeypatch, tmp_path):
     """A successful process must not hide an accidentally empty report."""
-    csv_path = tmp_path / "metrics.csv"
-    _EXTRACT.write_csv(str(csv_path), [_metric()])
+    directory = _target_dir(tmp_path, "a", None)
+    monkeypatch.setattr(_EXTRACT, "parse_elbencho_files", lambda _base: [_metric()])
 
     with pytest.raises(SystemExit) as raised:
         _run_main(
             monkeypatch,
-            "--from-csv",
-            str(csv_path),
+            str(directory),
             "--only-nodes",
             "99",
             "--markdown",
@@ -191,8 +137,9 @@ def test_failed_live_reports_cannot_hide_behind_aggregate(monkeypatch, tmp_path)
     assert raised.value.code == 1
 
 
-def test_csv_round_trip_preserves_report_dimensions(tmp_path):
-    """Persisted metrics retain the dimensions needed by later filtering."""
+def test_cli_filters_compound_size_and_forwards_plot_mode(monkeypatch, tmp_path):
+    """CLI filters preserve compound sizes and the single-axis request."""
+    directory = _target_dir(tmp_path, "a", None)
     metrics = [
         _metric(),
         replace(
@@ -202,45 +149,9 @@ def test_csv_round_trip_preserves_report_dimensions(tmp_path):
             threads=8,
             io_depth=4,
             operation="READ",
-            random_io=1,
         ),
     ]
-    path = tmp_path / "metrics.csv"
-    _EXTRACT.write_csv(str(path), metrics)
-    loaded = _EXTRACT.read_csv(str(path))
-    assert [
-        (
-            item.nodes,
-            item.io_size,
-            item.threads,
-            item.io_depth,
-            item.operation,
-            item.random_io,
-        )
-        for item in loaded
-    ] == [
-        (1, "4K", 1, 1, "WRITE", 0),
-        (2, "1M,r4K", 8, 4, "READ", 1),
-    ]
-
-
-def test_csv_cli_filters_compound_size_and_forwards_plot_mode(monkeypatch, tmp_path):
-    """CLI filters preserve compound sizes and the single-axis request."""
-    path = tmp_path / "metrics.csv"
-    _EXTRACT.write_csv(
-        str(path),
-        [
-            _metric(),
-            replace(
-                _metric(),
-                nodes=2,
-                io_size="1M,r4K",
-                threads=8,
-                io_depth=4,
-                operation="READ",
-            ),
-        ],
-    )
+    monkeypatch.setattr(_EXTRACT, "parse_elbencho_files", lambda _base: metrics)
     reported = []
     plotted = []
     monkeypatch.setattr(
@@ -258,8 +169,7 @@ def test_csv_cli_filters_compound_size_and_forwards_plot_mode(monkeypatch, tmp_p
 
     _run_main(
         monkeypatch,
-        "--from-csv",
-        str(path),
+        str(directory),
         "--only-nodes",
         "2",
         "--only-threads",
@@ -278,12 +188,11 @@ def test_csv_cli_filters_compound_size_and_forwards_plot_mode(monkeypatch, tmp_p
     assert [item.operation for item in reported[0][0]] == ["READ"]
 
 
-def test_csv_cli_can_reemit_cache_and_default_terminal_report(monkeypatch, tmp_path):
-    """CSV input supports cache output and the normal mirrored text report."""
-    source = tmp_path / "source.csv"
-    _EXTRACT.write_csv(str(source), [_metric()])
+def test_cli_default_terminal_report_is_mirrored_to_a_text_file(monkeypatch, tmp_path):
+    """Without --markdown the normal mirrored text report is written."""
+    directory = _target_dir(tmp_path, "a", None)
+    monkeypatch.setattr(_EXTRACT, "parse_elbencho_files", lambda _base: [_metric()])
     mirrored = []
-    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
         _EXTRACT,
         "mirror_stdout_to_file",
@@ -291,13 +200,10 @@ def test_csv_cli_can_reemit_cache_and_default_terminal_report(monkeypatch, tmp_p
     )
     monkeypatch.setattr(_EXTRACT, "plot_metrics", lambda *_arguments: None)
 
-    _run_main(monkeypatch, "--from-csv", str(source), "--to-csv")
+    _run_main(monkeypatch, str(directory))
 
-    cache = tmp_path / "elbencho-metrics.csv"
-    assert cache.is_file()
-    assert len(_EXTRACT.read_csv(str(cache))) == 1
     assert len(mirrored) == 1
-    assert mirrored[0][0] == str(tmp_path / _EXTRACT.REPORT_TXT_FILENAME)
+    assert mirrored[0][0] == str(directory / _EXTRACT.REPORT_TXT_FILENAME)
     assert [item.operation for item in mirrored[0][2]] == ["WRITE"]
 
 
@@ -310,10 +216,10 @@ def test_csv_cli_can_reemit_cache_and_default_terminal_report(monkeypatch, tmp_p
         "--client-max-heatmap-rows",
     ],
 )
-def test_live_report_limits_must_be_positive(monkeypatch, option):
+def test_live_report_limits_must_be_positive(monkeypatch, tmp_path, option):
     """Invalid live-report limits fail at the CLI boundary."""
     with pytest.raises(SystemExit) as raised:
-        _run_main(monkeypatch, "--from-csv", "unused.csv", option, "0")
+        _run_main(monkeypatch, str(tmp_path), option, "0")
     assert raised.value.code == 2
 
 
@@ -357,9 +263,7 @@ def test_mixed_targets_exit_before_anything_is_written(
     second = _target_dir(tmp_path, "b", "weka-b")
     output = tmp_path / "out"
     with pytest.raises(SystemExit) as raised:
-        _run_main(
-            monkeypatch, str(first), str(second), "--to-csv", f"--output-dir={output}"
-        )
+        _run_main(monkeypatch, str(first), str(second), f"--output-dir={output}")
     assert raised.value.code == 1
     captured = capsys.readouterr()
     assert captured.err.count("ERROR: ") == 1
@@ -368,7 +272,6 @@ def test_mixed_targets_exit_before_anything_is_written(
     assert "--allow-mixed-targets" in captured.err
     assert not output.exists()
     assert not list(tmp_path.rglob("report.txt"))
-    assert not (first / "elbencho-metrics.csv").exists()
     assert not stubbed_report
 
 
@@ -426,72 +329,9 @@ def test_snapshot_without_name_derives_it_from_the_roots(
     (directory / "env_used.yaml").write_text(
         'TEST_DIRS:\n  "/mnt/b/": 1\n  "/mnt/a": 1\n', encoding="utf-8"
     )
-    _run_main(monkeypatch, str(directory), "--markdown", "--to-csv")
+    _run_main(monkeypatch, str(directory), "--markdown")
     assert _target_lines(capsys.readouterr().out) == ["- Storage target: /mnt/a,/mnt/b"]
-    loaded = _EXTRACT.read_csv(str(directory / "elbencho-metrics.csv"))
-    assert [item.storage_target_name for item in loaded] == ["/mnt/a,/mnt/b"]
     assert stubbed_report
-
-
-def test_csv_round_trip_keeps_the_target(monkeypatch, tmp_path, capsys, stubbed_report):
-    directory = _target_dir(tmp_path, "a", "lustre-a")
-    _run_main(monkeypatch, str(directory), "--to-csv", "--markdown")
-    capsys.readouterr()
-    cached = directory / "elbencho-metrics.csv"
-    assert [m.storage_target_name for m in _EXTRACT.read_csv(str(cached))] == [
-        "lustre-a"
-    ]
-    _run_main(monkeypatch, "--from-csv", str(cached), "--markdown")
-    assert _target_lines(capsys.readouterr().out) == ["- Storage target: lustre-a"]
-    assert stubbed_report
-
-
-def test_csv_without_the_column_still_loads_with_unknown_target(
-    monkeypatch, tmp_path, capsys, stubbed_report
-):
-    path = tmp_path / "metrics.csv"
-    _EXTRACT.write_csv(str(path), [_metric()])
-    lines = path.read_text(encoding="utf-8").splitlines()
-    header = lines[0].split(",")
-    index = header.index('"storage_target_name"')
-    assert index == len(header) - 1
-    path.write_text(
-        "\n".join(",".join(line.split(",")[:index]) for line in lines) + "\n",
-        encoding="utf-8",
-    )
-    assert [m.storage_target_name for m in _EXTRACT.read_csv(str(path))] == [""]
-    _run_main(monkeypatch, "--from-csv", str(path), "--markdown")
-    captured = capsys.readouterr()
-    assert _target_lines(captured.out) == ["- Storage target: unknown"]
-    assert "WARNING" not in captured.err
-    assert stubbed_report
-
-
-def _mixed_csv(tmp_path):
-    path = tmp_path / "mixed.csv"
-    _EXTRACT.write_csv(
-        str(path),
-        [
-            replace(_metric(), storage_target_name="lustre-a"),
-            replace(_metric(), nodes=2, storage_target_name="weka-b"),
-        ],
-    )
-    return path
-
-
-def test_mixed_cached_metrics_are_refused(
-    monkeypatch, tmp_path, capsys, stubbed_report
-):
-    path = _mixed_csv(tmp_path)
-    output = tmp_path / "out"
-    with pytest.raises(SystemExit) as raised:
-        _run_main(
-            monkeypatch, "--from-csv", str(path), "--to-csv", f"--output-dir={output}"
-        )
-    assert raised.value.code == 1
-    err = capsys.readouterr().err
-    assert '"lustre-a": ' in err and '"weka-b": ' in err and f"{path} rows" in err
-    assert not output.exists() and not stubbed_report
 
 
 @pytest.mark.parametrize(
@@ -504,27 +344,29 @@ def test_mixed_cached_metrics_are_refused(
         ["--only-sizes", "99G"],
     ],
 )
-def test_cached_guard_runs_before_the_only_filters(
+def test_guard_runs_before_the_only_filters(
     monkeypatch, tmp_path, capsys, stubbed_report, filters
 ):
     """A filter that keeps one target's rows cannot hide the other target."""
-    path = _mixed_csv(tmp_path)
+    first = _target_dir(tmp_path, "a", "lustre-a")
+    second = _target_dir(tmp_path, "b", "weka-b")
     with pytest.raises(SystemExit) as raised:
-        _run_main(monkeypatch, "--from-csv", str(path), *filters)
+        _run_main(monkeypatch, str(first), str(second), *filters)
     assert raised.value.code == 1
     err = capsys.readouterr().err
     assert "inputs come from different storage targets" in err
     assert not stubbed_report
 
 
-def test_allowed_mixed_cache_label_ignores_the_only_filters(
+def test_allowed_mixed_label_ignores_the_only_filters(
     monkeypatch, tmp_path, capsys, stubbed_report
 ):
-    path = _mixed_csv(tmp_path)
+    first = _target_dir(tmp_path, "a", "lustre-a")
+    second = _target_dir(tmp_path, "b", "weka-b")
     _run_main(
         monkeypatch,
-        "--from-csv",
-        str(path),
+        str(first),
+        str(second),
         "--only-nodes",
         "1",
         "--markdown",
@@ -545,26 +387,4 @@ def test_mixed_label_with_a_quote_in_a_name_is_not_split(
     assert _target_lines(capsys.readouterr().out) == [
         '- Storage target: mixed: "x\\", \\"y", "z"'
     ]
-    assert stubbed_report
-
-
-def test_allowed_mixed_cached_metrics_keep_per_row_targets(
-    monkeypatch, tmp_path, capsys, stubbed_report
-):
-    path = _mixed_csv(tmp_path)
-    output = tmp_path / "out"
-    _run_main(
-        monkeypatch,
-        "--from-csv",
-        str(path),
-        _ALLOW_MIXED,
-        "--to-csv",
-        "--markdown",
-        f"--output-dir={output}",
-    )
-    assert _target_lines(capsys.readouterr().out) == [
-        '- Storage target: mixed: "lustre-a", "weka-b"'
-    ]
-    again = _EXTRACT.read_csv(str(output / "elbencho-metrics.csv"))
-    assert [m.storage_target_name for m in again] == ["lustre-a", "weka-b"]
     assert stubbed_report

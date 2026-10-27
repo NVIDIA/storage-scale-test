@@ -226,15 +226,13 @@ collect before resume.
   (`https://github.com/NVIDIA/warp-minio`).
 - Network testing is beta; Elbencho netbench has no native timeout, so
   external execution limits are the operator's concern.
-- Histogram caches reject colliding numeric bucket keys on import, while raw
-  and live histograms sum repeated buckets so no observation is lost.
+- Raw and live histograms sum repeated buckets so no observation is lost.
 
 ## Results and analysis
 
 - Analyzer help and version run before the `.venv` bootstrap; object and
   network launcher help also precedes configuration and credential guards.
-- Report versions stay out of metric models, so reporter CSV and Warp JSON
-  caches report `unknown` ([VERSIONING.md](VERSIONING.md)).
+- Report versions stay out of metric models ([VERSIONING.md](VERSIONING.md)).
 - Plot color maps are built before plotting so non-contiguous equivalent
   series share a color.
 - Batch `reports.txt` exists only with at least two eligible owned reports;

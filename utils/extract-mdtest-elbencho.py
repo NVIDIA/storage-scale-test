@@ -23,7 +23,6 @@ iterations, and generates performance reports and visualizations.
 """
 
 import csv
-import json
 import math
 import os
 import re
@@ -74,10 +73,7 @@ from lib.reporting_common import (  # pylint: disable=wrong-import-position
 )
 from lib.storage_target import (  # pylint: disable=wrong-import-position
     MIXED_PREFIX,
-    cached_target_sources,
-    exported_target_cell,
     guarded_report_target,
-    has_unverified_source,
     storage_target_from_env,
 )
 from lib.stdout_report_file import (  # pylint: disable=wrong-import-position
@@ -202,9 +198,6 @@ class AggregatedMetrics:
     create_command: str = ""
     stat_command: str = ""
     delete_command: str = ""
-
-    # Storage target recorded in a cached CSV ("" when unknown or computed fresh)
-    storage_target_name: str = ""
 
 
 # =============================================================================
@@ -1506,218 +1499,6 @@ def print_markdown_report(
 
 
 # =============================================================================
-# CSV Import/Export
-# =============================================================================
-
-
-def write_csv_export(
-    csv_path: str,
-    metrics: List[AggregatedMetrics],
-    test_configuration: Optional[Dict[str, str]] = None,
-    storage_target: str = "",
-) -> None:
-    """Write aggregated metrics, configuration provenance and target to CSV."""
-    if not metrics:
-        return
-
-    # Define fields to export (excluding histograms which we'll JSON-encode)
-    fieldnames = [
-        "node_count",
-        "thread_count",
-        "datestamps",
-        "iteration_count",
-        *MDTEST_CONFIG_KEYS,
-        "create_rate_avg",
-        "create_rate_stddev",
-        "create_rate_min",
-        "create_rate_max",
-        "stat_rate_avg",
-        "stat_rate_stddev",
-        "stat_rate_min",
-        "stat_rate_max",
-        "delete_rate_avg",
-        "delete_rate_stddev",
-        "delete_rate_min",
-        "delete_rate_max",
-        "create_elapsed_avg_sec",
-        "stat_elapsed_avg_sec",
-        "delete_elapsed_avg_sec",
-        "create_lat_p0",
-        "create_lat_p50",
-        "create_lat_p90",
-        "create_lat_p99",
-        "create_lat_p100",
-        "stat_lat_p0",
-        "stat_lat_p50",
-        "stat_lat_p90",
-        "stat_lat_p99",
-        "stat_lat_p100",
-        "delete_lat_p0",
-        "delete_lat_p50",
-        "delete_lat_p90",
-        "delete_lat_p99",
-        "delete_lat_p100",
-        "create_histogram",
-        "stat_histogram",
-        "delete_histogram",
-        "create_command",
-        "stat_command",
-        "delete_command",
-        "storage_target_name",
-    ]
-
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
-        writer.writeheader()
-
-        for m in metrics:
-            row = {
-                "node_count": m.node_count,
-                "thread_count": m.thread_count,
-                "datestamps": ",".join(sorted(m.datestamps)),
-                "iteration_count": m.iteration_count,
-                "create_rate_avg": m.create_rate_avg,
-                "create_rate_stddev": m.create_rate_stddev,
-                "create_rate_min": m.create_rate_min,
-                "create_rate_max": m.create_rate_max,
-                "stat_rate_avg": m.stat_rate_avg,
-                "stat_rate_stddev": m.stat_rate_stddev,
-                "stat_rate_min": m.stat_rate_min,
-                "stat_rate_max": m.stat_rate_max,
-                "delete_rate_avg": m.delete_rate_avg,
-                "delete_rate_stddev": m.delete_rate_stddev,
-                "delete_rate_min": m.delete_rate_min,
-                "delete_rate_max": m.delete_rate_max,
-                "create_elapsed_avg_sec": m.create_elapsed_avg_sec,
-                "stat_elapsed_avg_sec": m.stat_elapsed_avg_sec,
-                "delete_elapsed_avg_sec": m.delete_elapsed_avg_sec,
-                "create_lat_p0": m.create_lat_p0,
-                "create_lat_p50": m.create_lat_p50,
-                "create_lat_p90": m.create_lat_p90,
-                "create_lat_p99": m.create_lat_p99,
-                "create_lat_p100": m.create_lat_p100,
-                "stat_lat_p0": m.stat_lat_p0,
-                "stat_lat_p50": m.stat_lat_p50,
-                "stat_lat_p90": m.stat_lat_p90,
-                "stat_lat_p99": m.stat_lat_p99,
-                "stat_lat_p100": m.stat_lat_p100,
-                "delete_lat_p0": m.delete_lat_p0,
-                "delete_lat_p50": m.delete_lat_p50,
-                "delete_lat_p90": m.delete_lat_p90,
-                "delete_lat_p99": m.delete_lat_p99,
-                "delete_lat_p100": m.delete_lat_p100,
-                "create_histogram": json.dumps(m.create_histogram),
-                "stat_histogram": json.dumps(m.stat_histogram),
-                "delete_histogram": json.dumps(m.delete_histogram),
-                "create_command": m.create_command,
-                "stat_command": m.stat_command,
-                "delete_command": m.delete_command,
-                "storage_target_name": storage_target,
-            }
-            row.update(
-                {
-                    key: (test_configuration or {}).get(key, "")
-                    for key in MDTEST_CONFIG_KEYS
-                }
-            )
-            writer.writerow(row)
-
-
-def read_csv_import(
-    csv_path: str,
-) -> Tuple[List[AggregatedMetrics], Dict[str, str]]:
-    """Read aggregated metrics and configuration provenance from CSV."""
-    metrics = []
-    configuration_values: Dict[str, List[str]] = {key: [] for key in MDTEST_CONFIG_KEYS}
-
-    with open(csv_path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f, quoting=csv.QUOTE_ALL)
-        for row in reader:
-            _collect_configuration_values(configuration_values, row)
-            m = AggregatedMetrics(
-                node_count=int(row["node_count"]),
-                thread_count=int(row["thread_count"]),
-                datestamps={*row["datestamps"].split(",")},
-                iteration_count=int(row["iteration_count"]),
-                create_rate_avg=float(row["create_rate_avg"]),
-                create_rate_stddev=float(row["create_rate_stddev"]),
-                create_rate_min=float(row["create_rate_min"]),
-                create_rate_max=float(row["create_rate_max"]),
-                stat_rate_avg=float(row["stat_rate_avg"]),
-                stat_rate_stddev=float(row["stat_rate_stddev"]),
-                stat_rate_min=float(row["stat_rate_min"]),
-                stat_rate_max=float(row["stat_rate_max"]),
-                delete_rate_avg=float(row["delete_rate_avg"]),
-                delete_rate_stddev=float(row["delete_rate_stddev"]),
-                delete_rate_min=float(row["delete_rate_min"]),
-                delete_rate_max=float(row["delete_rate_max"]),
-                create_elapsed_avg_sec=float(row.get("create_elapsed_avg_sec", 0.0)),
-                stat_elapsed_avg_sec=float(row.get("stat_elapsed_avg_sec", 0.0)),
-                delete_elapsed_avg_sec=float(row.get("delete_elapsed_avg_sec", 0.0)),
-                create_lat_p0=float(row["create_lat_p0"]),
-                create_lat_p50=float(row["create_lat_p50"]),
-                create_lat_p90=float(row["create_lat_p90"]),
-                create_lat_p99=float(row["create_lat_p99"]),
-                create_lat_p100=float(row["create_lat_p100"]),
-                stat_lat_p0=float(row["stat_lat_p0"]),
-                stat_lat_p50=float(row["stat_lat_p50"]),
-                stat_lat_p90=float(row["stat_lat_p90"]),
-                stat_lat_p99=float(row["stat_lat_p99"]),
-                stat_lat_p100=float(row["stat_lat_p100"]),
-                delete_lat_p0=float(row["delete_lat_p0"]),
-                delete_lat_p50=float(row["delete_lat_p50"]),
-                delete_lat_p90=float(row["delete_lat_p90"]),
-                delete_lat_p99=float(row["delete_lat_p99"]),
-                delete_lat_p100=float(row["delete_lat_p100"]),
-                create_histogram=_read_histogram_json(row["create_histogram"]),
-                stat_histogram=_read_histogram_json(row["stat_histogram"]),
-                delete_histogram=_read_histogram_json(row["delete_histogram"]),
-                create_command=row.get("create_command", row.get("command", "")),
-                stat_command=row.get("stat_command", ""),
-                delete_command=row.get("delete_command", ""),
-                storage_target_name=row.get("storage_target_name") or "",
-            )
-            metrics.append(m)
-
-    configuration = _render_configuration_values(
-        configuration_values, "cached metric rows"
-    )
-    return metrics, configuration
-
-
-def _read_histogram_json(value: str) -> Dict[float, int]:
-    """Decode a JSON histogram, restoring and validating its numeric types."""
-
-    def reject_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-        """Reject duplicate literal keys before JSON can discard their values."""
-        result: Dict[str, Any] = {}
-        for key, item in pairs:
-            if key in result:
-                raise ValueError(f"Duplicate histogram JSON key: {key!r}")
-            result[key] = item
-        return result
-
-    decoded = json.loads(value, object_pairs_hook=reject_duplicate_keys)
-    if not isinstance(decoded, dict):
-        raise ValueError("Histogram JSON must be an object")
-
-    histogram: Dict[float, int] = {}
-    for raw_bucket, count in decoded.items():
-        try:
-            bucket = float(raw_bucket)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Invalid histogram bucket: {raw_bucket!r}") from exc
-        if not math.isfinite(bucket) or bucket < 0:
-            raise ValueError(f"Invalid histogram bucket: {raw_bucket!r}")
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-            raise ValueError(f"Invalid histogram count for bucket {raw_bucket!r}")
-        if bucket in histogram:
-            raise ValueError(f"Duplicate normalized histogram bucket: {raw_bucket!r}")
-        histogram[bucket] = count
-    return histogram
-
-
-# =============================================================================
 # Plotting
 # =============================================================================
 
@@ -2378,69 +2159,53 @@ def main() -> None:
                 eprint(f"  {op}: {len(hist)} buckets, total count={sum(hist.values())}")
         return
 
-    # Validate args
-    if not args.input_dirs and not args.from_csv:
-        parser.error("At least one input directory required (or use --from-csv)")
-
-    # Load metrics
     environments = {
         input_dir: load_env_used_yaml(input_dir)
         for input_dir in dict.fromkeys(args.input_dirs)
     }
-    aggregated_metrics: List[AggregatedMetrics] = []
-    test_configuration: Dict[str, str] = {}
     versions: List[Tuple[IterationMetrics, str]] = []
 
-    if args.from_csv:
-        eprint(f"Loading metrics from {args.from_csv}")
-        aggregated_metrics, test_configuration = read_csv_import(args.from_csv)
-        eprint(f"Loaded {len(aggregated_metrics)} aggregated metrics")
-        target_sources = cached_target_sources(
-            args.from_csv, (m.storage_target_name for m in aggregated_metrics)
+    # Refuse results from different storage targets before parsing or writing.
+    target_sources = [
+        (input_dir, storage_target_from_env(env))
+        for input_dir, env in environments.items()
+    ]
+    target_label = guarded_report_target(target_sources, args.allow_mixed_targets)
+    # Mixing was explicitly allowed: keep same-coordinate results per target.
+    target_groups = (
+        _directories_by_target(environments)
+        if target_label.startswith(MIXED_PREFIX)
+        else None
+    )
+    # Discover and parse files
+    file_pairs = discover_files(args.input_dirs, target_groups)
+    eprint(f"Found {len(file_pairs)} file pairs")
+
+    if not file_pairs:
+        eprint("No valid file pairs found")
+        sys.exit(1)
+
+    # Parse all file pairs
+    iterations: List[IterationMetrics] = []
+    for key, (csv_path, out_path) in file_pairs.items():
+        node_count, thread_count, datestamp, iteration = key[:4]
+        m = parse_file_pair(
+            csv_path, out_path, node_count, thread_count, datestamp, iteration
         )
-        target_label = guarded_report_target(target_sources, args.allow_mixed_targets)
-    else:
-        # Refuse results from different storage targets before parsing or writing.
-        target_sources = [
-            (input_dir, storage_target_from_env(env))
-            for input_dir, env in environments.items()
-        ]
-        target_label = guarded_report_target(target_sources, args.allow_mixed_targets)
-        # Mixing was explicitly allowed: keep same-coordinate results per target.
-        target_groups = (
-            _directories_by_target(environments)
-            if target_label.startswith(MIXED_PREFIX)
-            else None
-        )
-        # Discover and parse files
-        file_pairs = discover_files(args.input_dirs, target_groups)
-        eprint(f"Found {len(file_pairs)} file pairs")
+        if m:
+            iterations.append(m)
+            versions.append((m, result_version(out_path)))
 
-        if not file_pairs:
-            eprint("No valid file pairs found")
-            sys.exit(1)
+    eprint(f"Parsed {len(iterations)} iterations")
 
-        # Parse all file pairs
-        iterations: List[IterationMetrics] = []
-        for key, (csv_path, out_path) in file_pairs.items():
-            node_count, thread_count, datestamp, iteration = key[:4]
-            m = parse_file_pair(
-                csv_path, out_path, node_count, thread_count, datestamp, iteration
-            )
-            if m:
-                iterations.append(m)
-                versions.append((m, result_version(out_path)))
+    if not iterations:
+        eprint("No valid iterations parsed")
+        sys.exit(1)
 
-        eprint(f"Parsed {len(iterations)} iterations")
-
-        if not iterations:
-            eprint("No valid iterations parsed")
-            sys.exit(1)
-
-        # Aggregate
-        aggregated_dict = aggregate_metrics(iterations)
-        aggregated_metrics = list(aggregated_dict.values())
-        eprint(f"Aggregated into {len(aggregated_metrics)} (node, thread) groups")
+    # Aggregate
+    aggregated_dict = aggregate_metrics(iterations)
+    aggregated_metrics = list(aggregated_dict.values())
+    eprint(f"Aggregated into {len(aggregated_metrics)} (node, thread) groups")
 
     # Apply filters
     if args.only_nodes or args.only_threads:
@@ -2462,38 +2227,10 @@ def main() -> None:
         sys.exit(1)
 
     # Determine output directory
-    output_dir = "."
-    if args.input_dirs:
-        output_dir = args.input_dirs[0]
-    elif args.from_csv:
-        output_dir = os.path.dirname(os.path.abspath(args.from_csv)) or "."
-    output_dir = args.output_dir or output_dir
+    output_dir = args.output_dir or args.input_dirs[0]
     os.makedirs(output_dir, exist_ok=True)
 
-    if not test_configuration:
-        configuration_dirs = args.input_dirs or [
-            os.path.dirname(os.path.abspath(args.from_csv)) or "."
-        ]
-        test_configuration = load_mdtest_configuration(configuration_dirs, environments)
-
-    # Export to CSV if requested
-    if args.to_csv:
-        all_datestamps: Set[str] = set()
-        for m in aggregated_metrics:
-            all_datestamps.update(m.datestamps)
-        csv_filename = (
-            "mdtest-elbencho-metrics-"
-            f"{join_datestamps_for_filename(all_datestamps, prefix='mdtest-elbencho-metrics-', suffix='.csv', sep='+')}"
-            ".csv"
-        )
-        csv_path = os.path.join(output_dir, csv_filename)
-        write_csv_export(
-            csv_path,
-            aggregated_metrics,
-            test_configuration,
-            exported_target_cell(target_label, has_unverified_source(target_sources)),
-        )
-        eprint(f"Wrote metrics to {csv_path}")
+    test_configuration = load_mdtest_configuration(args.input_dirs, environments)
 
     # Print output
     produced_by = selected_versions(

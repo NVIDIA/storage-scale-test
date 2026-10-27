@@ -30,7 +30,6 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
-import json
 import math
 import os
 import re
@@ -38,7 +37,7 @@ import sys
 from pathlib import Path
 import traceback
 from collections import defaultdict
-from dataclasses import dataclass, fields, asdict, field
+from dataclasses import dataclass, field
 from functools import partial
 from itertools import chain
 from typing import (
@@ -54,7 +53,6 @@ from typing import (
     TypedDict,
     Union,
     cast,
-    get_type_hints,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -102,7 +100,6 @@ from lib.stdout_report_file import (  # pylint: disable=wrong-import-position
 )
 from lib.storage_target import (
     StorageTarget,
-    cached_target_sources,
     guarded_report_target,
     storage_target_from_env,
 )
@@ -194,9 +191,7 @@ class ElbenchoMetrics:
     # Throughput metrics
     iops: float  # IOPS [first] value
     throughput_mib_s: float  # MiB/s [first] value
-    throughput_mb_s: (
-        float  # Converted to MB/s (kept for CSV compatibility, display as GB/s)
-    )
+    throughput_mb_s: float  # Converted to MB/s (the tables display it as GB/s)
     throughput_gbps: float  # Converted to Gb/s
 
     # Latency metrics (from .out file "IO latency" lines)
@@ -284,13 +279,6 @@ class ElbenchoMetrics:
     # Histogram data (optional, for visualization); latency histogram data
     # as {time_sec: count}
     histogram: Dict[float, int] = field(default_factory=dict)
-
-    # Storage target name from the snapshot ("" when unknown). Keep last: it is
-    # the newest column, and older CSVs without it still load.
-    storage_target_name: str = ""
-
-
-_ELBENCHO_METRIC_FIELD_TYPES = get_type_hints(ElbenchoMetrics)
 
 
 @dataclass(frozen=True)
@@ -1147,7 +1135,7 @@ def normalize_time(time_str: str) -> float:
 def normalize_throughput_to_mb(mib_per_sec: float) -> float:
     """Convert MiB/s to MB/s (1 MiB = 1.048576 MB).
 
-    Note: This value is stored in MB/s for CSV compatibility but displayed as GB/s.
+    Note: This value is stored in MB/s but displayed as GB/s.
     """
     return mib_per_sec * 1.048576
 
@@ -2610,200 +2598,6 @@ def plot_metrics(
                         direct_io,
                         no_dual_y_axis,
                     )
-
-
-def write_csv(csv_file: str, metrics: List[ElbenchoMetrics]) -> None:
-    """Write metrics to a CSV file.
-
-    Args:
-        csv_file: Path to the CSV file
-        metrics: List of ElbenchoMetrics objects
-    """
-    if not metrics:
-        return
-
-    field_names = [f.name for f in fields(ElbenchoMetrics)]
-
-    try:
-        with open(csv_file, "w", newline="", encoding="utf-8") as f:
-            # Use QUOTE_ALL to ensure all fields are quoted, including booleans and numbers
-            writer = csv.DictWriter(f, fieldnames=field_names, quoting=csv.QUOTE_ALL)
-            writer.writeheader()
-
-            for metric in metrics:
-                # Convert histogram dictionary to string representation
-                metric_dict = asdict(metric)
-                if metric_dict["histogram"]:
-                    metric_dict["histogram"] = json.dumps(metric_dict["histogram"])
-
-                # If command field is None, set it to empty string to avoid None in CSV
-                if metric_dict["command"] is None:
-                    metric_dict["command"] = ""
-
-                writer.writerow(metric_dict)
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        eprint(f"Error writing to CSV: {e}")
-        traceback.print_exc()
-        raise IOError(f"Error writing to CSV: {e}") from e
-
-
-_TREESCAN_CSV_KEYS = (
-    "treescan_file_count",
-    "treescan_avg_bytes",
-    "treescan_min_bytes",
-    "treescan_max_bytes",
-    "treescan_first_file_bytes",
-)
-_WORKLOAD_STRING_CSV_KEYS = (
-    "configured_file_layout",
-    "configured_files_per_node",
-    "configured_file_size",
-    "workload_layout",
-    *_WORKLOAD_METADATA_KEYS,
-)
-
-
-def _csv_row_set_if_absent_or_empty(
-    row: Dict[str, Any], key: str, default: str
-) -> None:
-    """Set row[key] to default when missing or blank."""
-    if key not in row or row.get(key) in (None, ""):
-        row[key] = default
-
-
-def _elbencho_csv_parse_histogram_cell(row: Dict[str, Any]) -> None:
-    """Replace JSON histogram string with a dict (or {})."""
-    if "histogram" in row and row["histogram"]:
-        try:
-            row["histogram"] = json.loads(
-                row["histogram"], object_pairs_hook=_elbencho_histogram_pairs
-            )
-        except json.JSONDecodeError:
-            row["histogram"] = {}
-    else:
-        row["histogram"] = {}
-
-
-def _elbencho_histogram_pairs(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-    """Reject JSON histogram keys that normalize to the same latency bucket."""
-    normalized_keys = set()
-    result = {}
-    for key, value in pairs:
-        try:
-            normalized = float(key)
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"Invalid histogram bucket: {key}") from error
-        if not math.isfinite(normalized):
-            raise ValueError(f"Invalid histogram bucket: {key}")
-        if normalized in normalized_keys:
-            raise ValueError(f"Duplicate histogram bucket: {key}")
-        normalized_keys.add(normalized)
-        result[key] = value
-    return result
-
-
-def _elbencho_csv_apply_backward_compat_defaults(row: Dict[str, Any]) -> None:
-    """Fill optional / legacy CSV columns with safe string defaults."""
-    if "io_depth" not in row or not row.get("io_depth"):
-        row["io_depth"] = "1"
-    if "random_io" not in row or not row.get("random_io"):
-        row["random_io"] = "0"
-    _csv_row_set_if_absent_or_empty(row, "io_duration_sec", "0")
-    _csv_row_set_if_absent_or_empty(row, "phase_wall_duration_ms", "0")
-    _csv_row_set_if_absent_or_empty(row, "phase_first_duration_ms", "0")
-    _csv_row_set_if_absent_or_empty(row, "sweep_run_to_completion_option", "False")
-    _csv_row_set_if_absent_or_empty(row, "write_only_data_dir", "")
-    _csv_row_set_if_absent_or_empty(row, "treescan_size_stats_line", "")
-    _csv_row_set_if_absent_or_empty(row, "sweep_read_from_path", "")
-    for _ts_key in _TREESCAN_CSV_KEYS:
-        _csv_row_set_if_absent_or_empty(row, _ts_key, "0")
-    _csv_row_set_if_absent_or_empty(row, "is_single_big_file", "False")
-    _csv_row_set_if_absent_or_empty(row, "all_nodes_all_data", "False")
-    for workload_key in _WORKLOAD_STRING_CSV_KEYS:
-        _csv_row_set_if_absent_or_empty(row, workload_key, "")
-    _csv_row_set_if_absent_or_empty(row, "storage_target_name", "")
-    _elbencho_csv_parse_histogram_cell(row)
-
-
-def _elbencho_csv_coerce_field_types(row: Dict[str, Any]) -> None:
-    """Coerce string DictReader values to ElbenchoMetrics field types in place."""
-    for a_field in fields(ElbenchoMetrics):
-        field_name = a_field.name
-        field_value = row[field_name]
-        field_type = _ELBENCHO_METRIC_FIELD_TYPES[field_name]
-
-        if field_type is bool:
-            if isinstance(field_value, str):
-                row[field_name] = field_value.lower() == "true"
-        elif field_type is int:
-            row[field_name] = int(float(field_value)) if field_value else 0
-        elif field_type is float:
-            row[field_name] = float(field_value) if field_value else 0.0
-
-
-def read_csv(csv_file: str) -> List[ElbenchoMetrics]:
-    """Read metrics from a CSV file.
-
-    Args:
-        csv_file: Path to the CSV file
-
-    Returns:
-        List of ElbenchoMetrics objects
-    """
-    metrics = []
-
-    try:
-        with open(csv_file, "r", newline="", encoding="utf-8") as f:
-            # Use QUOTE_ALL since we're now writing all fields with quotes
-            reader = csv.DictReader(f, quoting=csv.QUOTE_ALL)
-
-            # Verify required fields are present (except io_depth for backward compatibility)
-            required_fields = [
-                f.name
-                for f in fields(ElbenchoMetrics)
-                if f.name
-                not in (
-                    "io_depth",
-                    "io_duration_sec",
-                    "phase_wall_duration_ms",
-                    "phase_first_duration_ms",
-                    "sweep_run_to_completion_option",
-                    "write_only_data_dir",
-                    "sweep_read_from_path",
-                    "treescan_size_stats_line",
-                    "treescan_file_count",
-                    "treescan_avg_bytes",
-                    "treescan_min_bytes",
-                    "treescan_max_bytes",
-                    "treescan_first_file_bytes",
-                    "is_single_big_file",
-                    "all_nodes_all_data",
-                    "storage_target_name",
-                    *_WORKLOAD_STRING_CSV_KEYS,
-                )
-            ]
-            fieldnames = reader.fieldnames
-            if fieldnames is None:
-                raise ValueError(f"CSV has no header row: {csv_file}")
-            missing_fields = [
-                field for field in required_fields if field not in fieldnames
-            ]
-
-            if missing_fields:
-                raise ValueError(
-                    f"CSV is missing required fields: {', '.join(missing_fields)}"
-                )
-
-            for row in reader:
-                _elbencho_csv_apply_backward_compat_defaults(row)
-                _elbencho_csv_coerce_field_types(row)
-                metrics.append(ElbenchoMetrics(**cast(Any, row)))
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        eprint(f"Error reading from CSV: {e}")
-        traceback.print_exc()
-        raise IOError(f"Error reading from CSV: {e}") from e
-
-    return metrics
 
 
 def filter_metrics(
@@ -4490,18 +4284,13 @@ def _load_input_environments(input_dirs: List[str]) -> Dict[str, dict]:
 
 
 def _target_sources(
-    environments: Dict[str, dict], csv_file: Optional[str], metrics: List[Any]
+    environments: Dict[str, dict],
 ) -> List[Tuple[str, Union[StorageTarget, str, None]]]:
     """Label every report input with its storage target, or None when unknown."""
-    sources: List[Tuple[str, Union[StorageTarget, str, None]]] = [
+    return [
         (input_dir, storage_target_from_env(env))
         for input_dir, env in environments.items()
     ]
-    if csv_file:
-        sources.extend(
-            cached_target_sources(csv_file, (m.storage_target_name for m in metrics))
-        )
-    return sources
 
 
 def main() -> None:
@@ -4513,13 +4302,9 @@ def main() -> None:
         route_batch_report(args, "io", sys.argv[1:])
     except (OSError, ValueError) as error:
         parser.error(str(error))
-    if args.from_csv and args.input_dirs:
-        parser.error("--from-csv cannot be combined with input directories")
-
-    # Check if input_dir is required but not provided
-    if not args.input_dirs and not args.from_csv and not args.test_parse:
+    if not args.input_dirs and not args.test_parse:
         parser.error(
-            "at least one input directory is required when not using --from-csv or --test-parse"
+            "at least one input directory is required unless using --test-parse"
         )
 
     # Handle test-parse mode
@@ -4527,25 +4312,13 @@ def main() -> None:
         test_parse(args.test_parse)
         return
 
-    # Read from CSV if input provided
     metrics = []
     versions = ResultVersions()
-
-    csv_loaded_count = 0
-    if args.from_csv:
-        try:
-            # Read the metrics
-            metrics = read_csv(args.from_csv)
-            eprint(f"Loaded {len(metrics)} metrics from {args.from_csv}")
-            csv_loaded_count = len(metrics)
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            eprint(f"Error reading CSV: {e}")
-            sys.exit(1)
 
     # Refuse results from different storage targets before parsing or writing.
     environments = _load_input_environments(args.input_dirs)
     target_label = guarded_report_target(
-        _target_sources(environments, args.from_csv, metrics),
+        _target_sources(environments),
         args.allow_mixed_targets,
     )
 
@@ -4593,7 +4366,7 @@ def main() -> None:
     # Print summary of metrics extracted from directories
     if args.input_dirs:
         eprint(
-            f"Extracted {len(metrics)-csv_loaded_count} metrics from all files in the input directories"
+            f"Extracted {len(metrics)} metrics from all files in the input directories"
         )
 
     had_aggregate_metrics = bool(metrics)
@@ -4667,25 +4440,10 @@ def main() -> None:
             eprint("ERROR: Filters matched no live CSV files")
             sys.exit(1)
 
-    # Write to CSV if requested
-    if args.to_csv:
-        # Use the first input directory or current directory if none provided
-        output_dir = args.output_dir or (args.input_dirs[0] if args.input_dirs else ".")
-        os.makedirs(output_dir, exist_ok=True)
-        csv_filename = "elbencho-metrics.csv"
-        csv_path = os.path.join(output_dir, csv_filename)
-        try:
-            write_csv(csv_path, metrics)
-            eprint(f"Wrote {len(metrics)} metrics to {csv_path}")
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            eprint(f"Error writing CSV: {e}")
-
     # Match plot output directory (used for report.txt and plots)
     output_dir = "."
     if args.input_dirs:
         output_dir = args.input_dirs[0]
-    elif args.from_csv:
-        output_dir = os.path.dirname(os.path.abspath(args.from_csv))
     output_dir = args.output_dir or output_dir
     os.makedirs(output_dir, exist_ok=True)
 
