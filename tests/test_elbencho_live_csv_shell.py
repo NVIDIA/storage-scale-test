@@ -54,7 +54,7 @@ class TestElbenchoLiveCsvShell(unittest.TestCase):
     """Live CSV naming and argv gating."""
 
     def test_disabled_keeps_existing_argv(self):
-        result = _run_bash(_common_args_script())
+        result = _run_bash(_common_args_script("ELBENCHO_LIVE_CSV_EXTENDED=0"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout.splitlines(),
@@ -82,6 +82,28 @@ class TestElbenchoLiveCsvShell(unittest.TestCase):
         self.assertIn("--livecsv=/tmp/result.live.csv", args)
         self.assertIn("--livecsvex", args)
         self.assertIn("--liveint=750", args)
+
+    def test_capture_is_on_when_unset(self):
+        result = _run_bash(_common_args_script())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = result.stdout.splitlines()
+        self.assertIn("--livecsv=/tmp/result.live.csv", args)
+        self.assertIn("--livecsvex", args)
+        self.assertIn("--liveint=1000", args)
+
+    def test_workload_defaults_enable_capture(self):
+        script = f"""
+source "{_ENV_FUNCTIONS}"
+unset ELBENCHO_LIVE_CSV_EXTENDED ELBENCHO_LIVEINT
+apply_filesystem_workload_defaults
+printf '%s %s\\n' "$ELBENCHO_LIVE_CSV_EXTENDED" "$ELBENCHO_LIVEINT"
+ELBENCHO_LIVE_CSV_EXTENDED=0 ELBENCHO_LIVEINT=500
+apply_filesystem_workload_defaults
+printf '%s %s\\n' "$ELBENCHO_LIVE_CSV_EXTENDED" "$ELBENCHO_LIVEINT"
+"""
+        result = _run_bash(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["1 1000", "0 500"])
 
     def test_extended_capture_defaults_to_one_second(self):
         result = _run_bash(_common_args_script("ELBENCHO_LIVE_CSV_EXTENDED=1"))

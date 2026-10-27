@@ -850,6 +850,7 @@ def _retained_lifecycle() -> FilesystemScenarioSpec:
 
 
 def _live_capture() -> FilesystemScenarioSpec:
+    # Unset the fixture's 0 so capture comes from the code default.
     env_lines = _override_env(
         _SHARED_ENV,
         {
@@ -857,7 +858,7 @@ def _live_capture() -> FilesystemScenarioSpec:
                 "export ELBENCHO_SCALE_READ_WRITE_DURATION=3"
             ),
             "ELBENCHO_FILES_PER_NODE": "export ELBENCHO_FILES_PER_NODE=2",
-            "ELBENCHO_LIVE_CSV_EXTENDED": "export ELBENCHO_LIVE_CSV_EXTENDED=1",
+            "ELBENCHO_LIVE_CSV_EXTENDED": "unset ELBENCHO_LIVE_CSV_EXTENDED",
         },
     ) + ("export ELBENCHO_LIVEINT=10",)
     return FilesystemScenarioSpec(

@@ -523,7 +523,7 @@ def test_fairness_lines_skip_phases_without_data(monkeypatch, tmp_path):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     monkeypatch.setattr(_EXTRACT, "_report_live_domain", lambda *_args: None)
     metadata = _EXTRACT.LiveFileMetadata(str(path), "1M", 1, 2, 1, "20261026Z120000")
-    options = _EXTRACT.LiveReportOptions(False, 5.0, 3, 10, 50)
+    options = _EXTRACT.LiveReportOptions(5.0, 3, 10, 50)
     collected = []
     assert _EXTRACT._report_one_live_file(  # pylint: disable=protected-access
         metadata, str(tmp_path), options, 1000, {}, collected

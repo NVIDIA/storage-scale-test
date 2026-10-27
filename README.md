@@ -123,7 +123,7 @@ partition="your-partition"
 reservation=""                 # set if your site requires one
 ```
 
-Configure site modules, `client_type`, and `client_arch` in `env.sh`.
+Configure `client_type` and `client_arch` in `env.sh`.
 Filesystem `TEST_DIRS` use worker-side paths as above. Set `run_time` for
 the complete filesystem sweep or batch, including startup and cleanup.
 See [advanced node selection and Slurm options](docs/FILESYSTEM_TESTING.md#advanced-node-selection-and-slurm-options).

@@ -19,6 +19,7 @@ from pathlib import Path
 import hashlib
 import os
 import shlex
+import shutil
 import subprocess
 
 import pytest
@@ -240,6 +241,75 @@ def test_append_rejects_frozen_environment_drift_without_commit(
     assert result.returncode != 0
     assert field in result.stderr
     assert (batch / "batch-manifest.tsv").read_bytes() == manifest
+
+
+def test_frozen_profile_ignores_retired_modules_field(checkout, tmp_path):
+    """Batches prepared before MODULES was removed still accept appends."""
+    (tmp_path / "common-fields.tsv").write_text(
+        'account\tproj\nMODULES\tdeclare -a MODULES=([0]="cuda")\n'
+    )
+    (tmp_path / "candidate.tsv").write_text("account\tproj\n")
+    compare = (
+        'source "$1/lib/_batch_functions.sh"; '
+        '_elbencho_batch_compare_profile "$2" "$2/candidate.tsv"'
+    )
+    result = subprocess.run(
+        ["bash", "-c", compare, "profile-test", str(checkout), str(tmp_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    (tmp_path / "candidate.tsv").write_text("account\tother\n")
+    result = subprocess.run(
+        ["bash", "-c", compare, "profile-test", str(checkout), str(tmp_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "differs: account" in result.stderr
+
+
+@pytest.mark.parametrize("site_module", [True, False])
+def test_slurm_batch_start_loads_the_slurm_module(checkout, tmp_path, site_module):
+    """--start and --resume bypass env.sh, so preflight loads the slurm module."""
+    tools = tmp_path / "slurm-module-bin"
+    tools.mkdir()
+    (tools / "sbatch").write_text("#!/bin/sh\nexit 0\n")
+    (tools / "sbatch").chmod(0o755)
+    # Only grep, so an ambient sbatch cannot satisfy the no-module case.
+    isolated = tmp_path / "isolated-bin"
+    isolated.mkdir()
+    (isolated / "grep").symlink_to(shutil.which("grep"))
+    available = "slurm/23.11" if site_module else ""
+    body = f"""
+        source "$1/lib/env_functions.sh"
+        source "$1/lib/_batch_functions.sh"
+        PATH={shlex.quote(str(isolated))}
+        module() {{
+            case "$1" in
+                avail) printf '%s\\n' {shlex.quote(available)} >&2 ;;
+                load) [[ "$2" == slurm ]] && PATH={shlex.quote(str(tools))}:$PATH ;;
+            esac
+        }}
+        max_nodes_remaining_executions() {{ echo 1; }}
+        _elbencho_batch_validate_cells() {{ :; }}
+        _elbencho_batch_validate_executable() {{ :; }}
+        EXECUTION_SUBSTRATE=slurm
+        _elbencho_batch_preflight /unused
+    """
+    result = subprocess.run(
+        ["bash", "-c", body, "preflight-test", str(checkout)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if site_module:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+        assert "sbatch is unavailable" in result.stderr
 
 
 def test_sealed_append_rejected_before_current_env_load(checkout):

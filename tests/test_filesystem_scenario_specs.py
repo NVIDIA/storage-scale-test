@@ -301,12 +301,15 @@ def test_retained_lifecycle_expresses_cache_miss_hit_and_deletion():
 
 
 def test_live_capture_has_stable_series_sampling_window():
-    """The real live-data case requests several intervals without a huge run."""
+    """The real live-data case requests several intervals without a huge run.
+
+    It unsets ELBENCHO_LIVE_CSV_EXTENDED so capture comes from the default.
+    """
     step = _scenario("live-capture").steps[0]
     environment = "\n".join(step.env_lines)
 
     assert "ELBENCHO_SCALE_READ_WRITE_DURATION=3" in environment
-    assert "ELBENCHO_LIVE_CSV_EXTENDED=1" in environment
+    assert "unset ELBENCHO_LIVE_CSV_EXTENDED" in environment
     assert "ELBENCHO_LIVEINT=10" in environment
     assert {execution.coordinate.nodes for execution in step.executions} == {2}
 

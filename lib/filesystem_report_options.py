@@ -117,12 +117,6 @@ REPORT_OPTIONS = (
         {"action": "store_true"},
     ),
     ReportOption(
-        "--per-client-plots",
-        "io",
-        "Write per-client live summaries and plots.",
-        {"action": "store_true"},
-    ),
-    ReportOption(
         SHORTFALL_FLAG,
         "io",
         "Slow client shortfall below the fleet median, percent.",

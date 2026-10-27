@@ -60,11 +60,7 @@ if elbencho_batch_is_batch "$OUTPUT_DIR"; then
     # shellcheck disable=SC1091
     source "${OUTPUT_DIR}/env_used.sh" || exit 1
     SCALE_TEST_BASE="$dir"
-    for module_name in "${MODULES[@]}"; do
-        if module_exists "$module_name"; then
-            module load "$module_name" || exit 1
-        fi
-    done
+    load_slurm_module || exit 1
 else
     if ! source_output=$("$BASH" -c "source \"\$1\"" env-loader \
             "${SCALE_TEST_BASE}/env.sh" 2>&1); then

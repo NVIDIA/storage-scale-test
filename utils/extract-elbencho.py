@@ -3561,7 +3561,6 @@ def _live_metadata_matches_filters(
 class LiveReportOptions:
     """Per-client report controls for one live CSV."""
 
-    per_client_plots: bool
     shortfall_percent: float
     min_slow_windows: int
     max_timeseries_lines: int
@@ -3726,10 +3725,9 @@ def _report_live_domain(  # pylint: disable=too-many-arguments,too-many-position
             f"{name}={count}" for name, count in sorted(domain.diagnostics.items())
         )
         eprint(f"Live CSV diagnostics for {domain_key.label}: {diagnostics}")
-    if options.per_client_plots:
-        _report_live_client_domain(
-            analysis, metadata, domain_key, domain, steady, output_dir, options
-        )
+    _report_live_client_domain(
+        analysis, metadata, domain_key, domain, steady, output_dir, options
+    )
 
 
 def _detail_subset(
@@ -5375,7 +5373,6 @@ def _emit_reports(
         eprint(f"Generated plots saved in {output_dir}")
 
     options = LiveReportOptions(
-        args.per_client_plots,
         args.client_shortfall_percent,
         args.client_min_slow_windows,
         args.client_max_timeseries_lines,

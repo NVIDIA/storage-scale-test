@@ -1280,7 +1280,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         tail_until_complete 42 /dev/null
         rc=$?
         set -e
-        [[ "$rc" -eq 1 && "$(head -1 "$tmp/sleeps")" == 15 ]]
+        [[ "$rc" -eq 1 && "$(head -1 "$tmp/sleeps")" == 60 ]]
         rm -f "$tmp/tailed"
         for interval in 0 -1 1.5 abc 015; do
             set +e
