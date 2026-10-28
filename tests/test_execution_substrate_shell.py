@@ -289,8 +289,8 @@ def test_kubectl_elbencho_image_defaults_to_the_pinned_release(
 
 
 def test_the_default_elbencho_image_is_the_downloaded_release():
-    """The default image's tag is the elbencho release build_tarball.sh pins."""
-    builder = (_REPOSITORY_ROOT / "utils" / "build_tarball.sh").read_text(
+    """The default image's tag is the elbencho release fetch_elbencho.sh pins."""
+    builder = (_REPOSITORY_ROOT / "utils" / "build" / "fetch_elbencho.sh").read_text(
         encoding="utf-8"
     )
     tag = builder.split("ELBENCHO_VERSION_TAG='", 1)[1].split("'", 1)[0]

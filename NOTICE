@@ -58,7 +58,7 @@ binary form).
 Description: Distributed storage benchmark for file systems, object stores, and
              block devices.
 Used by:     Filesystem and network benchmark tests; may be downloaded as a
-             static release binary by utils/build_tarball.sh.
+             static release binary by utils/build/fetch_elbencho.sh.
 License:     GPL-3.0-only
 Source:      https://github.com/breuner/elbencho
 License text: https://github.com/breuner/elbencho/blob/master/LICENSE

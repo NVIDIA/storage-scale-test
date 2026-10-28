@@ -414,6 +414,7 @@ This repository does not include or distribute third-party benchmark binaries. U
 | `utils/build_tarball.sh` | EE-2, PD-1, PD-2, PD-3 |
 | `utils/build/build_warp_from_source.sh` | EE-2, PD-2 |
 | `utils/build/build_s3test_from_source.sh` | EE-2, PD-2 |
+| `utils/build/fetch_elbencho.sh` | EE-2, PD-2 |
 | README and docs | PD-3 |
 
 ## Appendix B: Glossary

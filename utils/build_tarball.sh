@@ -71,143 +71,7 @@ cd .. || exit
 # tree will get used (acting as a cache) unless "--force-download" is given.
 # Failing to reach upstream sources warns but does not prevent tarball creation.
 
-# Pinned elbencho release for static binaries included in a user-created
-# deployment tarball.
-ELBENCHO_VERSION_TAG='v3.2-1'
-ELBENCHO_RELEASE_URL_BASE="https://github.com/breuner/elbencho/releases/download/${ELBENCHO_VERSION_TAG}"
-# SHA-256 values for the pinned upstream release archives. Downloads fail
-# closed unless the configured value is exactly 64 hexadecimal characters.
-ELBENCHO_SHA256_X86_64="c32f9f905e879b7efed8c2f83ea9be7a362dceae43155bb46ddab3d5d6c23210"
-ELBENCHO_SHA256_AARCH64="3af09f8110586863b35da019e748c8062fcf57cc0f32e446b1c054df4500eba3"
 UTILS_DIR="${SCRIPT_DIR}" # this script is in utils/
-
-elbencho_sha256_for_arch() {
-    local arch="$1"
-
-    case "${arch}" in
-        x86_64)
-            echo "${ELBENCHO_SHA256_X86_64}"
-            ;;
-        aarch64)
-            echo "${ELBENCHO_SHA256_AARCH64}"
-            ;;
-        *)
-            _error "No elbencho checksum is configured for architecture '${arch}'"
-            return 1
-            ;;
-    esac
-    return 0
-}
-
-calculate_sha256() {
-    local file_path="$1"
-    local output
-
-    if type -P sha256sum >/dev/null 2>&1; then
-        output=$(sha256sum "${file_path}") || return 1
-        echo "${output%% *}"
-    elif type -P shasum >/dev/null 2>&1; then
-        output=$(shasum -a 256 "${file_path}") || return 1
-        echo "${output%% *}"
-    elif type -P openssl >/dev/null 2>&1; then
-        output=$(openssl dgst -sha256 "${file_path}") || return 1
-        echo "${output##* }"
-    else
-        _error "Cannot verify downloads: sha256sum, shasum, or openssl is required"
-        return 1
-    fi
-    return 0
-}
-
-validate_expected_sha256() {
-    local expected="$1"
-    local display_name="$2"
-
-    if [[ ! "${expected}" =~ ^[[:xdigit:]]{64}$ ]]; then
-        _error "Refusing to use ${display_name}: replace checksum placeholder '${expected}' with its published SHA-256 value"
-        return 1
-    fi
-    return 0
-}
-
-verify_sha256() {
-    local file_path="$1"
-    local expected="$2"
-    local display_name="$3"
-    local actual expected_lower actual_lower
-
-    validate_expected_sha256 "${expected}" "${display_name}" || return 1
-
-    actual=$(calculate_sha256 "${file_path}") || return 1
-    expected_lower=$(printf '%s' "${expected}" | tr '[:upper:]' '[:lower:]')
-    actual_lower=$(printf '%s' "${actual}" | tr '[:upper:]' '[:lower:]')
-    if [[ "${actual_lower}" != "${expected_lower}" ]]; then
-        _error "SHA-256 verification failed for ${display_name}: expected ${expected_lower}, got ${actual_lower}"
-        return 1
-    fi
-    return 0
-}
-
-validate_elbencho_checksum_configuration() {
-    local arch expected
-
-    for arch in x86_64 aarch64; do
-        expected=$(elbencho_sha256_for_arch "${arch}") || return 1
-        if ! validate_expected_sha256 "${expected}" "elbencho ${ELBENCHO_VERSION_TAG} ${arch}"; then
-            return 1
-        fi
-    done
-    return 0
-}
-
-# Helper function: download and extract a pinned elbencho static binary from
-# the upstream GitHub release. Silent on success/failure - caller handles output.
-# Arguments: $1=arch ("x86_64" or "aarch64"), $2=output_path
-# Returns: 0 on success, 1 on failure.
-download_and_extract_elbencho() {
-    local arch="$1"
-    local output_path="$2"
-    local url="${ELBENCHO_RELEASE_URL_BASE}/elbencho-static-${arch}.tar.gz"
-    local tmpdir
-    local extracted
-    local archive
-    local expected_sha256
-
-    if ! tmpdir="$(mktemp -d 2>/dev/null)"; then
-        return 1
-    fi
-
-    archive="${tmpdir}/elbencho.tar.gz"
-    if ! curl -sL -f -o "${archive}" "$url"; then
-        rm -rf "$tmpdir"
-        return 1
-    fi
-
-    expected_sha256=$(elbencho_sha256_for_arch "${arch}") || {
-        rm -rf "$tmpdir"
-        return 1
-    }
-    if ! verify_sha256 "${archive}" "${expected_sha256}" "elbencho ${ELBENCHO_VERSION_TAG} ${arch}"; then
-        rm -rf "$tmpdir"
-        return 1
-    fi
-
-    if ! tar -xzf "${archive}" -C "$tmpdir"; then
-        rm -rf "$tmpdir"
-        return 1
-    fi
-
-    extracted="$(find "$tmpdir" -name 'elbencho' -type f 2>/dev/null | head -1)"
-    if [[ -z "$extracted" ]]; then
-        rm -rf "$tmpdir"
-        return 1
-    fi
-
-    cp "$extracted" "$output_path"
-    chmod +x "$output_path"
-    rm -rf "$tmpdir"
-    return 0
-}
 
 check_warp_binaries() {
     local missing=()
@@ -411,18 +275,6 @@ capture_credential_names || exit 1
 PROJECT_VERSION=$(project_version "${SCRIPT_DIR}/..")
 echo "Creating deployment tarball for storage-scale-test ${PROJECT_VERSION}..."
 
-# Build list of elbencho binaries to download/extract. Format per entry:
-#   arch|output_path|display_name
-declare -a binaries_to_download=(
-    "x86_64|${UTILS_DIR}/elbencho|elbencho amd64"
-    "aarch64|${UTILS_DIR}/elbencho.aarch64|elbencho arm64"
-)
-
-# Refuse to produce a deployment tarball until the pinned upstream checksums have
-# been filled in. This prevents placeholder values from degrading into the
-# historical warn-and-continue download behavior below.
-validate_elbencho_checksum_configuration || exit 1
-
 # Warp binaries are user-built from OSS source when object storage testing is needed.
 # Warn if either architecture is missing, but keep building the tarball.
 check_warp_binaries
@@ -432,50 +284,16 @@ check_warp_binaries
 # object storage testing will not work for that architecture.
 check_s3test_binaries ||:
 
-# Download all selected files concurrently.
-echo "Downloading required files..."
-download_start_time=$(date +%s)
-declare -a pids=()
-declare -a display_names=()
-declare -a skipped=()
-declare -a succeeded=()
-declare -a failed=()
-
-for spec in "${binaries_to_download[@]}"; do
-    IFS='|' read -r arch output_path display_name <<< "${spec}"
-
-    if [[ -f "$output_path" ]] && [[ "$force_download" == false ]]; then
-        skipped+=("$display_name")
-        continue
-    fi
-
-    display_names+=("$display_name")
-    (download_and_extract_elbencho "$arch" "$output_path") &
-    pids+=("$!")
-done
-
-for name in ${skipped[@]+"${skipped[@]}"}; do
-    echo "  using existing ${name} (add --force-download to override)"
-done
-
-for i in "${!pids[@]}"; do
-    if wait "${pids[$i]}"; then
-        succeeded+=("${display_names[$i]}")
-    else
-        failed+=("${display_names[$i]}")
-    fi
-done
-
-download_end_time=$(date +%s)
-download_elapsed=$((download_end_time - download_start_time))
-
-for name in ${succeeded[@]+"${succeeded[@]}"}; do
-    echo "  successfully downloaded ${name}"
-done
-for name in ${failed[@]+"${failed[@]}"}; do
-    _warn "Failed to download ${name}"
-done
-echo "  Downloads completed in ${download_elapsed} seconds."
+# A failed download only warns; other fetch errors stop the build.
+fetch_args=()
+[[ "$force_download" == false ]] || fetch_args+=(--force-download)
+"${UTILS_DIR}/build/fetch_elbencho.sh" ${fetch_args[@]+"${fetch_args[@]}"}
+fetch_rc=$?
+if [[ "$fetch_rc" -eq 1 ]]; then
+    _warn "The tarball will lack the elbencho binaries that failed to download."
+elif [[ "$fetch_rc" -ne 0 ]]; then
+    exit "$fetch_rc"
+fi
 
 # Warp source tarball validation removed -- warp is no longer bundled here.
 
