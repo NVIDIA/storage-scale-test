@@ -30,6 +30,17 @@ import yaml
 _ROOT = Path(__file__).resolve().parent.parent
 _FUNCTIONS = _ROOT / "storage-tests/fs/kubectl/_nv-elbencho-kubectl-functions.sh"
 _BASH = shutil.which("bash") or "/bin/bash"
+# What the collection Pod sends: stdin gzipped on stdout, then the size and
+# SHA-256 trailer on stderr.
+_SEND_ARCHIVE = r"""send_archive() {
+    local body
+    body=$(mktemp)
+    gzip -6 -n > "$body"
+    cat "$body"
+    printf '\n%s bytes=%s sha256=%s\n' "$KUBECTL_COLLECTION_TRAILER" \
+        "$(wc -c < "$body" | tr -d ' ')" "$(_kubectl_sha256_file "$body")" >&2
+    rm -f "$body"
+}"""
 
 
 def _bash(body: str) -> subprocess.CompletedProcess[str]:
@@ -45,6 +56,7 @@ def _bash(body: str) -> subprocess.CompletedProcess[str]:
                 _test_configuration() {{
                     printf 'declare -ga KUBECTL_SEGMENT_CONTROL_ROOTS=( test-ns/test-pvc:benchmark )\n' > "$1"
                 }}
+                {_SEND_ARCHIVE}
                 {body}
                 """),
         ],
@@ -1068,7 +1080,7 @@ def test_collection_stream_uses_its_operation_sized_deadline(tmp_path: Path) -> 
         export KUBECTL_COLLECTION_TIMEOUT_SECONDS=123
         kubectl_pvc_exec() {{
           printf '%s\t%s\n' "$KUBECTL_REQUEST_TIMEOUT_SECONDS" \
-            "$KUBECTL_PROCESS_TIMEOUT_SECONDS"
+            "$KUBECTL_PROCESS_TIMEOUT_SECONDS" | send_archive
         }}
         kubectl_stream_remote_attempt test-ns collector 1234abcd {str(archive)!r}
         read -r request process < {str(archive)!r}
@@ -1115,7 +1127,7 @@ def test_collection_retries_transient_transfer_and_publishes_complete_results(
                 return 1
             fi
             test ! -e {str(received)!r} || [[ ! -s {str(received)!r} ]]
-            cat {str(payload)!r}
+            send_archive < {str(payload)!r}
         }}
         injected_error=$(printf '%b' {error!r})
         kubectl_stream_remote_attempt test-ns collector 1234abcd \
@@ -1132,12 +1144,13 @@ def test_collection_retries_transient_transfer_and_publishes_complete_results(
     assert len(calls.read_text().splitlines()) == 2
     assert received.read_bytes() == payload.read_bytes()
     assert (tmp_path / "published/executions/0001.status").read_text() == "SUCCESS\n"
-    bundles = list((metadata / "diagnostics").glob("collection-stream.*"))
-    assert len(bundles) == 1
-    assert (bundles[0] / "transfer-1.stderr").read_text().strip() == error
-    assert "attempt_id\t1234abcd" in (bundles[0] / "bundle.tsv").read_text()
-    assert "\t1\t0\t" in (bundles[0] / "transfers.tsv").read_text()
-    assert "\t0\t0\tSUCCESS" in (bundles[0] / "transfers.tsv").read_text()
+    assert (metadata / "transfer-try-1.stderr").read_text().strip() == error
+    rows = [
+        row.split("\t") for row in (metadata / "transfer.tsv").read_text().splitlines()
+    ]
+    assert [row[-1] for row in rows] == ["result", "kubectl-error", "ok"]
+    assert rows[1][4:6] == ["1", "0"]
+    assert "Warning: collection transfer 1 of 3 failed (" in result.stderr
     assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=" not in result.stderr
 
 
@@ -1194,13 +1207,15 @@ def test_collection_never_retries_permanent_or_unknown_remote_errors(
             printf '%b\\n' {error!r} >&2
             return {rc}
         }}
-        ! kubectl_stream_remote_attempt test-ns collector 1234abcd {str(archive)!r}
+        ! kubectl_stream_remote_attempt test-ns collector 1234abcd {str(archive)!r} \
+            {str(tmp_path / 'state.sh')!r}
         test ! -e {str(archive)!r}
         """)
     assert result.returncode == 0, result.stderr
     assert len(calls.read_text().splitlines()) == 1
     assert f"STORAGE_SCALE_TEST_DIAGNOSTIC_REASON={reason}" in result.stderr
-    assert f"producer_rc={rc} consumer_rc=0" in result.stderr
+    row = (tmp_path / "transfer.tsv").read_text().splitlines()[1].split("\t")
+    assert row[4:6] == [str(rc), "0"]
 
 
 def test_collection_stream_reads_only_published_state(tmp_path: Path) -> None:
@@ -1248,7 +1263,7 @@ def test_changed_source_retry_still_rejects_content_corruption(tmp_path: Path) -
                 echo 'tar: 1234abcd/state/run.status: file changed as we read it' >&2
                 return 1
             fi
-            cat {str(payload)!r}
+            send_archive < {str(payload)!r}
         }}
         kubectl_stream_remote_attempt test-ns collector 1234abcd {str(received)!r}
         kubectl_extract_attempt_archive {str(received)!r} 1234abcd \
@@ -1323,11 +1338,10 @@ def test_collection_retry_limit_keeps_bounded_error_history(tmp_path: Path) -> N
         test ! -e {str(archive)!r}
         """)
     assert result.returncode == 0, result.stderr
-    bundle = next((metadata / "diagnostics").glob("collection-stream.*"))
-    errors = list(bundle.glob("transfer-*.stderr"))
+    errors = list(metadata.glob("transfer-try-*.stderr"))
     assert len(errors) == 3
     assert all(path.stat().st_size <= 131072 for path in errors)
-    assert len((bundle / "transfers.tsv").read_text().splitlines()) == 3
+    assert len((metadata / "transfer.tsv").read_text().splitlines()) == 4
     assert "STORAGE_SCALE_TEST_DIAGNOSTIC_PATH=" in result.stderr
 
 
@@ -1368,33 +1382,110 @@ def test_collection_does_not_retry_consumer_failures(
         }}
         _kubectl_write_bounded_collection_stream() {{ return {consumer_rc}; }}
         ! kubectl_stream_remote_attempt test-ns collector 1234abcd \
-            {str(tmp_path / 'attempt.tar')!r}
+            {str(tmp_path / 'attempt.tar')!r} {str(tmp_path / 'state.sh')!r}
         """)
     assert result.returncode == 0, result.stderr
     assert len(calls.read_text().splitlines()) == 1
     assert f"STORAGE_SCALE_TEST_DIAGNOSTIC_REASON={reason}" in result.stderr
-    assert f"consumer_rc={consumer_rc}" in result.stderr
+    row = (tmp_path / "transfer.tsv").read_text().splitlines()[1].split("\t")
+    assert row[5] == str(consumer_rc)
 
 
-def test_collection_retry_diagnostics_are_bounded_and_keep_current_bundle(
-    tmp_path: Path,
-) -> None:
-    """Equal timestamps cannot prune the error currently being captured."""
-    metadata = tmp_path / "metadata"
-    root = metadata / "diagnostics"
-    root.mkdir(parents=True)
-    for number in range(10):
-        (root / f"z-old-{number}").mkdir()
+def test_collection_keeps_only_this_runs_transfer_errors(tmp_path: Path) -> None:
+    """Evidence of an earlier --collect cannot be mistaken for this one's."""
+    metadata = tmp_path / "attempts/1234abcd"
+    metadata.mkdir(parents=True)
+    for name in ("transfer.tsv", "transfer-try-3.stderr", "transfer-s1-try-2.stderr"):
+        (metadata / name).write_text("old\n")
     result = _bash(f"""
-        kubectl_pvc_exec() {{ printf 'Forbidden\\n' >&2; return 1; }}
-        _kubectl_local_path_mtime() {{ printf '0\\n'; }}
-        ! kubectl_stream_remote_attempt test-ns collector 1234abcd \
-            {str(tmp_path / 'attempt.tar')!r} {str(metadata / 'state.sh')!r}
+        kubectl_attempt_load_metadata() {{ KUBECTL_LIFECYCLE_STATE=TERMINAL; }}
+        kubectl_attempt_remote_root() {{ printf '/mnt/pvc/runs/%s\\n' "$1"; }}
+        _kubectl_scavenge_collection_staging() {{ return 1; }}
+        ! kubectl_collect_attempt {str(tmp_path)!r} {str(tmp_path)!r} 9 1234abcd
         """)
     assert result.returncode == 0, result.stderr
-    assert len(list(root.iterdir())) == 8
-    bundle = next(root.glob("collection-stream.*"))
-    assert (bundle / "transfer-1.stderr").read_text() == "Forbidden\n"
+    assert not list(metadata.iterdir())
+
+
+def test_later_segment_keeps_earlier_segment_transfer_errors(tmp_path: Path) -> None:
+    """A segment's retried failure survives the next segment's transfer."""
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    calls = tmp_path / "calls"
+    result = _bash(f"""
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        calls={str(calls)!r} CUT_CALLS=none NO_TRAILER=
+        {_LOSSY_POD}
+        eval "lossy_exec() $(declare -f kubectl_pvc_exec | tail -n +2)"
+        kubectl_pvc_exec() {{
+            printf 'call\\n' >> {str(calls)!r}.reset
+            if [[ $(wc -l < {str(calls)!r}.reset) -eq 1 ]]; then
+                printf 'read tcp: connection reset by peer\\n' >&2
+                return 1
+            fi
+            lossy_exec "$@"
+        }}
+        for segment in 0 1; do
+            rm -f {str(tmp_path)!r}/attempt-$segment.tar
+            KUBECTL_ACTIVE_SEGMENT=$segment kubectl_stream_remote_attempt test-ns \\
+                collector 1234abcd {str(tmp_path)!r}/attempt-$segment.tar \\
+                {str(metadata / 'state.sh')!r}
+        done
+        """)
+    assert result.returncode == 0, result.stderr
+    assert "connection reset" in (metadata / "transfer-try-1.stderr").read_text()
+    assert not list(metadata.glob("transfer-s1-try-*.stderr"))
+    rows = [
+        row.split("\t") for row in (metadata / "transfer.tsv").read_text().splitlines()
+    ]
+    assert rows[0][:2] == ["segment", "try"]
+    assert [(row[0], row[-1]) for row in rows[1:]] == [
+        ("0", "kubectl-error"),
+        ("0", "ok"),
+        ("1", "ok"),
+    ]
+
+
+def test_diagnostics_index_counts_toward_the_size_limit(tmp_path: Path):
+    """A bundle just under the limit still fits once SUMMARY.txt lists its files."""
+    event = tmp_path / "event"
+    event.mkdir()
+    (event / "SUMMARY.txt").write_text("cause\nfix\n")
+    (event / "events.txt").write_bytes(b"e" * 1024)
+    used = sum(f.stat().st_size for f in event.iterdir())
+    (event / "pods.log").write_bytes(b"a" * (4194303 - used))
+    result = _bash(f"_kubectl_finish_diagnostic_summary {str(event)!r}")
+    assert result.returncode == 0, result.stderr
+    summary = (event / "SUMMARY.txt").read_text()
+    assert "[omitted pods.log (" in summary and "\nFiles:\n" in summary
+    assert "  events.txt " in summary and "  pods.log " not in summary
+    assert sum(f.stat().st_size for f in event.rglob("*") if f.is_file()) <= 4194304
+
+
+def test_oversized_diagnostics_drop_the_largest_optional_files(tmp_path: Path):
+    """An oversized bundle keeps its summary and transfer evidence."""
+    event = tmp_path / "event"
+    (event / "segment-1").mkdir(parents=True)
+    (event / "job-sst-elb-1234abcd-sweep").mkdir()
+    (event / "SUMMARY.txt").write_text("cause\nfix\n")
+    (event / "transfer.tsv").write_text("segment\ttry\n")
+    (event / "transfer-s1-try-1.stderr").write_text("reset\n")
+    (event / "job-sst-elb-1234abcd-sweep/resource.yaml").write_text("kind: Job\n")
+    (event / "pods.log").write_bytes(b"a" * (2 * 1024 * 1024))
+    (event / "segment-1/pods.log").write_bytes(b"b" * (3 * 1024 * 1024))
+    result = _bash(f"_kubectl_fit_diagnostic_budget {str(event)!r}")
+    assert result.returncode == 0, result.stderr
+    assert not (event / "segment-1/pods.log").exists()
+    assert (event / "pods.log").is_file()
+    summary = (event / "SUMMARY.txt").read_text().splitlines()
+    assert summary[:2] == ["cause", "fix"]
+    assert summary[2] == (
+        "[omitted segment-1/pods.log (3145728 bytes) to fit the 4194304-byte"
+        " diagnostics limit]"
+    )
+    for name in ("transfer.tsv", "transfer-s1-try-1.stderr"):
+        assert (event / name).is_file()
+    assert sum(f.stat().st_size for f in event.rglob("*") if f.is_file()) <= 4194304
 
 
 def test_collection_retry_uses_remaining_deadline_and_tolerates_diagnostic_failure(
@@ -1402,8 +1493,7 @@ def test_collection_retry_uses_remaining_deadline_and_tolerates_diagnostic_failu
 ) -> None:
     """Retries do not restart the clock or depend on a writable diagnostic path."""
     metadata = tmp_path / "metadata"
-    metadata.mkdir()
-    (metadata / "diagnostics").write_text("not a directory")
+    (metadata / "transfer.tsv").mkdir(parents=True)
     calls = tmp_path / "calls"
     archive = tmp_path / "attempt.tar"
     result = _bash(f"""
@@ -1417,7 +1507,7 @@ def test_collection_retry_uses_remaining_deadline_and_tolerates_diagnostic_failu
                 printf 'error: unexpected EOF\\n' >&2
                 return 1
             fi
-            printf complete
+            printf complete | send_archive
         }}
         kubectl_stream_remote_attempt test-ns collector 1234abcd \
             {str(archive)!r} {str(metadata / 'state.sh')!r}
@@ -1427,7 +1517,7 @@ def test_collection_retry_uses_remaining_deadline_and_tolerates_diagnostic_failu
     assert len(deadlines) == 2
     assert 0 < deadlines[1] <= deadlines[0] <= 10
     assert archive.read_text() == "complete"
-    assert "diagnostics could not be saved" in result.stderr
+    assert "transfer evidence could not be saved" in result.stderr
     assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=" not in result.stderr
 
 
@@ -1630,8 +1720,8 @@ def test_noisy_successful_collection_stream_is_not_killed(tmp_path: Path) -> Non
     archive = tmp_path / "attempt.tar"
     result = _bash(f"""
         kubectl_pvc_exec() {{
-            printf archive-data
             head -c 2097152 /dev/zero | tr '\\0' E >&2
+            printf archive-data | send_archive
         }}
         kubectl_stream_remote_attempt test-ns collector 1234abcd \
             {str(archive)!r}
@@ -1651,7 +1741,7 @@ def test_integration_collection_hold_is_an_explicit_pre_stream_boundary(
     result = _bash(f"""
         STORAGE_SCALE_TEST_INTEGRATION=1
         KUBECTL_INTEGRATION_COLLECTION_HOLD_FILE={str(hold)!r}
-        kubectl_pvc_exec() {{ printf archive-data; }}
+        kubectl_pvc_exec() {{ printf archive-data | send_archive; }}
         kubectl_stream_remote_attempt test-ns collector 1234abcd \
             {str(archive)!r} &
         pid=$!
@@ -4995,3 +5085,157 @@ def test_coordinator_log_is_not_written_without_a_usable_log(
     assert result.stdout == "reached\n"
     assert not list(tmp_path.glob("coordinator*"))
     assert not list(tmp_path.glob(".coordinator-log.*"))
+
+
+# A stub Pod whose stream a lossy transport can cut short: CUT_CALLS lists
+# the calls (1-based) that deliver only the first 10 compressed bytes, and
+# NO_TRAILER drops the size and SHA-256 trailer.
+_LOSSY_POD = r"""
+    body=$(mktemp)
+    printf complete | gzip -6 -n > "$body"
+    kubectl_pvc_exec() {
+        local call
+        printf 'call\n' >> "$calls"
+        call=$(wc -l < "$calls")
+        if [[ " $CUT_CALLS " == *" ${call// /} "* ]]; then
+            head -c 10 "$body"
+        else
+            cat "$body"
+        fi
+        [[ -n "${NO_TRAILER:-}" ]] || printf '\n%s bytes=%s sha256=%s\n' \
+            "$KUBECTL_COLLECTION_TRAILER" "$(wc -c < "$body" | tr -d ' ')" \
+            "$(_kubectl_sha256_file "$body")" >&2
+    }
+"""
+
+
+def _lossy_collect(tmp_path: Path, cut_calls: str, no_trailer: str = ""):
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    archive = tmp_path / "attempt.tar"
+    calls = tmp_path / "calls"
+    result = _bash(f"""
+        KUBECTL_COLLECTION_RETRY_BACKOFF_SECONDS=0
+        calls={str(calls)!r} CUT_CALLS={cut_calls!r} NO_TRAILER={no_trailer!r}
+        {_LOSSY_POD}
+        kubectl_stream_remote_attempt test-ns collector 1234abcd \\
+            {str(archive)!r} {str(metadata / 'state.sh')!r}
+        """)
+    rows = (metadata / "transfer.tsv").read_text().splitlines()[1:]
+    return result, archive, [row.split("\t") for row in rows]
+
+
+def test_collection_retries_a_stream_cut_short_with_exit_zero(tmp_path: Path):
+    """[R-03] A transport that drops the stream's tail is caught and retried."""
+    result, archive, rows = _lossy_collect(tmp_path, "1")
+    assert result.returncode == 0, result.stderr
+    assert archive.read_text() == "complete"
+    sent = rows[0][7]
+    assert [row[-1] for row in rows] == ["short", "ok"]
+    assert rows[0][6] == "10" and rows[1][6] == sent
+    assert rows[1][8] == rows[1][9]
+    assert result.stderr == (
+        f"Warning: collection transfer 1 of 3 was incomplete (got 10 of {sent} bytes);"
+        " retrying\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "no_trailer,result_name,cause",
+    [
+        ("", "short", "lost data in transit (got 10 of "),
+        (
+            "1",
+            "missing-trailer",
+            "lost data in transit (got 10 bytes and no size check",
+        ),
+    ],
+)
+def test_collection_persistent_loss_is_a_transfer_failure(
+    tmp_path: Path, no_trailer: str, result_name: str, cause: str
+):
+    """[R-03] Repeated loss fails as TRANSFER_FAILED and blames the transport."""
+    result, archive, rows = _lossy_collect(tmp_path, "1 2 3", no_trailer)
+    assert result.returncode != 0
+    assert not archive.exists()
+    assert [row[-1] for row in rows] == [result_name] * 3
+    assert f"Error: Collection transfer {cause}" in result.stderr
+    assert "3 tries). Remote results are intact; rerun --collect.\n" in result.stderr
+    assert "STORAGE_SCALE_TEST_DIAGNOSTIC_REASON=TRANSFER_FAILED" in result.stderr
+    assert "lost\\ data\\ in\\ transit" in result.stderr
+    assert "ARCHIVE_INVALID" not in result.stderr
+
+
+def test_collection_failure_writes_one_diagnostics_directory(tmp_path: Path):
+    """One failure event: SUMMARY.txt first, one folder, one printed path."""
+    root = tmp_path / "kubernetes"
+    metadata = root / "attempts/1234abcd"
+    result = _bash(f"""
+        {_identity(root)}
+        kubectl_attempt_write_state "$root" "$fd" 1234abcd TERMINAL
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd sweep \\
+            Job sst-elb-1234abcd-sweep test-ns job-uid \\
+            0123456789abcdef0123456789abcdef
+        kubectl_attempt_journal_resource "$root" "$fd" 1234abcd workers \\
+            DaemonSet sst-elb-1234abcd-workers test-ns workers-uid \\
+            0123456789abcdef0123456789abcdef
+        kubectl_local_lock_release "$fd"
+        kubectl_run_bounded() {{
+            if [[ "$*" == *'-o name'* ]]; then
+                printf 'pod/sst-elb-1234abcd-workers-abc\\n'
+            else
+                printf 'evidence\\n'
+            fi
+        }}
+        kubectl_pvc_exec() {{ printf 'manifest\\n'; }}
+        printf 'try\\tresult\\n1/3\\tshort\\n' > {str(metadata / 'transfer.tsv')!r}
+        KUBECTL_TRANSFER_RECEIVED_BYTES=79554560 KUBECTL_TRANSFER_SENT_BYTES=80640000
+        remote_state=SUCCESS KUBECTL_FAILURE_ATTEMPT=1234abcd
+        _kubectl_describe_lost_transfer test-ns collector 1234abcd \\
+            /mnt/pvc/runs/1234abcd 3 short
+        kubectl_report_collection_failure 1234abcd archive-stream TRANSFER_FAILED \\
+            'the transfer lost data in transit (kubectl exited 0); rerun --collect' \\
+            {str(metadata / 'state.sh')!r} /mnt/pvc/runs/1234abcd/state/run.status
+        kubectl_preserve_attempt_diagnostics "$root" 1234abcd collect-failed
+        """)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    assert lines[0] == (
+        "Error: Collection transfer lost data in transit (got 79554560 of 80640000"
+        " bytes, 3 tries). Remote results are intact; rerun --collect."
+    )
+    assert lines[1].startswith("Kubernetes failure diagnostics: ")
+    assert lines[2].startswith("STORAGE_SCALE_TEST_DIAGNOSTIC_OPERATION=collect")
+    assert result.stderr.count("Kubernetes failure diagnostics:") == 1
+    events = list((metadata / "diagnostics").iterdir())
+    assert len(events) == 1 and events[0].name.startswith("collect-failed-")
+    event = events[0]
+    assert f"STORAGE_SCALE_TEST_DIAGNOSTIC_PATH={event}" in result.stderr
+    summary = (event / "SUMMARY.txt").read_text().splitlines()
+    assert summary[0] == (
+        "Collection transfer lost data in transit (got 79554560 of 80640000 bytes,"
+        " 3 tries)."
+    )
+    assert summary[1] == "Remote results are intact; rerun --collect."
+    text = "\n".join(summary)
+    assert "Remote run SUCCESS; its results stay on the PVC." in text
+    assert "kubectl -n test-ns exec sst-elb-1234abcd-workers-abc -- sh -c 'cd" in text
+    assert "/mnt/pvc/runs && tar -cf - 1234abcd/state | gzip -6 -n" in text
+    assert "  transfer.tsv " in text and "  job-sst-elb-1234abcd-sweep/ " in text
+    assert (event / "job-sst-elb-1234abcd-sweep/resource.yaml").is_file()
+    assert (event / "daemonset-sst-elb-1234abcd-workers/resource.describe").is_file()
+    assert (event / "pods.log").is_file() and (event / "transfer.tsv").is_file()
+    assert not list(event.glob("*/pods.log"))
+
+
+def test_capped_diagnostics_say_they_were_truncated(tmp_path: Path):
+    """A cut diagnostic file states so instead of ending silently."""
+    whole = tmp_path / "whole"
+    cut = tmp_path / "cut"
+    result = _bash(f"""
+        printf 0123456789 | _kubectl_write_capped 10 {str(whole)!r}
+        printf 0123456789AB | _kubectl_write_capped 10 {str(cut)!r}
+        """)
+    assert result.returncode == 0, result.stderr
+    assert whole.read_text() == "0123456789"
+    assert cut.read_text() == "0123456789\n[truncated: showed the first 10 bytes]\n"

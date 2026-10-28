@@ -771,8 +771,11 @@ Normalized reasons are `AUTH`, `TIMEOUT`, `API_THROTTLED`,
 request made from a state in which that operation is not legal; its diagnostic
 must print the exact prerequisite command or next lifecycle action.
 `TRANSFER_FAILED` identifies an unrecognized or remote-command transfer
-failure; it does not claim an API outage. Collection retries positively
-identified transient transport failures or tar's isolated changed-source
+failure, or data lost in transit; it does not claim an API outage. The Pod
+sends `tar | gzip -6 -n` and then its byte count and SHA-256 on stderr; a
+missing or mismatched check means data was lost even if `kubectl exec`
+exited 0. Collection retries lost data, positively
+identified transient transport failures, or tar's isolated changed-source
 warning, making up to three attempts with backoff
 within one transfer deadline (plus the timeout tool's five-second kill
 grace). `KUBECTL_COLLECTION_TIMEOUT_SECONDS` (default 7200) is the total
@@ -780,9 +783,11 @@ deadline. Until a producer times out, each transfer is capped at
 `KUBECTL_COLLECTION_ATTEMPT_TIMEOUT_SECONDS` (default one third of the total);
 the following transfer may use the remaining deadline. Authentication,
 identity, path, local-storage, archive-integrity,
-and unknown failures remain fatal. Each failed transfer preserves bounded
-stderr and producer/consumer status in local attempt diagnostics, including
-when a later transfer succeeds; partial archives are discarded between tries.
+and unknown failures remain fatal. Each `--collect` starts a fresh
+`transfer.tsv` in the attempt's folder with one row per try and segment
+(exit statuses, sizes, SHA-256 values, result), including successes; a failed
+try keeps bounded stderr as `transfer[-s<K>]-try-<N>.stderr`, and partial
+archives are discarded between tries.
 Only the published `state/` subtree is transferred; uploaded control files
 remain available locally. Changed-source warnings are never ignored: a retry
 must finish cleanly and pass the same manifest hashes before publication.
@@ -803,7 +808,13 @@ coordinator Job's log (its last 16 MiB) is saved once per segment as
 `coordinator[-s<K>].log` in the attempt metadata. Store the
 schema-versioned, bounded diagnostic bundle in the attempt's local Kubernetes
 metadata, not in
-the benchmark result/reporting contract. If diagnostic capture fails, retain
+the benchmark result/reporting contract. One failure writes one
+`diagnostics/<operation>-<UTC>/` folder: `SUMMARY.txt` (cause, fix,
+supporting numbers, read-only checks, file list), Pod evidence once, and a
+subfolder per retained resource. A capped file ends with a `[truncated: …]`
+line; above 4 MiB, the largest Pod or resource files are dropped and listed in
+`SUMMARY.txt`. A failed collection prints one `Error:` line, the folder, then the
+key/value block. If diagnostic capture fails, retain
 the primary error, continue safe cleanup, print copy-pasteable inspection
 commands, and state whether data and resources were retained.
 

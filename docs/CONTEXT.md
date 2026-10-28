@@ -159,6 +159,8 @@ keys); every reader must accept the optional fifth field.
 - Lost creates are retried only after an exact GET proves absence; objects
   absent past the ambiguity horizon are never adopted; the
   `app.kubernetes.io/name` label never proves ownership.
+- `kubectl exec` (seen through Teleport) can drop a stream's tail and exit 0,
+  so collection trusts only the Pod's trailing size and SHA-256 check.
 - Elbencho validation, worker, and coordinator Pods use `Unconfined` seccomp
   for Linux AIO; other helpers keep `RuntimeDefault`.
 - Release gates: Docker SBX for the supported kind profile, dual-architecture
