@@ -110,7 +110,12 @@ from lib.elbencho_live_plots import (
     plot_fairness_timeseries,
 )
 from lib.elbencho_live_steady import (
+    CLASS_PERSISTENT,
+    CLASS_TRANSIENT,
     PhaseContext,
+    REASON_NO_FIRST_TIME,
+    REASON_NO_STEADY_STATE,
+    REASON_TOO_SHORT,
     SteadyAnalysis,
     WindowedClientDetail,
     WINDOW_30S,
@@ -277,6 +282,9 @@ class ElbenchoMetrics:
     treescan_min_bytes: int = 0
     treescan_max_bytes: int = 0
     treescan_first_file_bytes: int = 0  # when only first-file fallback line exists
+
+    # Directory of the .csv/.out pair; tells same-named runs apart across inputs.
+    result_dir: str = "."
 
     # Single-file mode annotations (from .out log lines)
     is_single_big_file: bool = False
@@ -2848,11 +2856,15 @@ def _terminal_table_subgroups(
     return out
 
 
-def print_terminal_table(metrics: List[ElbenchoMetrics]) -> None:
+def print_terminal_table(
+    metrics: List[ElbenchoMetrics],
+    live: Optional[Dict[LiveRowKey, SteadyAnalysis]] = None,
+) -> None:
     """Print formatted metrics table in terminal text format.
 
     Args:
         metrics: List of ElbenchoMetrics objects to display
+        live: Steady-state analyses by live_row_key, shown under each table
     """
     if not metrics:
         print("No metrics to display")
@@ -3093,6 +3105,8 @@ def print_terminal_table(metrics: List[ElbenchoMetrics]) -> None:
                 # Print data rows
                 for row in rows:
                     print(row_format.format(*row))
+                if live:
+                    print_live_fairness_table(sub_metrics, live)
 
     print("")  # Add blank line at end
 
@@ -3594,7 +3608,19 @@ def phase_contexts(metrics: Sequence[ElbenchoMetrics]) -> Dict[str, PhaseContext
 
 
 def _live_metrics_key(item: Any) -> Tuple[Any, ...]:
-    return (item.io_size, item.nodes, item.threads, item.io_depth, item.datestamp)
+    """Run identity shared by a live CSV and its metrics, directory included."""
+    if isinstance(item, LiveFileMetadata):
+        directory = os.path.normpath(os.path.dirname(item.path) or ".")
+    else:
+        directory = item.result_dir
+    return (
+        directory,
+        item.io_size,
+        item.nodes,
+        item.threads,
+        item.io_depth,
+        item.datestamp,
+    )
 
 
 def live_phase_contexts(
@@ -3653,6 +3679,176 @@ def format_live_fairness_line(stem: str, label: str, steady: SteadyAnalysis) -> 
     )
 
 
+LiveRowKey = Tuple[Any, ...]
+
+_STEADY_REASON_TEXT = {
+    REASON_NO_FIRST_TIME: "no elbencho [first] time",
+    REASON_TOO_SHORT: "phase too short",
+    REASON_NO_STEADY_STATE: "throughput never settled",
+}
+
+
+def live_row_key(item: Any, phase: str) -> LiveRowKey:
+    """Key matching a table row (metric) to a live domain of the same run."""
+    return (*_live_metrics_key(item), phase.upper())
+
+
+def _seconds_label(milliseconds: Set[int], nominal: str) -> str:
+    """'4.8s' when every row shares one length, else the nominal label."""
+    if len(milliseconds) == 1:
+        return f"{next(iter(milliseconds)) / 1000:g}s"
+    return nominal
+
+
+def _window_label(steadies: Sequence[SteadyAnalysis], label: str, nominal: str):
+    lengths = {s.series[label].window_ms for s in steadies if label in s.series}
+    return _seconds_label(lengths, nominal)
+
+
+def _latency_ms(value_us: Optional[float]) -> str:
+    return NO_VALUE if value_us is None else format_with_sig_figs(value_us / 1000)
+
+
+def _live_table_cells(steady: SteadyAnalysis) -> List[str]:
+    """Steady, Jain 5 s, Jain 30 s, slowest/median, slow clients, latency."""
+    if not steady.window.available:
+        return ["none"] + [NO_VALUE] * 8
+    window, summary_5s = steady.window, steady.summary(WINDOW_5S)
+    counts, latency = steady.class_counts(), steady.latency
+    total = sum(counts.values())
+    jains = [_jain_text(label, steady, "").strip() for label in (WINDOW_5S, WINDOW_30S)]
+    return [
+        f"{window.start_ms / 1000:.1f}",
+        f"{window.end_ms / 1000:.1f}",
+        *jains,
+        _fmt(summary_5s.min_over_median_p10 if summary_5s else None, ".3f"),
+        (
+            f"{counts[CLASS_PERSISTENT]}+{counts[CLASS_TRANSIENT]} of {total}"
+            if total
+            else NO_VALUE
+        ),
+        _latency_ms(latency.p50_us if latency else None),
+        _latency_ms(latency.p90_us if latency else None),
+        _fmt(latency.max_over_p50 if latency else None, ".2f"),
+    ]
+
+
+def _live_table_columns(
+    metrics: Sequence[ElbenchoMetrics], steadies: Sequence[SteadyAnalysis]
+) -> List[List[str]]:
+    """Display columns: row identity, then the aligned live cells."""
+    cells = [_live_table_cells(steady) for steady in steadies]
+    columns = [list(column) for column in zip(*cells)]
+    starts, ends = columns[0], columns[1]
+    start_width = max(len(value) for value in starts)
+    end_width = max(len(value) for value in ends)
+    steady_column = [
+        (
+            start
+            if start == "none"
+            else f"{start.rjust(start_width)}-{end.rjust(end_width)}"
+        )
+        for start, end in zip(starts, ends)
+    ]
+    for index in (6, 7):
+        columns[index] = align_decimal_points(columns[index], False)
+    return [
+        [str(metric.nodes) for metric in metrics],
+        [str(metric.threads) for metric in metrics],
+        [str(metric.io_depth) for metric in metrics],
+        steady_column,
+        *columns[2:],
+    ]
+
+
+def _render_header_groups(
+    groups: Sequence[Tuple[str, int]], widths: Sequence[int]
+) -> str:
+    """One header line; a label spanning several columns is centered in dashes."""
+    parts, column = [], 0
+    for label, span in groups:
+        width = sum(widths[column : column + span]) + 3 * (span - 1)
+        if span > 1:
+            parts.append(f" {label} ".center(width, "-"))
+        else:
+            parts.append(label.ljust(width) if column < 3 else label.rjust(width))
+        column += span
+    return " | ".join(parts)
+
+
+def print_live_fairness_table(
+    metrics: Sequence[ElbenchoMetrics],
+    live: Dict[LiveRowKey, SteadyAnalysis],
+) -> None:
+    """Print the live steady-state table for the rows of one terminal table."""
+    rows = [
+        (metric, live[key])
+        for metric in metrics
+        if (key := live_row_key(metric, metric.operation)) in live
+    ]
+    if not rows:
+        return
+    row_metrics = [metric for metric, _ in rows]
+    steadies = [steady for _, steady in rows]
+    window_5s = _window_label(steadies, WINDOW_5S, "5s")
+    interval = _seconds_label({steady.interval_ms for steady in steadies}, "live")
+    groups = [
+        ("", 1),
+        ("", 1),
+        ("", 1),
+        ("Steady", 1),
+        ("Jain p50/min", 2),
+        ("Slowest/med", 1),
+        ("Slow clients", 1),
+        ("Interval mean latency", 3),
+    ]
+    labels = [
+        "Nodes",
+        "Thrds",
+        "IODep",
+        "window (s)",
+        window_5s,
+        _window_label(steadies, WINDOW_30S, "30s"),
+        f"p10, {window_5s}",
+        "pers+trans",
+        "p50 (ms)",
+        "p90 (ms)",
+        "max/p50",
+    ]
+    columns = _live_table_columns(row_metrics, steadies)
+    widths = [
+        max(len(label), *(len(value) for value in column))
+        for label, column in zip(labels, columns)
+    ]
+    widths[0:3] = [max(width, 5) for width in widths[0:3]]
+    # A top label wider than its columns widens the last of them; a spanning
+    # label also needs room for one dash on each side.
+    span_start = 0
+    for label, span in groups:
+        span_end = span_start + span
+        needed = len(label) + (2 if span > 1 else 0)
+        widths[span_end - 1] += max(
+            0, needed - sum(widths[span_start:span_end]) - 3 * (span - 1)
+        )
+        span_start = span_end
+    print(
+        f"\n{LIVE_FAIRNESS_HEADING} (steady window only; latency is the mean "
+        f"of each {interval} interval, not a per-I/O percentile)"
+    )
+    print(_render_header_groups(groups, widths))
+    print(_render_header_groups([(label, 1) for label in labels], widths))
+    print("-" * (sum(widths) + 3 * (len(widths) - 1)))
+    for values in zip(*columns):
+        print(_render_header_groups([(value, 1) for value in values], widths))
+    for metric, steady in rows:
+        if not steady.window.available:
+            reason = _STEADY_REASON_TEXT.get(steady.window.reason, steady.window.reason)
+            print(
+                f"No steady window for Nodes {metric.nodes}, Thrds "
+                f"{metric.threads}, IODep {metric.io_depth}: {reason}"
+            )
+
+
 def _env_for_live(environments: Dict[str, dict], path: str) -> dict:
     directory = os.path.normpath(os.path.dirname(path))
     for input_dir, env in environments.items():
@@ -3667,9 +3863,9 @@ def _report_one_live_file(  # pylint: disable=too-many-arguments,too-many-positi
     options: LiveReportOptions,
     configured_interval_ms: Optional[int],
     contexts: Dict[str, PhaseContext],
-    fairness_lines: List[str],
+    fairness: List[Tuple[LiveFileMetadata, LiveDomainKey, SteadyAnalysis]],
 ) -> bool:
-    """Analyze one live CSV; write the live reports and collect fairness lines."""
+    """Analyze one live CSV; write the live reports and collect its fairness."""
     analysis = analyze_live_csv(metadata)
     eprint(f"Analyzed live CSV: {metadata.path}")
     if not analysis.domains:
@@ -3693,9 +3889,7 @@ def _report_one_live_file(  # pylint: disable=too-many-arguments,too-many-positi
             "WRITE",
             "READ",
         ):
-            fairness_lines.append(
-                format_live_fairness_line(metadata.stem, domain_key.label, steady)
-            )
+            fairness.append((metadata, domain_key, steady))
         _report_live_domain(
             analysis, metadata, domain_key, domain, steady, output_dir, options
         )
@@ -4269,6 +4463,8 @@ def parse_elbencho_files(base_filename: str) -> List[ElbenchoMetrics]:
 
     result_dir = os.path.dirname(base_filename) or "."
     apply_treescan_from_directory_scan(result_dir, metrics, base_filename)
+    for metric in metrics:
+        metric.result_dir = os.path.normpath(result_dir)
 
     return metrics
 
@@ -5335,6 +5531,60 @@ def main() -> None:
         sys.exit(exit_status)
 
 
+def _analyze_live_files(
+    args: argparse.Namespace,
+    metrics: List[ElbenchoMetrics],
+    live_files: List[LiveFileMetadata],
+    output_dir: str,
+    environments: Dict[str, dict],
+) -> Tuple[List[Tuple[LiveFileMetadata, LiveDomainKey, SteadyAnalysis]], int]:
+    """Write every live CSV's reports; return the fairness and success count."""
+    options = LiveReportOptions(
+        args.client_shortfall_percent,
+        args.client_min_slow_windows,
+        args.client_max_timeseries_lines,
+        args.client_max_heatmap_rows,
+    )
+    fairness: List[Tuple[LiveFileMetadata, LiveDomainKey, SteadyAnalysis]] = []
+    successful = 0
+    for metadata in live_files:
+        try:
+            if _report_one_live_file(
+                metadata,
+                output_dir,
+                options,
+                _configured_interval_ms(_env_for_live(environments, metadata.path)),
+                live_phase_contexts(metadata, metrics),
+                fairness,
+            ):
+                successful += 1
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            eprint(f"Error reporting live CSV {metadata.path}: {exc}")
+            traceback.print_exc()
+    return fairness, successful
+
+
+def _split_live_fairness(
+    fairness: List[Tuple[LiveFileMetadata, LiveDomainKey, SteadyAnalysis]],
+    metrics: List[ElbenchoMetrics],
+    markdown: bool,
+) -> Tuple[Dict[LiveRowKey, SteadyAnalysis], List[str]]:
+    """Domains shown under a terminal table row, and lines for all others."""
+    row_keys = {live_row_key(metric, metric.operation) for metric in metrics}
+    live: Dict[LiveRowKey, SteadyAnalysis] = {}
+    lines: List[str] = []
+    for metadata, domain_key, steady in fairness:
+        key = live_row_key(metadata, domain_key.phase)
+        plain = not domain_key.mix_type and not domain_key.occurrence
+        if not markdown and plain and key in row_keys:
+            live[key] = steady
+        else:
+            lines.append(
+                format_live_fairness_line(metadata.stem, domain_key.label, steady)
+            )
+    return live, lines
+
+
 def _emit_reports(
     args: argparse.Namespace,
     metrics: List[ElbenchoMetrics],
@@ -5345,6 +5595,10 @@ def _emit_reports(
 ) -> None:
     """Print the tables, generate the plots and the live reports."""
     target_label, environments = target_and_environments
+    fairness, successful_live_reports = _analyze_live_files(
+        args, metrics, live_files, output_dir, environments
+    )
+    live, fairness_lines = _split_live_fairness(fairness, metrics, args.markdown)
 
     if metrics:
         if args.markdown:
@@ -5361,6 +5615,7 @@ def _emit_reports(
                     print_terminal_table, versions.of(metrics), target=target_label
                 ),
                 metrics,
+                live,
             )
 
     # Generate plots if we have metrics and an input directory for storing plots
@@ -5372,28 +5627,6 @@ def _emit_reports(
         plot_metrics(metrics, output_dir, args.no_dual_y_axis)
         eprint(f"Generated plots saved in {output_dir}")
 
-    options = LiveReportOptions(
-        args.client_shortfall_percent,
-        args.client_min_slow_windows,
-        args.client_max_timeseries_lines,
-        args.client_max_heatmap_rows,
-    )
-    fairness_lines: List[str] = []
-    successful_live_reports = 0
-    for metadata in live_files:
-        try:
-            if _report_one_live_file(
-                metadata,
-                output_dir,
-                options,
-                _configured_interval_ms(_env_for_live(environments, metadata.path)),
-                live_phase_contexts(metadata, metrics),
-                fairness_lines,
-            ):
-                successful_live_reports += 1
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            eprint(f"Error reporting live CSV {metadata.path}: {exc}")
-            traceback.print_exc()
     emit_live_fairness(fairness_lines, args.markdown, output_dir)
     if live_files and not successful_live_reports:
         eprint("ERROR: No live CSV reports were generated")

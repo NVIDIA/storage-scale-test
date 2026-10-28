@@ -799,7 +799,7 @@ Outputs, named `<stem>-<phase slug>-*` in the report directory:
 
 | Output | Content |
 | --- | --- |
-| "Live fairness" lines | Per phase: steady span, Jain p50/min per window, 5 s slowest/median p10, slow-client counts, latency p50, p90, and max/p50. In `report.txt` and stdout (stdout only with `--markdown`) |
+| "Live fairness" table | Under each results table: steady span, Jain p50/min per window, slowest/median p10, slow clients, and per-interval mean latency p50, p90 and max/p50. In `report.txt` and stdout; `--markdown` prints one line per phase |
 | `aggregate-timeseries.png` | Total MiB/s and IOPS, plus a fleet IO latency panel; warmup and tail shaded, `[first]`/`[last]` marked |
 | `fairness-timeseries.png` | Jain per window with the 5 s floor; below, the 5 s slowest/median ratio against `1 - S` and `1 - 2S` |
 | `client-summary.csv` / `.txt` | Per client: class, steady MiB/s and ratio, worst 5 s and 30 s ratios and times, percent of 5 s windows short, whole-run mean and median, sample counts |
@@ -807,7 +807,8 @@ Outputs, named `<stem>-<phase slug>-*` in the report directory:
 | `client-ratio-heatmap.png` | Clients by 5 s windows, percent of the fleet median on a 50-150% scale; slow clients, then representatives |
 
 Fleet latency is the Total rows' `Lat IO us`, an op-weighted mean per
-interval; captures without that column have no latency panel.
+interval; captures without that column have no latency panel. Averaging
+hides slow I/Os, so its p90 sits well below the results table's per-I/O 99%.
 
 ## Advanced node selection and Slurm options
 

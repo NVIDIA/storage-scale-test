@@ -198,7 +198,7 @@ def test_cli_default_terminal_report_is_mirrored_to_a_text_file(monkeypatch, tmp
     monkeypatch.setattr(
         _EXTRACT,
         "mirror_stdout_to_file",
-        lambda path, printer, metrics: mirrored.append((path, printer, metrics)),
+        lambda path, printer, metrics, _live: mirrored.append((path, printer, metrics)),
     )
     monkeypatch.setattr(_EXTRACT, "plot_metrics", lambda *_arguments: None)
 
@@ -437,12 +437,12 @@ def test_phase_contexts_tolerate_missing_times():
 
 
 def test_live_contexts_match_by_coordinates():
-    """Only metrics sharing the live CSV's coordinates contribute."""
-    live = SimpleNamespace(
-        io_size="4K", nodes=1, threads=1, io_depth=1, datestamp="20260101Z000000"
-    )
-    other = replace(_io_metric(), threads=2, operation="READ")
-    contexts = _EXTRACT.live_phase_contexts(live, [_io_metric(), other])
+    """Only metrics sharing the live CSV's directory and coordinates contribute."""
+    live = _EXTRACT.LiveFileMetadata("a/x.live.csv", "4K", 1, 1, 1, "20260101Z000000")
+    same = _io_metric(result_dir="a")
+    other_threads = _io_metric(result_dir="a", threads=2, operation="READ")
+    other_dir = _io_metric(result_dir="b", operation="READ")
+    contexts = _EXTRACT.live_phase_contexts(live, [same, other_threads, other_dir])
     assert set(contexts) == {"write"}
 
 
@@ -528,4 +528,83 @@ def test_fairness_lines_skip_phases_without_data(monkeypatch, tmp_path):
     assert _EXTRACT._report_one_live_file(  # pylint: disable=protected-access
         metadata, str(tmp_path), options, 1000, {}, collected
     )
-    assert len(collected) == 1 and " WRITE: " in collected[0]
+    assert [key.label for _, key, _ in collected] == ["WRITE"]
+
+
+def _table_steady(reason=None, transient=2):
+    """A duck-typed SteadyAnalysis for the live table."""
+    stub = _steady_stub(
+        reason,
+        SimpleNamespace(p50_us=2180.0, p90_us=12860.0, max_over_p50=1.9923),
+    )
+    stub.interval_ms = 800
+    stub.series = {
+        "5s": SimpleNamespace(window_ms=4800),
+        "30s": SimpleNamespace(window_ms=30400),
+    }
+    stub.class_counts = lambda: {"persistent": 1, "transient": transient, "ok": 1}
+    return stub
+
+
+def test_live_fairness_table_follows_the_table_rows(capsys):
+    """Rows follow the metrics, labels span their columns, and decimals align."""
+    metrics = [_io_metric(io_depth=depth) for depth in (1, 4, 16)]
+    live = {
+        _EXTRACT.live_row_key(metrics[0], "write"): _table_steady(),
+        _EXTRACT.live_row_key(metrics[2], "write"): _table_steady("too_short"),
+    }
+    _EXTRACT.print_live_fairness_table(metrics, live)
+    assert capsys.readouterr().out.splitlines() == [
+        "",
+        "Live fairness (steady window only; latency is the mean of each 0.8s "
+        "interval, not a per-I/O percentile)",
+        "      |       |       |     Steady | --- Jain p50/min -- "
+        "| Slowest/med | Slow clients | --- Interval mean latency ---",
+        "Nodes | Thrds | IODep | window (s) |        4.8s | 30.4s "
+        "|   p10, 4.8s |   pers+trans | p50 (ms) | p90 (ms) | max/p50",
+        "-" * 117,
+        "1     | 1     | 1     |   2.0-31.5 | 0.977/0.900 |   -/- "
+        "|       0.950 |     1+2 of 4 |     2.18 |     12.9 |    1.99",
+        "1     | 1     | 16    |       none |           - |     - "
+        "|           - |            - |     -    |      -   |       -",
+        "No steady window for Nodes 1, Thrds 1, IODep 16: phase too short",
+    ]
+
+
+def test_live_fairness_rows_fall_back_to_lines():
+    """Mixed, repeated, unmatched and markdown domains keep their lines."""
+    metric = _io_metric(io_size="4K")
+    live_file = _EXTRACT.LiveFileMetadata("x.live.csv", "4K", 1, 1, 1, "20260101Z")
+    metric = replace(metric, datestamp="20260101Z")
+    fairness = [
+        (live_file, _EXTRACT.LiveDomainKey("WRITE", ""), _table_steady()),
+        (live_file, _EXTRACT.LiveDomainKey("WRITE", "", 1), _table_steady()),
+        (live_file, _EXTRACT.LiveDomainKey("READ", ""), _table_steady()),
+    ]
+    # pylint: disable=protected-access
+    live, lines = _EXTRACT._split_live_fairness(fairness, [metric], False)
+    assert list(live) == [_EXTRACT.live_row_key(metric, "WRITE")]
+    assert [line.split(":")[0] for line in lines] == [
+        "x WRITE occurrence 2",
+        "x READ",
+    ]
+    live, lines = _EXTRACT._split_live_fairness(fairness, [metric], True)
+    assert not live and len(lines) == 3
+
+def test_same_named_runs_in_different_inputs_keep_their_own_fairness():
+    """Identical filenames in two input directories never share a table row."""
+    direct = _io_metric(result_dir="direct", datestamp="20260101Z")
+    buffered = _io_metric(result_dir="buffered", datestamp="20260101Z")
+    fairness = [
+        (
+            _EXTRACT.LiveFileMetadata(f"{name}/x.live.csv", "4K", 1, 1, 1, "20260101Z"),
+            _EXTRACT.LiveDomainKey("WRITE", ""),
+            name,
+        )
+        for name in ("direct", "buffered")
+    ]
+    # pylint: disable=protected-access
+    live, lines = _EXTRACT._split_live_fairness(fairness, [direct, buffered], False)
+    assert not lines
+    assert live[_EXTRACT.live_row_key(direct, "WRITE")] == "direct"
+    assert live[_EXTRACT.live_row_key(buffered, "WRITE")] == "buffered"
