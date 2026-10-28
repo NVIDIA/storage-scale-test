@@ -48,7 +48,7 @@ _FILESYSTEM = sys.modules["filesystem_integration"]
 @pytest.mark.parametrize("architecture", ["x86_64", "aarch64"])
 def test_deployment_and_fixture_elbencho_release_pins_agree(architecture):
     """Download versions and archive identities must agree across both paths."""
-    builder = (_REPO_ROOT / "utils/build_tarball.sh").read_text(encoding="utf-8")
+    builder = (_REPO_ROOT / "utils/build/fetch_elbencho.sh").read_text(encoding="utf-8")
     version = _FILESYSTEM.ELBENCHO_VERSION
     assert f"ELBENCHO_VERSION_TAG='{version}'" in builder
     archive, digest, _ = _FILESYSTEM.ELBENCHO_ARCHIVES[architecture]

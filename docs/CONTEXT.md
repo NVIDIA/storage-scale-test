@@ -254,7 +254,7 @@ python3 utils/compress_json_for_context.py < result.json
 
 ## Deployment and supply chain
 
-`utils/build_tarball.sh` downloads pinned upstream elbencho `v3.2-1` and
+`utils/build/fetch_elbencho.sh` downloads pinned upstream elbencho `v3.2-1` and
 verifies per-architecture SHA-256 values; existing custom binaries stay unless
 `--force-download`. Warp is never downloaded: existing binaries are included,
 or users build them with `utils/build/build_warp_from_source.sh`. Archives

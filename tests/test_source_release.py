@@ -55,9 +55,12 @@ CHANGELOG = """# Changelog
 def _deployment_source(tmp_path):
     """Build an isolated checkout with user-provided binaries and no downloads."""
     root = tmp_path / "tree with 'spaces'"
-    (root / "utils").mkdir(parents=True)
+    (root / "utils/build").mkdir(parents=True)
     (root / "lib").mkdir()
     shutil.copy2(ROOT / "utils/build_tarball.sh", root / "utils/build_tarball.sh")
+    shutil.copy2(
+        ROOT / "utils/build/fetch_elbencho.sh", root / "utils/build/fetch_elbencho.sh"
+    )
     shutil.copy2(ROOT / "lib/project_version.sh", root / "lib/project_version.sh")
     (root / "NOTICE").write_text("notice\n")
     (root / "source.txt").write_text("source\n")

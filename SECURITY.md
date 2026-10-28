@@ -162,11 +162,11 @@ They are derived from the actual code paths and the intended deployment model.
    directory can execute attacker-controlled shell code. Only resume from
    results produced by this tool in trusted locations.
 
-6. **Downloaded elbencho archive integrity:** `utils/build_tarball.sh` can
-   download pinned upstream elbencho release archives. It verifies each archive
-   against the architecture-specific SHA-256 value recorded in the repository
-   before extraction. Maintainers must review and update both the pinned release
-   and its hashes together.
+6. **Downloaded elbencho archive integrity:** `utils/build/fetch_elbencho.sh`
+   can download pinned upstream elbencho release archives. It verifies each
+   archive against the architecture-specific SHA-256 value recorded in the
+   repository before extraction. Maintainers must review and update both the
+   pinned release and its hashes together.
 
 7. **Kubernetes workload and claim state:** The launcher acts with the
    operator's Kubernetes credentials, and the coordinator Pod executes the
@@ -239,7 +239,7 @@ risk and is responsible for meeting the stated conditions.
 - Benchmark listeners are reachable only from trusted benchmark clients or are
   otherwise restricted by network policy or host firewall rules.
 - Pinned elbencho archives remain available at their reviewed upstream release
-  URLs and match the SHA-256 values recorded in `utils/build_tarball.sh`.
+  URLs and match the SHA-256 values recorded in `utils/build/fetch_elbencho.sh`.
 - Warp source repositories, refs, dependencies, toolchains, and build
   environments selected by operators are trusted, currently security-supported,
   and reviewed before the locally built binaries are used. Operators apply any

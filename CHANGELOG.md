@@ -32,6 +32,8 @@ section below.
   fairness" lines in `report.txt`; `results.json` adds `steady`, `fairness`,
   and `latency`. See
   [docs/FILESYSTEM_TESTING.md](docs/FILESYSTEM_TESTING.md#live-client-and-latency-reports).
+- `utils/build/fetch_elbencho.sh` downloads the pinned elbencho binaries
+  without building a deployment archive.
 
 ### Changed
 

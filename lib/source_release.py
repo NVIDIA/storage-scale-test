@@ -38,7 +38,7 @@ VERSIONED_SHELL_COMMANDS = (
     "validate_env.sh",
     "storage-tests/*/nv-*.sh",
     "utils/build_tarball.sh",
-    "utils/build/build_*.sh",
+    "utils/build/*.sh",
 )
 VERSIONED_PYTHON_COMMANDS = (
     "utils/extract-*.py",
