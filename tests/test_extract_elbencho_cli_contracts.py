@@ -532,16 +532,13 @@ def test_fairness_lines_skip_phases_without_data(monkeypatch, tmp_path):
 
 
 def _table_steady(reason=None, transient=2):
-    """A duck-typed SteadyAnalysis for the live table."""
+    """A duck-typed LiveFairness for the live table."""
     stub = _steady_stub(
         reason,
         SimpleNamespace(p50_us=2180.0, p90_us=12860.0, max_over_p50=1.9923),
     )
     stub.interval_ms = 800
-    stub.series = {
-        "5s": SimpleNamespace(window_ms=4800),
-        "30s": SimpleNamespace(window_ms=30400),
-    }
+    stub.window_ms = {"5s": 4800, "30s": 30400}
     stub.class_counts = lambda: {"persistent": 1, "transient": transient, "ok": 1}
     return stub
 
@@ -590,6 +587,26 @@ def test_live_fairness_rows_fall_back_to_lines():
     ]
     live, lines = _EXTRACT._split_live_fairness(fairness, [metric], True)
     assert not live and len(lines) == 3
+
+
+def test_live_fairness_keeps_only_the_summary():
+    """The table's summary drops per-client series but keeps what it shows."""
+    series = SimpleNamespace(window_ms=4800)
+    steady = SimpleNamespace(
+        window="window",
+        interval_ms=800,
+        latency="latency",
+        series={"5s": series},
+        summary=lambda label: f"summary {label}",
+        class_counts=lambda: {"persistent": 0},
+    )
+    fairness = _EXTRACT.LiveFairness.of(steady)
+    assert fairness.window_ms == {"5s": 4800}
+    assert fairness.summary("5s") == "summary 5s"
+    assert fairness.summary("30s") is None
+    assert fairness.class_counts() == {"persistent": 0}
+    assert not hasattr(fairness, "series") and not hasattr(fairness, "clients")
+
 
 def test_same_named_runs_in_different_inputs_keep_their_own_fairness():
     """Identical filenames in two input directories never share a table row."""

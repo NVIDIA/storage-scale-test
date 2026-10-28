@@ -571,7 +571,7 @@ def test_batch_forwards_fragment_and_live_dir_options(tmp_path):
     manifest = _complete_batch(tmp_path)
     seen = {}
 
-    def engine(_manifest, group, _successful, output, options):
+    def engine(_manifest, group, _successful, output, options, **_kwargs):
         seen[group.kind] = options
         (output / "report.txt").write_text("x", encoding="utf-8")
         results.write_fragment(
@@ -669,7 +669,7 @@ def test_without_to_json_nothing_changes(tmp_path):
     manifest = _complete_batch(tmp_path)
     seen = []
 
-    def engine(_m, _group, _s, output, options):
+    def engine(_m, _group, _s, output, options, **_kwargs):
         seen.append(options)
         (output / "report.txt").write_text("x", encoding="utf-8")
 

@@ -39,6 +39,7 @@ section below.
 
 - Live fairness is a table under each results table, in the same row order;
   `--markdown` keeps one line per phase.
+- Reports are faster: live CSV analysis and plots run in parallel.
 - The report caches are removed: `--to-csv`/`--from-csv` (filesystem and
   netbench) and `--to-json`/`--from-json` (Warp). Reports read raw results.
 - Live-client analysis compares clients with the fleet median over a steady

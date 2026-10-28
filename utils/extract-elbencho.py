@@ -38,11 +38,13 @@ import sys
 from pathlib import Path
 import traceback
 from collections import defaultdict
+from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from functools import partial
 from itertools import chain
 from typing import (
     Any,
+    Callable,
     DefaultDict,
     Dict,
     FrozenSet,
@@ -75,6 +77,7 @@ import numpy as np
 # Local import after sys.path: repo root must be on path first.
 # pylint: disable=wrong-import-position
 from lib.report_provenance import ResultVersions, result_version, with_versions
+from lib.report_pool import captured, load_engine, replay, report_pool
 from lib.env_used_yaml import apply_env_used_to_metrics, load_env_used_yaml
 from lib.filesystem_batch import route_batch_report
 from lib.filesystem_report_options import (
@@ -112,11 +115,14 @@ from lib.elbencho_live_plots import (
 from lib.elbencho_live_steady import (
     CLASS_PERSISTENT,
     CLASS_TRANSIENT,
+    LatencySummary,
     PhaseContext,
     REASON_NO_FIRST_TIME,
     REASON_NO_STEADY_STATE,
     REASON_TOO_SHORT,
     SteadyAnalysis,
+    SteadyWindow,
+    WindowSummary,
     WindowedClientDetail,
     WINDOW_30S,
     WINDOW_5S,
@@ -2858,7 +2864,7 @@ def _terminal_table_subgroups(
 
 def print_terminal_table(
     metrics: List[ElbenchoMetrics],
-    live: Optional[Dict[LiveRowKey, SteadyAnalysis]] = None,
+    live: Optional[Dict[LiveRowKey, LiveFairness]] = None,
 ) -> None:
     """Print formatted metrics table in terminal text format.
 
@@ -3635,14 +3641,14 @@ def _fmt(value: Optional[float], spec: str) -> str:
     return NO_VALUE if value is None else format(value, spec)
 
 
-def _jain_text(label: str, steady: SteadyAnalysis, name: str) -> str:
+def _jain_text(label: str, steady: LiveFairness, name: str) -> str:
     summary = steady.summary(label)
     p50 = _fmt(summary.jain_p50 if summary else None, ".3f")
     low = _fmt(summary.jain_min if summary else None, ".3f")
     return f"{name} {p50}/{low}"
 
 
-def _latency_text(steady: SteadyAnalysis) -> str:
+def _latency_text(steady: LiveFairness) -> str:
     latency = steady.latency
     return (
         f"latency p50 {_fmt(latency.p50_us if latency else None, '.0f')} us, "
@@ -3651,7 +3657,7 @@ def _latency_text(steady: SteadyAnalysis) -> str:
     )
 
 
-def format_live_fairness_line(stem: str, label: str, steady: SteadyAnalysis) -> str:
+def format_live_fairness_line(stem: str, label: str, steady: LiveFairness) -> str:
     """One report.txt line summarizing a domain's steady-state fairness."""
     window = steady.window
     prefix = f"{stem} {label}:"
@@ -3688,6 +3694,42 @@ _STEADY_REASON_TEXT = {
 }
 
 
+@dataclass(frozen=True)
+class LiveFairness:
+    """What the fairness table and lines show of one SteadyAnalysis.
+
+    Kept instead of the analysis, whose per-client series would otherwise stay
+    in memory for every live CSV until the tables print.
+    """
+
+    window: SteadyWindow
+    interval_ms: int
+    latency: Optional[LatencySummary]
+    window_ms: Dict[str, int]
+    summaries: Dict[str, Optional[WindowSummary]]
+    counts: Dict[str, int]
+
+    @classmethod
+    def of(cls, steady: SteadyAnalysis) -> "LiveFairness":
+        """Summarize one domain's steady analysis."""
+        return cls(
+            steady.window,
+            steady.interval_ms,
+            steady.latency,
+            {label: series.window_ms for label, series in steady.series.items()},
+            {label: steady.summary(label) for label in steady.series},
+            steady.class_counts(),
+        )
+
+    def summary(self, label: str) -> Optional[WindowSummary]:
+        """Steady statistics of one window size, or None without windows."""
+        return self.summaries.get(label)
+
+    def class_counts(self) -> Dict[str, int]:
+        """Client count per class."""
+        return self.counts
+
+
 def live_row_key(item: Any, phase: str) -> LiveRowKey:
     """Key matching a table row (metric) to a live domain of the same run."""
     return (*_live_metrics_key(item), phase.upper())
@@ -3700,8 +3742,8 @@ def _seconds_label(milliseconds: Set[int], nominal: str) -> str:
     return nominal
 
 
-def _window_label(steadies: Sequence[SteadyAnalysis], label: str, nominal: str):
-    lengths = {s.series[label].window_ms for s in steadies if label in s.series}
+def _window_label(steadies: Sequence[LiveFairness], label: str, nominal: str):
+    lengths = {s.window_ms[label] for s in steadies if label in s.window_ms}
     return _seconds_label(lengths, nominal)
 
 
@@ -3709,7 +3751,7 @@ def _latency_ms(value_us: Optional[float]) -> str:
     return NO_VALUE if value_us is None else format_with_sig_figs(value_us / 1000)
 
 
-def _live_table_cells(steady: SteadyAnalysis) -> List[str]:
+def _live_table_cells(steady: LiveFairness) -> List[str]:
     """Steady, Jain 5 s, Jain 30 s, slowest/median, slow clients, latency."""
     if not steady.window.available:
         return ["none"] + [NO_VALUE] * 8
@@ -3734,7 +3776,7 @@ def _live_table_cells(steady: SteadyAnalysis) -> List[str]:
 
 
 def _live_table_columns(
-    metrics: Sequence[ElbenchoMetrics], steadies: Sequence[SteadyAnalysis]
+    metrics: Sequence[ElbenchoMetrics], steadies: Sequence[LiveFairness]
 ) -> List[List[str]]:
     """Display columns: row identity, then the aligned live cells."""
     cells = [_live_table_cells(steady) for steady in steadies]
@@ -3778,7 +3820,7 @@ def _render_header_groups(
 
 def print_live_fairness_table(
     metrics: Sequence[ElbenchoMetrics],
-    live: Dict[LiveRowKey, SteadyAnalysis],
+    live: Dict[LiveRowKey, LiveFairness],
 ) -> None:
     """Print the live steady-state table for the rows of one terminal table."""
     rows = [
@@ -3863,7 +3905,7 @@ def _report_one_live_file(  # pylint: disable=too-many-arguments,too-many-positi
     options: LiveReportOptions,
     configured_interval_ms: Optional[int],
     contexts: Dict[str, PhaseContext],
-    fairness: List[Tuple[LiveFileMetadata, LiveDomainKey, SteadyAnalysis]],
+    fairness: List[Tuple[LiveFileMetadata, LiveDomainKey, LiveFairness]],
 ) -> bool:
     """Analyze one live CSV; write the live reports and collect its fairness."""
     analysis = analyze_live_csv(metadata)
@@ -3889,7 +3931,7 @@ def _report_one_live_file(  # pylint: disable=too-many-arguments,too-many-positi
             "WRITE",
             "READ",
         ):
-            fairness.append((metadata, domain_key, steady))
+            fairness.append((metadata, domain_key, LiveFairness.of(steady)))
         _report_live_domain(
             analysis, metadata, domain_key, domain, steady, output_dir, options
         )
@@ -5340,11 +5382,24 @@ def _target_sources(
 
 def main() -> None:
     """Script entry point."""
+    with report_pool() as pool:
+        status = start_report(sys.argv[1:], pool)()
+    if status:
+        sys.exit(status)
+
+
+def start_report(argv: List[str], pool: Executor) -> Callable[[], int]:
+    """Parse and submit one report's pool work; the returned call finishes it.
+
+    Calling it waits for that work, prints the tables, and returns the exit
+    status. A batch starts every group before finishing any, keeping the
+    pool full across groups.
+    """
     parser = extract_elbencho_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         validate_analysis_arguments(args)
-        route_batch_report(args, "io", sys.argv[1:])
+        route_batch_report(args, "io", argv)
     except (OSError, ValueError) as error:
         parser.error(str(error))
     if not args.input_dirs and not args.test_parse:
@@ -5357,7 +5412,7 @@ def main() -> None:
     # Handle test-parse mode
     if args.test_parse:
         test_parse(args.test_parse)
-        return
+        return lambda: 0
 
     metrics = []
     versions = ResultVersions()
@@ -5524,54 +5579,51 @@ def main() -> None:
         sys.exit(exit_status)
     os.makedirs(output_dir, exist_ok=True)
 
-    _emit_reports(
-        args, metrics, live_files, output_dir, versions, (target_label, environments)
+    finish = _start_reports(
+        args,
+        metrics,
+        live_files,
+        output_dir,
+        versions,
+        (target_label, environments),
+        pool,
     )
-    if exit_status:
-        sys.exit(exit_status)
+
+    def done() -> int:
+        finish()
+        return exit_status
+
+    return done
 
 
-def _analyze_live_files(
-    args: argparse.Namespace,
-    metrics: List[ElbenchoMetrics],
-    live_files: List[LiveFileMetadata],
+def _live_file_task(
+    metadata: LiveFileMetadata,
     output_dir: str,
-    environments: Dict[str, dict],
-) -> Tuple[List[Tuple[LiveFileMetadata, LiveDomainKey, SteadyAnalysis]], int]:
-    """Write every live CSV's reports; return the fairness and success count."""
-    options = LiveReportOptions(
-        args.client_shortfall_percent,
-        args.client_min_slow_windows,
-        args.client_max_timeseries_lines,
-        args.client_max_heatmap_rows,
-    )
-    fairness: List[Tuple[LiveFileMetadata, LiveDomainKey, SteadyAnalysis]] = []
-    successful = 0
-    for metadata in live_files:
-        try:
-            if _report_one_live_file(
-                metadata,
-                output_dir,
-                options,
-                _configured_interval_ms(_env_for_live(environments, metadata.path)),
-                live_phase_contexts(metadata, metrics),
-                fairness,
-            ):
-                successful += 1
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            eprint(f"Error reporting live CSV {metadata.path}: {exc}")
-            traceback.print_exc()
-    return fairness, successful
+    options: LiveReportOptions,
+    configured_interval_ms: Optional[int],
+    contexts: Dict[str, PhaseContext],
+) -> Tuple[bool, List[Tuple[LiveFileMetadata, LiveDomainKey, LiveFairness]]]:
+    """Pool task: write one live CSV's reports; return success and fairness."""
+    fairness: List[Tuple[LiveFileMetadata, LiveDomainKey, LiveFairness]] = []
+    try:
+        reported = _report_one_live_file(
+            metadata, output_dir, options, configured_interval_ms, contexts, fairness
+        )
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        eprint(f"Error reporting live CSV {metadata.path}: {exc}")
+        traceback.print_exc()
+        return False, []
+    return reported, fairness
 
 
 def _split_live_fairness(
-    fairness: List[Tuple[LiveFileMetadata, LiveDomainKey, SteadyAnalysis]],
+    fairness: List[Tuple[LiveFileMetadata, LiveDomainKey, LiveFairness]],
     metrics: List[ElbenchoMetrics],
     markdown: bool,
-) -> Tuple[Dict[LiveRowKey, SteadyAnalysis], List[str]]:
+) -> Tuple[Dict[LiveRowKey, LiveFairness], List[str]]:
     """Domains shown under a terminal table row, and lines for all others."""
     row_keys = {live_row_key(metric, metric.operation) for metric in metrics}
-    live: Dict[LiveRowKey, SteadyAnalysis] = {}
+    live: Dict[LiveRowKey, LiveFairness] = {}
     lines: List[str] = []
     for metadata, domain_key, steady in fairness:
         key = live_row_key(metadata, domain_key.phase)
@@ -5585,53 +5637,77 @@ def _split_live_fairness(
     return live, lines
 
 
-def _emit_reports(
+def _start_reports(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     args: argparse.Namespace,
     metrics: List[ElbenchoMetrics],
     live_files: List[LiveFileMetadata],
     output_dir: str,
     versions: ResultVersions,
     target_and_environments: Tuple[Any, Dict[str, dict]],
-) -> None:
-    """Print the tables, generate the plots and the live reports."""
+    pool: Executor,
+) -> Callable[[], None]:
+    """Submit the live reports and plots; the returned call prints the tables."""
     target_label, environments = target_and_environments
-    fairness, successful_live_reports = _analyze_live_files(
-        args, metrics, live_files, output_dir, environments
+    options = LiveReportOptions(
+        args.client_shortfall_percent,
+        args.client_min_slow_windows,
+        args.client_max_timeseries_lines,
+        args.client_max_heatmap_rows,
     )
-    live, fairness_lines = _split_live_fairness(fairness, metrics, args.markdown)
+    live_tasks = [
+        pool.submit(
+            captured,
+            _live_file_task,
+            metadata,
+            output_dir,
+            options,
+            _configured_interval_ms(_env_for_live(environments, metadata.path)),
+            live_phase_contexts(metadata, metrics),
+        )
+        for metadata in live_files
+    ]
+    plots = (
+        pool.submit(captured, plot_metrics, metrics, output_dir, args.no_dual_y_axis)
+        if metrics
+        else None
+    )
 
-    if metrics:
-        if args.markdown:
-            with_versions(
-                print_markdown_table,
-                versions.of(metrics),
-                markdown=True,
-                target=target_label,
-            )(metrics, args.no_dual_y_axis)
-        else:
-            mirror_stdout_to_file(
-                os.path.join(output_dir, REPORT_TXT_FILENAME),
+    def finish() -> None:
+        fairness: List[Tuple[LiveFileMetadata, LiveDomainKey, LiveFairness]] = []
+        successful_live_reports = 0
+        for task in live_tasks:
+            reported, entries = replay(task)
+            successful_live_reports += reported
+            fairness.extend(entries)
+        live, fairness_lines = _split_live_fairness(fairness, metrics, args.markdown)
+        if metrics:
+            if args.markdown:
                 with_versions(
-                    print_terminal_table, versions.of(metrics), target=target_label
-                ),
-                metrics,
-                live,
-            )
+                    print_markdown_table,
+                    versions.of(metrics),
+                    markdown=True,
+                    target=target_label,
+                )(metrics, args.no_dual_y_axis)
+            else:
+                mirror_stdout_to_file(
+                    os.path.join(output_dir, REPORT_TXT_FILENAME),
+                    with_versions(
+                        print_terminal_table, versions.of(metrics), target=target_label
+                    ),
+                    metrics,
+                    live,
+                )
+        if plots is not None:
+            replay(plots)
+            eprint(f"Generated plots saved in {output_dir}")
+        emit_live_fairness(fairness_lines, args.markdown, output_dir)
+        if live_files and not successful_live_reports:
+            eprint("ERROR: No live CSV reports were generated")
+            sys.exit(1)
 
-    # Generate plots if we have metrics and an input directory for storing plots
-    if metrics:
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Generate plots
-        plot_metrics(metrics, output_dir, args.no_dual_y_axis)
-        eprint(f"Generated plots saved in {output_dir}")
-
-    emit_live_fairness(fairness_lines, args.markdown, output_dir)
-    if live_files and not successful_live_reports:
-        eprint("ERROR: No live CSV reports were generated")
-        sys.exit(1)
+    return finish
 
 
 if __name__ == "__main__":
-    main()
+    # Run as the importable reporter module so pool workers can load its tasks.
+    load_engine().main()
