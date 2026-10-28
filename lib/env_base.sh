@@ -37,7 +37,6 @@
 # reservation
 # partition
 # run_time
-# MODULES
 # SLURM_NODE_IGNORES
 # SLURM_NODE_INCLUDES
 #
@@ -128,20 +127,7 @@ fi
 
 # Do some slurm-related initialization if SLURM_ENABLED is set
 if [ -n "$SLURM_ENABLED" ]; then
-    # Load the modules we can
-    MODULES+=(
-        "slurm"
-        "shared"
-        "boost"  # needed to build elbencho?
-        "ucx"
-    )
-
-    # Try to load each module
-    for module_name in "${MODULES[@]}"; do
-        if module_exists "$module_name"; then
-            module load "$module_name"
-        fi
-    done
+    load_slurm_module ||:
 
     # See if an automatically-detected account can be used
     if [ -z "$account" ]; then

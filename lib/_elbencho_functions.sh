@@ -1382,7 +1382,7 @@ _elbencho_io_build_common_args() {
         --csvfile="$csvfile"
         --iodepth="$io_depth"
     )
-    if [[ "${ELBENCHO_LIVE_CSV_EXTENDED:-0}" == "1" ]]; then
+    if [[ "${ELBENCHO_LIVE_CSV_EXTENDED:-1}" == "1" ]]; then
         common_args+=(
             --livecsv="$livecsvfile"
             --livecsvex
@@ -2506,7 +2506,7 @@ run_elbencho_io_sweep_iteration_single_big_file() {
 
     echo "(remote) Human readable output file: $resfile"
     echo "(remote) CSV file: $csvfile"
-    if [[ "${ELBENCHO_LIVE_CSV_EXTENDED:-0}" == "1" ]]; then
+    if [[ "${ELBENCHO_LIVE_CSV_EXTENDED:-1}" == "1" ]]; then
         echo "(remote) Live CSV file: $livecsvfile"
     fi
 
@@ -3345,7 +3345,7 @@ run_elbencho_io_sweep_iteration() {
 
     echo "(remote) Human readable output file: $resfile"
     echo "(remote) CSV file: $csvfile"
-    if [[ "${ELBENCHO_LIVE_CSV_EXTENDED:-0}" == "1" ]]; then
+    if [[ "${ELBENCHO_LIVE_CSV_EXTENDED:-1}" == "1" ]]; then
         echo "(remote) Live CSV file: $livecsvfile"
     fi
 
@@ -3680,7 +3680,7 @@ reify_elbencho_execution() {
         printf 'export ELBENCHO_SCALE_READ_WRITE_DURATION=%s\n' \
             "${ELBENCHO_SCALE_READ_WRITE_DURATION}"
         printf 'export ELBENCHO_LIVE_CSV_EXTENDED=%s\n' \
-            "${ELBENCHO_LIVE_CSV_EXTENDED:-0}"
+            "${ELBENCHO_LIVE_CSV_EXTENDED:-1}"
         printf 'export ELBENCHO_LIVEINT=%s\n' \
             "${ELBENCHO_LIVEINT:-1000}"
         printf 'export ELBENCHO_FILE_SIZE_MULTIPLIER=%s\n' \

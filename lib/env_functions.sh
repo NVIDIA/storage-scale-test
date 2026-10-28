@@ -514,12 +514,21 @@ module_exists() {
     module avail "$1" 2>&1 | grep -q "^$1"
 }
 
+# Some sites put sbatch, srun, and sacct on PATH only through a slurm module.
+# Batch start, resume, and coordinators bypass env.sh, so they call this too.
+load_slurm_module() {
+    if module_exists slurm; then
+        module load slurm || return 1
+    fi
+    return 0
+}
+
 # Print the sacct poll interval used while waiting for Slurm jobs:
-# SLURM_JOB_POLL_INTERVAL_SECONDS, a positive integer (default 15).
+# SLURM_JOB_POLL_INTERVAL_SECONDS, a positive integer (default 60).
 # run_sbatch_job checks it before submitting, so an invalid value can never
 # leave submitted jobs running after the monitor rejects it.
 _slurm_job_poll_interval() {
-    local seconds="${SLURM_JOB_POLL_INTERVAL_SECONDS:-15}"
+    local seconds="${SLURM_JOB_POLL_INTERVAL_SECONDS:-60}"
     if [[ ! "$seconds" =~ ^[1-9][0-9]*$ ]]; then
         echo "Error: SLURM_JOB_POLL_INTERVAL_SECONDS must be a positive integer: $seconds" >&2
         return 1
@@ -531,7 +540,7 @@ _slurm_job_poll_interval() {
 # transitioned into a terminal state.  Return 0 on COMPLETED or 1 otherwise.
 # The final sacct information is printed after the terminal state has been
 # reached, and the tail killed and waited upon. sacct is polled every
-# SLURM_JOB_POLL_INTERVAL_SECONDS (a positive integer; default 15).
+# SLURM_JOB_POLL_INTERVAL_SECONDS (a positive integer; default 60).
 #
 # Call this function like:
 #   tail_until_complete "$JOBID" "${log_files[@]}"
@@ -1456,6 +1465,9 @@ apply_filesystem_workload_defaults() {
     export ELBENCHO_SINGLE_BIG_FILE_SIZE=${ELBENCHO_SINGLE_BIG_FILE_SIZE:-}
     # When 1, maps to elbencho --nosvcshare (each service touches full file)
     export ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=${ELBENCHO_ALL_NODES_ACCESS_ALL_DATA:-0}
+    # Extended live CSV capture (--livecsv/--livecsvex) every ELBENCHO_LIVEINT ms
+    export ELBENCHO_LIVE_CSV_EXTENDED=${ELBENCHO_LIVE_CSV_EXTENDED:-1}
+    export ELBENCHO_LIVEINT=${ELBENCHO_LIVEINT:-1000}
     # Operator-chosen storage target label (reporting metadata only). Empty means
     # "derive it when a snapshot is written"; the derived value is never stored here.
     export STORAGE_TARGET_NAME=${STORAGE_TARGET_NAME:-}
@@ -2354,7 +2366,7 @@ write_elbencho_env_used() {
         printf 'ELBENCHO_FILE_SIZE: "%s"\n' "${ELBENCHO_FILE_SIZE:-}"
         printf 'ELBENCHO_SCALE_READ_WRITE_DURATION: %s\n' "$ELBENCHO_SCALE_READ_WRITE_DURATION"
         printf 'ELBENCHO_READ_AFTER_WRITE_PAUSE: %s\n' "$ELBENCHO_READ_AFTER_WRITE_PAUSE"
-        printf 'ELBENCHO_LIVE_CSV_EXTENDED: %s\n' "${ELBENCHO_LIVE_CSV_EXTENDED:-0}"
+        printf 'ELBENCHO_LIVE_CSV_EXTENDED: %s\n' "${ELBENCHO_LIVE_CSV_EXTENDED:-1}"
         printf 'ELBENCHO_LIVEINT: %s\n' "${ELBENCHO_LIVEINT:-1000}"
 
         printf '\nELBENCHO_SINGLE_BIG_FILE: %s\n' "$ELBENCHO_SINGLE_BIG_FILE"
@@ -2492,7 +2504,7 @@ _write_elbencho_env_used_sh() {
         printf 'export ELBENCHO_FILE_SIZE=%q\n' "${ELBENCHO_FILE_SIZE:-}"
         printf 'export ELBENCHO_SCALE_READ_WRITE_DURATION=%q\n' "$ELBENCHO_SCALE_READ_WRITE_DURATION"
         printf 'export ELBENCHO_READ_AFTER_WRITE_PAUSE=%q\n' "$ELBENCHO_READ_AFTER_WRITE_PAUSE"
-        printf 'export ELBENCHO_LIVE_CSV_EXTENDED=%q\n' "${ELBENCHO_LIVE_CSV_EXTENDED:-0}"
+        printf 'export ELBENCHO_LIVE_CSV_EXTENDED=%q\n' "${ELBENCHO_LIVE_CSV_EXTENDED:-1}"
         printf 'export ELBENCHO_LIVEINT=%q\n' "${ELBENCHO_LIVEINT:-1000}"
         printf 'export ELBENCHO_SINGLE_BIG_FILE=%q\n' "$ELBENCHO_SINGLE_BIG_FILE"
         printf 'export ELBENCHO_SINGLE_BIG_FILE_BASENAME=%q\n' "$ELBENCHO_SINGLE_BIG_FILE_BASENAME"
@@ -4602,12 +4614,12 @@ validate_elbencho_duration() {
     return 0
 }
 
-# Validate optional elbencho live CSV settings.
+# Validate elbencho live CSV settings.
 # Unset variables use defaults so existing env.sh files remain compatible.
 # Usage: validate_elbencho_live_csv
 # Returns: 0 if valid, 1 if invalid (with messages to stderr)
 validate_elbencho_live_csv() {
-    local livecsvex="${ELBENCHO_LIVE_CSV_EXTENDED:-0}"
+    local livecsvex="${ELBENCHO_LIVE_CSV_EXTENDED:-1}"
     local liveint="${ELBENCHO_LIVEINT:-1000}"
 
     if [[ "$livecsvex" != "0" && "$livecsvex" != "1" ]]; then

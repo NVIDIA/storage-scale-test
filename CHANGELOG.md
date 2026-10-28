@@ -23,17 +23,6 @@ section below.
 
 ## Unreleased
 
-### Breaking
-
-- The report caches are removed: `--to-csv`/`--from-csv` (filesystem and
-  netbench) and `--to-json`/`--from-json` (Warp). Reports read raw results.
-- Live-client analysis compares clients with the fleet median over a steady
-  window instead of z-scores. `--client-shortfall-percent` and
-  `--client-min-slow-windows` replace `--client-outlier-threshold` and
-  `--client-min-underperform-segments`; the heatmap is now
-  `client-ratio-heatmap.png`, and the client summary and `results.json`
-  z-score fields are replaced.
-
 ### Added
 
 - `--to-json` writes a versioned, schema-validated results document for a
@@ -43,6 +32,25 @@ section below.
   fairness" lines in `report.txt`; `results.json` adds `steady`, `fairness`,
   and `latency`. See
   [docs/FILESYSTEM_TESTING.md](docs/FILESYSTEM_TESTING.md#live-client-and-latency-reports).
+
+### Changed
+
+- The report caches are removed: `--to-csv`/`--from-csv` (filesystem and
+  netbench) and `--to-json`/`--from-json` (Warp). Reports read raw results.
+- Live-client analysis compares clients with the fleet median over a steady
+  window instead of z-scores. `--client-shortfall-percent` and
+  `--client-min-slow-windows` replace `--client-outlier-threshold` and
+  `--client-min-underperform-segments`; the heatmap is now
+  `client-ratio-heatmap.png`, and the client summary and `results.json`
+  z-score fields are replaced.
+- Filesystem reports drop `--per-client-plots`: per-client live outputs are
+  always written when live CSVs are present.
+- IO sweeps capture live CSVs by default. An `env.sh` copied from an older
+  template still sets `ELBENCHO_LIVE_CSV_EXTENDED=0`; delete that line.
+- `MODULES` is removed from `env.sh`.
+- `SLURM_JOB_POLL_INTERVAL_SECONDS` defaults to 60 (was 15), to poll shared
+  Slurm clusters less often. An `env.sh` copied from an older template still
+  sets 15.
 
 ## [2.0.0] - 2026-10-19
 

@@ -368,7 +368,7 @@ def test_unified_reporter_routes_common_and_kind_specific_options(
                     "1M,r4K;4K",
                     "--only-sizes=1M",
                     "--markdown",
-                    "--per-client-plots",
+                    "--no-dual-y-axis",
                     "--client-max-heatmap-rows",
                     "12",
                     "--allow-mixed-targets",
@@ -381,7 +381,7 @@ def test_unified_reporter_routes_common_and_kind_specific_options(
     assert set(called["0001"]) == common | {
         "--only-sizes=1M,r4K;4K",
         "--only-sizes=1M",
-        "--per-client-plots",
+        "--no-dual-y-axis",
         "--client-max-heatmap-rows=12",
     }
     assert called["0001"] == called["0003"]
@@ -418,7 +418,7 @@ def test_all_analysis_options_share_registration_and_routing(option):
     "arguments, message",
     [
         (["--kind", "io", "--normalize-to", "1"], "no selected mdtest group"),
-        (["--groups", "0002", "--per-client-plots"], "no selected io group"),
+        (["--groups", "0002", "--no-dual-y-axis"], "no selected io group"),
         (["--kind", "mdtest", "--only-sizes", "1M"], "no selected io group"),
         (["--kind", "io", "--groups", "0002"], "No batch groups match"),
         (["--normalize-to", "0"], "positive integer"),

@@ -51,7 +51,6 @@ def _env_base_script(tmp_path, selection, *, host_list=""):
         reservation=
         partition=
         run_time=00:05:00
-        MODULES=()
         SLURM_EXTRA_ARGS=()
         client_type=cpu
         client_arch=x86_64

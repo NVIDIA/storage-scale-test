@@ -217,8 +217,8 @@ iterations: `iterations_expected`, `iterations_used`, and per phase `ops_per_s`
 
 ## Live detail
 
-Live data comes from elbencho live CSVs, captured only for IO sweeps with
-`ELBENCHO_LIVE_CSV_EXTENDED=1`. A domain is one execution and phase.
+Live data comes from elbencho live CSVs, which IO sweeps capture unless
+`ELBENCHO_LIVE_CSV_EXTENDED=0`. A domain is one execution and phase.
 
 | `--live-detail` | Per domain |
 | --- | --- |

@@ -231,7 +231,7 @@ _elbencho_batch_common_names() {
         ELBENCHO
     case "$EXECUTION_SUBSTRATE" in
         ssh) printf '%s\n' SSH_USER SSH_HOMEDIR_SHARED SSH_OPTIONS SSH_OPTS ;;
-        slurm) printf '%s\n' account reservation partition run_time MODULES \
+        slurm) printf '%s\n' account reservation partition run_time \
             SLURM_EXTRA_ARGS SLURM_EXCLUSIVE_USER SLURM_JOB_NAME_PREFIX ;;
         # Each group's snapshot records its own roots (and so its claims and
         # namespace); the batch freezes only what is shared. The sequencer image
@@ -336,6 +336,8 @@ _elbencho_batch_compare_profile() {
     local root="$1" candidate="$2" line name expected observed rc=0
     while IFS= read -r line; do
         name="${line%%$'\t'*}"
+        # Batches prepared before MODULES was removed still record it.
+        [[ "$name" != MODULES ]] || continue
         expected="${line#*$'\t'}"
         observed=$(awk -F '\t' -v field="$name" '$1==field {sub(/^[^\t]*\t/, ""); print}' "$candidate")
         if [[ "$expected" != "$observed" ]]; then
@@ -802,10 +804,7 @@ _elbencho_batch_preflight() {
     maximum=$(max_nodes_remaining_executions "$root/executions") || return 1
     _elbencho_batch_validate_cells "$root" || return 1
     if [[ "$EXECUTION_SUBSTRATE" == slurm ]]; then
-        local module_name
-        for module_name in "${MODULES[@]}"; do
-            if module_exists "$module_name"; then module load "$module_name" || return 1; fi
-        done
+        load_slurm_module || return 1
     fi
     case "$EXECUTION_SUBSTRATE" in
         ssh) (( maximum <= SSH_HOST_COUNT )) || {

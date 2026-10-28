@@ -41,7 +41,7 @@ def test_runtime_environment_selects_each_substrate_explicitly(tmp_path):
 
 
 def test_rendered_slurm_environment_polls_accounting_every_second(tmp_path):
-    """The fixture's poll interval overrides the template default of 15."""
+    """The fixture's poll interval overrides the template default of 60."""
     fixture = SimpleNamespace(
         architecture="x86_64",
         ssh_home_mode="separate",
@@ -57,6 +57,6 @@ def test_rendered_slurm_environment_polls_accounting_every_second(tmp_path):
         if "SLURM_JOB_POLL_INTERVAL_SECONDS=" in line and not line.startswith("#")
     ]
     assert assignments == [
-        "SLURM_JOB_POLL_INTERVAL_SECONDS=15",
+        "SLURM_JOB_POLL_INTERVAL_SECONDS=60",
         "export SLURM_JOB_POLL_INTERVAL_SECONDS=1",
     ]

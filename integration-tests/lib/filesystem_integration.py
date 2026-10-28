@@ -2649,7 +2649,6 @@ def _assert_scenario_report(
     if runtime.scenario.name == "live-capture":
         command.extend(
             (
-                "--per-client-plots",
                 "--client-min-slow-windows",
                 "2",
                 "--client-max-timeseries-lines",
@@ -2716,6 +2715,80 @@ def _assert_scenario_report(
             f"{runtime.scenario.name}/{runtime.selector}/{step.name}: no "
             "nonempty report plot was generated"
         )
+    if runtime.scenario.name == "live-capture":
+        _assert_live_report(runner, report_workspace, result, report_dir, output)
+
+
+def _assert_live_report(
+    runner: Any, report_workspace: Path, result: Path, report_dir: Path, output: str
+) -> None:
+    """Require live reports from real elbencho output, without judging values.
+
+    Two nodes run as two elbencho services with a 10 ms live interval.
+    """
+    problems = []
+    if LIVE_FAIRNESS_HEADING not in output:
+        problems.append(f"report lacks {LIVE_FAIRNESS_HEADING!r}")
+    for phase in LIVE_PHASES:
+        for suffix in ("aggregate-timeseries.png", "client-summary.csv"):
+            if not list(result.glob(f"*-{phase}-{suffix}")):
+                problems.append(f"no {phase} {suffix}")
+    json_dir = report_dir / "json"
+    completed = runner.run(
+        [
+            report_workspace / "utils/extract-filesystem.py",
+            result,
+            "--output-dir",
+            json_dir,
+            "--to-json",
+        ],
+        timeout=300,
+        check=False,
+    )
+    (report_dir / "extract-filesystem.log").write_text(
+        completed.stdout + completed.stderr, encoding="utf-8"
+    )
+    if completed.returncode:
+        problems.append("extract-filesystem.py --to-json failed")
+    else:
+        document = json.loads((json_dir / "results.json").read_text("utf-8"))
+        problems.extend(_live_object_problems(document))
+    if problems:
+        raise IntegrationTestError("live-capture report: " + "; ".join(problems))
+
+
+def _live_object_problems(document: dict[str, Any]) -> list[str]:
+    """Problems with the write and read live objects of every execution."""
+    problems = []
+    for execution in document.get("executions", ()):
+        phases = {
+            phase.get("phase"): phase.get("live")
+            for phase in (execution.get("results") or {}).get("phases", ())
+        }
+        for name in LIVE_PHASES:
+            label = f"execution {execution.get('execution_id')} {name}"
+            live = phases.get(name)
+            if not isinstance(live, dict) or "steady" not in live:
+                problems.append(f"{label}: no live analysis ({live!r})")
+                continue
+            # ELBENCHO_LIVEINT reaches the report through the env snapshot.
+            expected = {
+                "client_mode": "service",
+                "clients": 2,
+                "configured_interval_ms": 10,
+            }
+            for key, value in expected.items():
+                if live.get(key) != value:
+                    problems.append(f"{label}: {key} {live.get(key)!r}")
+            # No end_source means elbencho's [first] time was not found.
+            if live["steady"].get("end_source") != "elbencho_first":
+                problems.append(f"{label}: steady {live['steady']!r}")
+            latency = live.get("aggregate_series", {}).get("io_latency_avg_us", ())
+            if not any(isinstance(value, (int, float)) for value in latency):
+                problems.append(f"{label}: no Lat IO us samples")
+    if not document.get("executions"):
+        problems.append("no executions")
+    return problems
 
 
 def _reset_result_base(
@@ -2881,6 +2954,10 @@ def _assert_read_cache(step: ScenarioStep, result: Path) -> None:
         raise IntegrationTestError(
             f"{step.name}: expected treefile cache {expected!r}, found {actual!r}"
         )
+
+
+LIVE_FAIRNESS_HEADING = "Live fairness"
+LIVE_PHASES = ("write", "read")
 
 
 def _assert_live_capture(result: Path) -> None:
