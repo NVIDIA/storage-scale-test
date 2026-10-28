@@ -584,10 +584,13 @@ def test_resource_diagnostics_truncate_large_outputs(tmp_path):
         kubectl_run_bounded() {{ head -c 2097152 /dev/zero; }}
         path=$(kubectl_capture_resource_diagnostics {str(attempt)!r} \
             collect-failed test-ns Job sst-elb-1234abcd-sweep 1234abcd)
-        [[ $(wc -c < "$path/resource.yaml") -le 524288 ]]
-        [[ $(wc -c < "$path/resource.describe") -le 524288 ]]
-        [[ $(wc -c < "$path/pods.yaml") -le 524288 ]]
-        [[ $(wc -c < "$path/pods.log") -le 1048576 ]]
+        set -e
+        for file in resource.yaml resource.describe pods.yaml pods.log; do
+            limit=524288
+            [[ $file != pods.log ]] || limit=1048576
+            [[ $(wc -c < "$path/$file") -le $((limit + 64)) ]]
+            tail -n 1 "$path/$file" | grep -qxF "[truncated: showed the first $limit bytes]"
+        done
     """)
     assert result.returncode == 0, result.stderr
 
@@ -717,27 +720,22 @@ def test_attempt_diagnostics_prefer_exact_journaled_workload(tmp_path):
         kubectl_attempt_journal_resource "$root" "$fd" 1234abcd workers \
             DaemonSet sst-elb-1234abcd-workers test-ns workers-uid \
             0123456789abcdef0123456789abcdef
-        kubectl_capture_resource_diagnostics() {{
-            printf '%s|%s|%s|%s|%s|%s\n' "$@" >> {str(tmp_path / 'capture')!r}
-            mkdir -p "$1/diagnostics"
-            path=$(mktemp -d "$1/diagnostics/exact.XXXXXXXX")
-            printf '%s\n' "$path"
+        kubectl_local_lock_release "$fd"
+        set -e
+        kubectl_run_bounded() {{
+            printf '%s\n' "$*" >> {str(tmp_path / 'calls')!r}
+            printf 'evidence\n'
         }}
         first=$(kubectl_capture_attempt_diagnostics "$root" 1234abcd submit-failed)
         second=$(kubectl_capture_attempt_diagnostics "$root" 1234abcd submit-failed)
-        [[ $(wc -l <<< "$first") -eq 2 ]]
-        [[ $(wc -l <<< "$second") -eq 2 ]]
-        [[ "$first" == *"$root/attempts/1234abcd/diagnostics/exact."* ]]
-        [[ "$second" == *"$root/attempts/1234abcd/diagnostics/exact."* ]]
+        [[ $(wc -l <<< "$first") -eq 1 && $(wc -l <<< "$second") -eq 1 ]]
+        [[ "$first" == "$root/attempts/1234abcd/diagnostics/submit-failed-"* ]]
         [[ "$second" != "$first" ]]
-        [[ $(wc -l < {str(tmp_path / 'capture')!r}) -eq 4 ]]
-        grep -F -- \
-          'submit-failed|test-ns|Job|sst-elb-1234abcd-sweep|1234abcd' \
-          {str(tmp_path / 'capture')!r}
-        grep -F -- \
-          'submit-failed|test-ns|DaemonSet|sst-elb-1234abcd-workers|1234abcd' \
-          {str(tmp_path / 'capture')!r}
-        kubectl_local_lock_release "$fd"
+        [[ -f "$first/SUMMARY.txt" && -f "$first/pods.log" ]]
+        grep -F 'get Job sst-elb-1234abcd-sweep' {str(tmp_path / 'calls')!r}
+        [[ -f "$first/job-sst-elb-1234abcd-sweep/resource.yaml" ]]
+        [[ -f "$first/daemonset-sst-elb-1234abcd-workers/resource.describe" ]]
+        [[ $(grep -c -- ' logs ' {str(tmp_path / 'calls')!r}) -eq 2 ]]
     """)
     assert result.returncode == 0, result.stderr
 

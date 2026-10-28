@@ -53,6 +53,11 @@ section below.
 - `SLURM_JOB_POLL_INTERVAL_SECONDS` defaults to 60 (was 15), to poll shared
   Slurm clusters less often. An `env.sh` copied from an older template still
   sets 15.
+- Kubernetes `--collect` gzips the results transfer and checks its size and
+  SHA-256 against the Pod's, retrying a transfer cut short in transit.
+- A failed Kubernetes operation writes one diagnostics folder, with a
+  `SUMMARY.txt` stating the cause and fix, and `--collect` records every
+  transfer try in the attempt's `transfer.tsv`.
 
 ## [2.0.0] - 2026-10-19
 
