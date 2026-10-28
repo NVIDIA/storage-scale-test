@@ -73,6 +73,7 @@ from lib.join_datestamps import (  # pylint: disable=wrong-import-position
     join_datestamps_for_filename,
 )
 from lib.reporting_common import (  # pylint: disable=wrong-import-position
+    PNG_SAVE_OPTIONS,
     discover_result_pairs,
     filter_metrics_by_scale,
     format_decimal_aligned_latency_ms,
@@ -1674,6 +1675,7 @@ def plot_single_node_rates(
         os.path.join(output_dir, _plot_basename(prefix, datestamps)),
         bbox_inches="tight",
         dpi=150,
+        pil_kwargs=PNG_SAVE_OPTIONS,
     )
     plt.close()
 
@@ -1822,6 +1824,7 @@ def plot_multi_node_rates(
         os.path.join(output_dir, _plot_basename(prefix, datestamps)),
         bbox_inches="tight",
         dpi=150,
+        pil_kwargs=PNG_SAVE_OPTIONS,
     )
     plt.close()
 
@@ -1883,6 +1886,7 @@ def plot_single_node_efficiency(
         os.path.join(output_dir, _plot_basename(prefix, datestamps)),
         bbox_inches="tight",
         dpi=150,
+        pil_kwargs=PNG_SAVE_OPTIONS,
     )
     plt.close()
 
@@ -1974,6 +1978,7 @@ def plot_multi_node_efficiency(
             ),
             bbox_inches="tight",
             dpi=150,
+            pil_kwargs=PNG_SAVE_OPTIONS,
         )
         plt.close()
 
@@ -2083,6 +2088,7 @@ def plot_latency_histograms(
             ),
             bbox_inches="tight",
             dpi=150,
+            pil_kwargs=PNG_SAVE_OPTIONS,
         )
         plt.close()
 

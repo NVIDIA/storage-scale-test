@@ -133,7 +133,7 @@ from lib.elbencho_live_steady import (
     select_heatmap_rows,
 )
 from lib.join_datestamps import join_datestamps, join_datestamps_for_filename
-from lib.reporting_common import histogram_axis_ranges
+from lib.reporting_common import PNG_SAVE_OPTIONS, histogram_axis_ranges
 from lib.stdout_report_file import (  # pylint: disable=wrong-import-position
     REPORT_TXT_FILENAME,
     mirror_stdout_to_file,
@@ -1737,6 +1737,7 @@ def plot_latency_histograms(
         ),
         bbox_inches="tight",
         dpi=150,  # Increase DPI for better resolution
+        pil_kwargs=PNG_SAVE_OPTIONS,
     )
     plt.close()
 
@@ -2246,6 +2247,7 @@ def _finalize_single_performance_plot(
             ),
         ),
         bbox_inches="tight",
+        pil_kwargs=PNG_SAVE_OPTIONS,
     )
     plt.close()
 
@@ -2585,6 +2587,7 @@ def plot_throughput_scale_efficiency(
             ),
         ),
         bbox_inches="tight",
+        pil_kwargs=PNG_SAVE_OPTIONS,
     )
     plt.close()
 

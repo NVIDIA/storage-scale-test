@@ -26,6 +26,10 @@ import shlex
 from collections.abc import Callable, Hashable, Iterable, Sequence
 from typing import Any, TypeVar
 
+# zlib level 1 instead of Pillow's 6: plot saving is about 10% faster for
+# PNGs about 15% larger (measured on a 96-figure live report).
+PNG_SAVE_OPTIONS = {"compress_level": 1}
+
 _ResultKey = TypeVar("_ResultKey", bound=Hashable)
 _Metric = TypeVar("_Metric")
 
