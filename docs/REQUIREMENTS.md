@@ -135,14 +135,14 @@ These requirements are driven by the primary use cases of an **NVIDIA Storage Sc
 
 ### UC-8: Reporting
 
-> *As an NVIDIA Storage Scale Test runner, I need to generate a textual or Markdown report and associated PNG plots from any prior scale test run's results.*
+> *As an NVIDIA Storage Scale Test runner, I need to generate a textual report and associated PNG plots from any prior scale test run's results.*
 
 | ID | Requirement | Satisfied? |
 |----|-------------|:----------:|
 | UC-8.1 | The tool shall generate textual summary tables formatted for a fixed-width font on the terminal. | Yes |
 | UC-8.2 | The tool shall generate PNG plot images for throughput, latency, and scaling metrics. | Yes |
-| UC-8.3 | The tool shall support Markdown report output for elbencho filesystem results. | Yes |
-| UC-8.4 | The tool shall support Markdown report output for mdtest-elbencho metadata results. | Yes |
+| UC-8.3 | Removed: Markdown report output for elbencho filesystem results. | N/A |
+| UC-8.4 | Removed: Markdown report output for mdtest-elbencho metadata results. | N/A |
 | UC-8.5 | The tool shall support Markdown report output for netbench network results. | Yes |
 | UC-8.7 | Removed after v2.0.0: re-analysis from cached CSV/JSON intermediate data. Reports always read raw results. | N/A |
 | UC-8.8 | The tool shall support filtering reports by node count, thread count, IO size, IO depth, or object size. | Yes |
@@ -318,8 +318,8 @@ These requirements address the infrastructure and runtime constraints the tool m
 | ID | Requirement | Satisfied? |
 |----|-------------|:----------:|
 | RA-2.1 | An analyzer that supports the `--markdown` flag shall output a Markdown-formatted report to stdout (with progress on stderr), suitable for pasting into Google Docs. | Yes |
-| RA-2.2 | Markdown output shall be supported for elbencho filesystem reports. | Yes |
-| RA-2.3 | Markdown output shall be supported for mdtest-elbencho metadata reports. | Yes |
+| RA-2.2 | Removed: Markdown output for elbencho filesystem reports. | N/A |
+| RA-2.3 | Removed: Markdown output for mdtest-elbencho metadata reports. | N/A |
 | RA-2.4 | Markdown output shall be supported for netbench network reports. | Yes |
 
 ### RA-3: Plot Generation

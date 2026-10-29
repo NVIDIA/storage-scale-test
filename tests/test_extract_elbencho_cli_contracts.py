@@ -94,7 +94,6 @@ def test_valid_filter_matching_no_metrics_is_an_error(monkeypatch, tmp_path):
             str(directory),
             "--only-nodes",
             "99",
-            "--markdown",
         )
     assert raised.value.code == 1
 
@@ -119,7 +118,6 @@ def test_live_match_cannot_hide_empty_filtered_aggregate(monkeypatch, tmp_path):
             str(tmp_path),
             "--only-nodes",
             "2",
-            "--markdown",
         )
 
     assert raised.value.code == 1
@@ -129,12 +127,12 @@ def test_failed_live_reports_cannot_hide_behind_aggregate(monkeypatch, tmp_path)
     """Aggregate output does not turn a failed live report into success."""
     _mixed_report_input(tmp_path, live_nodes=1)
     monkeypatch.setattr(_EXTRACT, "parse_elbencho_files", lambda _base: [_metric()])
-    monkeypatch.setattr(_EXTRACT, "print_markdown_table", lambda *_args: None)
+    monkeypatch.setattr(_EXTRACT, "print_terminal_table", lambda *_args: None)
     monkeypatch.setattr(_EXTRACT, "plot_metrics", lambda *_args: None)
     monkeypatch.setattr(_EXTRACT, "_report_one_live_file", lambda *_args: False)
 
     with pytest.raises(SystemExit) as raised:
-        _run_main(monkeypatch, str(tmp_path), "--markdown")
+        _run_main(monkeypatch, str(tmp_path))
 
     assert raised.value.code == 1
 
@@ -158,8 +156,8 @@ def test_cli_filters_compound_size_and_forwards_plot_mode(monkeypatch, tmp_path)
     plotted = []
     monkeypatch.setattr(
         _EXTRACT,
-        "print_markdown_table",
-        lambda metrics, single_axis: reported.append((metrics, single_axis)),
+        "print_terminal_table",
+        lambda metrics, _live: reported.append(metrics),
     )
     monkeypatch.setattr(
         _EXTRACT,
@@ -181,17 +179,15 @@ def test_cli_filters_compound_size_and_forwards_plot_mode(monkeypatch, tmp_path)
         "--only-sizes",
         "1M,r4K",
         "--no-dual-y-axis",
-        "--markdown",
     )
 
     assert len(reported) == len(plotted) == 1
-    assert reported[0][1] is True
     assert plotted[0][2] is True
-    assert [item.operation for item in reported[0][0]] == ["READ"]
+    assert [item.operation for item in reported[0]] == ["READ"]
 
 
 def test_cli_default_terminal_report_is_mirrored_to_a_text_file(monkeypatch, tmp_path):
-    """Without --markdown the normal mirrored text report is written."""
+    """The mirrored text report is written."""
     directory = _target_dir(tmp_path, "a", None)
     monkeypatch.setattr(_EXTRACT, "parse_elbencho_files", lambda _base: [_metric()])
     mirrored = []
@@ -248,7 +244,6 @@ def stubbed_report_fixture(monkeypatch):
     """Parse every pair as one metric; record what a run would have plotted."""
     plotted = []
     monkeypatch.setattr(_EXTRACT, "parse_elbencho_files", lambda _base: [_metric()])
-    monkeypatch.setattr(_EXTRACT, "print_markdown_table", lambda *_args: None)
     monkeypatch.setattr(_EXTRACT, "print_terminal_table", lambda *_args: None)
     monkeypatch.setattr(_EXTRACT, "plot_metrics", lambda *args: plotted.append(args))
     return plotted
@@ -282,23 +277,22 @@ def test_allowed_mixed_targets_warn_and_label_the_report(
 ):
     first = _target_dir(tmp_path, "a", "lustre-a")
     second = _target_dir(tmp_path, "b", "weka-b")
-    _run_main(monkeypatch, str(first), str(second), "--markdown", _ALLOW_MIXED)
+    _run_main(monkeypatch, str(first), str(second), _ALLOW_MIXED)
     captured = capsys.readouterr()
     assert _target_lines(captured.out) == [
-        '- Storage target: mixed: "lustre-a", "weka-b"'
+        'Storage target: mixed: "lustre-a", "weka-b"'
     ]
     assert "WARNING: report mixes storage targets" in captured.err
     assert len(stubbed_report) == 1
 
 
-def test_one_target_is_named_in_both_report_forms(
+def test_one_target_is_named_on_stdout_and_in_report_txt(
     monkeypatch, tmp_path, capsys, stubbed_report
 ):
     first = _target_dir(tmp_path, "a", "lustre-a")
     second = _target_dir(tmp_path, "b", "lustre-a")
-    _run_main(monkeypatch, str(first), str(second), "--markdown")
-    assert _target_lines(capsys.readouterr().out) == ["- Storage target: lustre-a"]
     _run_main(monkeypatch, str(first), str(second))
+    assert _target_lines(capsys.readouterr().out) == ["Storage target: lustre-a"]
     assert "Storage target: lustre-a\n" in (first / "report.txt").read_text("utf-8")
     assert stubbed_report
 
@@ -308,18 +302,18 @@ def test_known_and_unverifiable_inputs_warn_without_failing(
 ):
     first = _target_dir(tmp_path, "a", "lustre-a")
     second = _target_dir(tmp_path, "b", None)
-    _run_main(monkeypatch, str(first), str(second), "--markdown")
+    _run_main(monkeypatch, str(first), str(second))
     captured = capsys.readouterr()
-    assert _target_lines(captured.out) == ["- Storage target: lustre-a"]
+    assert _target_lines(captured.out) == ["Storage target: lustre-a"]
     assert f"cannot verify storage target of 1 input(s): {second}" in captured.err
     assert stubbed_report
 
 
 def test_unknown_targets_are_silent(monkeypatch, tmp_path, capsys, stubbed_report):
     directory = _target_dir(tmp_path, "a", None)
-    _run_main(monkeypatch, str(directory), "--markdown")
+    _run_main(monkeypatch, str(directory))
     captured = capsys.readouterr()
-    assert _target_lines(captured.out) == ["- Storage target: unknown"]
+    assert _target_lines(captured.out) == ["Storage target: unknown"]
     assert "WARNING" not in captured.err
     assert stubbed_report
 
@@ -331,8 +325,8 @@ def test_snapshot_without_name_derives_it_from_the_roots(
     (directory / "env_used.yaml").write_text(
         'TEST_DIRS:\n  "/mnt/b/": 1\n  "/mnt/a": 1\n', encoding="utf-8"
     )
-    _run_main(monkeypatch, str(directory), "--markdown")
-    assert _target_lines(capsys.readouterr().out) == ["- Storage target: /mnt/a,/mnt/b"]
+    _run_main(monkeypatch, str(directory))
+    assert _target_lines(capsys.readouterr().out) == ["Storage target: /mnt/a,/mnt/b"]
     assert stubbed_report
 
 
@@ -371,11 +365,10 @@ def test_allowed_mixed_label_ignores_the_only_filters(
         str(second),
         "--only-nodes",
         "1",
-        "--markdown",
         _ALLOW_MIXED,
     )
     assert _target_lines(capsys.readouterr().out) == [
-        '- Storage target: mixed: "lustre-a", "weka-b"'
+        'Storage target: mixed: "lustre-a", "weka-b"'
     ]
     assert stubbed_report
 
@@ -385,9 +378,9 @@ def test_mixed_label_with_a_quote_in_a_name_is_not_split(
 ):
     first = _target_dir(tmp_path, "a", "'x\", \"y'")
     second = _target_dir(tmp_path, "b", "z")
-    _run_main(monkeypatch, str(first), str(second), "--markdown", _ALLOW_MIXED)
+    _run_main(monkeypatch, str(first), str(second), _ALLOW_MIXED)
     assert _target_lines(capsys.readouterr().out) == [
-        '- Storage target: mixed: "x\\", \\"y", "z"'
+        'Storage target: mixed: "x\\", \\"y", "z"'
     ]
     assert stubbed_report
 
@@ -496,16 +489,15 @@ def test_fairness_line_unavailable_window():
 
 
 def test_live_fairness_block_prints_and_appends_to_report(tmp_path, capsys):
-    """The block goes to stdout and, outside markdown, to report.txt."""
+    """The block goes to stdout and to report.txt."""
     report = tmp_path / _EXTRACT.REPORT_TXT_FILENAME
     report.write_text("table\n", encoding="utf-8")
-    _EXTRACT.emit_live_fairness(["line one"], False, str(tmp_path))
+    _EXTRACT.emit_live_fairness(["line one"], str(tmp_path))
     assert "Live fairness\nline one" in capsys.readouterr().out
     text = report.read_text(encoding="utf-8")
     assert text.startswith("table\n") and "Live fairness\nline one" in text
-    _EXTRACT.emit_live_fairness(["line two"], True, str(tmp_path))
-    assert "line two" not in report.read_text(encoding="utf-8")
-    _EXTRACT.emit_live_fairness([], False, str(tmp_path))
+    _EXTRACT.emit_live_fairness([], str(tmp_path))
+    assert report.read_text(encoding="utf-8") == text
 
 
 def test_fairness_lines_skip_phases_without_data(monkeypatch, tmp_path):
@@ -569,7 +561,7 @@ def test_live_fairness_table_follows_the_table_rows(capsys):
 
 
 def test_live_fairness_rows_fall_back_to_lines():
-    """Mixed, repeated, unmatched and markdown domains keep their lines."""
+    """Mixed, repeated and unmatched domains keep their lines."""
     metric = _io_metric(io_size="4K")
     live_file = _EXTRACT.LiveFileMetadata("x.live.csv", "4K", 1, 1, 1, "20260101Z")
     metric = replace(metric, datestamp="20260101Z")
@@ -579,14 +571,12 @@ def test_live_fairness_rows_fall_back_to_lines():
         (live_file, _EXTRACT.LiveDomainKey("READ", ""), _table_steady()),
     ]
     # pylint: disable=protected-access
-    live, lines = _EXTRACT._split_live_fairness(fairness, [metric], False)
+    live, lines = _EXTRACT._split_live_fairness(fairness, [metric])
     assert list(live) == [_EXTRACT.live_row_key(metric, "WRITE")]
     assert [line.split(":")[0] for line in lines] == [
         "x WRITE occurrence 2",
         "x READ",
     ]
-    live, lines = _EXTRACT._split_live_fairness(fairness, [metric], True)
-    assert not live and len(lines) == 3
 
 
 def test_live_fairness_keeps_only_the_summary():
@@ -621,7 +611,7 @@ def test_same_named_runs_in_different_inputs_keep_their_own_fairness():
         for name in ("direct", "buffered")
     ]
     # pylint: disable=protected-access
-    live, lines = _EXTRACT._split_live_fairness(fairness, [direct, buffered], False)
+    live, lines = _EXTRACT._split_live_fairness(fairness, [direct, buffered])
     assert not lines
     assert live[_EXTRACT.live_row_key(direct, "WRITE")] == "direct"
     assert live[_EXTRACT.live_row_key(buffered, "WRITE")] == "buffered"

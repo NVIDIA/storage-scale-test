@@ -972,7 +972,7 @@ they do not need a wrapper or a manually activated environment.
 ### 9.2 Analysis Workflow
 
 ```
-Results directory → extract-*.py → Terminal tables + PNG plots [+ Markdown report]
+Results directory → extract-*.py → Terminal tables + PNG plots [+ Markdown report for netbench and Warp]
 ```
 
 Each analysis script:
@@ -981,15 +981,15 @@ Each analysis script:
 2. **Aggregates** metrics across iterations/directions where applicable.
 3. **Prints** summary tables to stdout, formatted for fixed-width terminal.
 4. **Generates** PNG plots saved alongside the results.
-5. **Optionally** produces `--markdown` output to stdout (with progress on
-   stderr) suitable for pasting into Google Docs.
+5. **Optionally** (netbench and Warp only) produces `--markdown` output to
+   stdout (with progress on stderr) suitable for pasting into Google Docs.
 
 ### 9.3 Markdown Report / Google Docs Workflow
 
-The `--markdown` flag produces a complete report in Markdown on stdout. The
-intended workflow:
+The `--markdown` flag of the netbench and Warp analyzers produces a complete
+report in Markdown on stdout. The intended workflow:
 
-1. `./utils/extract-elbencho.py --markdown results/elbencho-20250815Z143022/ > report.md`
+1. `./utils/extract-netbench.py --markdown results/netbench-20250815Z143022/ > report.md`
 2. Open Google Docs → Edit → Paste from Markdown
 3. For each plot reference: Insert → Image → Upload from computer → select the
    corresponding PNG

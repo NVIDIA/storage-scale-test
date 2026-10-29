@@ -222,9 +222,9 @@ class TestFragment(MdtestResultsJsonCase):
         self.add_execution("0001", 1, 8)
         self.add_iteration(1, 8, 1)
         self.add_iteration(1, 8, 2, _truncated_csv(), _truncated_out())
-        code, out, _ = self.run_main(self.results, "--markdown")
+        code, out, _ = self.run_main(self.results)
         self.assertIn(code, (0, None))
-        self.assertIn("| **Total Iterations** | 1 |", out)
+        self.assertRegex(out, r"(?m)^\s*1\s+8\s+1\s")
 
     def test_missing_iteration(self) -> None:
         self.add_execution("0001", 1, 8)

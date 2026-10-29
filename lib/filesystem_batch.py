@@ -997,8 +997,6 @@ def _report_group(  # pylint: disable=too-many-arguments
                 wait()
         finally:
             shutil.rmtree(temporary, ignore_errors=True)
-        if "--markdown" in engine_options:
-            (output / "report.txt").write_text(sink.stdout, encoding="utf-8")
 
     return finish
 

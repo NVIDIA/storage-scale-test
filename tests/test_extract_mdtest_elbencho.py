@@ -514,23 +514,6 @@ class TestDenseResultsParse(unittest.TestCase):
             ]
             self.assertEqual(percentiles, sorted(percentiles), prefix)
 
-    def test_markdown_report_renders_dense_run(self) -> None:
-        buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer):
-            _EXTRACT_MOD.print_markdown_report(
-                [self._aggregated_metrics()],
-                test_configuration=_MDTEST_CONFIGURATION,
-            )
-
-        report = buffer.getvalue()
-        self.assertIn("MDTest-Elbencho Benchmark Results", report)
-        self.assertIn("-n 0", report)
-        self.assertIn("16,962", report)
-        for key, value in _MDTEST_CONFIGURATION.items():
-            self.assertIn(f"| `{key}` | {value} |", report)
-        self.assertIn("### 3.2 Average Phase Elapsed Times", report)
-        self.assertIn("| 1 | 8 | 1 | 588ms | 10ms | 479ms |", report)
-
     def test_terminal_report_renders_phase_elapsed_times(self) -> None:
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
@@ -540,6 +523,8 @@ class TestDenseResultsParse(unittest.TestCase):
             )
 
         report = buffer.getvalue()
+        self.assertIn("-n 0", report)
+        self.assertIn("16,962", report)
         self.assertIn("=== Average Phase Elapsed Times ===", report)
         self.assertIn("last worker completion", report)
         self.assertIn("588ms", report)
@@ -617,46 +602,43 @@ class TestStorageTargetGuard(unittest.TestCase):
         code, out, err, plots = self._run(
             self.first,
             self.second,
-            "--markdown",
             _ALLOW_MIXED,
             f"--output-dir={output}",
         )
         self.assertEqual(code, 0)
         self.assertEqual(
-            self._target_lines(out), ['- Storage target: mixed: "lustre-a", "weka-b"']
+            self._target_lines(out), ['Storage target: mixed: "lustre-a", "weka-b"']
         )
         self.assertIn("WARNING: report mixes storage targets", err)
         self.assertEqual(plots, 1)
 
-    def test_one_target_is_named_in_both_report_forms(self) -> None:
+    def test_one_target_is_named_on_stdout_and_in_report_txt(self) -> None:
         third = self._results("c", "20260814Z120000", "lustre-a")
-        code, out, _, _ = self._run(self.first, third, "--markdown")
+        code, out, _, _ = self._run(self.first, third)
         self.assertEqual(code, 0)
-        self.assertEqual(self._target_lines(out), ["- Storage target: lustre-a"])
-        code, _, _, _ = self._run(self.first, third)
-        self.assertEqual(code, 0)
+        self.assertEqual(self._target_lines(out), ["Storage target: lustre-a"])
         report = (self.first / "report.txt").read_text(encoding="utf-8")
         self.assertIn("Storage target: lustre-a\n", report)
 
     def test_known_and_unverifiable_inputs_warn_without_failing(self) -> None:
         third = self._results("c", "20260814Z120000", None)
-        code, out, err, _ = self._run(self.first, third, "--markdown")
+        code, out, err, _ = self._run(self.first, third)
         self.assertEqual(code, 0)
-        self.assertEqual(self._target_lines(out), ["- Storage target: lustre-a"])
+        self.assertEqual(self._target_lines(out), ["Storage target: lustre-a"])
         self.assertIn(f"cannot verify storage target of 1 input(s): {third}", err)
 
     def test_unknown_targets_are_silent(self) -> None:
         unnamed = self._results("c", "20260814Z120000", None)
-        code, out, err, _ = self._run(unnamed, "--markdown")
+        code, out, err, _ = self._run(unnamed)
         self.assertEqual(code, 0)
-        self.assertEqual(self._target_lines(out), ["- Storage target: unknown"])
+        self.assertEqual(self._target_lines(out), ["Storage target: unknown"])
         self.assertNotIn("WARNING", err)
 
     def test_same_coordinates_in_two_targets_are_kept_when_mixing_is_allowed(
         self,
     ) -> None:
         clash = self._results("c", _DATESTAMP, "weka-b")
-        code, _, err, _ = self._run(self.first, clash, "--markdown", _ALLOW_MIXED)
+        code, _, err, _ = self._run(self.first, clash, _ALLOW_MIXED)
         self.assertEqual(code, 0)
         self.assertNotIn("Duplicate result pair", err)
         self.assertIn("Found 2 file pairs", err)
@@ -670,7 +652,7 @@ class TestStorageTargetGuard(unittest.TestCase):
         ):
             with self.subTest(target=target, extra=extra):
                 clash = self._results(f"d{target}{extra}", _DATESTAMP, target)
-                code, _, err, _ = self._run(self.first, clash, "--markdown", *extra)
+                code, _, err, _ = self._run(self.first, clash, *extra)
                 self.assertEqual(code, 1)
                 self.assertIn("Duplicate result pair", err)
                 self.assertIn("skipping both", err)

@@ -2867,10 +2867,7 @@ def _assert_scenario_report(
         if step.workload_kind == "mdtest"
         else "extract-elbencho.py"
     )
-    command: list[str | Path] = [
-        report_workspace / "utils" / extractor,
-        "--markdown",
-    ]
+    command: list[str | Path] = [report_workspace / "utils" / extractor]
     if runtime.scenario.name == "live-capture":
         command.extend(
             (
@@ -2899,8 +2896,8 @@ def _assert_scenario_report(
             (item.coordinate.nodes, item.coordinate.tasks_per_node)
             for item in step.executions
             if not re.search(
-                rf"^\|\s*{item.coordinate.nodes}\s*\|\s*"
-                rf"{item.coordinate.tasks_per_node}\s*\|",
+                rf"^\s*{item.coordinate.nodes}\s+"
+                rf"{item.coordinate.tasks_per_node}\s+",
                 output,
                 re.MULTILINE,
             )
@@ -2908,10 +2905,10 @@ def _assert_scenario_report(
         missing_operations = [
             heading
             for heading in (
-                "| Nodes | Threads | Iters | Create/s | Stat/s | Delete/s |",
-                "Create Latency Histogram",
-                "Stat Latency Histogram",
-                "Delete Latency Histogram",
+                "Create/s (avg±std)",
+                "=== Create Latency Percentiles",
+                "=== Stat Latency Percentiles",
+                "=== Delete Latency Percentiles",
             )
             if heading not in output
         ]
@@ -2920,15 +2917,17 @@ def _assert_scenario_report(
         missing_rows = [
             nodes
             for nodes in node_counts
-            if not re.search(rf"^\|\s*{nodes}\s*\|", output, re.MULTILINE)
+            if not re.search(rf"^{nodes}\s*\|", output, re.MULTILINE)
         ]
         required_operations = []
         if WorkloadPhase.WRITE in step.required_phases:
-            required_operations.append("WRITE Operation")
+            required_operations.append("WRITE")
         if WorkloadPhase.READ in step.required_phases:
-            required_operations.append("READ Operation")
+            required_operations.append("READ")
         missing_operations = [
-            item for item in required_operations if item not in output
+            item
+            for item in required_operations
+            if not re.search(rf"^=== IO Size: .* {item} - ", output, re.MULTILINE)
         ]
     if missing_rows or missing_operations:
         raise IntegrationTestError(

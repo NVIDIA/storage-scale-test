@@ -77,7 +77,6 @@ from lib.reporting_common import (  # pylint: disable=wrong-import-position
     discover_result_pairs,
     filter_metrics_by_scale,
     format_decimal_aligned_latency_ms,
-    format_latency_ms,
     latency_column_widths,
     parse_int_values_with_ranges as parse_int_ranges,
     strip_command_options,
@@ -832,11 +831,6 @@ def aggregate_metrics(
 # =============================================================================
 
 
-def format_rate(rate: float) -> str:
-    """Format rate with comma separators."""
-    return f"{int(round(rate)):,}"
-
-
 def format_rate_with_std(avg: float, std: float) -> str:
     """Format rate with standard deviation."""
     return f"{int(round(avg)):,} ± {int(round(std)):,}"
@@ -880,11 +874,6 @@ def format_aligned_rate_with_std(
     return f"{avg_str:>{avg_width}} ± {std_str:>{std_width}}"
 
 
-def format_latency(lat_ms: float) -> str:
-    """Format latency in milliseconds with appropriate precision."""
-    return format_latency_ms(lat_ms)
-
-
 def compute_latency_column_widths(values: List[float]) -> Tuple[int, int]:
     """
     Compute max widths before and after decimal for latency column.
@@ -918,7 +907,7 @@ def _datestamp_token(prefix: str, datestamps: Set[str]) -> str:
 
 
 def _plot_basename(prefix: str, datestamps: Set[str]) -> str:
-    """Plot basename; markdown refs and savefig must pass the same ``prefix``."""
+    """Plot basename for ``prefix`` within NAME_MAX."""
     return f"{prefix}{_datestamp_token(prefix, datestamps)}.png"
 
 
@@ -1264,273 +1253,6 @@ def print_terminal_table(
     print()
 
 
-def print_markdown_report(
-    metrics: List[AggregatedMetrics],
-    normalize_to: Optional[int] = None,
-    test_configuration: Optional[Dict[str, str]] = None,
-) -> None:
-    """Print formatted markdown report."""
-    if not metrics:
-        print("No metrics to display")
-        return
-
-    # Collect all datestamps
-    all_datestamps: Set[str] = set()
-    for m in metrics:
-        all_datestamps.update(m.datestamps)
-
-    datestamp_str = join_datestamps(all_datestamps)
-
-    # Sort by (node_count, thread_count)
-    sorted_metrics = sorted(metrics, key=lambda m: (m.node_count, m.thread_count))
-
-    # Determine if single-node or multi-node
-    unique_nodes = {m.node_count for m in metrics}
-    is_multi_node = len(unique_nodes) > 1
-    sn_mn = "mn" if is_multi_node else "sn"
-
-    # Get unique thread counts
-    unique_threads = sorted({m.thread_count for m in metrics})
-
-    # Find configs with peak (normalized) rates so the summary numbers stay
-    # consistent with the rates table when --normalize-to is used.
-    peak_create_cfg = max(
-        metrics,
-        key=lambda m: _normalize_value(m.create_rate_avg, m.node_count, normalize_to),
-    )
-    peak_stat_cfg = max(
-        metrics,
-        key=lambda m: _normalize_value(m.stat_rate_avg, m.node_count, normalize_to),
-    )
-    peak_delete_cfg = max(
-        metrics,
-        key=lambda m: _normalize_value(m.delete_rate_avg, m.node_count, normalize_to),
-    )
-    peak_create = _normalize_value(
-        peak_create_cfg.create_rate_avg, peak_create_cfg.node_count, normalize_to
-    )
-    peak_stat = _normalize_value(
-        peak_stat_cfg.stat_rate_avg, peak_stat_cfg.node_count, normalize_to
-    )
-    peak_delete = _normalize_value(
-        peak_delete_cfg.delete_rate_avg, peak_delete_cfg.node_count, normalize_to
-    )
-
-    # =========================================================================
-    # Section 1: Summary
-    # =========================================================================
-    print("# MDTest-Elbencho Benchmark Results\n")
-    print("## 1. Summary\n")
-    print("| Property | Value |")
-    print("|:---------|:------|")
-    print(f"| **Datestamps** | {datestamp_str} |")
-    print(f"| **Node Counts** | {', '.join(str(n) for n in sorted(unique_nodes))} |")
-    print(f"| **Thread Counts** | {', '.join(str(t) for t in unique_threads)} |")
-    total_iters = sum(m.iteration_count for m in metrics)
-    print(f"| **Total Iterations** | {total_iters} |")
-    print()
-    note = _normalization_note(normalize_to)
-    print(f"**Peak Performance{note}:**")
-    print(
-        f"- **Create:** {format_rate(peak_create)} files/s "
-        f"@ {_format_nodes_col(peak_create_cfg.node_count, normalize_to)}n"
-        f"/{peak_create_cfg.thread_count}t"
-    )
-    print(
-        f"- **Stat:** {format_rate(peak_stat)} files/s "
-        f"@ {_format_nodes_col(peak_stat_cfg.node_count, normalize_to)}n"
-        f"/{peak_stat_cfg.thread_count}t"
-    )
-    print(
-        f"- **Delete:** {format_rate(peak_delete)} files/s "
-        f"@ {_format_nodes_col(peak_delete_cfg.node_count, normalize_to)}n"
-        f"/{peak_delete_cfg.thread_count}t"
-    )
-
-    # =========================================================================
-    # Section 2: Test Configuration
-    # =========================================================================
-    print(MARKDOWN_SECTION_BREAK)
-    print("## 2. Test Configuration\n")
-    if test_configuration:
-        print("**MDTest Settings (`env_used.yaml`):**\n")
-        print("| Setting | Value |")
-        print("|:--------|------:|")
-        for key in MDTEST_CONFIG_KEYS:
-            if key in test_configuration:
-                print(f"| `{key}` | {test_configuration[key]} |")
-        print()
-    if sorted_metrics:
-        m = sorted_metrics[0]
-        print("**Representative Commands:**\n")
-        print("```bash")
-        if m.create_command:
-            print("# Create")
-            print(strip_command(m.create_command))
-        if m.stat_command:
-            print("# Stat")
-            print(strip_command(m.stat_command))
-        if m.delete_command:
-            print("# Delete")
-            print(strip_command(m.delete_command))
-        print("```")
-
-    # =========================================================================
-    # Section 3: Performance Rates
-    # =========================================================================
-    print(MARKDOWN_SECTION_BREAK)
-    print("## 3. Performance Rates\n")
-    print("### 3.1 Rate Summary Table\n")
-    if normalize_to is not None:
-        print(f"*Op/s and stddev normalized to {normalize_to} node(s).*\n")
-    print("| Nodes | Threads | Iters | Create/s | Stat/s | Delete/s |")
-    print("|------:|--------:|------:|---------:|-------:|---------:|")
-    for m in sorted_metrics:
-        nc = m.node_count
-        nodes_cell = _format_nodes_col(nc, normalize_to)
-        cr_avg = _normalize_value(m.create_rate_avg, nc, normalize_to)
-        cr_std = _normalize_value(m.create_rate_stddev, nc, normalize_to)
-        st_avg = _normalize_value(m.stat_rate_avg, nc, normalize_to)
-        st_std = _normalize_value(m.stat_rate_stddev, nc, normalize_to)
-        dl_avg = _normalize_value(m.delete_rate_avg, nc, normalize_to)
-        dl_std = _normalize_value(m.delete_rate_stddev, nc, normalize_to)
-        print(
-            f"| {nodes_cell} | {m.thread_count} | {m.iteration_count} "
-            f"| {format_rate(cr_avg)} ± {format_rate(cr_std)} "
-            f"| {format_rate(st_avg)} ± {format_rate(st_std)} "
-            f"| {format_rate(dl_avg)} ± {format_rate(dl_std)} |"
-        )
-
-    print("\n### 3.2 Average Phase Elapsed Times\n")
-    print(
-        "*Mean measured-operation wall time to last worker completion "
-        "across iterations.*\n"
-    )
-    print("| Nodes | Threads | Iters | Create avg | Stat avg | Delete avg |")
-    print("|------:|--------:|------:|-----------:|---------:|-----------:|")
-    for m in sorted_metrics:
-        print(
-            f"| {m.node_count} | {m.thread_count} | {m.iteration_count} "
-            f"| {format_elapsed_time(m.create_elapsed_avg_sec)} "
-            f"| {format_elapsed_time(m.stat_elapsed_avg_sec)} "
-            f"| {format_elapsed_time(m.delete_elapsed_avg_sec)} |"
-        )
-
-    print("\n### 3.3 Rate Chart\n")
-    print("*Insert the following image:*\n")
-    rates_png = _plot_basename(f"mdtest-elbencho-{sn_mn}-rates-", all_datestamps)
-    print(f"**Performance Rates:** `{rates_png}`")
-
-    # =========================================================================
-    # Section 4: Scaling Efficiency
-    # =========================================================================
-    print(MARKDOWN_SECTION_BREAK)
-    print("## 4. Scaling Efficiency\n")
-    if is_multi_node:
-        eff_prefix = "mdtest-elbencho-mn-efficiency-"
-        print("### 4.1 Create Scaling Efficiency\n")
-        print(f"`{_plot_basename(eff_prefix + 'create-', all_datestamps)}`\n")
-        print("### 4.2 Stat Scaling Efficiency\n")
-        print(f"`{_plot_basename(eff_prefix + 'stat-', all_datestamps)}`\n")
-        print("### 4.3 Delete Scaling Efficiency\n")
-        print(f"`{_plot_basename(eff_prefix + 'delete-', all_datestamps)}`")
-    else:
-        print("### 4.1 Efficiency Chart\n")
-        print(f"`{_plot_basename('mdtest-elbencho-sn-efficiency-', all_datestamps)}`")
-
-    # =========================================================================
-    # Section 5: Latency Analysis
-    # =========================================================================
-    print(MARKDOWN_SECTION_BREAK)
-    print("## 5. Latency Analysis\n")
-
-    # Print one table per operation type
-    for section_num, (op_name, get_percentiles) in enumerate(
-        [
-            (
-                "Create",
-                lambda m: (
-                    m.create_lat_p0,
-                    m.create_lat_p50,
-                    m.create_lat_p90,
-                    m.create_lat_p99,
-                    m.create_lat_p100,
-                ),
-            ),
-            (
-                "Stat",
-                lambda m: (
-                    m.stat_lat_p0,
-                    m.stat_lat_p50,
-                    m.stat_lat_p90,
-                    m.stat_lat_p99,
-                    m.stat_lat_p100,
-                ),
-            ),
-            (
-                "Delete",
-                lambda m: (
-                    m.delete_lat_p0,
-                    m.delete_lat_p50,
-                    m.delete_lat_p90,
-                    m.delete_lat_p99,
-                    m.delete_lat_p100,
-                ),
-            ),
-        ],
-        start=1,
-    ):
-        print(f"### 5.{section_num} {op_name} Latency Percentiles\n")
-        print(
-            "| Nodes | Threads | p0 (ms) | p50 (ms) | p90 (ms) | p99 (ms) | p100 (ms) |"
-        )
-        print(
-            "|------:|--------:|--------:|---------:|---------:|---------:|----------:|"
-        )
-
-        for m in sorted_metrics:
-            p0, p50, p90, p99, p100 = get_percentiles(m)
-            print(
-                f"| {m.node_count} | {m.thread_count} "
-                f"| {format_latency(p0)} | {format_latency(p50)} "
-                f"| {format_latency(p90)} | {format_latency(p99)} "
-                f"| {format_latency(p100)} |"
-            )
-        print()
-
-    hist_prefix = f"mdtest-elbencho-{sn_mn}-latency-hist-"
-    print("### 5.4 Create Latency Histogram\n")
-    print(f"`{_plot_basename(hist_prefix + 'create-', all_datestamps)}`\n")
-    print("### 5.5 Stat Latency Histogram\n")
-    print(f"`{_plot_basename(hist_prefix + 'stat-', all_datestamps)}`\n")
-    print("### 5.6 Delete Latency Histogram\n")
-    print(f"`{_plot_basename(hist_prefix + 'delete-', all_datestamps)}`")
-
-    # =========================================================================
-    # Section 6: Appendix
-    # =========================================================================
-    print(MARKDOWN_SECTION_BREAK)
-    print("## 6. Appendix\n")
-    print("### 6.1 Metrics Explanation\n")
-    print("| Metric | Description |")
-    print("|:-------|:------------|")
-    print("| **Create/s** | File creation operations per second (WRITE phase) |")
-    print("| **Stat/s** | File stat operations per second (STAT phase) |")
-    print("| **Delete/s** | File deletion operations per second (RMFILES phase) |")
-    print("| **±std** | Standard deviation across iterations |")
-    print(
-        "| **Phase elapsed** | Mean measured-operation wall time through last "
-        "worker completion across iterations |"
-    )
-    print("| **p0** | Minimum latency (0th percentile) |")
-    print("| **p50** | Median latency (50th percentile) |")
-    print("| **p90** | 90th percentile latency |")
-    print("| **p99** | 99th percentile latency |")
-    print("| **p100** | Maximum latency (100th percentile) |")
-
-    print()
-
-
 # =============================================================================
 # Plotting
 # =============================================================================
@@ -1543,7 +1265,6 @@ OPERATION_COLORS = {
 }
 
 LEGEND_LOC_UPPER_LEFT = "upper left"
-MARKDOWN_SECTION_BREAK = "\n---\n"
 
 
 def _normalize_to_max_percent(values: List[float]) -> List[float]:
@@ -2636,7 +2357,7 @@ def main() -> None:
 
 
 def _run_text_report(args, environments: Dict[str, dict]) -> None:
-    """Print the table or Markdown report and write the plots."""
+    """Print the table report and write the plots."""
     versions: List[Tuple[IterationMetrics, str]] = []
 
     # Refuse results from different storage targets before parsing or writing.
@@ -2712,22 +2433,13 @@ def _run_text_report(args, environments: Dict[str, dict]) -> None:
         aggregated_metrics,
         lambda metric: (metric.node_count, metric.thread_count),
     )
-    if args.markdown:
-        with_versions(
-            print_markdown_report, produced_by, markdown=True, target=target_label
-        )(
-            aggregated_metrics,
-            normalize_to=args.normalize_to,
-            test_configuration=test_configuration,
-        )
-    else:
-        mirror_stdout_to_file(
-            os.path.join(output_dir, REPORT_TXT_FILENAME),
-            with_versions(print_terminal_table, produced_by, target=target_label),
-            aggregated_metrics,
-            normalize_to=args.normalize_to,
-            test_configuration=test_configuration,
-        )
+    mirror_stdout_to_file(
+        os.path.join(output_dir, REPORT_TXT_FILENAME),
+        with_versions(print_terminal_table, produced_by, target=target_label),
+        aggregated_metrics,
+        normalize_to=args.normalize_to,
+        test_configuration=test_configuration,
+    )
 
     # Generate plots
     plot_all(aggregated_metrics, output_dir)

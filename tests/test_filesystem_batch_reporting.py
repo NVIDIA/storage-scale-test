@@ -367,7 +367,6 @@ def test_unified_reporter_routes_common_and_kind_specific_options(
                     "--only-sizes",
                     "1M,r4K;4K",
                     "--only-sizes=1M",
-                    "--markdown",
                     "--no-dual-y-axis",
                     "--client-max-heatmap-rows",
                     "12",
@@ -376,7 +375,7 @@ def test_unified_reporter_routes_common_and_kind_specific_options(
             )
             == 0
         )
-    common = {"--only-nodes=1,2", "--markdown", "--allow-mixed-targets"}
+    common = {"--only-nodes=1,2", "--allow-mixed-targets"}
     assert set(called["0002"]) == common | {"--normalize-to=1"}
     assert set(called["0001"]) == common | {
         "--only-sizes=1M,r4K;4K",
@@ -647,10 +646,9 @@ def test_interrupted_index_publication_preserves_previous_index(tmp_path):
     assert not list(output.glob(".index-*"))
 
 
-@pytest.mark.parametrize("markdown", [False, True])
 @pytest.mark.parametrize("custom_output", [False, True])
 def test_omnibus_report_preserves_tables_with_each_saved_environment(
-    tmp_path, markdown, custom_output
+    tmp_path, custom_output
 ):
     """IO summaries and raw metadata settings precede each intact group report."""
     manifest = _create_batch(tmp_path / "batch", kinds=("io", "mdtest"))
@@ -662,17 +660,7 @@ def test_omnibus_report_preserves_tables_with_each_saved_environment(
     contents = {}
     for group in manifest.groups:
         identifier = group.group_id
-        if markdown:
-            first_header = f"| Nodes | {identifier} first metric |"
-            second_header = f"| Nodes | {identifier} second metric |"
-            contents[identifier] = (
-                f"# Group {identifier} results\n\n"
-                "```text\n# Example command\n"
-                "| Example | Value |\n| --- | --- |\n| fake | row |\n```\n\n"
-                f"## First table\n\n{first_header}\n| --- | --- |\n| 1 | 10 |\n\n"
-                f"## Second table\n\n{second_header}\n| --- | --- |\n| 1 | 20 |\n"
-            )
-        elif group.kind == "io":
+        if group.kind == "io":
             first_header = f"Nodes | Thrds | {identifier} first metric"
             second_header = f"Nodes | Thrds | {identifier} second metric"
             contents[identifier] = (
@@ -724,11 +712,8 @@ def test_omnibus_report_preserves_tables_with_each_saved_environment(
             encoding="utf-8"
         ) == contents[group.group_id]
     assert "\n\n" in combined
-    if markdown:
-        assert combined.count("| Example | Value |\n| --- | --- |\n| fake | row |") == 2
-    else:
-        assert "MDTEST_ITERATIONS  1" in combined
-        assert "# Create: elbencho --mkdir" in combined
+    assert "MDTEST_ITERATIONS  1" in combined
+    assert "# Create: elbencho --mkdir" in combined
     index = (report_root / "index.md").read_text(encoding="utf-8")
     assert "reports.txt" in index
     if not custom_output:
@@ -880,9 +865,8 @@ def test_single_group_batch_does_not_write_omnibus(tmp_path):
     assert not (manifest.root / "reports.txt").exists()
 
 
-@pytest.mark.parametrize("markdown", [False, True])
 def test_omnibus_keeps_actual_metadata_reports_together_by_saved_environment(
-    tmp_path, markdown
+    tmp_path,
 ):
     """Actual metadata reports stay contiguous beneath their own override settings."""
     manifest = _create_batch(tmp_path / "batch", kinds=("io", "mdtest", "mdtest"))
@@ -952,12 +936,7 @@ def test_omnibus_keeps_actual_metadata_reports_together_by_saved_environment(
             if group.kind == "io":
                 io_reporter.print_terminal_table([io_metric])
             else:
-                printer = (
-                    metadata_reporter.print_markdown_report
-                    if markdown
-                    else metadata_reporter.print_terminal_table
-                )
-                printer(
+                metadata_reporter.print_terminal_table(
                     [metadata_metric],
                     test_configuration={"MDTEST_ITERATIONS": group.group_id},
                 )
@@ -1065,9 +1044,8 @@ def test_failed_stale_omnibus_deletion_does_not_link_old_tables(tmp_path, capsys
     assert str(omnibus) in diagnostic
 
 
-@pytest.mark.parametrize("markdown", [False, True])
-def test_omnibus_keeps_real_io_report_titles_and_tables_adjacent(tmp_path, markdown):
-    """One summary precedes unchanged real WRITE/READ reports in either format."""
+def test_omnibus_keeps_real_io_report_titles_and_tables_adjacent(tmp_path):
+    """One summary precedes unchanged real WRITE/READ reports."""
     manifest = _create_batch(tmp_path / "batch", kinds=("io", "io"))
     repository = Path(__file__).resolve().parents[1]
     renderer = """
@@ -1083,7 +1061,7 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 metric = module.ElbenchoMetrics(
-    nodes=int(sys.argv[3]), io_size="1M", threads=1, io_depth=1,
+    nodes=int(sys.argv[2]), io_size="1M", threads=1, io_depth=1,
     operation="WRITE", datestamp="20260930Z120000", is_multi_node=True,
     command="elbencho --write --read", file_size_bytes=1024**3,
     direct_io=1, random_io=0, iops=100, throughput_mib_s=100,
@@ -1091,8 +1069,7 @@ metric = module.ElbenchoMetrics(
     min_lat_sec=0.001, avg_lat_sec=0.002, max_lat_sec=0.003,
     lat_pct_1=0.001, lat_pct_50=0.002, lat_pct_75=0.002, lat_pct_99=0.003,
 )
-printer = module.print_markdown_table if sys.argv[2] == "True" else module.print_terminal_table
-printer([metric, replace(metric, operation="READ")])
+module.print_terminal_table([metric, replace(metric, operation="READ")])
 """
     contents = {}
     for group in manifest.groups:
@@ -1103,7 +1080,6 @@ printer([metric, replace(metric, operation="READ")])
                 "-c",
                 renderer,
                 str(repository),
-                str(markdown),
                 group.group_id,
             ],
             check=True,
@@ -1144,7 +1120,14 @@ def test_unified_front_door_delegates_test_parse(tmp_path, unified_reporter, kin
         engine.return_value.returncode = 7
         assert (
             unified_reporter.main(
-                ["--kind", kind, "--test-parse", str(path), option, "--markdown"]
+                [
+                    "--kind",
+                    kind,
+                    "--test-parse",
+                    str(path),
+                    option,
+                    "--allow-mixed-targets",
+                ]
             )
             == 7
         )
@@ -1154,7 +1137,7 @@ def test_unified_front_door_delegates_test_parse(tmp_path, unified_reporter, kin
     )
     assert f"--test-parse={path}" in command
     assert option in command
-    assert "--markdown" in command
+    assert "--allow-mixed-targets" in command
 
 
 def test_unified_ordinary_directory_inference_and_options(tmp_path, unified_reporter):
@@ -1218,7 +1201,6 @@ def test_unified_real_metadata_report_normalizes_metrics(tmp_path, reporting_che
             "2",
             "--only-threads",
             "4",
-            "--markdown",
             str(manifest.root),
         ],
         capture_output=True,
@@ -1228,7 +1210,7 @@ def test_unified_real_metadata_report_normalizes_metrics(tmp_path, reporting_che
     assert completed.returncode == 0, completed.stdout + completed.stderr
     report = manifest.root / "reports/groups/0001/report.txt"
     assert "normalized to 1 node" in report.read_text(encoding="utf-8")
-    assert "- Produced by storage-scale-test: v1.2.3\n" in report.read_text()
+    assert "Produced by storage-scale-test: v1.2.3\n" in report.read_text()
 
 
 def test_legacy_reporter_batch_routing_forwards_options(tmp_path):
@@ -1289,7 +1271,7 @@ def test_allow_mixed_targets_reaches_the_real_engine_from_route_batch_report(
     args = argparse.Namespace(
         input_dirs=[str(manifest.root)], groups=None, output_dir=None
     )
-    argv = ["--allow-mixed-targets", "--markdown", str(manifest.root)]
+    argv = ["--allow-mixed-targets", str(manifest.root)]
     with (
         mock.patch.object(batch_module, "_REPO_ROOT", reporting_checkout),
         mock.patch("lib.filesystem_batch.subprocess.run", wraps=subprocess.run) as run,
@@ -1309,7 +1291,7 @@ def test_allow_mixed_targets_reaches_the_real_engine_from_report_batch(
 
     manifest = _real_mdtest_batch(tmp_path / "batch")
     args = extract_filesystem_parser().parse_args(
-        ["--allow-mixed-targets", "--markdown", str(manifest.root)]
+        ["--allow-mixed-targets", str(manifest.root)]
     )
     with (
         mock.patch.object(batch_module, "_REPO_ROOT", reporting_checkout),
@@ -1347,7 +1329,6 @@ def test_mdtest_engine_guards_mixed_targets_with_the_real_engine(
         sys.executable,
         str(reporting_checkout / "utils/extract-mdtest-elbencho.py"),
         *inputs,
-        "--markdown",
         "--output-dir",
         str(tmp_path / "reports"),
     ]
@@ -1361,7 +1342,7 @@ def test_mdtest_engine_guards_mixed_targets_with_the_real_engine(
         check=False,
     )
     assert allowed.returncode == 0, allowed.stderr
-    assert '- Storage target: mixed: "lustre-a", "weka-b"' in allowed.stdout
+    assert 'Storage target: mixed: "lustre-a", "weka-b"' in allowed.stdout
 
 
 def test_ordinary_reporter_routing_is_unchanged(tmp_path):
@@ -1370,21 +1351,6 @@ def test_ordinary_reporter_routing_is_unchanged(tmp_path):
     args.groups = "0001"
     with pytest.raises(ValueError, match="requires a prepared batch"):
         route_batch_report(args, "io", [])
-
-
-def test_markdown_batch_reports_have_persistent_report_file(tmp_path):
-    manifest = _create_batch(tmp_path / "batch", kinds=("io",))
-    _publish_result(manifest, manifest.groups[0])
-    markdown = "# Saved Markdown\n"
-    with mock.patch.object(
-        batch_module,
-        "_start_engine",
-        return_value=lambda: print(markdown, end=""),
-    ):
-        assert report_batch(manifest.root, engine_options=["--markdown"]) == 0
-    assert (manifest.root / "reports/groups/0001/report.txt").read_text(
-        encoding="utf-8"
-    ) == markdown
 
 
 @pytest.fixture(name="reporting_checkout")

@@ -716,13 +716,12 @@ complete `env_used.yaml` snapshots, which the `Saved settings` path and
 Table titles remain adjacent to their tables. Metadata reports include the raw
 saved YAML once before the entire workload group report, keeping configuration,
 rates, elapsed times, latency tables, and commands together. Individual group
-`report.txt` files remain unchanged. Both plain-text and `--markdown` reports
-are supported. With `--output-dir PATH`,
+`report.txt` files remain unchanged. With `--output-dir PATH`,
 the combined file is `PATH/reports.txt`, alongside `PATH/index.md` and
 `PATH/groups/`.
 
 The unified reporter also accepts the established analysis options. Common
-options such as `--only-nodes` and `--markdown` apply to both kinds;
+options such as `--only-nodes` apply to both kinds;
 `--normalize-to` applies only to metadata and `--only-sizes` only to IO.
 An option with no matching selected group is an error. Filtered runs update
 selected reports and rebuild the index and combined file, retaining valid
@@ -745,7 +744,6 @@ and is not a batch-reporting mode. For scripts and gates, see
 | Scope | Option | Purpose |
 | --- | --- | --- |
 | Both | `--only-nodes LIST`, `--only-threads LIST` | Select counts with comma lists or ranges |
-| Both | `--markdown` | Markdown on stdout; progress on stderr |
 | Both | `--test-parse FILE` | Inspect one raw result without reporting |
 | Both | `--to-json` | Also write `<output-dir>/results.json`, the [machine-readable results document](MACHINE_READABLE_RESULTS.md) |
 | Both | `--allow-mixed-targets` | Combine results from different [storage targets](#reporting-per-target) in one report (a batch never needs it) |
@@ -759,8 +757,8 @@ and is not a batch-reporting mode. For scripts and gates, see
 | Metadata | `--normalize-to N` | Scale rates/stddev to N nodes, not latency |
 
 For several result directories at once, use `extract-elbencho.py` or
-`extract-mdtest-elbencho.py`, which accept the same filters
-and `--markdown`. IO reports show IOPS or throughput and
+`extract-mdtest-elbencho.py`, which accept the same filters.
+IO reports show IOPS or throughput and
 latency by operation, size, thread count, node count, and I/O depth. Metadata
 reports show create/stat/delete rates, elapsed times, latency distributions,
 variance, and scaling efficiency.
@@ -799,7 +797,7 @@ Outputs, named `<stem>-<phase slug>-*` in the report directory:
 
 | Output | Content |
 | --- | --- |
-| "Live fairness" table | Under each results table: steady span, Jain p50/min per window, slowest/median p10, slow clients, and per-interval mean latency p50, p90 and max/p50. In `report.txt` and stdout; `--markdown` prints one line per phase |
+| "Live fairness" table | Under each results table: steady span, Jain p50/min per window, slowest/median p10, slow clients, and per-interval mean latency p50, p90 and max/p50. In `report.txt` and stdout |
 | `aggregate-timeseries.png` | Total MiB/s and IOPS, plus a fleet IO latency panel; warmup and tail shaded, `[first]`/`[last]` marked |
 | `fairness-timeseries.png` | Jain per window with the 5 s floor; below, the 5 s slowest/median ratio against `1 - S` and `1 - 2S` |
 | `client-summary.csv` / `.txt` | Per client: class, steady MiB/s and ratio, worst 5 s and 30 s ratios and times, percent of 5 s windows short, whole-run mean and median, sample counts |

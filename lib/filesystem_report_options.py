@@ -73,12 +73,6 @@ REPORT_OPTIONS = (
         {"metavar": "NODES"},
     ),
     ReportOption(
-        "--markdown",
-        "common",
-        "Markdown on stdout; progress on stderr.",
-        {"action": "store_true"},
-    ),
-    ReportOption(
         "--test-parse",
         "common",
         "Inspect one raw result without reporting.",

@@ -1135,42 +1135,6 @@ def strip_hosts_from_command(command: str) -> str:
     return result
 
 
-def parse_size_string(size_str: str) -> Tuple[str, str]:
-    """Parse size string, returning write_size and read_size.
-
-    Preserves the optional 'r' prefix which indicates random IO.
-    For formats like "1M,4K", returns ("1M", "4K").
-    For formats like "r1M,4K", returns ("r1M", "4K").
-    For single value formats like "r4K", returns ("r4K", "r4K").
-    """
-    if "," in size_str:
-        write_size, read_size = size_str.split(",", 1)
-        return write_size, read_size
-    return size_str, size_str
-
-
-def parse_size_with_order(size_str: str) -> Tuple[str, str]:
-    """Parse size string with optional random prefix, returning order and clean size.
-
-    Args:
-        size_str: Size string that may have 'r' prefix (e.g., "r4K", "1M", "r10M")
-
-    Returns:
-        Tuple of (order, clean_size) where:
-        - order is "Rand" or "Seq"
-        - clean_size is the size without the 'r' prefix
-
-    Examples:
-        "r4K" -> ("Rand", "4K")
-        "4K" -> ("Seq", "4K")
-        "1M" -> ("Seq", "1M")
-        "r1M" -> ("Rand", "1M")
-    """
-    if size_str.startswith("r"):
-        return ("Rand", size_str[1:])
-    return ("Seq", size_str)
-
-
 def normalize_time(time_str: str) -> float:
     """Convert time string (with units) to seconds."""
     if not time_str:
@@ -2761,7 +2725,7 @@ def format_with_sig_figs(value: float, sig_figs: int = 3) -> str:
 
 
 # Function to align decimal points in a column
-def align_decimal_points(values: List[str], markdown: bool) -> List[str]:
+def align_decimal_points(values: List[str]) -> List[str]:
     """Align decimal points in a column of values.
 
     Args:
@@ -2780,28 +2744,18 @@ def align_decimal_points(values: List[str], markdown: bool) -> List[str]:
             max_before_decimal = max(max_before_decimal, len(before))
             max_after_decimal = max(max_after_decimal, len(after))
 
-    # Align each value
+    # Align each value with fixed-width alignment
     aligned_values = []
     for val in values:
         if "." in val:
             before, after = val.split(".")
             # Right-align the part before decimal, left-align the part after decimal
-            if markdown:
-                # For Markdown, just use the original values without extra spaces
-                aligned = f"{before}.{after}"
-            else:
-                # For console output, use fixed-width alignment
-                aligned = f"{before.rjust(max_before_decimal)}.{after.ljust(max_after_decimal)}"
+            aligned = (
+                f"{before.rjust(max_before_decimal)}.{after.ljust(max_after_decimal)}"
+            )
         else:
             # For integer values, right-align and add spaces for where decimal point would be
-            if markdown:
-                # For Markdown, just use the original values without extra spaces
-                aligned = val
-            else:
-                # For console output, use fixed-width alignment
-                aligned = (
-                    f"{val.rjust(max_before_decimal)}{' ' * (1 + max_after_decimal)}"
-                )
+            aligned = f"{val.rjust(max_before_decimal)}{' ' * (1 + max_after_decimal)}"
 
         aligned_values.append(aligned)
 
@@ -3012,12 +2966,12 @@ def print_terminal_table(
                     rows.append(row)
 
                 # Align the decimal points in GB/s column
-                aligned_gb_s_col = align_decimal_points(gb_s_col, False)
+                aligned_gb_s_col = align_decimal_points(gb_s_col)
 
                 # Align the decimal points in latency columns
                 aligned_latency_cols = []
                 for lat_col in latency_cols:
-                    aligned_latency_cols.append(align_decimal_points(lat_col, False))
+                    aligned_latency_cols.append(align_decimal_points(lat_col))
 
                 # Calculate column widths
                 col_widths = [len(h) for h in table_headers]
@@ -3118,269 +3072,6 @@ def print_terminal_table(
                     print_live_fairness_table(sub_metrics, live)
 
     print("")  # Add blank line at end
-
-
-def print_markdown_table(
-    metrics: List[ElbenchoMetrics], no_dual_y_axis: bool = False
-) -> None:
-    """Print formatted metrics table in Markdown format.
-
-    Args:
-        metrics: List of ElbenchoMetrics objects to display
-        no_dual_y_axis: If True, reference separate single-axis plots instead of dual y-axis plots
-    """
-    if not metrics:
-        print("No metrics to display")
-        return
-
-    clustered_metrics = cluster_metrics_for_reporting(metrics)
-
-    # Create a main heading for all data
-    print("# Elbencho Benchmark Results")
-
-    # Create a list of unique runs performed
-    unique_sn_runs = set()  # (io_size, dio_bio, datestamp, threads, io_depths) tuples
-    unique_mn_runs = (
-        set()
-    )  # (io_size, dio_bio, datestamp, max_nodes, threads, io_depths) tuples
-
-    for is_multi_node, by_mn in clustered_metrics.items():
-        for operation, by_op_metrics in by_mn.items():
-            for direct_io, annotated_size_groups in by_op_metrics.items():
-                for annotated_size_group in annotated_size_groups:
-                    for io_size, metric_list in annotated_size_group[
-                        "metrics_by_size"
-                    ].items():
-                        if not is_multi_node:
-                            unique_sn_runs.add(
-                                (
-                                    io_size,
-                                    direct_io,
-                                    metric_list[0].datestamp,
-                                    ",".join(
-                                        sorted({str(m.threads) for m in metric_list})
-                                    ),
-                                    ",".join(
-                                        sorted(
-                                            {str(m.io_depth) for m in metric_list},
-                                            key=int,
-                                        )
-                                    ),
-                                )
-                            )
-                        else:
-                            unique_mn_runs.add(
-                                (
-                                    io_size,
-                                    direct_io,
-                                    metric_list[0].datestamp,
-                                    max(m.nodes for m in metric_list),
-                                    ",".join(
-                                        sorted({str(m.threads) for m in metric_list})
-                                    ),
-                                    ",".join(
-                                        sorted(
-                                            {str(m.io_depth) for m in metric_list},
-                                            key=int,
-                                        )
-                                    ),
-                                )
-                            )
-
-    if unique_sn_runs:
-        # Sort unique single-node runs by dio_bio, IO size (write phase value), datestamp
-        # (direct io first, so we "not" the boolean)
-        unique_sn_runs = sorted(
-            unique_sn_runs,
-            key=lambda t: (not t[1], get_size_in_bytes(t[0], "WRITE"), t[2]),
-        )
-
-        # Print list of unique runs
-        print("\n# Unique Single-Node Runs Performed")
-        print("\n| Mode | Wr | Rd | Datestamp | Threads | IODepths |")
-        print("|:-----|:-------|:-------|:----------|:---------------|:---------|")
-
-        for io_size, direct_io, datestamp, threads, io_depths in unique_sn_runs:
-            # Parse the IO size string to get write and read components
-            write_size, read_size = parse_size_string(io_size)
-
-            # Parse order and clean size for write
-            write_order, write_size_clean = parse_size_with_order(write_size)
-
-            # Parse order and clean size for read
-            read_order, read_size_clean = parse_size_with_order(read_size)
-
-            # Format columns
-            io_mode = "DirectIO" if direct_io else "BufferedIO"
-            write_col = f"{write_order} {write_size_clean}"
-            read_col = f"{read_order} {read_size_clean}"
-
-            print(
-                f"| {io_mode} | {write_col} | {read_col} | {datestamp} | {threads} | {io_depths} |"
-            )
-
-    if unique_mn_runs:
-        # Sort unique multi-node runs by dio_bio, IO size (write phase value), datestamp
-        # (direct io first, so we "not" the boolean)
-        unique_mn_runs = sorted(
-            unique_mn_runs,
-            key=lambda t: (not t[1], get_size_in_bytes(t[0], "WRITE"), t[2]),
-        )
-
-        # Print list of unique runs
-        print("\n# Unique Multi-Node Runs Performed")
-        print("\n| Mode | Wr | Rd | Datestamp | Max Nodes | Threads | IODepths |")
-        print(
-            "|:-----|:-------|:-------|:----------|:---------------|:-------------|:---------|"
-        )
-
-        for (
-            io_size,
-            direct_io,
-            datestamp,
-            max_nodes,
-            threads,
-            io_depths,
-        ) in unique_mn_runs:
-            # Parse the IO size string to get write and read components
-            write_size, read_size = parse_size_string(io_size)
-
-            # Parse order and clean size for write
-            write_order, write_size_clean = parse_size_with_order(write_size)
-
-            # Parse order and clean size for read
-            read_order, read_size_clean = parse_size_with_order(read_size)
-
-            # Format columns
-            io_mode = "DirectIO" if direct_io else "BufferedIO"
-            write_col = f"{write_order} {write_size_clean}"
-            read_col = f"{read_order} {read_size_clean}"
-
-            print(
-                f"| {io_mode} | {write_col} | {read_col} | {datestamp} | {max_nodes} | {threads} | {io_depths} |"
-            )
-
-    # Metrics are grouped by sn/mn, operation type, dio/bio, and then by size group
-    for is_multi_node, by_mn in clustered_metrics.items():
-        for operation, by_op_metrics in by_mn.items():
-            for direct_io, annotated_size_groups in by_op_metrics.items():
-                sn_mn_str = "MN" if is_multi_node else "SN"
-
-                # Create a subsection for this operation
-                print(
-                    f"\n# {sn_mn_str} {operation} Operation ({'DirectIO' if direct_io else 'BufferedIO'})"
-                )
-
-                for annotated_size_group in annotated_size_groups:
-                    # Get random_io from first metric (should be same for all in group)
-                    first_metrics = next(
-                        iter(annotated_size_group["metrics_by_size"].values())
-                    )
-                    random_io = first_metrics[0].random_io
-
-                    group_name = annotated_size_group["group_name"]
-                    size_group_list = annotated_size_group["size_group"]
-                    # Create group heading
-                    if len(size_group_list) == 1:
-                        group_heading = f"IO Size: {size_group_list[0]}"
-                    else:
-                        # Join all sizes with forward slashes for the heading
-                        group_heading = f"IO Size: {' / '.join(size_group_list)}"
-
-                    # Print the section heading
-                    print(f"\n## {group_heading}")
-
-                    # Add image placeholders for charts
-                    print("\n### Charts")
-                    print("\n*Insert the following images here:*\n")
-
-                    metadata = plot_metadata(
-                        is_multi_node, direct_io, random_io, annotated_size_group
-                    )
-
-                    # Determine which images to reference based on no_dual_y_axis flag
-                    if no_dual_y_axis:
-                        # Generate references for 3 single-axis plots
-                        if get_size_in_bytes(size_group_list[-1], operation) <= 2**16:
-                            # Small IO - IOPS is more relevant
-                            image_types = [
-                                ("iops", f"IOPS vs. {metadata['x_label']}"),
-                            ]
-                        else:
-                            # Large IO - Bandwidth is more relevant
-                            image_types = [
-                                ("bw", f"Bandwidth vs. {metadata['x_label']}"),
-                            ]
-                        # Always add latency for no-dual-y-axis mode
-                        image_types.append(
-                            ("latency", f"Latency vs. {metadata['x_label']}")
-                        )
-                    else:
-                        # Original logic - dual axis plots
-                        if get_size_in_bytes(size_group_list[-1], operation) <= 2**16:
-                            image_types = [
-                                (
-                                    "iops-latency",
-                                    f"IOPS/Latency vs. {metadata['x_label']}",
-                                ),
-                            ]
-                        else:
-                            image_types = [
-                                (
-                                    "bw-latency",
-                                    f"Bandwidth/Latency vs. {metadata['x_label']}",
-                                ),
-                            ]
-                    # Only include scaling efficiency plots for multi-node cases
-                    if is_multi_node:
-                        image_types.append(
-                            (
-                                "bw-efficiency",
-                                f"Throughput Scale Efficiency vs. {metadata['x_label']}",
-                            )
-                        )
-                    image_types.append(("latency-hist", "Latency Histogram"))
-
-                    # Print image filenames as a list
-                    for img_type, img_desc in image_types:
-                        img_filename = plot_filename(
-                            metadata["sn_or_mn"],
-                            operation,
-                            group_name,
-                            metadata["dio_or_bio"],
-                            img_type,
-                            metadata["datestamps"],
-                        )
-                        print(f"* **{img_desc}**: `{img_filename}`")
-
-                    # Create performance metrics section
-                    print(
-                        f"\n### Performance Metrics ({' / '.join(annotated_size_group['size_group'])})"
-                    )
-
-                    # Process each IO size within this group separately for metrics tables
-                    for io_size in annotated_size_group["metrics_by_size"]:
-                        print_markdown_metrics_table_and_command(
-                            annotated_size_group["metrics_by_size"][io_size],
-                            io_size,
-                            operation,
-                        )
-
-    # Add metrics explanation at the end
-    print("\n# Metrics Explanation")
-    print("\n* **IOPS**: Input/Output Operations Per Second")
-    print("* **AvgBW**: Average Bandwidth in GB/s")
-    print("* **Gb/s**: Gigabits per second conversion of the bandwidth")
-    print("* **Latency metrics**: All latency values are in milliseconds (ms)")
-    print("  * **MinLat/AvgLat/MaxLat**: Minimum, Average, and Maximum latency")
-    print(
-        "  * **99%**: 99th percentile latency (representative of worst-case performance)"
-    )
-    print(
-        "* **Dur**: Phase duration from CSV ``time ms [first]`` (aligned with elbencho "
-        "``[first]`` throughput/IOPS)"
-    )
-    print("* **DurTot**: Total wall time from CSV ``time ms [last]`` (last completion)")
 
 
 def test_parse(base_filename: str) -> None:
@@ -3796,7 +3487,7 @@ def _live_table_columns(
         for start, end in zip(starts, ends)
     ]
     for index in (6, 7):
-        columns[index] = align_decimal_points(columns[index], False)
+        columns[index] = align_decimal_points(columns[index])
     return [
         [str(metric.nodes) for metric in metrics],
         [str(metric.threads) for metric in metrics],
@@ -4030,16 +3721,15 @@ def _report_live_client_domain(  # pylint: disable=too-many-arguments,too-many-p
             eprint(f"Generated live per-client plot: {report_path}")
 
 
-def emit_live_fairness(lines: List[str], markdown: bool, output_dir: str) -> None:
-    """Print the Live fairness block; append it to report.txt outside markdown."""
+def emit_live_fairness(lines: List[str], output_dir: str) -> None:
+    """Print the Live fairness block and append it to report.txt."""
     if not lines:
         return
     block = "\n".join(["", LIVE_FAIRNESS_HEADING, *lines, ""])
     print(block)
-    if not markdown:
-        report_path = os.path.join(output_dir, REPORT_TXT_FILENAME)
-        with open(report_path, "a", encoding="utf-8") as handle:
-            handle.write(block + "\n")
+    report_path = os.path.join(output_dir, REPORT_TXT_FILENAME)
+    with open(report_path, "a", encoding="utf-8") as handle:
+        handle.write(block + "\n")
 
 
 def _elbencho_find_last_operation_section(
@@ -4512,218 +4202,6 @@ def parse_elbencho_files(base_filename: str) -> List[ElbenchoMetrics]:
         metric.result_dir = os.path.normpath(result_dir)
 
     return metrics
-
-
-def print_markdown_metrics_table_and_command(
-    size_metrics: List[ElbenchoMetrics],
-    io_size: str,
-    operation: str,
-) -> None:
-    """Print a markdown table for a set of metrics and a representative command.
-
-    Args:
-        size_metrics: List of metrics for this IO size and operation
-        io_size: IO size string (full string like "5M,4K")
-        operation: Operation type (READ or WRITE)
-        headers: Column headers for the table
-    """
-    # Sort metrics by nodes, then by (io_depth * threads, threads)
-    size_metrics.sort(key=lambda m: (m.nodes, m.io_depth * m.threads, m.threads))
-
-    # Determine IO mode for this specific size and operation
-    io_mode = (
-        "DirectIO (dio)"
-        if any(m.direct_io == 1 for m in size_metrics)
-        else "BufferedIO (bio)"
-    )
-
-    # Determine IO order for this specific size and operation
-    io_order = "Rand" if any(m.random_io == 1 for m in size_metrics) else "Seq"
-
-    # Get the operation-specific IO size
-    write_size, read_size = parse_size_string(io_size)
-    op_specific_size = write_size if operation == "WRITE" else read_size
-    display_fs = metric_display_file_size_bytes(size_metrics[0])
-    fs_label_txt = bytes_to_elbencho_size_string(display_fs) if display_fs > 0 else "0"
-    fs_prefix = file_size_header_prefix_for_metrics(size_metrics)
-    anad_suffix = _all_nodes_all_data_suffix(size_metrics)
-    datestamp = size_metrics[0].datestamp
-    print_sweep_auxiliary_lines_for_metrics(size_metrics)
-    print_workload_metadata_for_metrics(size_metrics)
-    # Print IO size header for this specific size
-    print(
-        f"\nIO Size: **{op_specific_size}** - "
-        f"{fs_prefix}**{fs_label_txt}{anad_suffix}** - "
-        f"Operation: **{operation}** - "
-        f"IO Order: **{io_order}** - "
-        f"IO Mode: **{io_mode}** - "
-        f"Datestamp: **{datestamp}**\n"
-    )
-
-    # Define table headers with shortened names for better readability
-    # For markdown, remove the 50% and 75% latency columns to make the table more compact
-    md_base_headers = [
-        "Nodes",
-        "Thrds",
-        "IODep",
-        "IOPS",
-        "AvgBW(GB/s)",
-        "Gb/s",
-        "MinLat (ms)",
-        "AvgLat (ms)",
-        "MaxLat (ms)",
-        "99% (ms)",
-    ]
-    show_dur_md = any(_metric_should_show_csv_phase_dur(m) for m in size_metrics)
-    table_headers = md_base_headers + (["Dur", "DurTot"] if show_dur_md else [])
-
-    # Prepare data rows with raw values
-    rows = []
-
-    # Collect columns that need decimal alignment: GB/s + 4 latency columns for markdown
-    gb_s_col = []
-    latency_cols = [[] for _ in range(4)]
-
-    for metric in size_metrics:
-        # Convert and format GB/s value
-        gb_s_value = mb_s_to_gb_s(metric.throughput_mb_s)
-        gb_s_fmt = format_gb_s(gb_s_value)
-        gb_s_col.append(gb_s_fmt)
-
-        # Convert latency values to ms for display
-        min_lat_ms = metric.min_lat_sec * 1000
-        avg_lat_ms = metric.avg_lat_sec * 1000
-        max_lat_ms = metric.max_lat_sec * 1000
-        lat_pct_99_ms = metric.lat_pct_99 * 1000
-
-        # Format all values
-        min_lat_fmt = format_with_sig_figs(min_lat_ms)
-        avg_lat_fmt = format_with_sig_figs(avg_lat_ms)
-        max_lat_fmt = format_with_sig_figs(max_lat_ms)
-        lat_pct_99_fmt = format_with_sig_figs(lat_pct_99_ms)
-
-        # Store formatted latency values for alignment
-        latency_cols[0].append(min_lat_fmt)
-        latency_cols[1].append(avg_lat_fmt)
-        latency_cols[2].append(max_lat_fmt)
-        latency_cols[3].append(lat_pct_99_fmt)
-
-        # Store other non-latency metrics (except GB/s which needs alignment)
-        base_row = [
-            str(metric.nodes),
-            str(metric.threads),
-            str(metric.io_depth),
-            f"{int(metric.iops):,d}",
-            None,  # Placeholder for GB/s (will be filled after alignment)
-            f"{metric.throughput_gbps:.2f}",
-        ]
-
-        # Add placeholders for latency columns
-        row = base_row + [None, None, None, None]  # 4 placeholder values for markdown
-        if show_dur_md:
-            row.append(None)
-            row.append(None)
-        rows.append(row)
-
-    # Align the decimal points in GB/s column
-    aligned_gb_s_col = align_decimal_points(gb_s_col, True)
-
-    # Align the decimal points in latency columns
-    aligned_latency_cols = []
-    for lat_col in latency_cols:
-        aligned_latency_cols.append(align_decimal_points(lat_col, True))
-
-    # Calculate column widths
-    col_widths = [len(h) for h in table_headers]
-
-    # Update widths for non-aligned columns (excluding GB/s at index 4 and latency at indices 6+)
-    for row in rows:
-        for i, val in enumerate(row[:6]):
-            if val is not None and i != 4:  # Skip GB/s placeholder at index 4
-                col_widths[i] = max(col_widths[i], len(val))
-
-    # Update width for aligned GB/s column (index 4)
-    for val in aligned_gb_s_col:
-        col_widths[4] = max(col_widths[4], len(val))
-
-    # Update widths for aligned latency columns
-    for i, aligned_col in enumerate(aligned_latency_cols):
-        col_index = 6 + i  # Latency columns start at index 6
-        if col_index < len(col_widths):  # Make sure we don't go out of bounds
-            for val in aligned_col:
-                col_widths[col_index] = max(col_widths[col_index], len(val))
-
-    # Apply aligned GB/s values to rows (index 4)
-    for row_idx, row in enumerate(rows):
-        row[4] = aligned_gb_s_col[row_idx]
-
-    # Apply aligned latency values to rows
-    for row_idx, row in enumerate(rows):
-        for col_idx, aligned_col in enumerate(aligned_latency_cols):
-            row[6 + col_idx] = aligned_col[row_idx]  # Latency columns start at index 6
-
-    if show_dur_md:
-        dur_col = len(md_base_headers)
-        dur_tot_col = dur_col + 1
-        for row_idx, row in enumerate(rows):
-            metric = size_metrics[row_idx]
-            if _metric_should_show_csv_phase_dur(metric):
-                dur_str = format_dur_xmys_ms(metric.phase_first_duration_ms)
-                dur_tot_str = format_dur_xmys_ms(metric.phase_wall_duration_ms)
-            else:
-                dur_str = ""
-                dur_tot_str = ""
-            row[dur_col] = dur_str
-            row[dur_tot_col] = dur_tot_str
-            col_widths[dur_col] = max(col_widths[dur_col], len(dur_str))
-            col_widths[dur_tot_col] = max(col_widths[dur_tot_col], len(dur_tot_str))
-
-    # Ensure minimum widths
-    min_widths = [5, 5, 5, 8, 12, 5, 10, 10, 10, 7]  # 10 columns for markdown
-    if show_dur_md:
-        min_widths.append(3)
-        min_widths.append(6)
-    for i, col_width in enumerate(col_widths):
-        if i < len(min_widths):  # Make sure we don't go out of bounds
-            col_widths[i] = max(col_width, min_widths[i])
-
-    # Print markdown table header
-    header_line = " | ".join(table_headers)
-    print(f"| {header_line} |")
-
-    # Print separator line with proper alignment
-    separator = []
-    for i, width in enumerate(col_widths):
-        if i <= 2:  # Text columns (Nodes, Threads, IODep)
-            separator.append(":" + "-" * (width - 1))
-        else:  # Numeric columns (right-aligned)
-            separator.append("-" * (width - 1) + ":")
-    separator_line = " | ".join(separator)
-    print(f"| {separator_line} |")
-
-    # Print data rows
-    ncols = len(table_headers)
-    for row in rows:
-        data_line = " | ".join(row[:ncols])
-        print(f"| {data_line} |")
-
-    # Add the Elbencho Command section
-    print("\n**Representative Elbencho Command**")
-
-    # Extract command from the first metric that has a non-empty command
-    command = ""
-    for metric in size_metrics:
-        if metric.command and metric.command.strip():
-            command = metric.command.strip()
-            break
-
-    # If we found a command, print it in a monospace font (using markdown code block)
-    if command:
-        print("\n```")
-        print(command)
-        print("```")
-    else:
-        print("\n*Command information not available*")
 
 
 # --- Machine-readable results (fragment / document) --------------------------
@@ -5622,7 +5100,6 @@ def _live_file_task(
 def _split_live_fairness(
     fairness: List[Tuple[LiveFileMetadata, LiveDomainKey, LiveFairness]],
     metrics: List[ElbenchoMetrics],
-    markdown: bool,
 ) -> Tuple[Dict[LiveRowKey, LiveFairness], List[str]]:
     """Domains shown under a terminal table row, and lines for all others."""
     row_keys = {live_row_key(metric, metric.operation) for metric in metrics}
@@ -5631,7 +5108,7 @@ def _split_live_fairness(
     for metadata, domain_key, steady in fairness:
         key = live_row_key(metadata, domain_key.phase)
         plain = not domain_key.mix_type and not domain_key.occurrence
-        if not markdown and plain and key in row_keys:
+        if plain and key in row_keys:
             live[key] = steady
         else:
             lines.append(
@@ -5682,28 +5159,20 @@ def _start_reports(  # pylint: disable=too-many-arguments,too-many-positional-ar
             reported, entries = replay(task)
             successful_live_reports += reported
             fairness.extend(entries)
-        live, fairness_lines = _split_live_fairness(fairness, metrics, args.markdown)
+        live, fairness_lines = _split_live_fairness(fairness, metrics)
         if metrics:
-            if args.markdown:
+            mirror_stdout_to_file(
+                os.path.join(output_dir, REPORT_TXT_FILENAME),
                 with_versions(
-                    print_markdown_table,
-                    versions.of(metrics),
-                    markdown=True,
-                    target=target_label,
-                )(metrics, args.no_dual_y_axis)
-            else:
-                mirror_stdout_to_file(
-                    os.path.join(output_dir, REPORT_TXT_FILENAME),
-                    with_versions(
-                        print_terminal_table, versions.of(metrics), target=target_label
-                    ),
-                    metrics,
-                    live,
-                )
+                    print_terminal_table, versions.of(metrics), target=target_label
+                ),
+                metrics,
+                live,
+            )
         if plots is not None:
             replay(plots)
             eprint(f"Generated plots saved in {output_dir}")
-        emit_live_fairness(fairness_lines, args.markdown, output_dir)
+        emit_live_fairness(fairness_lines, output_dir)
         if live_files and not successful_live_reports:
             eprint("ERROR: No live CSV reports were generated")
             sys.exit(1)

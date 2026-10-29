@@ -71,22 +71,20 @@ def test_elbencho_report_lists_versions_of_selected_results(
         return [replace(_metric(), nodes=nodes_of[Path(base).name.split("-")[2]])]
 
     monkeypatch.setattr(_EXTRACT, "parse_elbencho_files", parse)
-    monkeypatch.setattr(_EXTRACT, "print_markdown_table", lambda *_args: None)
+    monkeypatch.setattr(_EXTRACT, "print_terminal_table", lambda *_args: None)
     monkeypatch.setattr(_EXTRACT, "plot_metrics", lambda *_args: None)
-    monkeypatch.setattr(
-        sys, "argv", ["extract-elbencho.py", str(tmp_path), "--markdown"]
-    )
+    monkeypatch.setattr(sys, "argv", ["extract-elbencho.py", str(tmp_path)])
     _EXTRACT.main()
     monkeypatch.setattr(
         sys,
         "argv",
-        ["extract-elbencho.py", str(tmp_path), "--markdown", "--only-nodes", "1,4"],
+        ["extract-elbencho.py", str(tmp_path), "--only-nodes", "1,4"],
     )
     _EXTRACT.main()
     produced = [line for line in _header(capsys.readouterr().out) if "Produced" in line]
     assert produced == [
-        "- Produced by storage-scale-test: unknown, v1.9.0, v1.10.0",
-        "- Produced by storage-scale-test: unknown, v1.10.0",
+        "Produced by storage-scale-test: unknown, v1.9.0, v1.10.0",
+        "Produced by storage-scale-test: unknown, v1.10.0",
     ]
 
 
