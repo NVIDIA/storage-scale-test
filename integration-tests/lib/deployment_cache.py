@@ -29,6 +29,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from lib.project_version import resolve_version, stamp_source
+from lib.source_release import archive_source_tree
 
 CACHE_SCHEMA = 1
 DEFAULT_RECIPE = 1
@@ -400,3 +401,17 @@ def get_or_build_deployment(
                 f"published deployment cache is invalid: {entry}"
             )
         return CachedDeployment(key, archive, manifest, build_log, not published)
+
+
+def build_release_source_archive(runner: Any, repo_root: Path, output: Path) -> Path:
+    """Archive the tracked working tree exactly as a release source archive.
+
+    It carries the checkout's version, like the deployment archive, so both
+    test the same source.
+    """
+    output.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".source-", dir=output) as temporary:
+        snapshot = Path(temporary) / "source"
+        _copy_tracked_snapshot(runner, repo_root, snapshot)
+        archive, _ = archive_source_tree(snapshot, output, resolve_version(repo_root))
+    return archive

@@ -46,6 +46,7 @@ import yaml
 from deployment_cache import (
     DeploymentCacheError,
     DeploymentCacheRequest,
+    build_release_source_archive,
     get_or_build_deployment,
 )
 from failure_injection import (
@@ -199,6 +200,10 @@ WORKLOAD_GID = 2000
 
 class IntegrationTestError(RuntimeError):
     """An actionable filesystem integration test failure."""
+
+
+class UpstreamDownloadError(IntegrationTestError):
+    """An upstream request failed, before any archive could be verified."""
 
 
 def _runtime_workload_kind(runtime: Any) -> str:
@@ -997,6 +1002,11 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _in_github_actions() -> bool:
+    """GitHub Actions must prove upstream downloads; elsewhere they may be blocked."""
+    return os.environ.get("GITHUB_ACTIONS") == "true"
+
+
 def _request(url: str, accept: str = "application/vnd.github+json") -> Any:
     """Open a bounded upstream request with retries."""
     request = urllib.request.Request(
@@ -1015,7 +1025,9 @@ def _request(url: str, accept: str = "application/vnd.github+json") -> Any:
             last_error = error
             if attempt < 3:
                 time.sleep(attempt * 2)
-    raise IntegrationTestError(f"download failed after 3 attempts: {url}: {last_error}")
+    raise UpstreamDownloadError(
+        f"download failed after 3 attempts: {url}: {last_error}"
+    )
 
 
 def _asset_url(name: str) -> str:
@@ -1195,31 +1207,51 @@ def _sbx_bundle_is_current(
     return document == expected
 
 
+def _ensure_container_elbencho(
+    runner: Any, cache: Path, architecture: str, binary_name: str
+) -> tuple[Path, str, Path | None]:
+    """Reuse the pinned container runtime without overwriting the static binary."""
+    cache = cache / "container"
+    cache.mkdir(parents=True, exist_ok=True)
+    binary = cache / f"{ELBENCHO_VERSION}-{binary_name}"
+    runtime = cache / f"{ELBENCHO_VERSION}-{binary_name}.runtime"
+    marker = cache / f"{ELBENCHO_VERSION}-{binary_name}.bundle.json"
+    bundle_document = _sbx_bundle_document(architecture, binary_name)
+    if not _sbx_bundle_is_current(binary, runtime, marker, bundle_document):
+        LOG.info("Extracting pinned elbencho %s container", ELBENCHO_VERSION)
+        _extract_container_elbencho(runner, cache, binary, runtime, architecture)
+        _write_sbx_bundle_marker(marker, bundle_document)
+    else:
+        LOG.info("Using cached elbencho from the pinned upstream container")
+    return binary, binary_name, runtime
+
+
 def _ensure_elbencho(
     runner: Any, config: Any, architecture: str, storage_backend: str
 ) -> tuple[Path, str, Path | None]:
-    """Return a verified, extracted pinned elbencho binary and staged name."""
+    """Acquire pinned elbencho, permitting a container backup outside CI."""
     archive_name, expected, binary_name = ELBENCHO_ARCHIVES[architecture]
     cache = config.state_dir / "test-cache"
     cache.mkdir(parents=True, exist_ok=True)
     binary = cache / f"{ELBENCHO_VERSION}-{binary_name}"
     if storage_backend == "sbx-shared":
-        runtime = cache / f"{ELBENCHO_VERSION}-{binary_name}.runtime"
-        marker = cache / f"{ELBENCHO_VERSION}-{binary_name}.bundle.json"
-        bundle_document = _sbx_bundle_document(architecture, binary_name)
-        if not _sbx_bundle_is_current(binary, runtime, marker, bundle_document):
-            LOG.info("Extracting pinned elbencho %s container", ELBENCHO_VERSION)
-            _extract_container_elbencho(runner, cache, binary, runtime, architecture)
-            _write_sbx_bundle_marker(marker, bundle_document)
-        else:
-            LOG.info("Using cached elbencho from the pinned upstream container")
-        return binary, binary_name, runtime
+        return _ensure_container_elbencho(runner, cache, architecture, binary_name)
     archive = cache / f"{ELBENCHO_VERSION}-{archive_name}"
     if not archive.is_file() or _sha256(archive) != expected:
         LOG.info(
             "Downloading pinned elbencho %s for %s", ELBENCHO_VERSION, architecture
         )
-        _download_archive(archive, archive_name, expected)
+        try:
+            _download_archive(archive, archive_name, expected)
+        except UpstreamDownloadError as error:
+            if _in_github_actions():
+                raise
+            LOG.warning(
+                "Could not download the harness's elbencho archive: %s; "
+                "using the pinned upstream container instead",
+                error,
+            )
+            return _ensure_container_elbencho(runner, cache, architecture, binary_name)
     else:
         LOG.info("Using cached pinned elbencho archive for %s", architecture)
     with tarfile.open(archive, "r:gz") as tar:
@@ -1441,6 +1473,18 @@ def _render_env(
     return rendered, support
 
 
+_REQUIRED_SOURCE_FILES = frozenset(
+    {
+        "storage-scale-test/NOTICE",
+        "storage-scale-test/env.sh.template",
+        "storage-scale-test/validate_env.sh",
+        "storage-scale-test/lib/env_base.sh",
+        "storage-scale-test/storage-tests/fs/nv-elbencho-sweep.sh",
+        "storage-scale-test/storage-tests/fs/nv-mdtest-elbencho.sh",
+    }
+)
+
+
 def _validate_deployment_archive(
     archive: Path,
     destination: Path,
@@ -1451,21 +1495,24 @@ def _validate_deployment_archive(
     bundled_runtime: bool,
 ) -> Path:
     """Validate and safely extract the deployment tarball."""
+    required = {*_REQUIRED_SOURCE_FILES, f"storage-scale-test/utils/{binary_name}"}
+    if bundled_runtime:
+        required.add("storage-scale-test/utils/elbencho-runtime/usr/bin/elbencho")
+    root = _extract_checked_archive(archive, destination, required)
+    _check_packaged_elbencho(
+        root, binary_name, binary_digest, architecture, runner, bundled_runtime
+    )
+    return root
+
+
+def _extract_checked_archive(
+    archive: Path, destination: Path, required: set[str] | frozenset[str]
+) -> Path:
+    """Safely extract a storage-scale-test archive holding the required files."""
     if not archive.is_file() or archive.stat().st_size > MAX_DEPLOYMENT_ARCHIVE_BYTES:
         raise IntegrationTestError(
             f"deployment archive is absent or oversized: {archive}"
         )
-    required = {
-        "storage-scale-test/NOTICE",
-        "storage-scale-test/env.sh.template",
-        "storage-scale-test/validate_env.sh",
-        "storage-scale-test/lib/env_base.sh",
-        "storage-scale-test/storage-tests/fs/nv-elbencho-sweep.sh",
-        "storage-scale-test/storage-tests/fs/nv-mdtest-elbencho.sh",
-        f"storage-scale-test/utils/{binary_name}",
-    }
-    if bundled_runtime:
-        required.add("storage-scale-test/utils/elbencho-runtime/usr/bin/elbencho")
     names: set[str] = set()
     content_bytes = 0
     with tarfile.open(archive, "r:gz") as tar:
@@ -1506,7 +1553,18 @@ def _validate_deployment_archive(
             )
         destination.mkdir(parents=True)
         tar.extractall(destination, filter="data")
-    root = destination / "storage-scale-test"
+    return destination / "storage-scale-test"
+
+
+def _check_packaged_elbencho(
+    root: Path,
+    binary_name: str,
+    binary_digest: str,
+    architecture: str,
+    runner: Any,
+    bundled_runtime: bool,
+) -> None:
+    """Require the tree's elbencho to be the pinned binary for this host."""
     packaged_binary = root / "utils" / binary_name
     if (
         not packaged_binary.is_file()
@@ -1516,6 +1574,26 @@ def _validate_deployment_archive(
     ):
         raise IntegrationTestError(
             f"packaged elbencho failed identity checks: {packaged_binary}"
+        )
+    _check_elbencho_executable(root, binary_name, architecture, runner, bundled_runtime)
+
+
+def _check_elbencho_executable(
+    root: Path,
+    binary_name: str,
+    architecture: str,
+    runner: Any,
+    bundled_runtime: bool,
+) -> None:
+    """Check an already verified binary's executable bit and host architecture."""
+    packaged_binary = root / "utils" / binary_name
+    if (
+        not packaged_binary.is_file()
+        or packaged_binary.is_symlink()
+        or not os.access(packaged_binary, os.X_OK)
+    ):
+        raise IntegrationTestError(
+            f"packaged elbencho is not executable: {packaged_binary}"
         )
     inspected_binary = packaged_binary
     if bundled_runtime:
@@ -1527,7 +1605,6 @@ def _validate_deployment_archive(
             f"packaged elbencho architecture mismatch: {description.strip()}"
         )
     runner.run([packaged_binary, "--help"], timeout=30)
-    return root
 
 
 def _build_deployment_archive(
@@ -1570,6 +1647,154 @@ def _build_deployment_archive(
         runtime is not None,
     )
     return archive, extracted
+
+
+# The SSH baseline runs from a release source archive instead of the
+# deployment archive, as a user who downloads a release would.
+RELEASE_SOURCE_SCENARIO = ("baseline", "ssh")
+
+
+def _prepare_release_source_tree(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    runner: Any,
+    repo_root: Path,
+    build_root: Path,
+    log_dir: Path,
+    binary: Path,
+    binary_name: str,
+    architecture: str,
+    runtime: Path | None,
+    *,
+    download: bool = True,
+) -> Path:
+    """Unpack a release source archive and add elbencho as a user would.
+
+    NFS always attempts utils/build/fetch_elbencho.sh, even when the harness
+    itself needed the container backup. SBX copies its container runtime.
+    """
+    try:
+        archive = build_release_source_archive(
+            runner, repo_root, build_root / "release-source"
+        )
+    except DeploymentCacheError as error:
+        raise IntegrationTestError(str(error)) from error
+    root = _extract_checked_archive(
+        archive,
+        build_root / "release-source" / "extracted",
+        {*_REQUIRED_SOURCE_FILES, "storage-scale-test/VERSION"},
+    )
+    if download:
+        copied = _fetch_release_elbencho(
+            runner, root, log_dir, binary, binary_name, runtime
+        )
+    else:
+        _copy_harness_elbencho(root, binary, binary_name, runtime)
+        copied = True
+    if copied or runtime is None:
+        _check_packaged_elbencho(
+            root,
+            binary_name,
+            _sha256(binary),
+            architecture,
+            runner,
+            copied and runtime is not None,
+        )
+    else:
+        # fetch_elbencho.sh verified the static archive's pinned checksum.
+        # It is intentionally a different binary from our container backup.
+        _check_elbencho_executable(root, binary_name, architecture, runner, False)
+    _require_release_version(runner, root)
+    LOG.info("Prepared release source tree %s", archive.name)
+    return root
+
+
+def _fetch_release_elbencho(
+    runner: Any,
+    root: Path,
+    log_dir: Path,
+    binary: Path,
+    binary_name: str,
+    runtime: Path | None = None,
+) -> bool:
+    """Download elbencho into a release tree with utils/build/fetch_elbencho.sh.
+
+    GitHub Actions must download it. Elsewhere a network that blocks GitHub
+    release assets falls back to the harness's own binary, so the scenario
+    still runs. Return whether the harness binary was copied.
+    """
+    required = _in_github_actions()
+    fetched = runner.run(
+        [root / "utils/build/fetch_elbencho.sh"], timeout=600, check=required
+    )
+    log = log_dir / "fetch-elbencho.log"
+    log.write_text(fetched.stdout + fetched.stderr, encoding="utf-8")
+    if fetched.returncode:
+        LOG.warning(
+            "fetch_elbencho.sh could not download elbencho (see %s); "
+            "copying the harness's binary into the release tree instead",
+            log,
+        )
+        _copy_harness_elbencho(root, binary, binary_name, runtime)
+        return True
+    return False
+
+
+def _copy_harness_elbencho(
+    root: Path, binary: Path, binary_name: str, runtime: Path | None
+) -> None:
+    """Copy the harness binary together with any libraries its wrapper needs."""
+    shutil.copy2(binary, root / "utils" / binary_name)
+    (root / "utils" / binary_name).chmod(0o755)
+    if runtime is not None:
+        shutil.copytree(runtime, root / "utils" / "elbencho-runtime")
+
+
+def _require_release_version(runner: Any, root: Path) -> str:
+    """Require the tree to report its stamped version, and an edit to show."""
+    version = (root / "VERSION").read_text(encoding="utf-8").strip()
+    resolver = root / "lib" / "project_version.sh"
+    resolved = runner.run(["bash", resolver, "resolve", root], timeout=60)
+    if resolved.stdout.strip() != version:
+        raise IntegrationTestError(
+            f"release source tree reports {resolved.stdout.strip()!r}, "
+            f"not its stamped {version!r}: {resolved.stderr.strip()}"
+        )
+    with tempfile.TemporaryDirectory(dir=root.parent) as temporary:
+        edited = Path(temporary) / root.name
+        shutil.copytree(root, edited, symlinks=True)
+        with (edited / "NOTICE").open("a", encoding="utf-8") as notice:
+            notice.write("edited\n")
+        reported = runner.run(["bash", resolver, "resolve", edited], timeout=60)
+    expected = version.removesuffix("-modified") + "-modified"
+    if (
+        reported.stdout.strip() != expected
+        or "do not match its SOURCE_SHA256" not in reported.stderr
+    ):
+        raise IntegrationTestError(
+            f"an edited release source tree was not reported as modified: "
+            f"{reported.stdout.strip()!r} {reported.stderr.strip()!r}"
+        )
+    return version
+
+
+def _require_release_reports(log_dir: Path, version: str) -> None:
+    """Require the scenario's reports to name the release as producer and reporter."""
+    logs = sorted(log_dir.glob("report-*/extract-elbencho.log"))
+    if not logs:
+        raise IntegrationTestError(
+            f"release source scenario wrote no reports: {log_dir}"
+        )
+    for log in logs:
+        text = log.read_text(encoding="utf-8")
+        for role in ("Produced", "Reported"):
+            # Compare whole values: a mixed or suffixed version must fail.
+            values = re.findall(
+                rf"^(?:- )?{role} by storage-scale-test: (.*)$", text, re.MULTILINE
+            )
+            if not values or any(value != version for value in values):
+                raise IntegrationTestError(
+                    f"{log}: report says it was {role.lower()} by "
+                    f"{values or 'no version'}, not release {version}"
+                )
 
 
 def _write_runtime_files(
@@ -7985,6 +8210,32 @@ def run_filesystem_tests(
             report_fixture,
             template=extracted / "env.sh.template",
         )
+        release_tree = release_report = None
+        if any(
+            (step.scenario.name, step.substrate.value) == RELEASE_SOURCE_SCENARIO
+            for step in work
+        ):
+            release_tree = _prepare_release_source_tree(
+                runner,
+                repo_root,
+                build_root,
+                log_dir,
+                binary,
+                binary_name,
+                fixture.architecture,
+                runtime,
+                download=fixture.storage_backend != "sbx-shared",
+            )
+            # Its reports set up their own .venv, as a release user's would.
+            release_report = build_root / "release-report-workspace"
+            shutil.copytree(release_tree, release_report)
+            _write_runtime_files(
+                release_report,
+                "ssh",
+                str(release_report),
+                report_fixture,
+                template=release_tree / "env.sh.template",
+            )
         home_mode = "separate"
         suite_error: Exception | None = None
         try:
@@ -8010,6 +8261,9 @@ def run_filesystem_tests(
                 scenario_logs = log_dir / f"{scenario}-{step.substrate.value}"
                 scenario_logs.mkdir()
                 specification = SCENARIO_SPECS_BY_NAME[scenario]
+                release = (scenario, step.substrate.value) == RELEASE_SOURCE_SCENARIO
+                source_tree = release_tree if release else extracted
+                reports = release_report if release else report_workspace
                 runtime_state = _make_scenario_runtime(
                     fixture,
                     specification,
@@ -8026,7 +8280,7 @@ def run_filesystem_tests(
                         fixture,
                         runtime_state,
                         archive,
-                        extracted,
+                        source_tree,
                     )
                     if scenario == "mixed-batch":
                         _run_mixed_batch(
@@ -8034,8 +8288,8 @@ def run_filesystem_tests(
                             config,
                             fixture,
                             runtime_state,
-                            extracted / "env.sh.template",
-                            report_workspace,
+                            source_tree / "env.sh.template",
+                            reports,
                             scenario_logs,
                             binary_name,
                             binary,
@@ -8051,8 +8305,8 @@ def run_filesystem_tests(
                             config,
                             fixture,
                             runtime_state,
-                            extracted / "env.sh.template",
-                            report_workspace,
+                            source_tree / "env.sh.template",
+                            reports,
                             scenario_logs,
                         )
                         if scenario == "kubectl-multi-target":
@@ -8086,8 +8340,8 @@ def run_filesystem_tests(
                             config,
                             fixture,
                             runtime_state,
-                            extracted / "env.sh.template",
-                            report_workspace,
+                            source_tree / "env.sh.template",
+                            reports,
                             scenario_logs,
                             binary_name,
                             binary,
@@ -8099,9 +8353,16 @@ def run_filesystem_tests(
                             config,
                             fixture,
                             runtime_state,
-                            extracted / "env.sh.template",
-                            report_workspace,
+                            source_tree / "env.sh.template",
+                            reports,
                             scenario_logs,
+                        )
+                    if release:
+                        _require_release_reports(
+                            scenario_logs,
+                            (source_tree / "VERSION")
+                            .read_text(encoding="utf-8")
+                            .strip(),
                         )
                 except Exception as error:
                     primary_error = error

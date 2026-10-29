@@ -289,10 +289,17 @@ afterward. SSH cases launch `validate_env.sh` and `nv-elbencho-sweep.sh` on the
 host and reach the two worker pods over SSH; Slurm cases stream the archive to
 the LoginSet, extract it in shared storage, and launch both there. The NFS
 profile gets Elbencho from a size-limited, checksum-verified upstream archive;
-on Docker SBX, where GitHub release assets may be unreachable, the binary and
-runtime libraries are extracted from the digest-pinned
+Docker SBX, and NFS outside GitHub Actions when that download is blocked,
+extract the binary and runtime libraries from the digest-pinned
 `docker.io/breuner/elbencho:v3.2-1` image into the generated test deployment
 only.
+
+The SSH `baseline` instead runs from a release source archive built from the
+same snapshot, as a user who downloads a release would. On NFS it gets
+Elbencho with `utils/build/fetch_elbencho.sh`, falling back to the harness's
+copy outside GitHub Actions; Docker SBX uses the harness's copy. Its reports
+set up their own `.venv`, and the tree must report its stamped version, and an
+edited copy `-modified`.
 
 Beyond each scenario's own checks, every test requires successful execution
 records, exact workload totals, ordered worker selection, nonempty benchmark
