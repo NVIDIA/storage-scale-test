@@ -4700,15 +4700,28 @@ def _datestamp(base_filename: str) -> str:
     return params["datestamp"] if params else ""
 
 
+# env_used.yaml flags (setting, ledger export) that stand in for the ledger.
+_ENV_USED_LEDGER_FLAGS = (
+    ("ELBENCHO_SINGLE_BIG_FILE", "ELBENCHO_SINGLE_BIG_FILE"),
+    ("ELBENCHO_ALL_NODES_ACCESS_ALL_DATA", "ELBENCHO_ALL_NODES_ACCESS_ALL_DATA"),
+    ("run_to_completion_option", "run_to_completion"),
+)
+
+
 def _synthetic_ledger(
-    base_filename: str, metrics: List[ElbenchoMetrics]
+    base_filename: str, metrics: List[ElbenchoMetrics], env: dict
 ) -> Optional[LedgerExecution]:
     """Describe a result pair that matches no ledger execution."""
     params = parse_benchmark_filename(os.path.basename(base_filename))
     if params is None:
         return None
     operations = {metric.operation.upper() for metric in metrics}
-    exports = {"dio_or_bio": "dio"}
+    exports = {
+        export: "1"
+        for setting, export in _ENV_USED_LEDGER_FLAGS
+        if str(env.get(setting)) == "1"
+    }
+    exports["dio_or_bio"] = "dio"
     if metrics:
         exports["dio_or_bio"] = "dio" if metrics[0].direct_io else "bio"
     if operations == {"WRITE"}:
@@ -4716,12 +4729,17 @@ def _synthetic_ledger(
     if metrics and all(metric.random_io for metric in metrics):
         exports["use_random"] = "1"
     if operations == {"READ"}:
-        exports[ENV_SWEEP_READ_FROM] = next(
+        read_from = next(
             (m.sweep_read_from_path for m in metrics if m.sweep_read_from_path),
-            "unknown",
+            env.get("sweep_read_from"),
         )
+        exports[ENV_SWEEP_READ_FROM] = str(read_from or "unknown")
     coordinates = ExecutionCoordinates(
-        params["nodes"], params["io_size"], params["threads"], params["io_depth"], ""
+        params["nodes"],
+        params["io_size"],
+        params["threads"],
+        params["io_depth"],
+        str(env.get("ELBENCHO_FILE_LAYOUT") or ""),
     )
     return LedgerExecution(None, coordinates, exports)
 
@@ -4745,7 +4763,7 @@ def build_io_fragment(data: IoResultsInput) -> dict:
         executions.append(_execution_entry(item, pair, metadata, data))
     for base_filename in unmatched:
         metrics = data.pairs[base_filename]
-        synthetic = _synthetic_ledger(base_filename, metrics)
+        synthetic = _synthetic_ledger(base_filename, metrics, data.env)
         if synthetic is None:
             continue
         coords = synthetic.coordinates

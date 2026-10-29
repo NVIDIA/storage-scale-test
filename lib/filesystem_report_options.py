@@ -227,6 +227,9 @@ def options_by_kind(args: argparse.Namespace, kinds: set[str]) -> dict[str, list
             continue
         value = getattr(args, option.destination)
         matching = kinds if option.scope == "common" else kinds & {option.scope}
+        # Restating the default (e.g. --live-detail) changes nothing elsewhere.
+        if not matching and value == option.settings.get("default", object()):
+            continue
         if not matching:
             raise ValueError(
                 f"{option.flag} applies to no selected {option.scope} group"

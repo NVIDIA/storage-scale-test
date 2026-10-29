@@ -210,7 +210,8 @@ Operation is in [FILESYSTEM_TESTING.md](FILESYSTEM_TESTING.md). Invariants:
 - A cell succeeds only with nonempty, nonsymlink result pairs and an atomic
   completion marker written after all phases and cleanup.
 - When a metadata ledger exists, the analyzer counts only `SUCCESS` cells;
-  legacy result directories without one remain readable.
+  legacy result directories without one remain readable. An `executions/`
+  directory without any `NNNN.sh` is no ledger (both engines).
 - Metadata phases use `-s 0` without `-b 0`: Elbencho 3.2 rejects zero block
   sizes even for zero-byte files.
 

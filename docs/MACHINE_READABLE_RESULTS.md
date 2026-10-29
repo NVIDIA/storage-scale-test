@@ -151,7 +151,7 @@ otherwise.
 | `report_failed` | any | The group's report failed (`missing`). |
 | `definition_unreadable` | any | The execution definition could not be parsed; `coordinates` is `null`. |
 | `execution_unmatched` | `diagnostics` | Result files match no ledger execution. |
-| `no_execution_ledger` | `diagnostics` | An ordinary directory has no `executions/`; ledger state is `unknown`. |
+| `no_execution_ledger` | `diagnostics` | An ordinary directory has no `executions/NNNN.sh`; ledger state is `unknown`. |
 
 `phase_missing`, `percentiles_missing`, `rates_missing`, and
 `completion_incomplete` make an IO execution `partial`.

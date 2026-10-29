@@ -699,14 +699,23 @@ def assemble_batch_document(  # pylint: disable=too-many-arguments,too-many-posi
     return _compose(batch, specs, generator, live_dir)
 
 
+def _ledger_definitions(result_dir: str | os.PathLike) -> set[str]:
+    return {
+        path.stem
+        for path in (Path(result_dir) / _EXECUTIONS_DIR).glob("[0-9]*.sh")
+        if path.stem.isdigit()
+    }
+
+
+def has_execution_ledger(result_dir: str | os.PathLike) -> bool:
+    """True when executions/ holds a definition; an empty one is no ledger."""
+    return bool(_ledger_definitions(result_dir))
+
+
 def _ordinary_ledger(result_dir: Path, fragment: Mapping[str, Any]) -> list[dict]:
     # The ledger is every executions/NNNN.sh, not just those the engine could
     # parse: an unreadable definition must still count against completeness.
-    defined = {
-        path.stem
-        for path in (result_dir / _EXECUTIONS_DIR).glob("[0-9]*.sh")
-        if path.stem.isdigit()
-    }
+    defined = _ledger_definitions(result_dir)
     parsed = {
         e[K_EXECUTION_ID] for e in fragment[K_EXECUTIONS] if e.get(K_EXECUTION_ID)
     }
@@ -737,7 +746,7 @@ def assemble_ordinary_document(
     """Build the one-group document for an ordinary (non-batch) result directory."""
     result_dir = Path(result_dir).resolve()
     settings = _load_settings(result_dir)
-    has_ledger = (result_dir / _EXECUTIONS_DIR).is_dir()
+    has_ledger = has_execution_ledger(result_dir)
     spec = _GroupSpec(
         group_id=_ORDINARY_GROUP_ID,
         kind=fragment[K_KIND],

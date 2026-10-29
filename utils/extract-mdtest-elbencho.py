@@ -306,7 +306,7 @@ def _successful_mdtest_coordinates(
 ) -> Optional[set[Tuple[int, int]]]:
     """Return successful reified MD coordinates, or None without a ledger."""
     executions_dir = os.path.join(input_dir, "executions")
-    if not os.path.isdir(executions_dir):
+    if not results_json.has_execution_ledger(input_dir):
         return None
 
     md_definitions = []
