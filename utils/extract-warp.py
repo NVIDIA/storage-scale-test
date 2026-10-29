@@ -47,6 +47,7 @@ from lib.parse_only_sizes import (  # pylint: disable=wrong-import-position
     parse_only_sizes_arg,
 )
 from lib.reporting_common import (  # pylint: disable=wrong-import-position
+    PNG_SAVE_OPTIONS,
     histogram_axis_ranges,
 )
 from lib.stdout_report_file import (  # pylint: disable=wrong-import-position
@@ -1385,7 +1386,7 @@ def _finalize_and_save_plot(
 
     ax.legend(loc=_LEGEND_LOC_CENTER_LEFT, bbox_to_anchor=(1.05, 0.5))
     plt.tight_layout()
-    plt.savefig(output_path, bbox_inches="tight")
+    plt.savefig(output_path, bbox_inches="tight", pil_kwargs=PNG_SAVE_OPTIONS)
     plt.close()
 
 
@@ -1666,6 +1667,7 @@ def plot_tput_scaling(
     plt.savefig(
         os.path.join(output_dir, f"warp-{plot_suffix}-GET-scaling-{datestamp}.png"),
         bbox_inches="tight",
+        pil_kwargs=PNG_SAVE_OPTIONS,
     )
     plt.close()
 
@@ -1898,7 +1900,12 @@ def plot_ttfb_histograms(
         filename = (
             f"warp-{plot_suffix}-GET-{config_label}-ttfb-histogram-{datestamp}.png"
         )
-        plt.savefig(os.path.join(output_dir, filename), bbox_inches="tight", dpi=150)
+        plt.savefig(
+            os.path.join(output_dir, filename),
+            bbox_inches="tight",
+            dpi=150,
+            pil_kwargs=PNG_SAVE_OPTIONS,
+        )
         plt.close()
         print(f"Generated histogram plot: {filename}")
 
@@ -2026,7 +2033,12 @@ def plot_client_throughput_distribution(
     filename = (
         f"warp-{plot_suffix}-GET-{config_label}-client-distribution-{datestamp}.png"
     )
-    plt.savefig(os.path.join(output_dir, filename), bbox_inches="tight", dpi=150)
+    plt.savefig(
+        os.path.join(output_dir, filename),
+        bbox_inches="tight",
+        dpi=150,
+        pil_kwargs=PNG_SAVE_OPTIONS,
+    )
     plt.close()
     print(f"Generated client distribution histogram: {filename}")
 
@@ -2132,7 +2144,12 @@ def plot_underperforming_clients_bars(
     # Save figure
     plot_suffix = "mn" if len({m.nodes for m in metrics}) > 1 else "sn"
     filename = f"warp-{plot_suffix}-GET-{config_label}-underperformers-{datestamp}.png"
-    plt.savefig(os.path.join(output_dir, filename), bbox_inches="tight", dpi=150)
+    plt.savefig(
+        os.path.join(output_dir, filename),
+        bbox_inches="tight",
+        dpi=150,
+        pil_kwargs=PNG_SAVE_OPTIONS,
+    )
     plt.close()
     print(f"Generated underperformer bar chart: {filename}")
 
@@ -2300,7 +2317,12 @@ def plot_underperforming_clients_ttfb_boxplot(
     # Save figure
     plot_suffix = "mn" if len({m.nodes for m in metrics}) > 1 else "sn"
     filename = f"warp-{plot_suffix}-GET-{config_label}-ttfb-boxplot-{datestamp}.png"
-    plt.savefig(os.path.join(output_dir, filename), bbox_inches="tight", dpi=150)
+    plt.savefig(
+        os.path.join(output_dir, filename),
+        bbox_inches="tight",
+        dpi=150,
+        pil_kwargs=PNG_SAVE_OPTIONS,
+    )
     plt.close()
     print(f"Generated TTFB box plot: {filename}")
 
@@ -2592,7 +2614,12 @@ def plot_persistent_underperformers(
 
     # Save figure
     filename = f"warp-mn-GET-persistent-underperformers-{datestamp}.png"
-    plt.savefig(os.path.join(output_dir, filename), bbox_inches="tight", dpi=150)
+    plt.savefig(
+        os.path.join(output_dir, filename),
+        bbox_inches="tight",
+        dpi=150,
+        pil_kwargs=PNG_SAVE_OPTIONS,
+    )
     plt.close()
     print(f"Generated persistent underperformer analysis: {filename}")
 
@@ -2852,7 +2879,12 @@ def plot_client_underperformance_heatmap(
     # Save figure
     plot_suffix = "mn" if len({m.nodes for m in metrics}) > 1 else "sn"
     filename = f"warp-{plot_suffix}-GET-{config_label}-underperformance-heatmap-{datestamp}.png"
-    plt.savefig(os.path.join(output_dir, filename), bbox_inches="tight", dpi=150)
+    plt.savefig(
+        os.path.join(output_dir, filename),
+        bbox_inches="tight",
+        dpi=150,
+        pil_kwargs=PNG_SAVE_OPTIONS,
+    )
     plt.close()
     print(f"Generated underperformance heatmap: {filename}")
 
@@ -3033,7 +3065,12 @@ def plot_client_ttfb_percentile_lines(
     # Save figure
     plot_suffix = "mn" if len({m.nodes for m in metrics}) > 1 else "sn"
     filename = f"warp-{plot_suffix}-GET-{config_label}-ttfb-percentiles-{datestamp}.png"
-    plt.savefig(os.path.join(output_dir, filename), bbox_inches="tight", dpi=150)
+    plt.savefig(
+        os.path.join(output_dir, filename),
+        bbox_inches="tight",
+        dpi=150,
+        pil_kwargs=PNG_SAVE_OPTIONS,
+    )
     plt.close()
     print(f"Generated TTFB percentile plot: {filename}")
 
@@ -3209,7 +3246,12 @@ def plot_client_throughput_timeseries(
     filename = (
         f"warp-{plot_suffix}-GET-{config_label}-throughput-timeseries-{datestamp}.png"
     )
-    plt.savefig(os.path.join(output_dir, filename), bbox_inches="tight", dpi=150)
+    plt.savefig(
+        os.path.join(output_dir, filename),
+        bbox_inches="tight",
+        dpi=150,
+        pil_kwargs=PNG_SAVE_OPTIONS,
+    )
     plt.close()
 
     print(f"Generated throughput time-series plot: {filename}")

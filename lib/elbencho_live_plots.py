@@ -41,6 +41,7 @@ from lib.elbencho_live_steady import (
     SteadyAnalysis,
     WindowedClientDetail,
 )
+from lib.reporting_common import PNG_SAVE_OPTIONS
 
 DPI = 150
 SHADE_COLOR = "lightgray"
@@ -186,7 +187,7 @@ def _output_path(
 
 
 def _save(figure, plt, path: str) -> str:
-    figure.savefig(path, bbox_inches="tight", dpi=DPI)
+    figure.savefig(path, bbox_inches="tight", dpi=DPI, pil_kwargs=PNG_SAVE_OPTIONS)
     plt.close(figure)
     return path
 

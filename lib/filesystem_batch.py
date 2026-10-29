@@ -19,15 +19,22 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from concurrent.futures import Executor
+import contextlib
 from dataclasses import dataclass
+from functools import partial
 import hashlib
+import io
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
+from typing import Any, Callable
 from urllib.parse import quote
 
 from lib.filesystem_report_options import (
@@ -40,6 +47,7 @@ from lib.filesystem_report_options import (
     options_by_kind,
 )
 from lib.filesystem_snapshot_summary import format_io_snapshot_summary
+from lib.report_pool import load_engine, report_pool, report_workers, run_command
 from lib.report_provenance import VERSION_SUFFIX
 from lib.storage_target import (
     UNKNOWN_TARGET,
@@ -552,28 +560,45 @@ def report_batch(  # pylint: disable=too-many-locals
     failed = False
     fragments: dict[str, dict | None] = {}
     report_failed: set[str] = set()
-    for group in selected:
-        report_dir = output / "groups" / group.group_id
-        base = routed.get(group.kind, engine_options or [])
-        result, group_generated, group_failed = _generate_group_report(
-            manifest,
-            group,
-            output,
-            [
-                *base,
-                *_engine_results_options(request, report_dir, live_dir, group.kind),
-            ],
-            reset_fragment=request is not None,
+    workers = report_workers()
+    if workers > 1 and len(selected) > 1:
+        print(
+            f"Reporting {len(selected)} groups with {workers} worker processes; "
+            "each group's output prints once it and earlier groups finish.",
+            file=sys.stderr,
+            flush=True,
         )
-        generated += group_generated
-        failed = failed or group_failed
-        outcomes[group.group_id] = result
-        if request is not None:
-            fragment, broken = _collect_fragment(report_dir, group_generated)
-            fragments[group.group_id] = fragment
-            if group_failed or broken:
-                report_failed.add(group.group_id)
-                failed = failed or broken
+    with report_pool() as pool:
+        # Start every group before finishing any, so the pool stays full.
+        started = []
+        for group in selected:
+            report_dir = output / "groups" / group.group_id
+            options = [
+                *routed.get(group.kind, engine_options or []),
+                *_engine_results_options(request, report_dir, live_dir, group.kind),
+            ]
+            sink, finish = _start_group_report(
+                manifest,
+                group,
+                output,
+                options,
+                reset_fragment=request is not None,
+                pool=pool,
+            )
+            started.append((group, sink, finish))
+        for group, sink, finish in started:
+            result, group_generated, group_failed = finish()
+            sink.emit()
+            generated += group_generated
+            failed = failed or group_failed
+            outcomes[group.group_id] = result
+            if request is not None:
+                report_dir = output / "groups" / group.group_id
+                fragment, broken = _collect_fragment(report_dir, group_generated)
+                fragments[group.group_id] = fragment
+                if group_failed or broken:
+                    report_failed.add(group.group_id)
+                    failed = failed or broken
     combined = (
         output / COMBINED_REPORT_FILENAME
         if output_dir
@@ -595,6 +620,32 @@ def report_batch(  # pylint: disable=too-many-locals
     if failed or complete is None:
         return 1
     return EXIT_INCOMPLETE if request.require_complete and not complete else 0
+
+
+@dataclass
+class GroupOutput:
+    """One group's captured stdout and stderr, printed later in group order."""
+
+    stdout: str = ""
+    stderr: str = ""
+
+    @contextlib.contextmanager
+    def capture(self):
+        """Capture this process's stdout and stderr into the group."""
+        stdout, stderr = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                yield
+        finally:
+            self.stdout += stdout.getvalue()
+            self.stderr += stderr.getvalue()
+
+    def emit(self) -> None:
+        """Print the captured stderr, then stdout, so the tables end the group."""
+        sys.stderr.write(self.stderr)
+        sys.stderr.flush()
+        sys.stdout.write(self.stdout)
+        sys.stdout.flush()
 
 
 def _clear_live_sidecars(live_dir: Path) -> None:
@@ -647,15 +698,29 @@ def _write_results_document(  # pylint: disable=too-many-arguments,too-many-posi
     return filesystem_results.document_is_complete(document)
 
 
-def _generate_group_report(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+_REPORT_ERRORS = (OSError, ValueError, subprocess.CalledProcessError)
+
+
+def _start_group_report(  # pylint: disable=too-many-arguments
     manifest: BatchManifest,
     group: BatchGroup,
     output: Path,
     options: list[str],
     *,
-    reset_fragment: bool = False,
-) -> tuple[str, bool, bool]:
-    """Report one successful subset without abandoning other selected groups."""
+    reset_fragment: bool,
+    pool: Executor,
+) -> tuple[GroupOutput, Callable[[], tuple[str, bool, bool]]]:
+    """Start one group's report; the returned call finishes it.
+
+    Failures stay within the group. Its output and errors go to the
+    returned GroupOutput.
+    """
+    sink = GroupOutput()
+
+    def failed(error: Exception) -> tuple[str, bool, bool]:
+        sink.stderr += f"Group {group.group_id}: {error}\n"
+        return "Reporting failed", False, True
+
     if reset_fragment:
         # A stale fragment must never stand in for this run's evidence.
         (output / "groups" / group.group_id / RESULTS_FRAGMENT_FILENAME).unlink(
@@ -667,27 +732,37 @@ def _generate_group_report(  # pylint: disable=too-many-arguments,too-many-posit
         if execution_status(manifest, execution) == SUCCESS
     )
     if not successful:
-        return "No successful results", False, False
+        return sink, lambda: ("No successful results", False, False)
     report_dir = output / "groups" / group.group_id
+    report = report_dir / "report.txt"
     try:
         report_dir.mkdir(parents=True, exist_ok=True)
         # Invalidate prior evidence before an engine can partially overwrite it.
         (report_dir / REPORT_IDENTITY_FILENAME).unlink(missing_ok=True)
-        report = report_dir / "report.txt"
         report.unlink(missing_ok=True)
-        _report_group(manifest, group, successful, report_dir, options)
-        if reset_fragment and not report.exists():
-            # An engine whose filters matched nothing exits 0 with only a
-            # fragment; the group still needs a report to bind its identity to.
-            _publish_report_text(report, NO_MATCHING_RESULTS_TEXT)
-        _publish_report_text(
-            report_dir / REPORT_IDENTITY_FILENAME,
-            _report_identity(manifest, group, report),
+        pending = _report_group(
+            manifest, group, successful, report_dir, options, sink=sink, pool=pool
         )
-        return _markdown_link("report", report_dir / "report.txt", output), True, False
-    except (OSError, ValueError, subprocess.CalledProcessError) as error:
-        print(f"Group {group.group_id}: {error}", file=sys.stderr)
-        return "Reporting failed", False, True
+    except _REPORT_ERRORS as error:
+        return sink, partial(failed, error)
+
+    def finish() -> tuple[str, bool, bool]:
+        try:
+            if pending is not None:
+                pending()
+            if reset_fragment and not report.exists():
+                # An engine whose filters matched nothing exits 0 with only a
+                # fragment; the group still needs a report to bind its identity to.
+                _publish_report_text(report, NO_MATCHING_RESULTS_TEXT)
+            _publish_report_text(
+                report_dir / REPORT_IDENTITY_FILENAME,
+                _report_identity(manifest, group, report),
+            )
+        except _REPORT_ERRORS as error:
+            return failed(error)
+        return _markdown_link("report", report, output), True, False
+
+    return sink, finish
 
 
 def _report_identity(manifest: BatchManifest, group: BatchGroup, report: Path) -> str:
@@ -890,38 +965,85 @@ def _publish_report_text(destination: Path, content: str) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def _report_group(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+def _report_group(  # pylint: disable=too-many-arguments
     manifest: BatchManifest,
     group: BatchGroup,
     successful: tuple[BatchExecution, ...],
     output: Path,
     engine_options: list[str],
-) -> None:
-    """Run one group's engine against staged successful inputs."""
-    with tempfile.TemporaryDirectory(prefix="filesystem-report-") as temporary:
+    *,
+    sink: GroupOutput,
+    pool: Executor,
+) -> Callable[[], None]:
+    """Stage one group's inputs and start its reporter on the pool.
+
+    The returned call waits for the reporter, capturing its output into
+    ``sink``.
+    """
+    temporary = tempfile.mkdtemp(prefix="filesystem-report-")
+    try:
         inputs = Path(temporary) / manifest.group_path(group).name
         stage_group_inputs(manifest, group, inputs, successful)
-        engine = (
-            "extract-elbencho.py"
-            if group.kind == "io"
-            else "extract-mdtest-elbencho.py"
-        )
-        command = [
-            sys.executable,
-            str(_REPO_ROOT / "utils" / engine),
-            str(inputs),
-            "--output-dir",
-            str(output),
-            *engine_options,
-        ]
+        argv = [str(inputs), "--output-dir", str(output), *engine_options]
+        with sink.capture():
+            wait = _start_engine(group.kind, argv, pool)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+    def finish() -> None:
+        try:
+            with sink.capture():
+                wait()
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
         if "--markdown" in engine_options:
-            completed = subprocess.run(
-                command, check=True, stdout=subprocess.PIPE, text=True
-            )
-            (output / "report.txt").write_text(completed.stdout, encoding="utf-8")
-            print(completed.stdout, end="")
-        else:
-            subprocess.run(command, check=True)
+            (output / "report.txt").write_text(sink.stdout, encoding="utf-8")
+
+    return finish
+
+
+_IO_ENGINE = "extract-elbencho.py"
+
+
+def _in_process_engine(call: Callable[[], Any]) -> Any:
+    """Run elbencho reporter code; a nonzero exit or a crash fails the group."""
+    try:
+        return call()
+    except SystemExit as stop:
+        if stop.code in (None, 0):
+            return None
+        raise ValueError(f"{_IO_ENGINE} exited with status {stop.code}") from None
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        traceback.print_exc()
+        raise ValueError(f"{_IO_ENGINE} failed: {error}") from error
+
+
+def _start_engine(kind: str, argv: list[str], pool: Executor) -> Callable[[], None]:
+    """Start a group's reporter: elbencho in this process, mdtest as a task."""
+    if kind == "io":
+        finish = _in_process_engine(lambda: load_engine().start_report(argv, pool))
+
+        def wait_io() -> None:
+            status = _in_process_engine(finish) if finish is not None else None
+            if status:
+                raise ValueError(f"{_IO_ENGINE} exited with status {status}")
+
+        return wait_io
+    command = [
+        sys.executable,
+        str(_REPO_ROOT / "utils" / "extract-mdtest-elbencho.py"),
+        *argv,
+    ]
+    future = pool.submit(run_command, command)
+
+    def wait_mdtest() -> None:
+        completed = future.result()
+        sys.stdout.write(completed.stdout)
+        sys.stderr.write(completed.stderr)
+        completed.check_returncode()
+
+    return wait_mdtest
 
 
 def route_batch_report(args: argparse.Namespace, kind: str, argv: list[str]) -> bool:

@@ -246,6 +246,9 @@ collect before resume.
 - Live fairness ends the steady window at elbencho `[first]` and compares
   clients by ratio to the fleet median, not z-scores; analysis streams the
   live CSV in at most three passes.
+- Report pool tasks pickle as module `extract_elbencho` (`lib/report_pool.py`
+  loads it in workers; the script runs `main` from that module). Tests run
+  tasks inline via `tests/conftest.py`, so monkeypatches still apply.
 
 Inspect large JSON/JSON.zst without printing complete datasets:
 

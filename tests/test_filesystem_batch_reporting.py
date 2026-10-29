@@ -280,18 +280,18 @@ def test_reports_keep_repeated_coordinates_separate_and_count_failed_cells(tmp_p
     output = tmp_path / "custom reports"
     called = []
 
-    def engine(command, check):
-        assert check
-        inputs = Path(command[2])
+    def engine(_kind, argv, _pool):
+        inputs = Path(argv[0])
         identifier = (inputs / f"{IO_STEM}.csv").read_text(encoding="utf-8")
         called.append(identifier)
-        output_dir = Path(command[4])
+        output_dir = Path(argv[2])
         assert output_dir.name == identifier
         (output_dir / "report.txt").write_text(identifier, encoding="utf-8")
+        return lambda: None
 
-    with mock.patch("lib.filesystem_batch.subprocess.run", side_effect=engine):
+    with mock.patch.object(batch_module, "_start_engine", side_effect=engine):
         assert report_batch(manifest.root, output_dir=output) == 0
-    assert called == ["0001", "0003"]
+    assert sorted(called) == ["0001", "0003"]
     index = (output / "index.md").read_text(encoding="utf-8")
     assert "FAILED: 1" in index
     assert "No successful results" in index
@@ -306,14 +306,14 @@ def test_report_failure_retains_successful_other_group(tmp_path):
     for group in manifest.groups:
         _publish_result(manifest, group)
 
-    def engine(command, check):
-        assert check
-        output = Path(command[4])
+    def engine(_kind, argv, _pool):
+        output = Path(argv[2])
         if output.name == "0001":
-            raise subprocess.CalledProcessError(1, command)
+            raise ValueError("extract-elbencho.py exited with status 1")
         (output / "report.txt").write_text("retained", encoding="utf-8")
+        return lambda: None
 
-    with mock.patch("lib.filesystem_batch.subprocess.run", side_effect=engine):
+    with mock.patch.object(batch_module, "_start_engine", side_effect=engine):
         assert report_batch(manifest.root) == 1
     assert (manifest.root / "reports/groups/0002/report.txt").exists()
     assert "Reporting failed" in (manifest.root / "reports/index.md").read_text(
@@ -352,7 +352,7 @@ def test_unified_reporter_routes_common_and_kind_specific_options(
         _publish_result(manifest, group)
     called = {}
 
-    def report(_manifest, group, _successful, output, options):
+    def report(_manifest, group, _successful, output, options, **_kwargs):
         called[group.group_id] = options
         (output / "report.txt").write_text(group.kind, encoding="utf-8")
 
@@ -451,7 +451,7 @@ def test_filtered_reports_preserve_other_kinds_groups_and_index(
         _publish_result(manifest, group)
     calls = []
 
-    def report(_manifest, group, _successful, output, options):
+    def report(_manifest, group, _successful, output, options, **_kwargs):
         calls.append(group.group_id)
         (output / "report.txt").write_text(str(options), encoding="utf-8")
 
@@ -501,7 +501,12 @@ def test_filtered_reports_preserve_other_kinds_groups_and_index(
             )
             == 0
         )
-    assert calls == ["0002", "0001", "0003", "0001"]
+    # The middle invocation reports its two groups concurrently.
+    assert [calls[0], sorted(calls[1:3]), calls[3]] == [
+        "0002",
+        ["0001", "0003"],
+        "0001",
+    ]
     index = (output / "index.md").read_text(encoding="utf-8")
     for identifier in ("0001", "0002", "0003"):
         assert f"groups/{identifier}/report.txt" in index
@@ -514,7 +519,7 @@ def test_failed_filtered_report_retains_other_report_links(tmp_path):
     for group in manifest.groups:
         _publish_result(manifest, group)
 
-    def report(_manifest, group, _successful, output, _options):
+    def report(_manifest, group, _successful, output, _options, **_kwargs):
         (output / "report.txt").write_text(group.kind, encoding="utf-8")
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
@@ -538,7 +543,7 @@ def test_shared_report_destination_does_not_retain_another_batch(tmp_path):
         for group in manifest.groups:
             _publish_result(manifest, group)
 
-    def report(manifest, _group, _successful, destination, _options):
+    def report(manifest, _group, _successful, destination, _options, **_kwargs):
         (destination / "report.txt").write_text(str(manifest.root), encoding="utf-8")
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
@@ -566,7 +571,7 @@ def test_filtered_report_rejects_unproven_retained_content(tmp_path, fault):
     for group in manifest.groups:
         _publish_result(manifest, group)
 
-    def report(_manifest, group, _successful, output, _options):
+    def report(_manifest, group, _successful, output, _options, **_kwargs):
         (output / "report.txt").write_text(group.kind, encoding="utf-8")
 
     output = manifest.root / "reports"
@@ -600,7 +605,7 @@ def test_retained_report_accepts_canonical_batch_alias(tmp_path):
     alias = tmp_path / "alias"
     alias.symlink_to(manifest.root, target_is_directory=True)
 
-    def report(_manifest, group, _successful, output, _options):
+    def report(_manifest, group, _successful, output, _options, **_kwargs):
         (output / "report.txt").write_text(group.kind, encoding="utf-8")
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
@@ -615,7 +620,7 @@ def test_successful_engine_without_report_cannot_certify_prior_content(tmp_path)
     manifest = _create_batch(tmp_path / "batch", kinds=("io",))
     _publish_result(manifest, manifest.groups[0])
 
-    def report(_manifest, _group, _successful, output, _options):
+    def report(_manifest, _group, _successful, output, _options, **_kwargs):
         (output / "report.txt").write_text("original", encoding="utf-8")
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
@@ -690,7 +695,7 @@ def test_omnibus_report_preserves_tables_with_each_saved_environment(
                 "=== Representative Commands ===\n# Create: elbencho --mkdir\n"
             )
 
-    def report(_manifest, group, _successful, destination, _options):
+    def report(_manifest, group, _successful, destination, _options, **_kwargs):
         (destination / "report.txt").write_text(
             contents[group.group_id], encoding="utf-8"
         )
@@ -750,7 +755,7 @@ def _targeted_batch(tmp_path):
     return manifest
 
 
-def _fake_report(_manifest, group, _successful, destination, _options):
+def _fake_report(_manifest, group, _successful, destination, _options, **_kwargs):
     (destination / "report.txt").write_text(group.group_id, encoding="utf-8")
 
 
@@ -832,7 +837,7 @@ def test_filtered_omnibus_retains_owned_reports_and_removes_stale_output(tmp_pat
         _publish_result(manifest, group)
     omnibus = manifest.root / "reports.txt"
 
-    def report(_manifest, group, _successful, destination, options):
+    def report(_manifest, group, _successful, destination, options, **_kwargs):
         (destination / "report.txt").write_text(
             f"Group {group.group_id}: {options}\n", encoding="utf-8"
         )
@@ -867,7 +872,7 @@ def test_single_group_batch_does_not_write_omnibus(tmp_path):
     manifest = _create_batch(tmp_path / "batch", kinds=("io",))
     _publish_result(manifest, manifest.groups[0])
 
-    def report(_manifest, _group, _successful, destination, _options):
+    def report(_manifest, _group, _successful, destination, _options, **_kwargs):
         (destination / "report.txt").write_text("single report\n", encoding="utf-8")
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
@@ -941,7 +946,7 @@ def test_omnibus_keeps_actual_metadata_reports_together_by_saved_environment(
     )
     contents = {}
 
-    def report(_manifest, group, _successful, destination, _options):
+    def report(_manifest, group, _successful, destination, _options, **_kwargs):
         captured = io.StringIO()
         with contextlib.redirect_stdout(captured):
             if group.kind == "io":
@@ -994,7 +999,7 @@ def test_failed_omnibus_publication_removes_stale_report_and_keeps_group_reports
         _publish_result(manifest, group)
     omnibus = manifest.root / "reports.txt"
 
-    def report(_manifest, group, _successful, destination, _options):
+    def report(_manifest, group, _successful, destination, _options, **_kwargs):
         (destination / "report.txt").write_text(group.group_id, encoding="utf-8")
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
@@ -1027,7 +1032,7 @@ def test_failed_stale_omnibus_deletion_does_not_link_old_tables(tmp_path, capsys
         _publish_result(manifest, group)
     omnibus = manifest.root / "reports.txt"
 
-    def report(_manifest, group, _successful, destination, options):
+    def report(_manifest, group, _successful, destination, options, **_kwargs):
         (destination / "report.txt").write_text(
             f"Group {group.group_id}: {options}\n", encoding="utf-8"
         )
@@ -1107,7 +1112,7 @@ printer([metric, replace(metric, operation="READ")])
         )
         contents[group.group_id] = completed.stdout
 
-    def report(_manifest, group, _successful, destination, _options):
+    def report(_manifest, group, _successful, destination, _options, **_kwargs):
         (destination / "report.txt").write_text(
             contents[group.group_id], encoding="utf-8"
         )
@@ -1370,15 +1375,16 @@ def test_ordinary_reporter_routing_is_unchanged(tmp_path):
 def test_markdown_batch_reports_have_persistent_report_file(tmp_path):
     manifest = _create_batch(tmp_path / "batch", kinds=("io",))
     _publish_result(manifest, manifest.groups[0])
-    result = subprocess.CompletedProcess([], 0, stdout="# Saved Markdown\n")
-    with mock.patch(
-        "lib.filesystem_batch.subprocess.run", return_value=result
-    ) as engine:
+    markdown = "# Saved Markdown\n"
+    with mock.patch.object(
+        batch_module,
+        "_start_engine",
+        return_value=lambda: print(markdown, end=""),
+    ):
         assert report_batch(manifest.root, engine_options=["--markdown"]) == 0
-    assert engine.call_args.kwargs["stdout"] == subprocess.PIPE
     assert (manifest.root / "reports/groups/0001/report.txt").read_text(
         encoding="utf-8"
-    ) == result.stdout
+    ) == markdown
 
 
 @pytest.fixture(name="reporting_checkout")
@@ -1580,3 +1586,82 @@ def test_missing_batch_manifest_cannot_enter_legacy_reporter_path(
     )
     assert not (manifest.root / "reports").exists()
     assert not (source / "report.txt").exists()
+
+
+def test_groups_all_start_before_any_finishes_and_print_in_order(tmp_path, capsys):
+    """Every group's work is submitted first; output prints in group order."""
+    manifest = _create_batch(tmp_path / "batch", kinds=("io", "io", "io"))
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+    events = []
+
+    def engine(_kind, argv, _pool):
+        group = Path(argv[2]).name
+        events.append(f"start {group}")
+        print(f"progress {group}", file=sys.stderr)
+
+        def wait():
+            events.append(f"finish {group}")
+            print(f"table {group}")
+            (Path(argv[2]) / "report.txt").write_text(group, encoding="utf-8")
+
+        return wait
+
+    with mock.patch.object(batch_module, "report_workers", return_value=3):
+        with mock.patch.object(batch_module, "_start_engine", side_effect=engine):
+            assert report_batch(manifest.root) == 0
+    assert events == [
+        "start 0001",
+        "start 0002",
+        "start 0003",
+        "finish 0001",
+        "finish 0002",
+        "finish 0003",
+    ]
+    captured = capsys.readouterr()
+    assert captured.out == "table 0001\ntable 0002\ntable 0003\n"
+    assert captured.err.splitlines() == [
+        "Reporting 3 groups with 3 worker processes; each group's output prints "
+        "once it and earlier groups finish.",
+        "progress 0001",
+        "progress 0002",
+        "progress 0003",
+    ]
+
+
+def test_group_failure_is_reported_in_its_place(tmp_path, capsys):
+    """A failing group's output and error print with that group, in order."""
+    manifest = _create_batch(tmp_path / "batch", kinds=("io", "io"))
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+
+    def engine(_kind, argv, _pool):
+        output = Path(argv[2])
+
+        def wait():
+            if output.name == "0001":
+                print("partial")
+                raise ValueError("extract-elbencho.py exited with status 2")
+            print("table")
+            (output / "report.txt").write_text("ok", encoding="utf-8")
+
+        return wait
+
+    with mock.patch.object(batch_module, "_start_engine", side_effect=engine):
+        assert report_batch(manifest.root) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "partial\ntable\n"
+    assert captured.err == ("Group 0001: extract-elbencho.py exited with status 2\n")
+
+
+def test_in_process_engine_exit_status_fails_only_nonzero_exits():
+    """SystemExit(0) is success; other exits and crashes fail the group."""
+    # pylint: disable=protected-access
+    assert batch_module._in_process_engine(lambda: sys.exit(0)) is None
+    with pytest.raises(ValueError, match="exited with status 2"):
+        batch_module._in_process_engine(lambda: sys.exit(2))
+    with pytest.raises(ValueError, match="failed: boom"):
+        with contextlib.redirect_stderr(io.StringIO()):
+            batch_module._in_process_engine(
+                lambda: (_ for _ in ()).throw(OSError("boom"))
+            )
