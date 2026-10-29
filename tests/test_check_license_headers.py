@@ -42,6 +42,16 @@ class TestCheckText(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIsNone(check_text(path, expected_notice(path)))
 
+    def test_javascript_and_css_use_block_notice(self) -> None:
+        for path in (Path("assets/report.js"), Path("assets/report.css")):
+            with self.subTest(path=path):
+                notice = expected_notice(path)
+                hash_notice = expected_notice(Path("tool.py"))
+
+                self.assertTrue(notice.startswith("/*\n"))
+                self.assertIsNone(check_text(path, notice + "\n"))
+                self.assertIn("malformed", check_text(path, hash_notice))
+
     def test_license_is_exempt(self) -> None:
         self.assertIsNone(check_text(Path("LICENSE"), "Apache License\n"))
 

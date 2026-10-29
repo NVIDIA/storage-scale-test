@@ -27,7 +27,7 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _EXEMPT_PATHS = {Path("LICENSE")}
 _MARKDOWN_SUFFIXES = {".md"}
-_C_SUFFIXES = {".c", ".h"}
+_C_SUFFIXES = {".c", ".h", ".js", ".css"}
 _JSON_SUFFIXES = {".json"}
 _NOTICE_LINES = (
     "SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",

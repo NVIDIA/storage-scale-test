@@ -36,7 +36,8 @@ repository. Helper scripts may download or build them on the machine where you
 prepare a deployment tarball. Python packages listed below are installed into a
 local virtual environment by setup scripts. Alpine Linux libraries listed below
 are used when building static helper binaries (for example, s3test) inside an
-Alpine Linux container.
+Alpine Linux container. Components that a browser loads from a CDN when it
+views a generated report are also listed; they are not bundled.
 
 Nothing in this file grants rights beyond those provided by the applicable
 third-party license for each component. Full license texts are available at the
@@ -52,7 +53,25 @@ license when you use, reproduce, or distribute that component (including in
 binary form).
 
 --------------------------------------------------------------------------------
-1. elbencho
+1. Chart.js
+--------------------------------------------------------------------------------
+
+Description: JavaScript charting library used to draw charts in generated HTML
+             reports.
+Used by:     Filesystem HTML report (report.html), which loads Chart.js from
+             the jsDelivr CDN. The reader's web browser downloads it when the
+             report is viewed; it is not bundled in this repository or in
+             deployment tarballs.
+License:     MIT
+Source:      https://github.com/chartjs/Chart.js
+License text: https://github.com/chartjs/Chart.js/blob/master/LICENSE.md
+
+Copyright (c) 2014-2022 Chart.js Contributors
+
+See the upstream LICENSE.md file for the complete MIT License text.
+
+--------------------------------------------------------------------------------
+2. elbencho
 --------------------------------------------------------------------------------
 
 Description: Distributed storage benchmark for file systems, object stores, and
@@ -82,7 +101,7 @@ you must comply with GPL-3.0 source-offer and license-conveyance requirements.
 Obtain corresponding source from the URL above.
 
 --------------------------------------------------------------------------------
-2. matplotlib
+3. matplotlib
 --------------------------------------------------------------------------------
 
 Description: Python plotting library used by benchmark extraction and summary
@@ -108,7 +127,7 @@ See the upstream LICENSE file for the complete Python Software Foundation
 License agreement text.
 
 --------------------------------------------------------------------------------
-3. musl (Alpine Linux package)
+4. musl (Alpine Linux package)
 --------------------------------------------------------------------------------
 
 Description: C standard library implementation; provided as part of the Alpine
@@ -148,7 +167,7 @@ upstream COPYRIGHT file for the complete list of incorporated works and their
 notices.
 
 --------------------------------------------------------------------------------
-4. numpy
+5. numpy
 --------------------------------------------------------------------------------
 
 Description: Python numerical computing library used by benchmark extraction and
@@ -280,7 +299,7 @@ example, OpenBLAS) may carry separate licenses. Consult the LICENSE.txt file
 shipped with your NumPy installation for the authoritative list.
 
 --------------------------------------------------------------------------------
-5. OpenSSL (Alpine Linux package)
+6. OpenSSL (Alpine Linux package)
 --------------------------------------------------------------------------------
 
 Description: Cryptographic and TLS library; used when building static s3test
@@ -304,7 +323,7 @@ above and provide a copy of the Apache License 2.0. See the upstream LICENSE.txt
 file for the complete license text.
 
 --------------------------------------------------------------------------------
-6. PyYAML
+7. PyYAML
 --------------------------------------------------------------------------------
 
 Description: YAML parser and emitter for Python; used by benchmark extraction
@@ -337,7 +356,7 @@ License text: https://github.com/yaml/pyyaml/blob/master/LICENSE
     SOFTWARE.
 
 --------------------------------------------------------------------------------
-7. Warp (MinIO Warp)
+8. Warp (MinIO Warp)
 --------------------------------------------------------------------------------
 
 Description: S3-compatible object storage benchmark.
@@ -378,7 +397,7 @@ trigger source-offer obligations. Obtain corresponding source from the URL
 above.
 
 --------------------------------------------------------------------------------
-8. zlib (Alpine Linux package)
+9. zlib (Alpine Linux package)
 --------------------------------------------------------------------------------
 
 Description: Compression library; used when building static s3test helper
@@ -408,7 +427,7 @@ License text: https://github.com/madler/zlib/blob/master/LICENSE
     3. This notice may not be removed or altered from any source distribution.
 
 --------------------------------------------------------------------------------
-9. zstandard (python-zstandard)
+10. zstandard (python-zstandard)
 --------------------------------------------------------------------------------
 
 Description: Python bindings to the Zstandard compression library; used by
