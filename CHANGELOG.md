@@ -21,7 +21,7 @@ Notable changes in each release. Versions follow [Semantic Versioning](https://s
 see [docs/VERSIONING.md](docs/VERSIONING.md). Each release's notes are its
 section below.
 
-## Unreleased
+## [2.1.0] - 2026-10-29
 
 ### Added
 
