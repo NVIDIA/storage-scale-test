@@ -25,6 +25,7 @@ import io
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -99,7 +100,7 @@ def release_notes(root, tag) -> str:
 
 def build_source_archive(root, output, tag):
     """Archive the tagged tree, stamped with the tag, plus its .sha256 file."""
-    root, output = Path(root), Path(output)
+    root = Path(root)
     commit = release_commit(root, tag)
     release_notes(root, tag)
     tree = subprocess.run(
@@ -107,14 +108,32 @@ def build_source_archive(root, output, tag):
         check=True,
         stdout=subprocess.PIPE,
     ).stdout
-    output.mkdir(parents=True, exist_ok=True)
-    archive = output / f"{ARCHIVE_ROOT}-{tag}-source.tar.gz"
     with tempfile.TemporaryDirectory() as temporary:
         staging = Path(temporary) / ARCHIVE_ROOT
         with tarfile.open(fileobj=io.BytesIO(tree)) as source:
             source.extractall(staging, filter="data")
-        stamp_source(staging, tag)
-        archive.write_bytes(_reproducible_archive(staging))
+        return _archive_staged_tree(staging, output, tag)
+
+
+def archive_source_tree(tree, output, version):
+    """Archive a copy of an unpacked source tree as a release would.
+
+    The copy is stamped with version, so the archive matches a release source
+    archive without needing a release tag. Returns the archive and .sha256.
+    """
+    with tempfile.TemporaryDirectory() as temporary:
+        staging = Path(temporary) / ARCHIVE_ROOT
+        shutil.copytree(tree, staging, symlinks=True)
+        return _archive_staged_tree(staging, output, version)
+
+
+def _archive_staged_tree(staging: Path, output, version) -> tuple[Path, Path]:
+    """Stamp a disposable tree, then write its archive and .sha256 to output."""
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    stamp_source(staging, version)
+    archive = output / f"{ARCHIVE_ROOT}-{version}-source.tar.gz"
+    archive.write_bytes(_reproducible_archive(staging))
     return archive, _write_checksum(archive)
 
 

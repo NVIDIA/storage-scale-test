@@ -63,6 +63,8 @@ Slurm; operation and CI are in its README. Invariants:
   install `requirements.txt`.
 - On-demand CI shard manifests must cover the unsharded plan exactly; only the
   SSH shard (and an unsharded run) repeats setup and fixture stop/start.
+- Blocked Elbencho downloads fall back to the pinned container, except in
+  GitHub Actions; checksum failures are always fatal.
 
 ## Entry points
 

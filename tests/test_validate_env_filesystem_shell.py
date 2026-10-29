@@ -329,3 +329,34 @@ def test_a_skipped_check_still_warns_without_slurm_or_ssh(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("Filesystem check skipped for:\n/a\n")
+
+
+_FILE_ARCH = {"x86_64": "x86-64", "aarch64": "aarch64"}
+
+
+def _arch_problem(binary: Path, arch: str) -> str:
+    source = _VALIDATE_ENV.read_text(encoding="utf-8")
+    function = _between(source, "binary_arch_problem() {", "check_arch_and_binaries")
+    result = subprocess.run(
+        [_BASH, "-c", f'{function}\nbinary_arch_problem "$1" "$2"', "_", binary, arch],
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+@pytest.mark.skipif(os.uname().machine not in _FILE_ARCH, reason="unsupported host")
+def test_binary_architecture_ignores_the_path_and_spares_scripts(tmp_path):
+    """A path naming the architecture cannot pass; a wrapper script is unchecked."""
+    host = _FILE_ARCH[os.uname().machine]
+    other = next(arch for arch in _FILE_ARCH.values() if arch != host)
+    native = tmp_path / f"elbencho.{other}"
+    shutil.copy2(shutil.which("ls") or "/bin/ls", native)
+    script = tmp_path / f"elbencho.{host}"
+    script.write_text("#!/usr/bin/env bash\nexec true\n", encoding="utf-8")
+    assert _arch_problem(native, host) == ""
+    assert _arch_problem(native, other) == "mismatch"
+    assert _arch_problem(script, host) == "script"

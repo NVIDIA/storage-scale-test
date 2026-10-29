@@ -353,3 +353,29 @@ def test_tag_only_change_invalidates_deployment_cache(tmp_path):
     with tarfile.open(second.archive) as archive:
         assert archive.extractfile("./VERSION").read() == b"v1.2.3\n"
     assert runner.builder_calls == 2
+
+
+def test_release_source_archive_is_the_stamped_tracked_tree(tmp_path):
+    """The source archive holds tracked files only, stamped, without building."""
+    repository, _ = _repository(tmp_path)
+    _write(repository / "payload.txt", "tracked edit\n")
+    _write(repository / "untracked.txt", "not released\n")
+    runner = _Runner()
+    output = tmp_path / "release"
+
+    archive = _CACHE.build_release_source_archive(runner, repository, output)
+
+    assert runner.builder_calls == 0
+    assert sorted(path.name for path in output.iterdir()) == [
+        archive.name,
+        archive.name + ".sha256",
+    ]
+    with tarfile.open(archive) as tar:
+        names = set(tar.getnames())
+        root = "storage-scale-test"
+        assert f"{root}/untracked.txt" not in names
+        assert f"{root}/SOURCE_SHA256" in names
+        assert tar.extractfile(f"{root}/payload.txt").read() == b"tracked edit\n"
+        version = tar.extractfile(f"{root}/VERSION").read().decode().strip()
+    assert archive.name == f"{root}-{version}-source.tar.gz"
+    assert version == _CACHE.resolve_version(repository)

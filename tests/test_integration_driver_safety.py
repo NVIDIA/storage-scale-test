@@ -5612,8 +5612,8 @@ def test_csi_chart_tag_is_published_only_inside_kind_nodes():
 
 def test_markerless_sbx_elbencho_bundle_is_rebuilt(tmp_path, monkeypatch):
     """A pre-recipe cached wrapper cannot survive a repository update."""
-    cache = tmp_path / "test-cache"
-    cache.mkdir()
+    cache = tmp_path / "test-cache" / "container"
+    cache.mkdir(parents=True)
     binary_name = "elbencho.aarch64"
     binary = cache / f"v3.2-1-{binary_name}"
     runtime = cache / f"v3.2-1-{binary_name}.runtime"

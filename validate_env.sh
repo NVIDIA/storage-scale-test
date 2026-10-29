@@ -970,6 +970,18 @@ check_kubectl_target_runtime() {
         "$namespace"
 }
 
+# Print "script" or "mismatch" when binary $1 cannot be shown to match the
+# file(1) architecture $2. -b omits the path, which may name an architecture.
+binary_arch_problem() {
+    local type
+    type=$(file -b -L "$1")
+    if [[ "$type" == *script* ]]; then
+        echo script
+    elif [[ "$type" != *"$2"* ]]; then
+        echo mismatch
+    fi
+}
+
 # Determine architecture & check for binaries
 check_arch_and_binaries() {
     # Since we support SSH mode, we can no longer rely on an assumption that the invoking
@@ -1039,10 +1051,10 @@ check_arch_and_binaries() {
             continue
         fi
 
-        # Check binary architecture
-        if ! file "$binary" | grep -q "$remote_arch_pattern"; then
-            register_error "Binary ${binary} not compiled for ${remote_arch}"
-        fi
+        case $(binary_arch_problem "$binary" "$remote_arch_pattern") in
+            script) register_warning "Cannot check the architecture of script ${binary}" ;;
+            mismatch) register_error "Binary ${binary} not compiled for ${remote_arch}" ;;
+        esac
     done
     if [[ -n "$any_bin_missing" ]]; then
         register_error "Missing binaries. Ensure you extracted a complete prepared tarball."
@@ -1059,8 +1071,7 @@ check_arch_and_binaries() {
             continue
         fi
 
-        # Check binary architecture
-        if ! file "$binary" | grep -q "$remote_arch_pattern"; then
+        if [[ $(binary_arch_problem "$binary" "$remote_arch_pattern") == mismatch ]]; then
             register_warning "$(printf '%s\n%s' "Optional binary not compiled for ${remote_arch}:" "$binary")"
         fi
     done

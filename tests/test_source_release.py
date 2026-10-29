@@ -17,6 +17,7 @@
 
 import gzip
 import hashlib
+import io
 import json
 from pathlib import Path
 import shutil
@@ -28,6 +29,7 @@ import pytest
 
 from lib.project_version import ROOT, resolve_version
 from lib.source_release import (
+    archive_source_tree,
     build_source_archive,
     changelog_notes,
     publish_release,
@@ -377,6 +379,24 @@ def test_release_archive_is_reproducible_stamped_and_verified(tmp_path):
         assert {member.mtime for member in tar.getmembers()} == {0}
     assert "storage-scale-test/untracked.txt" not in names
     smoke_source_archive(first)
+
+
+def test_an_unpacked_tree_archives_like_its_tagged_release(tmp_path):
+    """Without a tag, the same tree gives the release archive's exact bytes."""
+    source = _release_repository(tmp_path)
+    released, _ = build_source_archive(source, tmp_path / "released", "v1.2.3")
+    tree = tmp_path / "tree"
+    tracked = subprocess.run(
+        ["git", "-C", str(source), "archive", "HEAD"],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    with tarfile.open(fileobj=io.BytesIO(tracked)) as tar:
+        tar.extractall(tree, filter="data")
+    archive, checksum = archive_source_tree(tree, tmp_path / "unreleased", "v1.2.3")
+    assert archive.read_bytes() == released.read_bytes()
+    assert checksum.read_text().endswith(f"  {archive.name}\n")
+    assert not (tree / "VERSION").exists()
 
 
 @pytest.mark.parametrize(
