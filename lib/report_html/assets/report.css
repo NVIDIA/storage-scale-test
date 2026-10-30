@@ -1,0 +1,231 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* Storage report page styles. Colours are variables so the dark theme only
+   swaps values; report.js reads the same variables for charts. */
+
+:root {
+  --paper: #ffffff;
+  --panel: #f4f6f9;
+  --ink: #1b2430;
+  --ink-soft: #5d6878;
+  --rule: #d9dee6;
+  --gridline: #e7ebf0;
+  --hi: #2468c8;
+  --tip-bg: #1d232b;
+  --tip-ink: #f5f7fa;
+  --ok-bg: #e2f4e6;
+  --ok-ink: #22703a;
+  --warn-bg: #fdf3d0;
+  --warn-ink: #8a6100;
+  --bad-bg: #fbe4e2;
+  --bad-ink: #b02a22;
+  --read: #2468c8;
+  --write: #c4501a;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    --paper: #12161c;
+    --panel: #1a2029;
+    --ink: #e3e8ee;
+    --ink-soft: #9aa5b3;
+    --rule: #2c3440;
+    --gridline: #252c36;
+    --hi: #6ea4ef;
+    --tip-bg: #e3e8ee;
+    --tip-ink: #12161c;
+    --ok-bg: #17321f;
+    --ok-ink: #6fd28b;
+    --warn-bg: #33290c;
+    --warn-ink: #f0c44c;
+    --bad-bg: #3b1a18;
+    --bad-ink: #f28b82;
+    --read: #7fb0f2;
+    --write: #f09a6c;
+    color-scheme: dark;
+  }
+}
+
+:root.dark {
+  --paper: #12161c;
+  --panel: #1a2029;
+  --ink: #e3e8ee;
+  --ink-soft: #9aa5b3;
+  --rule: #2c3440;
+  --gridline: #252c36;
+  --hi: #6ea4ef;
+  --tip-bg: #e3e8ee;
+  --tip-ink: #12161c;
+  --ok-bg: #17321f;
+  --ok-ink: #6fd28b;
+  --warn-bg: #33290c;
+  --warn-ink: #f0c44c;
+  --bad-bg: #3b1a18;
+  --bad-ink: #f28b82;
+  --read: #7fb0f2;
+  --write: #f09a6c;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+a { color: var(--hi); }
+
+/* Layout: sticky contents on the left, report on the right. */
+.page {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+}
+
+main { min-width: 0; padding: 28px 32px 96px; }
+
+.toc {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  padding: 20px 14px 32px;
+  border-right: 1px solid var(--rule);
+  font-size: 13.5px;
+}
+.toc a { display: block; padding: 2px 8px; border-radius: 6px; color: var(--ink); text-decoration: none; }
+.toc a:hover, .toc a.here { background: var(--panel); color: var(--hi); }
+.toc-title { margin: 0 0 6px; font-weight: 700; }
+.toc-group { margin: 12px 8px 2px; color: var(--ink-soft); font-size: 11.5px; letter-spacing: .05em; text-transform: uppercase; }
+.toc-filter { width: 100%; margin-bottom: 8px; padding: 5px 8px; border: 1px solid var(--rule); border-radius: 6px; background: var(--paper); color: var(--ink); font: inherit; }
+.tools { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 16px; }
+
+/* Headings and text. */
+h1 { margin: 0 0 4px; font-size: 27px; }
+h2 { margin: 48px 0 12px; padding-bottom: 6px; border-bottom: 2px solid var(--rule); font-size: 21px; }
+h3 { margin: 26px 0 8px; font-size: 16.5px; }
+h4 { margin: 18px 0 6px; font-size: 15px; }
+.lede { margin: 0; color: var(--ink-soft); }
+.meta { color: var(--ink-soft); font-size: 13px; font-weight: 400; }
+p.meta { margin: 2px 0 0; overflow-wrap: anywhere; }
+.hint { color: var(--ink-soft); font-size: 13px; }
+/* Tables, figures and cards use the window; only running text keeps a
+   readable line length. */
+main p, .hint { max-width: 100ch; }
+.note { margin: 12px 0; padding: 8px 12px; border-left: 4px solid var(--warn-ink); border-radius: 4px; background: var(--warn-bg); }
+
+/* Hover-only permalinks; the template name follows the "#". */
+.pl { margin-left: 4px; color: var(--ink-soft); font-size: 13px; font-weight: 400; text-decoration: none; opacity: 0; }
+:hover > .pl, .pl:focus { opacity: 1; }
+.pl[data-template]:hover::after { content: " " attr(data-template); font-family: var(--mono); font-size: 12px; }
+
+/* Headline cards. */
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; margin: 12px 0; }
+.card { display: flex; flex-direction: column; min-width: 0; padding: 12px 14px; border: 1px solid var(--rule); border-radius: 10px; background: var(--panel); color: inherit; text-decoration: none; }
+.card:hover { border-color: var(--hi); }
+.card .label, .card .sub, .card .detail { color: var(--ink-soft); font-size: 12.5px; }
+.card .value { font-size: 25px; font-weight: 700; overflow-wrap: anywhere; }
+.card .value small { margin-left: 4px; color: var(--ink-soft); font-size: 13px; font-weight: 600; }
+
+/* Settings and provenance lists. */
+details.settings { margin: 8px 0 14px; }
+details.fold { margin: 4px 0; }
+details.settings > summary, details.fold > summary, details.run > summary { cursor: pointer; }
+details.settings > summary, details.fold > summary { color: var(--hi); font-size: 13.5px; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 16px; margin: 8px 0; padding: 10px 14px; border: 1px solid var(--rule); border-radius: 10px; background: var(--panel); font-size: 13.5px; }
+dt { color: var(--ink-soft); }
+dd { margin: 0; font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+.settings-text { max-height: 360px; overflow: auto; padding: 10px 14px; border: 1px solid var(--rule); border-radius: 10px; font: 12.5px/1.45 var(--mono); }
+ul.diag, ul.sources { margin: 4px 0; padding-left: 20px; font-size: 13px; overflow-wrap: anywhere; }
+
+/* Figures. */
+.fig { min-width: 0; margin: 14px 0; padding: 12px 16px 14px; border: 1px solid var(--rule); border-radius: 10px; }
+.fig figcaption { text-align: center; font-weight: 650; font-size: 14px; }
+.fig .cap { margin: 8px 0 0; color: var(--ink-soft); font-size: 13px; }
+.num { margin-right: 4px; color: var(--ink-soft); font-weight: 600; }
+.plot { position: relative; height: 400px; }
+/* A canvas not yet drawn keeps its default 300 px width; never wider than its box. */
+.plot canvas { max-width: 100%; }
+.grid .plot { height: 290px; }
+.plot.offline { height: auto; padding: 24px 8px; border: 1px dashed var(--rule); border-radius: 8px; color: var(--ink-soft); font-size: 13px; text-align: center; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(440px, 100%), 1fr)); gap: 0 14px; }
+.heat canvas { cursor: crosshair; }
+.heat-tip { position: absolute; z-index: 2; padding: 5px 8px; border-radius: 6px; background: var(--tip-bg); color: var(--tip-ink); font-size: 12px; line-height: 1.45; white-space: pre; pointer-events: none; }
+
+/* Tables. */
+.tbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; margin-top: 16px; }
+.tbar .cap { margin: 0; color: var(--ink-soft); font-size: 13px; }
+.scroll { max-height: 620px; overflow: auto; margin: 6px 0; border: 1px solid var(--rule); border-radius: 8px; }
+table.data { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13.5px; }
+.data th, .data td { padding: 5px 10px; border-bottom: 1px solid var(--rule); text-align: right; white-space: nowrap; }
+.data th { position: sticky; top: 0; z-index: 1; background: var(--panel); font-weight: 600; cursor: pointer; user-select: none; }
+.data th:hover { color: var(--hi); }
+.data th[aria-sort="ascending"]::after { content: " \2191"; }
+.data th[aria-sort="descending"]::after { content: " \2193"; }
+.data .txt { text-align: left; }
+.data td.best { color: var(--hi); font-weight: 700; }
+.data tbody tr:hover td { background: var(--panel); }
+table.lean .x { display: none; }
+
+button { padding: 3px 10px; border: 1px solid var(--rule); border-radius: 6px; background: var(--panel); color: var(--ink); font: inherit; font-size: 12.5px; cursor: pointer; }
+button:hover { border-color: var(--hi); }
+
+/* Badges: phases, operations and slow-client classes. */
+.badge { display: inline-block; padding: 0 7px; border-radius: 9px; background: var(--panel); font-size: 11.5px; font-weight: 700; }
+.b-read { background: color-mix(in srgb, var(--read) 16%, transparent); color: var(--read); }
+.b-write { background: color-mix(in srgb, var(--write) 16%, transparent); color: var(--write); }
+.b-create { background: color-mix(in srgb, #1b8a94 18%, transparent); color: #1b8a94; }
+.b-stat { background: color-mix(in srgb, #7349c2 18%, transparent); color: #7349c2; }
+.b-delete { background: color-mix(in srgb, #7d5a3c 18%, transparent); color: #7d5a3c; }
+.b-ok { background: var(--ok-bg); color: var(--ok-ink); }
+.b-transient { background: var(--warn-bg); color: var(--warn-ink); }
+.b-persistent { background: var(--bad-bg); color: var(--bad-ink); }
+
+/* Collapsed per-run detail. */
+.runbar { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+details.run { margin: 6px 0; border: 1px solid var(--rule); border-radius: 8px; }
+details.run > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 7px 12px; }
+details.run[open] > summary { border-bottom: 1px solid var(--rule); }
+.rid { font-family: var(--mono); font-weight: 700; }
+.cfg, .chip { color: var(--ink-soft); font-size: 13px; }
+.run-body { padding: 2px 14px 14px; }
+
+.hidden { display: none !important; }
+
+@media (max-width: 920px) {
+  .page { display: block; }
+  .toc { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--rule); }
+  main { padding: 18px 14px 60px; }
+  .grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media print {
+  .toc, button, .pl { display: none; }
+  .page { display: block; }
+  .scroll { max-height: none; overflow: visible; }
+  /* Fit a table expanded with "Show all columns" (the only one with visible
+     .x cells) to the page: smaller type and padding, then wrapped headers and
+     text cells. Numbers stay whole. Default-column tables print as before. */
+  table.data:not(.lean):has(.x) { font-size: 10px; }
+  table.data:not(.lean):has(.x) th, table.data:not(.lean):has(.x) td { padding: 3px 4px; }
+  table.data:not(.lean):has(.x) th, table.data:not(.lean):has(.x) td.txt { white-space: normal; }
+}

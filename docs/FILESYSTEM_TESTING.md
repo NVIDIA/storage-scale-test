@@ -78,6 +78,9 @@ depth values for the scale sweep:
 ./storage-tests/fs/nv-elbencho-sweep.sh --nodes 1,2,4,8
 ```
 
+The report prints text tables and writes `report.html`, `results.json`, and
+plots beside the results; see [filesystem reporting](#filesystem-reporting).
+
 All sweep scripts accept comma-separated positive integers and ascending
 inclusive ranges: `X`, `X-Y`, or `X-Y+Z`; order is preserved. The endpoint is
 always included: `3-10+2` expands to `3,5,7,9,10`. Run a script with `--help`
@@ -564,8 +567,8 @@ STORAGE_SCALE_TEST_BATCH_GROUP_0002_TARGET=vendor-b
 ```
 
 The report step writes `reports/groups/0001/report.txt` and
-`reports/groups/0002/report.txt`, `reports/index.md` (with a Target column),
-and the combined `reports.txt`, all under `$BATCH`.
+`reports/groups/0002/report.txt`, `reports/report.html` (sections headed by
+target), and the combined `reports.txt`, all under `$BATCH`.
 
 ### Rules
 
@@ -667,11 +670,11 @@ Report a multi-target batch like any other batch: run
 Each group is one target and gets its own report; there is no combined
 cross-target report.
 
-- **Batches.** Groups are single-target, so batch reports never mix targets. `reports/index.md` has a `Target` column, and the
-  combined `reports.txt` heads every group `Group 0001 (io) target: "<name>"`.
+- **Batches.** Groups are single-target, so batch reports never mix targets.
+  `reports/report.html` heads each section with its target, and the combined
+  `reports.txt` heads every group `Group 0001 (io) target: "<name>"`.
   Current snapshots always record the effective name, so `(derived)` appears
   only beside results saved before this feature, which never recorded one.
-  Index cells are escaped, so odd characters in a name show literally.
 - **Report headers.** IO and metadata reports print a `Storage target:` line
   after the version lines, and the IO settings summary leads its Targets row
   with `name=` (a long row is shortened with an ellipsis or `(+K more)`).
@@ -690,44 +693,53 @@ cross-target report.
 
 Use `./utils/extract-filesystem.py "$RUN"` as the unified front door for
 ordinary IO or metadata runs and mixed batches. It dispatches each kind to
-its analyzer without combining unlike metrics.
+its analyzer without combining unlike metrics. IO reports show throughput or
+IOPS and latency by operation, size, threads, nodes, and I/O depth; metadata
+reports show create/stat/delete rates, elapsed times, latency distributions,
+variance, and scaling efficiency. Reports include successful cells only;
+Kubernetes results must first be collected.
 
-Each group has separate artifacts and reports, so repeated coordinates never
-overwrite or average across groups. All tables for one group are saved in
-`reports/groups/<group-id>/report.txt`; individual tables do not have separate
-text files. `reports/index.md` links the group reports and lists cell states.
-Report only selected groups with `--groups 0001,0003`, choose
-`--kind io|mdtest|all`, or redirect reports with `--output-dir PATH`.
-Reports include successful cells only; Kubernetes results must first be
-collected. Both existing specialized reporters accept batches and select their
-own workload kind.
+A report parses the raw results once into
+[`results.json`](MACHINE_READABLE_RESULTS.md) and renders everything else
+from it:
 
-When at least two groups have valid reports, the reporter also writes
-`reports.txt` at the batch root and links it from `reports/index.md`. This file
-collects the groups' tables in manifest order without combining their metrics.
-Each IO group begins with one compact summary of its effective saved settings,
-targeting about six lines. It covers the runner, targets, configured sweep,
-file layout and sizing, lifecycle, and a `Setting files:` row naming the
-target and override files; inactive optional settings are omitted. The summary
-abbreviates: long names and lines are shortened and long lists end in
-`(+N more)`. To check that groups used equivalent settings, compare their
-complete `env_used.yaml` snapshots, which the `Saved settings` path and
-`reports/index.md` link.
-Table titles remain adjacent to their tables. Metadata reports include the raw
-saved YAML once before the entire workload group report, keeping configuration,
-rates, elapsed times, latency tables, and commands together. Individual group
-`report.txt` files remain unchanged. With `--output-dir PATH`,
-the combined file is `PATH/reports.txt`, alongside `PATH/index.md` and
-`PATH/groups/`.
+| Output | Content |
+| --- | --- |
+| stdout | Text tables (diagnostics go to stderr) |
+| `report.txt` | The same text |
+| `results.json`, `results.live/` | The results document and its live-client sidecars |
+| `report.html` | One [HTML report](HTML_REPORT.md): charts, tables, comparisons |
+| `*.png` | Plots, and live-client plots and summaries |
 
-The unified reporter also accepts the established analysis options. Common
-options such as `--only-nodes` apply to both kinds;
-`--normalize-to` applies only to metadata and `--only-sizes` only to IO.
-An option with no matching selected group is an error. Filtered runs update
-selected reports and rebuild the index and combined file, retaining valid
-reports from other groups in the same batch. Failed, stale, or unowned reports
-are excluded; when fewer than two valid group reports remain, `reports.txt`
-is removed:
+### Output locations
+
+`--output-dir PATH` redirects everything, including a batch's `reports.txt`
+(to `PATH/reports.txt`). Without it:
+
+| Input | Location |
+| --- | --- |
+| Ordinary result directory | The directory itself |
+| Batch | `<batch>/reports/`: `results.json`, `results.live/` and `report.html` for every group, and `groups/<group-id>/` with each group's `report.txt` and plots; the combined `<batch>/reports.txt` is beside `reports/` |
+
+Each group has its own artifacts, so repeated coordinates never overwrite or
+average across groups. Select groups with `--groups 0001,0003` and kinds with
+`--kind io|mdtest|all`.
+
+When at least two groups have valid reports, `reports.txt` collects their
+tables in manifest order without combining metrics. Each IO group begins with
+a compact summary of its saved settings (runner, targets, sweep, file layout
+and sizing, lifecycle, and a `Setting files:` row); long names and lists are
+shortened, with `(+N more)`. To check that groups used equivalent settings,
+compare their `env_used.yaml` snapshots, which the `Saved settings` path
+names. Metadata reports include the raw saved YAML once before the group's
+report. Filtered runs update the selected reports, rebuild `reports.txt` from
+the valid reports of the batch, and remove it when fewer than two remain.
+Failed, stale, or unowned reports are excluded.
+
+The unified reporter accepts the established analysis options. Common
+options such as `--only-nodes` apply to both kinds; `--normalize-to` applies
+only to metadata and `--only-sizes` only to IO. An option with no matching
+selected group is an error:
 
 ```bash
 ./utils/extract-filesystem.py --normalize-to 1 --only-nodes 2,4 "$BATCH"
@@ -735,17 +747,14 @@ is removed:
 ```
 
 Results from different storage targets are never combined silently; see
-[reporting per target](#reporting-per-target).
-
-Use `--help` for all options. Single-file parsing requires `--kind io|mdtest`
-and is not a batch-reporting mode. For scripts and gates, see
-[MACHINE_READABLE_RESULTS.md](MACHINE_READABLE_RESULTS.md).
+[reporting per target](#reporting-per-target). Use `--help` for all options.
+Single-file parsing requires `--kind io|mdtest` and is not a batch mode.
 
 | Scope | Option | Purpose |
 | --- | --- | --- |
 | Both | `--only-nodes LIST`, `--only-threads LIST` | Select counts with comma lists or ranges |
 | Both | `--test-parse FILE` | Inspect one raw result without reporting |
-| Both | `--to-json` | Also write `<output-dir>/results.json`, the [machine-readable results document](MACHINE_READABLE_RESULTS.md) |
+| Both | `--require-complete` | Exit 3 if the results document is incomplete |
 | Both | `--allow-mixed-targets` | Combine results from different [storage targets](#reporting-per-target) in one report (a batch never needs it) |
 | IO | `--only-sizes SIZE` | Repeat or separate with `;`; preserve compound-size commas |
 | IO | `--only-iodepths LIST` | Select depths with comma lists or ranges |
@@ -754,14 +763,100 @@ and is not a batch-reporting mode. For scripts and gates, see
 | IO | `--client-min-slow-windows N` | Minimum 5 s windows at twice the shortfall for a transient client (default 3) |
 | IO | `--client-max-timeseries-lines N` | Limit client lines per plot (default 10) |
 | IO | `--client-max-heatmap-rows N` | Limit clients per heatmap (default 50) |
+| IO | `--live-detail LEVEL` | [Live detail](#live-detail-levels) (default `full`) |
 | Metadata | `--normalize-to N` | Scale rates/stddev to N nodes, not latency |
 
-For several result directories at once, use `extract-elbencho.py` or
-`extract-mdtest-elbencho.py`, which accept the same filters.
-IO reports show IOPS or throughput and
-latency by operation, size, thread count, node count, and I/O depth. Metadata
-reports show create/stat/delete rates, elapsed times, latency distributions,
-variance, and scaling efficiency.
+### Rendering again
+
+`--from-json` renders every output again from a results document (any schema
+1.x), without touching the raw results. The `results.live/` sidecars must
+stay beside the document. Rendering options not given take the document's
+recorded values; `--client-shortfall-percent` and `--client-min-slow-windows`
+cannot change (re-run from the raw results). `--only-*`, `--groups` and
+`--live-detail` apply at render time, to text and `report.html`, for raw
+input and documents alike (a document's live detail can only be lowered).
+Schema 1.0 sidecars lack per-client byte counts, so their runs get no client
+CSVs or PNGs; report the raw results again for those.
+
+```bash
+./utils/extract-filesystem.py --from-json reports/results.json --output-dir again
+./utils/extract-elbencho.py --from-json "$DIR/results.json" --output-dir io-only --only-nodes 4
+```
+
+`--output-dir` is required and must not be the document's directory (a
+subdirectory is fine). Batch documents keep the batch layout.
+
+### Several inputs
+
+`extract-elbencho.py` and `extract-mdtest-elbencho.py` accept several result
+directories, and `--from-json` several documents. `--output-dir` is required
+and must not resolve (after symlinks) to an input directory or a source
+document's directory; choose a separate directory. Input directories cannot
+be combined with `--from-json`.
+
+- **Several directories** make one document with one group per directory,
+  `0001`, `0002`, ..., and one report.
+- **Several documents** share one `report.html`. Document N renders its text
+  and PNGs under `<output-dir>/dN/`, with the batch layout inside for
+  batches.
+
+### Comparisons
+
+`report.html` pairs sections, across batches or runs, that match in kind, IO
+shape, swept dimension and fixed values (for example the same threads in a
+node sweep) and differ in exactly one of IO mode, read-from path, storage
+target, test directory, file size, or file layout. Other differences (thread
+list, run to completion) block automatic pairing, unless the setting does not
+apply to both runs (for example writer file sizes with `--read-from`,
+Kubernetes settings on SSH, or the swept dimension's own list). Run duration
+does not block, but differing durations are named in the comparison, its
+series labels and figure captions. Pairs get overlay charts (at most 8 series each). Section
+settings boxes likewise hide settings that do not apply.
+
+`--comparisons FILE` (with any input) forces pairs. The file is a YAML list
+of `title` and `sections`, each `<doc>:<group>[:<shape>]`. `<doc>` is the
+1-based position of a `--from-json` document, or its path; raw result
+directories and a batch always form document 1. `<group>` is the group ID:
+`0000` for one result directory, `0001`, `0002`, ... for several (in input
+order) or for a batch's groups. `<shape>` (the section's anchor part, for
+example `1m-seq-dio`) is needed only when the group has several.
+
+For two `--from-json` documents with a group `0001` each:
+
+```yaml
+- title: Target A vs target B
+  sections: ["1:0001", "2:0001"]
+```
+
+For two raw result directories, use `["1:0001", "1:0002"]`.
+
+### Exit statuses
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | Reports and document written |
+| 1 | A group report failed or a file could not be written; also a run with no text report (no results, or filters matched none), though the document is still written |
+| 2 | Usage error, including an invalid comparison file |
+| 3 | `--require-complete` and some execution is not complete |
+
+Without `--require-complete`, an incomplete batch exits 0; gate on the
+document ([MACHINE_READABLE_RESULTS.md](MACHINE_READABLE_RESULTS.md)).
+
+### Live detail levels
+
+`--live-detail` sets how much live-CSV data the document keeps.
+
+| Level | Document | Text, PNGs and `report.html` |
+| --- | --- | --- |
+| `none` | No live analysis | No live tables, plots or run detail |
+| `summary` | Summaries, no per-client rates | Fairness table; aggregate plot; per-run aggregate, spread and fairness charts |
+| `selected` | `summary` plus inline rates of the selected slow and representative clients | Same as `summary` |
+| `full` (default) | `summary` plus every client's rates in `results.live/` sidecars | Everything: also client plots, heatmaps and tables |
+
+Below `full`, per-client output is omitted with a note on stderr and in
+`report.html`; this is not an error. Use `full` for large fleets only when
+you need the per-client detail: sidecars grow with clients and run time
+(see [sizes](MACHINE_READABLE_RESULTS.md#size)).
 
 ### Live client and latency reports
 
@@ -793,7 +888,9 @@ and do not affect the class.
 In multi-node runs each client is a host, so imbalance between threads inside
 a host is invisible.
 
-Outputs, named `<stem>-<phase slug>-*` in the report directory:
+Outputs, named `<stem>-<phase slug>-*` in the report directory (`<stem>` is
+prefixed `<group>.`, as `0002.`, when several results directories are reported
+together):
 
 | Output | Content |
 | --- | --- |

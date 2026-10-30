@@ -25,6 +25,7 @@ one coordinator Job.
 # pylint: disable=protected-access
 
 import hashlib
+import html
 import json
 import subprocess
 from dataclasses import replace
@@ -911,24 +912,20 @@ def test_group_status_keys_cover_every_group():
         _FILESYSTEM.assert_group_status_keys(output.split("GROUP_0002")[0], rows)
 
 
-_INDEX = (
-    "# Filesystem batch reports\n\n"
-    "| Group | Kind | Target | Saved settings | Cell states | Reports |\n"
-    "| --- | --- | --- | --- | --- | --- |\n"
-    "| 0001 | io | /a | x | SUCCESS: 1 | y |\n"
-    f"| 0002 | mdtest | {_NAME} | x | SUCCESS: 1 | y |\n"
+_PAGE = (
+    '<h2>1. /a — 1M seq <span class="meta">group 0001 · 2 executions</span></h2>\n'
+    f'<h2>2. {html.escape(_NAME)} — metadata <span class="meta">group 0002 · '
+    "1 executions</span></h2>\n"
 )
 
 
-def test_report_index_must_name_each_groups_target():
-    """The Target column is checked row by row, not by substring."""
+def test_report_html_must_name_each_groups_target():
+    """Each group's section heading is checked, not a page-wide substring."""
     rows = (("0001", "io", "/a"), ("0002", "mdtest", _NAME))
-    _FILESYSTEM.assert_report_index_targets(_INDEX, rows)
+    _FILESYSTEM.assert_report_html_targets(_PAGE, rows)
     swapped = (("0001", "io", _NAME), ("0002", "mdtest", "/a"))
-    with pytest.raises(_Error, match="no row for group 0001"):
-        _FILESYSTEM.assert_report_index_targets(_INDEX, swapped)
-    with pytest.raises(_Error, match="Target column"):
-        _FILESYSTEM.assert_report_index_targets("| Group | Kind |\n", rows)
+    with pytest.raises(_Error, match="no section for group 0001"):
+        _FILESYSTEM.assert_report_html_targets(_PAGE, swapped)
 
 
 def _digest(text):

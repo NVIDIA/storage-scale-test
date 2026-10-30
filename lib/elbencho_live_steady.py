@@ -38,8 +38,7 @@ from lib.elbencho_live_report import (
     LiveAnalysis,
     LiveClientId,
     client_sort_key,
-    iter_parsed_rows,
-    live_csv_reader,
+    iter_live_rows,
     percentile_from_sorted,
 )
 
@@ -71,6 +70,11 @@ CLASS_ORDER = (CLASS_PERSISTENT, CLASS_TRANSIENT, CLASS_OK)
 REASON_NO_FIRST_TIME = "no_first_time"
 REASON_TOO_SHORT = "too_short"
 REASON_NO_STEADY_STATE = "no_steady_state"
+STEADY_REASON_TEXT = {
+    REASON_NO_FIRST_TIME: "no elbencho [first] time",
+    REASON_TOO_SHORT: "phase too short",
+    REASON_NO_STEADY_STATE: "throughput never settled",
+}
 END_SOURCE_FIRST = "elbencho_first"
 
 # Fallback live interval when neither ELBENCHO_LIVEINT nor row spacing is known.
@@ -102,7 +106,7 @@ class SteadyWindow:
     @property
     def available(self) -> bool:
         """Whether the window has bounds."""
-        return self.reason is None and self.start_interval is not None
+        return self.reason is None and self.start_ms is not None
 
 
 @dataclass
@@ -362,18 +366,15 @@ def _domain_client_rows(
     """Stream (interval, client, DoneBytes) of the domain's client rows."""
     key = domain.key
     to_interval = domain.runtime_to_interval
-    path = analysis.metadata.path
-    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
-        reader, columns = live_csv_reader(handle, path)
-        for row in iter_parsed_rows(reader, columns):
-            client = row.client
-            if client is None or row.done_bytes is None or row.key != key:
-                continue
-            if wanted is not None and client not in wanted:
-                continue
-            interval = to_interval.get(row.runtime_ms)
-            if interval is not None:
-                yield interval, client, row.done_bytes
+    for row in iter_live_rows(analysis):
+        client = row.client
+        if client is None or row.done_bytes is None or row.key != key:
+            continue
+        if wanted is not None and client not in wanted:
+            continue
+        interval = to_interval.get(row.runtime_ms)
+        if interval is not None:
+            yield interval, client, row.done_bytes
 
 
 def _iter_interval_snapshots(

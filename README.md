@@ -59,6 +59,27 @@ test comes from `env.sh` or `--env-override`. See
 [Testing several filesystems](docs/FILESYSTEM_TESTING.md#testing-several-filesystems).
 Kubernetes runs asynchronously: collect terminal results before reporting.
 
+## Reporting
+
+```bash
+./utils/extract-filesystem.py "$RUN"        # an IO or metadata run, or a batch
+```
+
+A filesystem report prints text tables and writes, in the result directory
+(a batch: `<batch>/reports`, or `--output-dir`), `report.txt`, `results.json`
+(with `results.live/`), `report.html`, and PNG plots. Open `report.html` in a
+browser: tables work offline, charts load Chart.js from a CDN. See the
+[HTML report guide](docs/HTML_REPORT.md) for its layout and template names.
+
+- `--from-json results.json... --output-dir DIR` renders again from documents
+  without the raw results; several documents share one `report.html`.
+- Several result directories (`extract-elbencho.py`, `extract-mdtest-elbencho.py`)
+  also need `--output-dir`.
+- `--comparisons FILE` forces which sections `report.html` compares.
+
+Details: [filesystem reporting](docs/FILESYSTEM_TESTING.md#filesystem-reporting).
+Object and network reports differ; see their guides.
+
 ## Prerequisites and deployment
 
 - Benchmarks and Slurm orchestration require Linux. macOS can launch SSH and

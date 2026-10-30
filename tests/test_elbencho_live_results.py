@@ -69,7 +69,7 @@ def _stub_filesystem_results():
     """Minimal stand-in used only while lib.filesystem_results is absent."""
     stub = types.ModuleType("lib.filesystem_results")
     stub.LIVE_SCHEMA = "storage-scale-test/live-client-series"
-    stub.LIVE_SCHEMA_VERSION = "1.0"
+    stub.LIVE_SCHEMA_VERSION = "1.1"
     stub.mib_s_to_bytes_per_s = lambda v: None if v is None else round(v * 1048576)
 
     def file_record(path, rel):
@@ -90,8 +90,11 @@ def _stub_filesystem_results():
         def __enter__(self):
             return self
 
-        def write_interval(self, elapsed_ms, rates):
-            self.lines.append({"elapsed_ms": elapsed_ms, "bytes_per_s": rates})
+        def write_interval(self, elapsed_ms, rates, deltas=None):
+            line = {"elapsed_ms": elapsed_ms, "bytes_per_s": rates}
+            if deltas is not None:
+                line["done_bytes_delta"] = deltas
+            self.lines.append(line)
 
         def __exit__(self, *exc):
             text = "".join(
@@ -208,6 +211,12 @@ def _build_csv(path, per_client_mib, services=None, drop=None):
 
 
 def _build(live, path, level="summary", **overrides):
+    """The first live object of each phase."""
+    objects = _build_objects(live, path, level, **overrides)
+    return objects.split(set(objects.by_phase))[0]
+
+
+def _build_objects(live, path, level="summary", **overrides):
     args = {
         "live_csv_path": path,
         "relative_source_path": "g/live.csv",
@@ -419,6 +428,130 @@ def test_multiple_domains_and_phases(live, tmp_path):
     assert "additional_domains" not in out["read"]["diagnostics"]
 
 
+def test_every_domain_has_an_object_and_sidecar(live, tmp_path):
+    rows = []
+    for phase in ("WRITE", "SYNC", "READ"):
+        for step in range(1, 4):
+            rows.append(_row(step * 1000, "Total", step * 10, phase=phase, mib_s=1))
+            if phase != "SYNC":
+                rows.append(_row(step * 1000, 0, step * 10, phase=phase))
+    for step in range(1, 3):  # a second WRITE occurrence: runtime restarts
+        rows.append(_row(step * 1000, "Total", step * 10, phase="WRITE", mib_s=1))
+        rows.append(_row(step * 1000, 0, step * 10, phase="WRITE"))
+    sidecars = tmp_path / "side"
+    context = PhaseContext(3000, 3000, 4096, None)
+    objects = _build_objects(
+        live,
+        _write_csv(tmp_path / "p.live.csv", rows),
+        level="full",
+        sidecar_dir=str(sidecars),
+        contexts={"write": context},
+    )
+    # Every domain is stored once: in phases[].live or among the others.
+    phases, others = objects.split({"write", "read"})
+    every = [*phases.values(), *others]
+    domains = [(o["domain"]["phase"], o["domain"]["occurrence"]) for o in others]
+    assert domains == [("sync", 0), ("write", 1)]
+    assert sorted(phases) == ["read", "write"]
+    assert phases["write"]["domain"]["occurrence"] == 0
+    assert phases["write"]["diagnostics"]["additional_domains"] == 1
+    assert "additional_domains" not in phases["read"]["diagnostics"]
+    assert "additional_domains" not in others[1]["diagnostics"]
+    assert sorted(o["client_series"]["path"] for o in every) == sorted(
+        path.name for path in sidecars.iterdir()
+    )
+    assert others[1]["client_series"]["path"] == "0001.write.occ1.jsonl.zst"
+    assert phases["read"]["phase_context"] is None
+    assert others[0]["phase_context"] is None
+    assert phases["write"]["phase_context"]["first_ms"] == 3000
+    assert others[0]["clients"] == 0
+    _, unpaired = objects.split(())
+    assert [_domain(o) for o in unpaired] == [
+        ("read", 0),
+        ("sync", 0),
+        ("write", 0),
+        ("write", 1),
+    ]
+    header, *_ = _read_sidecar(sidecars / "0001.write.occ1.jsonl.zst")
+    assert (header["phase"], header["mix_type"], header["occurrence"]) == (
+        "write",
+        "",
+        1,
+    )
+    for obj in every:
+        _validate_live(obj)
+
+
+def _domain(obj):
+    return obj["domain"]["phase"], obj["domain"]["occurrence"]
+
+
+def test_sidecar_done_bytes_delta_rebuilds_counters(live, tmp_path):
+    done = {0: [100, 300, 600, 650], 1: [50, None, 250, 40]}  # 1: missing, reset
+    rows = []
+    for step in range(4):
+        rows.append(_row((step + 1) * 1000, "Total", 0, mib_s=1))
+        for rank, values in done.items():
+            if values[step] is not None:
+                rows.append(_row((step + 1) * 1000, rank, values[step]))
+    sidecars = tmp_path / "side"
+    _build(
+        live,
+        _write_csv(tmp_path / "d.live.csv", rows),
+        level="full",
+        sidecar_dir=str(sidecars),
+    )
+    _, *intervals = _read_sidecar(sidecars / "0001.write.jsonl.zst")
+    assert [i["done_bytes_delta"] for i in intervals] == [
+        [100, 50],
+        [200, None],
+        [300, 200],
+        [50, -210],
+    ]
+    rebuilt = {0: [], 1: []}
+    for line in intervals:
+        for rank, delta in enumerate(line["done_bytes_delta"]):
+            last = next((v for v in reversed(rebuilt[rank]) if v is not None), 0)
+            rebuilt[rank].append(None if delta is None else last + delta)
+    assert rebuilt == done
+
+
+def test_unpaired_sidecar_name_comes_from_the_csv(live, tmp_path):
+    path = _build_csv(tmp_path / "run_20261026Z120000.live.csv", [100])
+    sidecars = tmp_path / "side"
+    obj = _build(
+        live, path, level="full", sidecar_dir=str(sidecars), sidecar_prefix=None
+    )["write"]
+    digest = obj["source"]["sha256"][:12]
+    assert obj["client_series"]["path"] == (
+        f"run_20261026Z120000.{digest}.write.jsonl.zst"
+    )
+
+
+def test_wall_clock_start_and_skew(live, tmp_path):
+    rows = []
+    for step, skew in ((1, 0), (2, 0), (3, 1), (4, -1)):
+        row = _row(step * 1000, "Total", step, mib_s=1, iops=2)
+        row["ISO Date"] = f"2026-07-29T23:59:5{step + 5}.{skew + 5:03d}+0000"
+        row["Lat Ent us"] = "7"
+        rows.append(row)
+        rows.append(_row(step * 1000, 0, step))
+    rows[-2]["ISO Date"] = "not a date"
+    obj = _build(live, _write_csv(tmp_path / "w.live.csv", rows))["write"]
+    series = obj["aggregate_series"]
+    assert series["start_time"] == "2026-07-29T23:59:56.005+0000"
+    # Each ISO Date is its own clock: 1 s after 23:59:56.005 is 23:59:57.005.
+    assert series["clock_skew_ms"] == [0, 0, 1, None]
+    assert series["entries_latency_avg_us"] == [7.0] * 4
+    assert live.live_timestamp(series["start_time"], 2000 + 1) == (
+        "2026-07-29T23:59:58.006+0000"
+    )
+    assert live.live_timestamp("2026-07-29T23:59:59Z", 1500) == ("2026-07-30T00:00:00Z")
+    assert live.live_timestamp("garbage", 0) is None
+    first = _columns(obj)[0]
+    assert first["first_progress_elapsed_ms"] == 1000
+
+
 def test_deterministic(live, tmp_path):
     path = _build_csv(tmp_path / "t.live.csv", [100, 150, 90, 20])
     first = _build(live, path, level="full", sidecar_dir=str(tmp_path / "s1"))
@@ -494,23 +627,31 @@ def test_steady_fairness_latency_objects(live, tmp_path, monkeypatch):
         "write"
     ]
     assert seen["args"][2:] == (context, 1000, 7.5, 4)
-    assert list(obj)[:9] == [
+    assert list(obj)[:10] == [
         "source",
         "configured_interval_ms",
         "client_mode",
         "domain",
+        "phase_context",
         "intervals",
         "clients",
         "steady",
         "aggregate_series",
         "fleet_series",
     ]
-    assert list(obj)[9:12] == ["fairness", "latency", "distribution"]
+    assert list(obj)[10:13] == ["fairness", "latency", "distribution"]
+    assert obj["phase_context"] == {
+        "first_ms": 4000,
+        "last_ms": 5000,
+        "block_size_bytes": 1048576,
+        "final_avg_latency_us": 99.5,
+    }
     assert obj["steady"] == {
         "start_ms": 1000,
         "end_ms": 4000,
         "end_source": "elbencho_first",
         "reason": None,
+        "interval_ms": 1000,
     }
     assert obj["aggregate_series"]["io_latency_avg_us"] == [None] * 4
     fairness = obj["fairness"]
@@ -548,6 +689,7 @@ def test_steady_fairness_latency_objects(live, tmp_path, monkeypatch):
     assert first["worst_5s_ratio"] == 0.81
     assert first["worst_5s_elapsed_ms"] == 5000
     assert first["short_5s_share"] == 0.5
+    assert (first["short_5s_windows"], first["steady_5s_windows"]) == (1, 2)
     assert _columns(obj)[1]["class"] is None
     assert list(_columns(obj)[0]) == live.CLIENT_COLUMNS
     _validate_live(obj)
@@ -612,3 +754,49 @@ def test_real_steady_analysis_end_to_end(live, tmp_path, monkeypatch):
     assert classes["worker-3"] == "persistent"
     assert classes["worker-0"] == "ok"
     assert obj["aggregate_series"]["io_latency_avg_us"] == [None] * 20
+
+
+def _analysis_state(domain):
+    """Everything the live reports read from a first-pass domain analysis."""
+    clients = {}
+    for client, summary in domain.clients.items():
+        values = dict(vars(summary))
+        values["median"] = values.pop("median_estimator").value()
+        clients[client] = values
+    return (
+        domain.key,
+        domain.aggregate_points,
+        domain.fleet_points,
+        domain.interval_times,
+        domain.runtime_to_interval,
+        clients,
+    )
+
+
+def test_document_replay_matches_the_live_csv(live, tmp_path, monkeypatch):
+    """A full live object and its sidecar replay the live CSV's analysis."""
+    monkeypatch.setattr(live, "analyze_steady", steady_mod.analyze_steady)
+    done = {0: [100, 300, 600, 650, 900], 1: [50, None, 250, 40, 90]}
+    rows = []
+    for step in range(5):
+        rows.append(_row((step + 1) * 1000, "Total", 0, mib_s=1.5, iops=2))
+        rows[-1]["Lat IO us"] = str(400 + step)
+        rows.extend(
+            _row((step + 1) * 1000, rank, values[step], service=f"host{rank}:1611")
+            for rank, values in done.items()
+            if values[step] is not None
+        )
+    rows.append(_row(1000, 0, 7, phase="READ"))
+    path = _write_csv(tmp_path / "x_20261026Z120000.live.csv", rows)
+    sidecars = tmp_path / "side"
+    objects = _build_objects(live, path, level="full", sidecar_dir=str(sidecars))
+    metadata = live.LiveFileMetadata(path, "", 0, 0, 0, "")
+    original = live.analyze_live_csv(metadata)
+    for obj in [*objects.by_phase.values(), *objects.later]:
+        sidecar = str(sidecars / obj["client_series"]["path"])
+        analysis, domain = live.analyze_document_live(obj, sidecar, metadata)
+        expected = original.domains[live.live_domain_key(obj)]
+        assert _analysis_state(domain) == _analysis_state(expected)
+        context = live.document_phase_context(obj)
+        replayed = steady_mod.analyze_steady(analysis, domain, context, 1000)
+        assert replayed == steady_mod.analyze_steady(original, expected, context, 1000)

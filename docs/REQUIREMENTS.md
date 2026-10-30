@@ -135,7 +135,7 @@ These requirements are driven by the primary use cases of an **NVIDIA Storage Sc
 
 ### UC-8: Reporting
 
-> *As an NVIDIA Storage Scale Test runner, I need to generate a textual report and associated PNG plots from any prior scale test run's results.*
+> *As an NVIDIA Storage Scale Test runner, I need to generate a textual report, an HTML report, and associated PNG plots from any prior scale test run's results.*
 
 | ID | Requirement | Satisfied? |
 |----|-------------|:----------:|
@@ -148,7 +148,9 @@ These requirements are driven by the primary use cases of an **NVIDIA Storage Sc
 | UC-8.8 | The tool shall support filtering reports by node count, thread count, IO size, IO depth, or object size. | Yes |
 | UC-8.9 | Reporting shall clearly separate and label write vs. read results, sequential vs. random IO, and direct IO vs. buffered IO in all tables and plots. | Yes |
 | UC-8.10 | Plot colors shall use colorblind-accessible palettes. | Yes |
-| UC-8.11 | A unified filesystem reporting entry point shall discover batch groups, report successful cells separately per group, and publish a state-counted index without combining groups or implicitly collecting Kubernetes results. | Yes |
+| UC-8.11 | A unified filesystem reporting entry point shall discover batch groups, report successful cells separately per group, and publish one HTML report and results document covering every group without combining groups or implicitly collecting Kubernetes results. | Yes |
+| UC-8.12 | Every filesystem report shall write a single-file HTML report, with charts and sortable tables, for a run, sweep, batch, or several inputs. | Yes |
+| UC-8.13 | Filesystem reports shall render from a previously written results document, alone or with others, and pair sections that differ in one setting into comparisons. | Yes |
 
 ### UC-9: Minimal Environment
 
@@ -313,7 +315,7 @@ These requirements address the infrastructure and runtime constraints the tool m
 | RA-1.3 | Terminal output shall include summary tables formatted for fixed-width fonts. | Yes |
 | RA-1.4 | Analysis scripts shall support filtering output by relevant dimensions (nodes, threads, sizes, IO depths, modes). | Yes |
 
-### RA-2: Markdown Reports
+### RA-2: Markdown and HTML Reports
 
 | ID | Requirement | Satisfied? |
 |----|-------------|:----------:|
@@ -321,12 +323,17 @@ These requirements address the infrastructure and runtime constraints the tool m
 | RA-2.2 | Removed: Markdown output for elbencho filesystem reports. | N/A |
 | RA-2.3 | Removed: Markdown output for mdtest-elbencho metadata reports. | N/A |
 | RA-2.4 | Markdown output shall be supported for netbench network reports. | Yes |
+| RA-2.5 | Filesystem reporters shall parse raw results once into the versioned results document and render the text tables, PNG plots, live reports, and HTML report from it. | Yes |
+| RA-2.6 | Every filesystem report shall write `report.html` as one file. Its tables shall work offline; its only external reference shall be a pinned Chart.js URL with an integrity hash, and every document string shall be escaped. | Yes |
+| RA-2.7 | `--from-json` shall render all outputs from one or more results documents (any schema 1.x), with `--only-*` filters applied at render time and an output directory that is not an input. | Yes |
+| RA-2.8 | The HTML report shall pair sections whose sweeps differ in exactly one setting (IO mode, read-from path, storage target, test directory, file size, or file layout) into overlay comparisons, and a comparison file shall be able to force pairs. | Yes |
+| RA-2.9 | Figures and tables shall carry numbers and stable anchors naming their template, catalogued in user documentation. | Yes |
 
 ### RA-3: Plot Generation
 
 | ID | Requirement | Satisfied? |
 |----|-------------|:----------:|
-| RA-3.1 | Plots shall be saved as PNG images in the results or output directory. | Yes |
+| RA-3.1 | Plots shall be saved as PNG images in the results or output directory; filesystem reports also chart them in `report.html`. | Yes |
 | RA-3.2 | For filesystem benchmarks: separate throughput (MB/s or GB/s) and IOPS plots shall be generated, grouped by IO size ranges. | Yes |
 | RA-3.3 | For filesystem benchmarks: latency plots shall be generated. | Yes |
 | RA-3.4 | For filesystem benchmarks: single-node plots shall use thread count on the x-axis; multi-node plots shall use node count. | Yes |
@@ -400,7 +407,7 @@ This repository does not include or distribute third-party benchmark binaries. U
 | `utils/extract-warp.py` | UC-8, RA-1, RA-3, RA-4 |
 | `utils/extract-mdtest-elbencho.py` | UC-8, RA-1, RA-2, RA-3 |
 | `utils/extract-netbench.py` | UC-8, RA-1, RA-2, RA-3 |
-| `utils/extract-filesystem.py` | UC-8.11, EE-3.6 |
+| `utils/extract-filesystem.py` | UC-8.11, UC-8.12, UC-8.13, EE-3.6 |
 | `validate_env.sh` | EE-2, CV-2 |
 | `env.sh` / `env.sh.template` | EE-2, CV-1 |
 | `lib/env_base.sh` | EE-2, CV-1 |

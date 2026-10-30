@@ -577,13 +577,14 @@ batch manifest and group provenance, including on partial resume.
 
 `utils/extract-filesystem.py` delegates to the existing reporters independently
 per group. It snapshots only authoritative successful evidence into temporary
-inputs, writes disjoint group reports and an index, and never averages across
+inputs, writes disjoint group reports plus one batch results document and
+`report.html`, and never averages across
 group boundaries or contacts the cluster. The specialized reporter entry points
-share this batch routing while preserving legacy and cached-input behavior.
+share this batch routing and read legacy result layouts.
 All three entry points share analysis option definitions. The unified reporter
 routes common options to both kinds and type-specific options only to matching
 selected groups, rejecting unused options. Filtered runs atomically rebuild the
-whole-batch index from current cell states and retained group reports.
+combined `reports.txt` from current cell states and retained group reports.
 
 ### 4.6 Remote Scriptlet and Result-Transfer Patterns
 
@@ -983,6 +984,35 @@ Each analysis script:
 4. **Generates** PNG plots saved alongside the results.
 5. **Optionally** (netbench and Warp only) produces `--markdown` output to
    stdout (with progress on stderr) suitable for pasting into Google Docs.
+
+The filesystem reporters (`extract-filesystem.py`, `extract-elbencho.py`,
+`extract-mdtest-elbencho.py`) are document-first:
+
+```
+raw results → parse (process pool) → results.json + results.live/
+                                        → text tables, report.html (parent)
+                                        → PNG plots (pool)
+```
+
+- **One parse.** Pool tasks parse each execution and live CSV once and write
+  the sidecars; the parent assembles `results.json` (schema in
+  [MACHINE_READABLE_RESULTS.md](MACHINE_READABLE_RESULTS.md)). Text tables,
+  PNGs, live reports, and HTML all render from the document, so raw results
+  and `--from-json` produce the same report.
+- **`--from-json`.** Skips the parse and renders from one or more documents;
+  `--only-*` filters apply at render time. Several documents share one
+  `report.html`, each rendering its text and PNGs under `<output-dir>/dN/`.
+- **Report model.** `lib/report_html/` builds a renderer-neutral model of
+  sections, numbered figures and tables, and stable anchors, then renders one
+  HTML file; see [HTML_REPORT.md](HTML_REPORT.md). Chart.js is referenced by
+  pinned URL only; tables work offline.
+- **Pairing.** The model pairs sections, across documents, whose sweeps differ
+  in exactly one of IO mode, read-from path, storage target, test directory,
+  file size, or file layout, and draws overlay charts. A comparison file
+  forces pairs.
+- **Output safety.** The document and `report.html` are written to temporary
+  names and renamed. With several inputs or `--from-json`, `--output-dir` must
+  not be an input or a source document's directory.
 
 ### 9.3 Markdown Report / Google Docs Workflow
 

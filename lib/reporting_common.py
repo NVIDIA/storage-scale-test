@@ -34,6 +34,15 @@ _ResultKey = TypeVar("_ResultKey", bound=Hashable)
 _Metric = TypeVar("_Metric")
 
 
+def natural_key(text: str) -> tuple:
+    """Sort key ordering embedded numbers by value: ``c_500`` before
+    ``c_1000``, ``node9`` before ``node10``. Parts alternate text and
+    number, so any two keys compare; the text itself breaks ties
+    (``node09`` before ``node9``)."""
+    parts = re.split(r"(\d+)", text)
+    return tuple(int(part) if part.isdigit() else part for part in parts), text
+
+
 def discover_result_pairs(
     input_dirs: Sequence[str],
     filename_pattern: re.Pattern[str],

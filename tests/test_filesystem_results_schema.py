@@ -118,12 +118,21 @@ def test_sidecar_lines_validate_and_bad_lines_fail(tmp_path):
         "schema_version": results.LIVE_SCHEMA_VERSION,
         "execution_id": "0001",
         "phase": "write",
+        "mix_type": "",
+        "occurrence": 0,
         "clients": ["a", "b"],
     }
     with results.SidecarWriter(path, header) as writer:
         writer.write_interval(1000, [1, None])
-        writer.write_interval(2000, [2, 3])
-    assert len(validate_sidecar_lines(path)) == 3
+        writer.write_interval(2000, [2, 3], [2048, None])
+    lines = validate_sidecar_lines(path)
+    assert len(lines) == 3
+    assert "done_bytes_delta" not in lines[1]
+    assert lines[2]["done_bytes_delta"] == [2048, None]
     bad = _load("live-client-series-1.schema.json")
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.Draft202012Validator(bad).validate({"elapsed_ms": "x"})
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.Draft202012Validator(bad).validate(
+            {"elapsed_ms": 1, "bytes_per_s": [], "done_bytes_delta": [1.5]}
+        )

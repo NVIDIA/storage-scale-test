@@ -27,23 +27,38 @@ import csv
 import math
 import os
 import re
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from collections import Counter
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import (
+    Collection,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from lib.elbencho_live_report import (
     MIB,
     TOTAL_RANK,
+    AggregatePoint,
     ClientSummary,
     DomainAnalysis,
     LiveAnalysis,
     LiveClientId,
+    LiveDomainKey,
     LiveFileMetadata,
+    ParsedRow,
     PreviousSample,
     analyze_live_csv,
     client_sort_key,
     collect_selected_client_detail,
     derive_rate,
-    iter_parsed_rows,
-    live_csv_reader,
+    iter_live_rows,
     percentile_from_sorted,
 )
 from lib.elbencho_live_steady import (
@@ -55,6 +70,7 @@ from lib.elbencho_live_steady import (
     ClientSteady,
     PhaseContext,
     SteadyAnalysis,
+    SteadyWindow,
     analyze_steady,
     classified_clients,
     select_heatmap_rows,
@@ -93,14 +109,53 @@ CLIENT_COLUMNS = [
     "valid_samples",
     "missing_samples",
     "invalid_samples",
+    "short_5s_windows",
+    "steady_5s_windows",
+    "first_progress_elapsed_ms",
 ]
 DEFAULT_DIAGNOSTICS = ("missing_samples", "counter_resets", "non_adjacent_samples")
 ADDITIONAL_DOMAINS = "additional_domains"
 NO_CONTEXT = PhaseContext(None, None, None, None)
+LIVE_SUFFIX = ".live.csv"
+DONE_BYTES_DELTA = "done_bytes_delta"
+# An elbencho ISO Date: date and time, an optional fraction, then the zone.
+_ISO_DATE = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,6}))?(.*)")
 
 
 class LiveCSVError(Exception):
     """Raised when a live CSV cannot be read or analyzed."""
+
+
+def _domain_order(live: dict) -> Tuple[str, str, int]:
+    domain = live["domain"]
+    return domain["phase"], domain["mix_type"], domain["occurrence"]
+
+
+class LiveObjects(NamedTuple):
+    """One live CSV's objects, each domain once: the first domain of each
+    lowercase phase, and the later ones in domain order."""
+
+    by_phase: Dict[str, dict]
+    later: List[dict]
+
+    def split(self, attached: Collection[str]) -> Tuple[Dict[str, dict], List[dict]]:
+        """(``phases[].live`` of the ``attached`` phases, every other domain).
+
+        An attached object counts its phase's later domains in
+        ``diagnostics.additional_domains``.
+        """
+        counts = Counter(live["domain"]["phase"] for live in self.later)
+        phases: Dict[str, dict] = {}
+        others = list(self.later)
+        for phase, live in self.by_phase.items():
+            if phase not in attached:
+                others.append(live)
+                continue
+            if counts[phase]:
+                diagnostics = {**live["diagnostics"], ADDITIONAL_DOMAINS: counts[phase]}
+                live = {**live, "diagnostics": dict(sorted(diagnostics.items()))}
+            phases[phase] = live
+        return phases, sorted(others, key=_domain_order)
 
 
 def null_live(reason: str) -> dict:
@@ -132,57 +187,66 @@ def build_live_objects(  # pylint: disable=too-many-arguments,too-many-positiona
     classification: Tuple[float, int],
     selection_limits: Tuple[int, int],
     sidecar_dir: Optional[str],
-    sidecar_prefix: str,
+    sidecar_prefix: Optional[str],
     execution_id: Optional[str],
     workers: Optional[Mapping[str, Tuple[str, str]]],
-) -> Dict[str, dict]:
-    """Analyze one live CSV and return live objects keyed by lowercase phase.
+) -> LiveObjects:
+    """Analyze one live CSV into one object per domain (see LiveObjects).
 
-    ``classification`` is (shortfall percent, minimum slow 5 s windows).
+    ``classification`` is (shortfall percent, minimum slow 5 s windows). A
+    ``sidecar_prefix`` of None derives one from the CSV name and digest.
     """
     try:
         source = file_record(live_csv_path, relative_source_path)
         analysis = analyze_live_csv(LiveFileMetadata(live_csv_path, "", 0, 0, 0, ""))
     except (OSError, ValueError, csv.Error, UnicodeError) as exc:
         raise LiveCSVError(f"cannot read live CSV {live_csv_path}: {exc}") from exc
-    by_phase: Dict[str, List[DomainAnalysis]] = {}
-    for domain in analysis.domains.values():
-        if domain.aggregate_points or domain.clients:
-            by_phase.setdefault(domain.key.phase.lower(), []).append(domain)
-    result: Dict[str, dict] = {}
-    for phase, domains in by_phase.items():
+    if sidecar_prefix is None:
+        stem = os.path.basename(live_csv_path).removesuffix(LIVE_SUFFIX)
+        sidecar_prefix = f"{stem}.{source['sha256'][:12]}"
+    analyzed = [
+        domain
+        for domain in analysis.domains.values()
+        if domain.aggregate_points or domain.clients
+    ]
+    built: Dict[LiveDomainKey, dict] = {}
+    for domain in analyzed:
+        context = contexts.get(domain.key.phase.lower())
         try:
             steady = analyze_steady(
                 analysis,
-                domains[0],
-                contexts.get(phase) or NO_CONTEXT,
+                domain,
+                context or NO_CONTEXT,
                 configured_interval_ms,
                 *classification,
             )
         except (OSError, ValueError, csv.Error, UnicodeError) as exc:
             raise LiveCSVError(f"cannot read live CSV {live_csv_path}: {exc}") from exc
-        live = _build_live_object(
-            (analysis, domains[0], steady),
+        built[domain.key] = _build_live_object(
+            (analysis, domain, steady, context),
             source,
             (level, configured_interval_ms, selection_limits),
             (sidecar_dir, sidecar_prefix, execution_id),
             workers or {},
         )
-        if len(domains) > 1:
-            live["diagnostics"][ADDITIONAL_DOMAINS] = len(domains) - 1
-            live["diagnostics"] = dict(sorted(live["diagnostics"].items()))
-        result[phase] = live
-    return result
+    by_phase: Dict[str, dict] = {}
+    for domain in analyzed:
+        by_phase.setdefault(domain.key.phase.lower(), built[domain.key])
+    first = {id(live) for live in by_phase.values()}
+    later = [built[key] for key in sorted(built) if id(built[key]) not in first]
+    return LiveObjects(by_phase, later)
 
 
 def _build_live_object(
-    analyzed: Tuple[LiveAnalysis, DomainAnalysis, SteadyAnalysis],
+    analyzed: Tuple[
+        LiveAnalysis, DomainAnalysis, SteadyAnalysis, Optional[PhaseContext]
+    ],
     source: dict,
     detail: Tuple[str, Optional[int], Tuple[int, int]],
     sidecar: Tuple[Optional[str], str, Optional[str]],
     workers: Mapping[str, Tuple[str, str]],
 ) -> dict:
-    analysis, domain, steady = analyzed
+    analysis, domain, steady, context = analyzed
     level, configured_interval_ms, selection_limits = detail
     ordered = _ordered_clients(domain)
     summaries = [domain.clients[client] for client in ordered]
@@ -199,6 +263,7 @@ def _build_live_object(
             "mix_type": domain.key.mix_type,
             "occurrence": domain.key.occurrence,
         },
+        "phase_context": _phase_context(context),
         "intervals": len(domain.interval_times),
         "clients": len(ordered),
         "steady": _steady_object(steady),
@@ -209,12 +274,24 @@ def _build_live_object(
         "distribution": _distribution(summaries, steady),
         "clients_summary": {
             "columns": list(CLIENT_COLUMNS),
-            "rows": [_client_row(item, steady, workers) for item in summaries],
+            "rows": [_client_row(item, domain, steady, workers) for item in summaries],
         },
         "client_series": _client_series(
             analysis, domain, steady, ordered, level, selection_limits, sidecar
         ),
         "diagnostics": dict(sorted(diagnostics.items())),
+    }
+
+
+def _phase_context(context: Optional[PhaseContext]) -> Optional[dict]:
+    """What the result pair says about the phase, or None without one."""
+    if context is None:
+        return None
+    return {
+        "first_ms": context.first_ms,
+        "last_ms": context.last_ms,
+        "block_size_bytes": context.block_size_bytes,
+        "final_avg_latency_us": round_latency_us(context.final_avg_latency_us),
     }
 
 
@@ -227,6 +304,7 @@ def _steady_object(steady: SteadyAnalysis) -> dict:
             None if window.reason == REASON_NO_FIRST_TIME else END_SOURCE_FIRST
         ),
         "reason": window.reason,
+        "interval_ms": steady.interval_ms,
     }
 
 
@@ -244,6 +322,7 @@ def _bytes(mib_s: Optional[float]) -> Optional[int]:
 
 def _aggregate_series(domain: DomainAnalysis) -> dict:
     points = domain.aggregate_points
+    start_time, skews = _clock_skews(points)
     return {
         "elapsed_ms": [_ms(point.elapsed_sec) for point in points],
         "bytes_per_s": [_bytes(point.throughput_mib_s) for point in points],
@@ -251,7 +330,72 @@ def _aggregate_series(domain: DomainAnalysis) -> dict:
         "io_latency_avg_us": [
             round_latency_us(point.io_latency_us) for point in points
         ],
+        "entries_latency_avg_us": [
+            round_latency_us(point.entries_latency_us) for point in points
+        ],
+        "start_time": start_time,
+        "clock_skew_ms": skews,
     }
+
+
+def _split_iso_date(text: str) -> Optional[Tuple[datetime, int, str]]:
+    """(naive date and time, fraction digits, zone suffix) of an ISO Date."""
+    match = _ISO_DATE.fullmatch(text)
+    if match is None:
+        return None
+    try:
+        moment = datetime.fromisoformat(match.group(1))
+    except ValueError:
+        return None
+    fraction = match.group(2) or ""
+    if fraction:
+        moment += timedelta(microseconds=int(fraction.ljust(6, "0")))
+    return moment, len(fraction), match.group(3)
+
+
+def _format_iso_date(parts: Tuple[datetime, int, str], offset_ms: int) -> str:
+    start, digits, zone = parts
+    moment = start + timedelta(milliseconds=offset_ms)
+    text = moment.isoformat(timespec="seconds")
+    if digits:
+        text += "." + f"{moment.microsecond:06d}"[:digits]
+    return text + zone
+
+
+def live_timestamp(start_time: str, offset_ms: int) -> Optional[str]:
+    """The ISO Date ``offset_ms`` after ``start_time``, written in its format.
+
+    Rebuilds ``aggregate_series`` sample times: ``offset_ms`` is the sample's
+    ``elapsed_ms`` minus the first one, plus its ``clock_skew_ms``.
+    """
+    parts = _split_iso_date(start_time)
+    return None if parts is None else _format_iso_date(parts, offset_ms)
+
+
+def _clock_skews(
+    points: Sequence[AggregatePoint],
+) -> Tuple[Optional[str], List[Optional[int]]]:
+    """The first sample's ISO Date and, per sample, how far its ISO Date is
+    from that start plus its RuntimeMS offset (elbencho reads two clocks).
+
+    A skew is None when ``live_timestamp`` cannot rebuild the sample's text.
+    """
+    if not points or not points[0].iso_timestamp:
+        return None, [None] * len(points)
+    start_time = points[0].iso_timestamp
+    start = _split_iso_date(start_time)
+    origin_ms = _ms(points[0].elapsed_sec)
+    skews: List[Optional[int]] = []
+    for point in points:
+        parts = _split_iso_date(point.iso_timestamp)
+        if start is None or parts is None:
+            skews.append(None)
+            continue
+        offset_ms = _ms(point.elapsed_sec) - origin_ms
+        skew = round((parts[0] - start[0]).total_seconds() * 1000) - offset_ms
+        rebuilt = _format_iso_date(start, offset_ms + skew)
+        skews.append(skew if rebuilt == point.iso_timestamp else None)
+    return start_time, skews
 
 
 def _fleet_series(domain: DomainAnalysis) -> dict:
@@ -408,6 +552,7 @@ def _kubernetes_names(
 
 def _client_row(
     summary: ClientSummary,
+    domain: DomainAnalysis,
     steady: SteadyAnalysis,
     workers: Mapping[str, Tuple[str, str]],
 ) -> list:
@@ -415,6 +560,7 @@ def _client_row(
     node, pod = _kubernetes_names(client.service, workers)
     has_samples = summary.sample_count > 0
     detail = steady.clients.get(client) or ClientSteady(client)
+    first = summary.first_progress_interval
     return [
         client.label,
         _rank_value(client.rank),
@@ -441,6 +587,9 @@ def _client_row(
         summary.sample_count,
         summary.missing_count,
         summary.invalid_count,
+        detail.short_5s,
+        detail.windows_5s,
+        None if first is None else _ms(domain.interval_times[first]),
     ]
 
 
@@ -513,12 +662,18 @@ def _write_sidecar(
         "schema_version": LIVE_SCHEMA_VERSION,
         "execution_id": execution_id,
         "phase": domain.key.phase.lower(),
+        "mix_type": domain.key.mix_type,
+        "occurrence": domain.key.occurrence,
         "clients": [client.label for client in ordered],
     }
     try:
         with SidecarWriter(os.path.join(sidecar_dir, name), header) as writer:
-            for interval, rates in _iter_interval_rates(analysis, domain, ordered):
-                writer.write_interval(_ms(domain.interval_times[interval]), rates)
+            for interval, rates, deltas in _iter_interval_samples(
+                analysis, domain, ordered
+            ):
+                writer.write_interval(
+                    _ms(domain.interval_times[interval]), rates, deltas
+                )
     except (OSError, ValueError, csv.Error, UnicodeError) as exc:
         raise LiveCSVError(f"cannot write live sidecar {name}: {exc}") from exc
     return {
@@ -530,40 +685,241 @@ def _write_sidecar(
     }
 
 
-def _iter_interval_rates(
+class _IntervalSamples:
+    """One interval's per-client rates and DoneBytes, and each client's last
+    emitted DoneBytes (the base of the next delta)."""
+
+    def __init__(self, count: int) -> None:
+        self.count = count
+        self.last_done: List[Optional[int]] = [None] * count
+        self.rates: List[Optional[int]] = [None] * count
+        self.done: List[Optional[int]] = [None] * count
+
+    def emit(self) -> Tuple[List[Optional[int]], List[Optional[int]]]:
+        """Return (bytes/s, DoneBytes deltas) and start the next interval."""
+        deltas: List[Optional[int]] = [None] * self.count
+        for position, done_bytes in enumerate(self.done):
+            if done_bytes is not None:
+                deltas[position] = done_bytes - (self.last_done[position] or 0)
+                self.last_done[position] = done_bytes
+        rates = self.rates
+        self.rates = [None] * self.count
+        self.done = [None] * self.count
+        return rates, deltas
+
+
+def _iter_interval_samples(
     analysis: LiveAnalysis,
     domain: DomainAnalysis,
     ordered: Sequence[LiveClientId],
 ):
-    """Yield (interval, per-client bytes/s) for every interval, O(clients) memory."""
+    """Yield (interval, per-client bytes/s, per-client DoneBytes delta) for
+    every interval in O(clients) memory. A delta is relative to the client's
+    previous sample (its first is absolute); None means no sample."""
     index = {client: position for position, client in enumerate(ordered)}
-    count = len(domain.interval_times)
     previous: Dict[LiveClientId, PreviousSample] = {}
+    samples = _IntervalSamples(len(ordered))
     pending = 0
-    current: List[Optional[int]] = [None] * len(ordered)
-    with open(analysis.metadata.path, "r", encoding="utf-8-sig", newline="") as handle:
-        reader, columns = live_csv_reader(handle, analysis.metadata.path)
-        for parsed in iter_parsed_rows(reader, columns):
-            runtime_ms, client, done_bytes = (
-                parsed.runtime_ms,
-                parsed.client,
-                parsed.done_bytes,
-            )
-            if parsed.key != domain.key or parsed.rank == TOTAL_RANK:
-                continue
-            if client not in index or done_bytes is None:
-                continue
-            if runtime_ms not in domain.runtime_to_interval:
-                continue
-            interval = domain.runtime_to_interval[runtime_ms]
-            while pending < interval:
-                yield pending, current
-                pending += 1
-                current = [None] * len(ordered)
-            rate = derive_rate(previous.get(client), done_bytes, runtime_ms, interval)
-            current[index[client]] = _bytes(rate)
-            previous[client] = PreviousSample(done_bytes, runtime_ms, interval)
-    while pending < count:
-        yield pending, current
+    for parsed in iter_live_rows(analysis):
+        client, done_bytes = parsed.client, parsed.done_bytes
+        if parsed.key != domain.key or parsed.rank == TOTAL_RANK:
+            continue
+        if client not in index or done_bytes is None:
+            continue
+        interval = domain.runtime_to_interval.get(parsed.runtime_ms)
+        if interval is None or interval < pending:
+            continue
+        while pending < interval:
+            yield (pending, *samples.emit())
+            pending += 1
+        rate = derive_rate(
+            previous.get(client), done_bytes, parsed.runtime_ms, interval
+        )
+        samples.rates[index[client]] = _bytes(rate)
+        samples.done[index[client]] = done_bytes
+        previous[client] = PreviousSample(done_bytes, parsed.runtime_ms, interval)
+    while pending < len(domain.interval_times):
+        yield (pending, *samples.emit())
         pending += 1
-        current = [None] * len(ordered)
+
+
+# -- rebuilding the analysis from a results document -------------------------
+
+
+def live_domain_key(live: dict) -> LiveDomainKey:
+    """The analysis key of a live object (live CSV phases are upper case)."""
+    domain = live["domain"]
+    return LiveDomainKey(
+        domain["phase"].upper(), domain["mix_type"], domain["occurrence"]
+    )
+
+
+def document_phase_context(live: dict) -> PhaseContext:
+    """The live object's phase context, or the empty one without a result pair."""
+    context = live.get("phase_context")
+    if context is None:
+        return NO_CONTEXT
+    return PhaseContext(
+        context["first_ms"],
+        context["last_ms"],
+        context["block_size_bytes"],
+        context["final_avg_latency_us"],
+    )
+
+
+def _document_clients(live: dict, labels: Sequence[str]) -> List[LiveClientId]:
+    """Client identities of the sidecar columns, from ``clients_summary``."""
+    summary = live["clients_summary"]
+    columns = summary["columns"]
+    label, rank, service = (columns.index(name) for name in CLIENT_COLUMNS[:3])
+    by_label = {
+        row[label]: LiveClientId(str(row[rank]), row[service] or "")
+        for row in summary["rows"]
+    }
+    try:
+        return [by_label[name] for name in labels]
+    except KeyError as exc:
+        raise ValueError(f"sidecar client {exc} is not in clients_summary") from exc
+
+
+def _total_row(key: LiveDomainKey, series: dict, index: int) -> ParsedRow:
+    """The Rank=Total row of one aggregate sample, its ISO Date rebuilt."""
+    elapsed = series["elapsed_ms"][index]
+    # Schema 1.0 lacks start_time, clock_skew_ms and entries_latency_avg_us.
+    start = series.get("start_time")
+    skews = series.get("clock_skew_ms")
+    skew = skews[index] if skews else None
+    iso = ""
+    if start is not None and skew is not None:
+        iso = live_timestamp(start, elapsed - series["elapsed_ms"][0] + skew) or ""
+    rate = series["bytes_per_s"][index]
+    entries = series.get("entries_latency_avg_us")
+    return ParsedRow(
+        key,
+        elapsed,
+        iso,
+        TOTAL_RANK,
+        None,
+        None,
+        None if rate is None else rate / MIB,
+        series["ops_per_s"][index],
+        series["io_latency_avg_us"][index],
+        entries[index] if entries else None,
+    )
+
+
+def _client_rows(
+    key: LiveDomainKey,
+    elapsed: int,
+    clients: Sequence[LiveClientId],
+    done: List[int],
+    deltas: Sequence[Optional[int]],
+) -> Iterator[ParsedRow]:
+    """Client rows of one interval; ``done`` accumulates each DoneBytes."""
+    for position, delta in enumerate(deltas):
+        if delta is None:
+            continue
+        done[position] += delta
+        client = clients[position]
+        yield ParsedRow(
+            key,
+            elapsed,
+            "",
+            client.rank,
+            client,
+            done[position],
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def _document_rows(live: dict, series) -> Iterator[ParsedRow]:
+    """The parsed rows of one domain, from its live object and sidecar.
+
+    Summing ``done_bytes_delta`` restores each client's DoneBytes; every
+    interval keeps a row, so the analysis sees the live CSV's intervals.
+    """
+    key = live_domain_key(live)
+    clients = _document_clients(live, series.clients)
+    aggregate = live["aggregate_series"]
+    totals = {elapsed: index for index, elapsed in enumerate(aggregate["elapsed_ms"])}
+    done = [0] * len(clients)
+    for elapsed, deltas in series.rows:
+        index = totals.get(elapsed)
+        if index is not None:
+            yield _total_row(key, aggregate, index)
+        emitted = index is not None
+        for row in _client_rows(key, elapsed, clients, done, deltas):
+            emitted = True
+            yield row
+        if not emitted:
+            yield ParsedRow(
+                key, elapsed, "", TOTAL_RANK, None, None, None, None, None, None
+            )
+
+
+def analyze_document_live(
+    live: dict, sidecar: str, metadata: LiveFileMetadata
+) -> Tuple[LiveAnalysis, Optional[DomainAnalysis]]:
+    """Rebuild one domain's first-pass analysis from a ``full`` live object.
+
+    Later passes re-read the sidecar, as they would re-read the live CSV.
+    """
+    # Deferred: only rendering from a document reads sidecars.
+    from lib.results_document import (  # pylint: disable=import-outside-toplevel
+        open_client_series,
+    )
+
+    analysis = analyze_live_csv(
+        metadata,
+        lambda: _document_rows(
+            live, open_client_series(Path(sidecar), DONE_BYTES_DELTA)
+        ),
+    )
+    return analysis, analysis.domains.get(live_domain_key(live))
+
+
+def document_steady(
+    live: dict, shortfall_percent: float, min_slow_windows: int
+) -> SteadyAnalysis:
+    """The steady window of a live object, without its window series."""
+    steady = live["steady"]
+    interval_ms = steady.get("interval_ms")
+    if interval_ms is None:
+        # Schema 1.0: the interval the fairness windows were measured at.
+        interval = (live.get("fairness") or {}).get("interval") or {}
+        interval_ms = interval.get("window_ms") or live.get("configured_interval_ms")
+    return SteadyAnalysis(
+        window=SteadyWindow(
+            start_ms=steady["start_ms"],
+            end_ms=steady["end_ms"],
+            reason=steady["reason"],
+        ),
+        context=document_phase_context(live),
+        interval_ms=interval_ms,
+        shortfall_percent=shortfall_percent,
+        min_slow_windows=min_slow_windows,
+    )
+
+
+def document_aggregate_domain(live: dict) -> DomainAnalysis:
+    """A domain holding only the live object's aggregate samples."""
+    key = live_domain_key(live)
+    series = live["aggregate_series"]
+    domain = DomainAnalysis(key=key)
+    for index in range(len(series["elapsed_ms"])):
+        row = _total_row(key, series, index)
+        domain.aggregate_points.append(
+            AggregatePoint(
+                interval=index,
+                elapsed_sec=row.runtime_ms / 1000.0,
+                iso_timestamp=row.iso_timestamp,
+                throughput_mib_s=row.mib_s,
+                iops=row.iops,
+                io_latency_us=row.io_latency_us,
+                entries_latency_us=row.entries_latency_us,
+            )
+        )
+    return domain

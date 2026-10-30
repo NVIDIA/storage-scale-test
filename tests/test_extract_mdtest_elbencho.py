@@ -279,6 +279,35 @@ ISO DATE end  : 2026-08-12T14:22:10-0400
 """
 
 
+def _document(*directories):
+    """The results document a report writes for these result directories."""
+    fragments = [
+        (
+            str(directory),
+            _EXTRACT_MOD.build_results_fragment(
+                str(directory), _EXTRACT_MOD.load_env_used_yaml(str(directory))
+            ),
+        )
+        for directory in directories
+    ]
+    return _EXTRACT_MOD.results_json.assemble_inputs_document(
+        fragments, None, {"options": {}}
+    )
+
+
+def _iterations(*directories):
+    """The complete iterations a report renders from those directories."""
+    document = _document(*directories)
+    return _EXTRACT_MOD.document_iterations(document, document["groups"])
+
+
+def _keys(iterations):
+    return [
+        (metrics.node_count, metrics.thread_count, metrics.datestamp, metrics.iteration)
+        for metrics, _ in iterations
+    ]
+
+
 class TestDenseResultsParse(unittest.TestCase):
     """A dense result pair parses end to end with no extractor changes."""
 
@@ -292,8 +321,7 @@ class TestDenseResultsParse(unittest.TestCase):
         self.results = results
 
     def test_file_pair_is_discovered(self) -> None:
-        pairs = _EXTRACT_MOD.discover_files([str(self.results)])
-        self.assertEqual(list(pairs), [(1, 8, _DATESTAMP, 1)])
+        self.assertEqual(_keys(_iterations(self.results)), [(1, 8, _DATESTAMP, 1)])
 
     def test_discovery_does_not_join_success_and_failed_runs(self) -> None:
         """A successful CSV cannot authorize an OUT file from a failed run."""
@@ -311,9 +339,7 @@ class TestDenseResultsParse(unittest.TestCase):
         (self.results / f"{_STEM}.csv").rename(success / f"{_STEM}.csv")
         (self.results / f"{_STEM}.out").rename(failed / f"{_STEM}.out")
 
-        pairs = _EXTRACT_MOD.discover_files([str(success), str(failed)])
-
-        self.assertEqual(pairs, {})
+        self.assertEqual(_iterations(success, failed), [])
 
     def test_reified_mdtest_ledger_filters_non_successful_coordinates(self) -> None:
         executions = self.results / "executions"
@@ -354,14 +380,8 @@ class TestDenseResultsParse(unittest.TestCase):
             inputs = (self.results, direct_link, parent_link / self.results.name)
             for input_dir in inputs:
                 with self.subTest(input_dir=input_dir):
-                    pairs = _EXTRACT_MOD.discover_files([str(input_dir)])
-                    self.assertEqual(list(pairs), [(2, 8, _DATESTAMP, 1)])
                     self.assertEqual(
-                        pairs[(2, 8, _DATESTAMP, 1)],
-                        (
-                            str(self.results.resolve() / f"{successful_stem}.csv"),
-                            str(self.results.resolve() / f"{successful_stem}.out"),
-                        ),
+                        _keys(_iterations(input_dir)), [(2, 8, _DATESTAMP, 1)]
                     )
 
     def test_non_mdtest_ledger_excludes_unowned_metadata_results(self) -> None:
@@ -372,9 +392,7 @@ class TestDenseResultsParse(unittest.TestCase):
         )
         (executions / "0001.status").write_text("FAILED\n", encoding="utf-8")
 
-        pairs = _EXTRACT_MOD.discover_files([str(self.results)])
-
-        self.assertEqual(list(pairs), [])
+        self.assertEqual(_iterations(self.results), [])
 
     def test_mdtest_configuration_is_loaded_from_env_used_yaml(self) -> None:
         env_used = self.results / "env_used.yaml"
@@ -385,14 +403,15 @@ class TestDenseResultsParse(unittest.TestCase):
             encoding="utf-8",
         )
 
-        configuration = _EXTRACT_MOD.load_mdtest_configuration([str(self.results)])
+        configuration = _EXTRACT_MOD.document_configuration(
+            _document(self.results)["groups"]
+        )
 
         self.assertEqual(configuration, _MDTEST_CONFIGURATION)
 
     def _iteration_metrics(self):
-        pairs = _EXTRACT_MOD.discover_files([str(self.results)])
-        csv_path, out_path = next(iter(pairs.values()))
-        return _EXTRACT_MOD.parse_file_pair(csv_path, out_path, 1, 8, _DATESTAMP, 1)
+        found = _iterations(self.results)
+        return found[0][0] if found else None
 
     def _aggregated_metrics(self):
         aggregated = _EXTRACT_MOD.aggregate_metrics([self._iteration_metrics()])
@@ -420,15 +439,12 @@ class TestDenseResultsParse(unittest.TestCase):
             line for line in _DENSE_CSV.splitlines() if ",RMFILES," not in line
         ]
         csv_path.write_text("\n".join(incomplete_lines) + "\n", encoding="utf-8")
-        stderr = io.StringIO()
-
-        with contextlib.redirect_stderr(stderr):
-            metrics = self._iteration_metrics()
-
-        self.assertIsNone(metrics)
-        warning = stderr.getvalue()
-        self.assertIn("Skipping incomplete or in-flight result", warning)
-        self.assertIn("missing CSV operations: RMFILES", warning)
+        self.assertIsNone(self._iteration_metrics())
+        iteration = _document(self.results)["executions"][0]["results"]["iterations"][0]
+        self.assertEqual(iteration["state"], "incomplete")
+        self.assertIn(
+            "missing CSV operations: RMFILES", iteration["problems"][0]["detail"]
+        )
 
     def test_dense_flags_survive_into_representative_commands(self) -> None:
         metrics = self._iteration_metrics()
@@ -614,15 +630,18 @@ class TestStorageTargetGuard(unittest.TestCase):
 
     def test_one_target_is_named_on_stdout_and_in_report_txt(self) -> None:
         third = self._results("c", "20260814Z120000", "lustre-a")
-        code, out, _, _ = self._run(self.first, third)
+        output = self.root / "out"
+        code, out, _, _ = self._run(self.first, third, f"--output-dir={output}")
         self.assertEqual(code, 0)
         self.assertEqual(self._target_lines(out), ["Storage target: lustre-a"])
-        report = (self.first / "report.txt").read_text(encoding="utf-8")
+        report = (output / "report.txt").read_text(encoding="utf-8")
         self.assertIn("Storage target: lustre-a\n", report)
 
     def test_known_and_unverifiable_inputs_warn_without_failing(self) -> None:
         third = self._results("c", "20260814Z120000", None)
-        code, out, err, _ = self._run(self.first, third)
+        code, out, err, _ = self._run(
+            self.first, third, f"--output-dir={self.root / 'out'}"
+        )
         self.assertEqual(code, 0)
         self.assertEqual(self._target_lines(out), ["Storage target: lustre-a"])
         self.assertIn(f"cannot verify storage target of 1 input(s): {third}", err)
@@ -638,11 +657,12 @@ class TestStorageTargetGuard(unittest.TestCase):
         self,
     ) -> None:
         clash = self._results("c", _DATESTAMP, "weka-b")
-        code, _, err, _ = self._run(self.first, clash, _ALLOW_MIXED)
+        code, _, err, _ = self._run(
+            self.first, clash, _ALLOW_MIXED, f"--output-dir={self.root / 'out'}"
+        )
         self.assertEqual(code, 0)
         self.assertNotIn("Duplicate result pair", err)
-        self.assertIn("Found 2 file pairs", err)
-        self.assertIn("Parsed 2 iterations", err)
+        self.assertIn("Found 2 complete iterations", err)
 
     def test_same_coordinates_inside_one_target_are_still_ambiguous(self) -> None:
         for target, extra in (
@@ -652,23 +672,27 @@ class TestStorageTargetGuard(unittest.TestCase):
         ):
             with self.subTest(target=target, extra=extra):
                 clash = self._results(f"d{target}{extra}", _DATESTAMP, target)
-                code, _, err, _ = self._run(self.first, clash, *extra)
+                code, _, err, _ = self._run(
+                    self.first, clash, *extra, f"--output-dir={self.root / 'out'}"
+                )
+                # No pair is usable: the run fails, but the document remains.
                 self.assertEqual(code, 1)
+                self.assertIn("No text report produced", err)
                 self.assertIn("Duplicate result pair", err)
                 self.assertIn("skipping both", err)
                 shutil.rmtree(clash)
 
-    def test_discover_files_keys_same_coordinates_by_target_group(self) -> None:
+    def test_same_coordinates_are_kept_per_target_only_by_target(self) -> None:
         clash = self._results("c", _DATESTAMP, "weka-b")
-        pairs = _EXTRACT_MOD.discover_files(
-            [str(self.first), str(clash)],
-            {"lustre-a": [str(self.first)], "weka-b": [str(clash)]},
+        document = _document(self.first, clash)
+        by_target = _EXTRACT_MOD.document_iterations(
+            document, document["groups"], by_target=True
         )
-        self.assertEqual(
-            sorted(pairs),
-            [(1, 8, _DATESTAMP, 1, "lustre-a"), (1, 8, _DATESTAMP, 1, "weka-b")],
-        )
-        self.assertEqual(len(_EXTRACT_MOD.discover_files([str(self.first)])), 1)
+        self.assertEqual(_keys(by_target), [(1, 8, _DATESTAMP, 1)] * 2)
+        with contextlib.redirect_stderr(io.StringIO()):
+            shared = _EXTRACT_MOD.document_iterations(document, document["groups"])
+        self.assertEqual(shared, [])
+        self.assertEqual(len(_iterations(self.first)), 1)
 
 
 if __name__ == "__main__":

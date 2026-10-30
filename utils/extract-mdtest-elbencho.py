@@ -22,15 +22,18 @@ Parses result files from nv-mdtest-elbencho tests, aggregates metrics across
 iterations, and generates performance reports and visualizations.
 """
 
+from concurrent.futures import Executor
+import contextlib
 import csv
 import math
 import os
 import re
+import shlex
 import sys
 import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Set, Tuple
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -55,9 +58,11 @@ from lib.env_used_yaml import (  # pylint: disable=wrong-import-position
 from lib import (  # pylint: disable=wrong-import-position
     filesystem_results as results_json,
 )
-from lib.filesystem_batch import (
+from lib.filesystem_batch import (  # pylint: disable=wrong-import-position
+    is_batch_document,
+    report_documents,
     route_batch_report,
-)  # pylint: disable=wrong-import-position
+)
 from lib.filesystem_coordinates import (  # pylint: disable=wrong-import-position
     MdtestDefinition,
     is_mdtest_definition,
@@ -66,7 +71,12 @@ from lib.filesystem_coordinates import (  # pylint: disable=wrong-import-positio
     parse_mdtest_definition,
 )
 from lib.filesystem_report_options import (  # pylint: disable=wrong-import-position
+    document_output_dir,
+    resolve_report_options,
+    unique_inputs,
     validate_analysis_arguments,
+    validate_integer_filter,
+    validate_report_inputs,
 )
 from lib.join_datestamps import (  # pylint: disable=wrong-import-position
     join_datestamps as join_datestamps_lib,
@@ -74,24 +84,37 @@ from lib.join_datestamps import (  # pylint: disable=wrong-import-position
 )
 from lib.reporting_common import (  # pylint: disable=wrong-import-position
     PNG_SAVE_OPTIONS,
-    discover_result_pairs,
     filter_metrics_by_scale,
     format_decimal_aligned_latency_ms,
     latency_column_widths,
-    parse_int_values_with_ranges as parse_int_ranges,
     strip_command_options,
+)
+from lib.results_document import (  # pylint: disable=wrong-import-position
+    recorded_options,
 )
 from lib.storage_target import (  # pylint: disable=wrong-import-position
     MIXED_PREFIX,
+    guarded_document_target,
     guarded_report_target,
     storage_target_from_env,
 )
 from lib.stdout_report_file import (  # pylint: disable=wrong-import-position
     REPORT_TXT_FILENAME,
     mirror_stdout_to_file,
+    remove_stale_report,
+)
+from lib.project_version import (  # pylint: disable=wrong-import-position
+    UNKNOWN as UNKNOWN_VERSION,
+)
+from lib.report_pool import (  # pylint: disable=wrong-import-position
+    InlineExecutor,
+    captured,
+    replay,
+    report_pool,
 )
 from lib.report_provenance import (  # pylint: disable=wrong-import-position
-    result_version,
+    VERSION_SUFFIX,
+    recorded_result_version,
     selected_versions,
     with_versions,
 )
@@ -227,131 +250,6 @@ MDTEST_CONFIG_KEYS = (
 )
 
 
-def discover_files(
-    input_dirs: List[str],
-    target_groups: Optional[Dict[str, List[str]]] = None,
-) -> Dict[Tuple[Any, ...], Tuple[str, str]]:
-    """
-    Scan directories for matching file pairs.
-
-    Args:
-        input_dirs: List of directories to scan
-        target_groups: input directories grouped by storage target name. When
-            given, identical (nodes, threads, datestamp, iteration) results are
-            kept from every group instead of being rejected as ambiguous, and
-            each key gains the group name as a fifth element. Directories of one
-            group still reject duplicates among themselves.
-
-    Returns:
-        Dict mapping (node_count, thread_count, datestamp, iteration)
-        to (csv_path, out_path)
-    """
-    if target_groups is None:
-        return _discover_directories(input_dirs)
-    pairs: Dict[Tuple[Any, ...], Tuple[str, str]] = {}
-    for name, directories in target_groups.items():
-        for key, paths in _discover_directories(directories).items():
-            pairs[(*key, name)] = paths
-    return pairs
-
-
-def _discover_directories(
-    input_dirs: List[str],
-) -> Dict[Tuple[int, int, str, int], Tuple[str, str]]:
-    """Find successful result pairs, rejecting duplicate keys across directories."""
-
-    def key_from_match(match: re.Match[str]) -> Tuple[int, int, str, int]:
-        return (
-            int(match.group(1)),
-            int(match.group(2)),
-            match.group(3),
-            int(match.group(4)),
-        )
-
-    file_pairs = discover_result_pairs(
-        input_dirs, FILENAME_PATTERN, key_from_match, extension_group=5, warn=eprint
-    )
-    successful_coordinates: Dict[str, Optional[set[Tuple[int, int]]]] = {
-        os.path.realpath(directory): _successful_mdtest_coordinates(directory)
-        for directory in dict.fromkeys(input_dirs)
-    }
-    filtered_pairs = {}
-    for key, paths in file_pairs.items():
-        result_dir = os.path.realpath(os.path.dirname(paths[0]))
-        coordinates = successful_coordinates.get(result_dir)
-        # None means this is a legacy result directory without a ledger.
-        if coordinates is None or (key[0], key[1]) in coordinates:
-            filtered_pairs[key] = paths
-        else:
-            eprint(
-                "Skipping metadata result without a SUCCESS execution ledger "
-                f"entry: {os.path.basename(paths[0])}"
-            )
-    return filtered_pairs
-
-
-def _directories_by_target(
-    environments: Dict[str, dict],
-) -> Dict[str, List[str]]:
-    """Group input directories by storage target name; "" collects unknown ones."""
-    groups: Dict[str, List[str]] = {}
-    for input_dir, env in environments.items():
-        name = storage_target_from_env(env).name or ""
-        groups.setdefault(name, []).append(input_dir)
-    return groups
-
-
-def _successful_mdtest_coordinates(
-    input_dir: str,
-) -> Optional[set[Tuple[int, int]]]:
-    """Return successful reified MD coordinates, or None without a ledger."""
-    executions_dir = os.path.join(input_dir, "executions")
-    if not results_json.has_execution_ledger(input_dir):
-        return None
-
-    md_definitions = []
-    for filename in os.listdir(executions_dir):
-        if not re.fullmatch(r"[0-9]+\.sh", filename):
-            continue
-        execution_id = filename[:-3]
-        definition_path = os.path.join(executions_dir, filename)
-        try:
-            with open(definition_path, "r", encoding="utf-8") as definition:
-                content = definition.read()
-        except OSError as error:
-            eprint(
-                f"Warning: Cannot read execution definition {definition_path}: {error}"
-            )
-            continue
-        if not re.search(
-            r"^export ELBENCHO_EXECUTION_KIND=mdtest$", content, re.MULTILINE
-        ):
-            continue
-        nodes_match = re.search(r"^export nodes=([0-9]+)$", content, re.MULTILINE)
-        tasks_match = re.search(
-            r"^export tasks_per_node=([0-9]+)$", content, re.MULTILINE
-        )
-        md_definitions.append((execution_id, nodes_match, tasks_match))
-
-    successful = set()
-    for execution_id, nodes_match, tasks_match in md_definitions:
-        status_path = os.path.join(executions_dir, f"{execution_id}.status")
-        try:
-            with open(status_path, "r", encoding="utf-8") as status_file:
-                status = status_file.read().strip()
-        except OSError:
-            status = ""
-        if status != "SUCCESS":
-            continue
-        if nodes_match and tasks_match:
-            successful.add((int(nodes_match.group(1)), int(tasks_match.group(1))))
-        else:
-            eprint(
-                f"Warning: Invalid metadata execution coordinates in {execution_id}.sh"
-            )
-    return successful
-
-
 def _collect_configuration_values(
     values_by_key: Dict[str, List[str]], source: Dict[str, Any]
 ) -> None:
@@ -377,22 +275,6 @@ def _render_configuration_values(
         if values:
             configuration[key] = ", ".join(values)
     return configuration
-
-
-def load_mdtest_configuration(
-    input_dirs: List[str], environments: Optional[Dict[str, Dict[str, Any]]] = None
-) -> Dict[str, str]:
-    """Load reportable mdtest settings across result directories.
-
-    ``environments`` holds env_used.yaml data already read, keyed by directory.
-    """
-    values_by_key: Dict[str, List[str]] = {key: [] for key in MDTEST_CONFIG_KEYS}
-    for input_dir in dict.fromkeys(input_dirs):
-        loaded = (environments or {}).get(input_dir)
-        if loaded is None:
-            loaded = load_env_used_yaml(input_dir)
-        _collect_configuration_values(values_by_key, loaded)
-    return _render_configuration_values(values_by_key, "input directories")
 
 
 def parse_csv_file(csv_path: str) -> Dict[str, Dict[str, Any]]:
@@ -563,48 +445,6 @@ def parse_out_file(out_path: str) -> Dict[str, Dict[float, int]]:
         result[op] = parse_latency_histogram(hist_match.group(1))
 
     return result
-
-
-def parse_file_pair(
-    csv_path: str,
-    out_path: str,
-    node_count: int,
-    thread_count: int,
-    datestamp: str,
-    iteration: int,
-) -> Optional[IterationMetrics]:
-    """
-    Parse a CSV/OUT file pair and return IterationMetrics.
-
-    Args:
-        csv_path: Path to CSV file
-        out_path: Path to OUT file
-        node_count: Node count from filename
-        thread_count: Thread count from filename
-        datestamp: Datestamp from filename
-        iteration: Iteration number from filename
-
-    Returns:
-        IterationMetrics or None if parsing failed
-    """
-    try:
-        csv_data = parse_csv_file(csv_path)
-        out_data = parse_out_file(out_path)
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        eprint(f"Error parsing {csv_path} / {out_path}: {e}")
-        return None
-
-    incomplete_reason = incomplete_result_reason(csv_data, out_data)
-    if incomplete_reason:
-        eprint(
-            "Warning: Skipping incomplete or in-flight result "
-            f"{os.path.basename(csv_path)}: {incomplete_reason}"
-        )
-        return None
-
-    return metrics_from_parsed(
-        csv_data, out_data, node_count, thread_count, datestamp, iteration
-    )
 
 
 def metrics_from_parsed(
@@ -1861,15 +1701,6 @@ def plot_all(
 # =============================================================================
 
 
-def parse_int_values_with_ranges(value_str: str) -> Set[int]:
-    """
-    Parse a comma-separated list of integers or ranges.
-
-    Example: '1,2,5-10,15' -> {1, 2, 5, 6, 7, 8, 9, 10, 15}
-    """
-    return parse_int_ranges(value_str, eprint)
-
-
 def filter_metrics(
     metrics: List[AggregatedMetrics],
     only_nodes: Optional[Set[int]] = None,
@@ -2023,6 +1854,7 @@ def _iteration_phase(
         ),
         "latency_us": latency,
         "histogram_us": results_json.histogram_columnar(histogram),
+        "command": results_json.command_argv(row["command"]) if csv_row else None,
     }
 
 
@@ -2043,13 +1875,16 @@ def _iteration_entry(
         )
     ]
     problems = (
-        [results_json.problem("iteration_incomplete", "; ".join(reasons))]
+        [results_json.problem(results_json.ITERATION_INCOMPLETE, "; ".join(reasons))]
         if reasons
         else []
     )
     return {
         "iteration": files.iteration,
         "datestamp": files.datestamp,
+        "producer_version": (
+            recorded_result_version(files.out_path) if files.out_path else None
+        ),
         "state": "incomplete" if reasons else "complete",
         "problems": problems,
         "phases": phases,
@@ -2129,8 +1964,12 @@ def _result_file_records(
     paths = sorted(
         path
         for files in files_list
-        for path in (files.csv_path, files.out_path)
-        if path is not None
+        for path in (
+            files.csv_path,
+            files.out_path,
+            files.out_path and files.out_path + VERSION_SUFFIX,
+        )
+        if path is not None and os.path.isfile(path)
     )
     return [
         results_json.file_record(path, os.path.relpath(path, input_dir))
@@ -2170,7 +2009,7 @@ def _execution_entry(
     ]
     if missing:
         detail = "missing iterations: " + ", ".join(str(number) for number in missing)
-        problems.append(results_json.problem("iterations_missing", detail))
+        problems.append(results_json.problem(results_json.ITERATIONS_MISSING, detail))
     results = None
     if files_list:
         results = {
@@ -2205,6 +2044,77 @@ def _not_reported_entry(slot: _Slot) -> Dict[str, Any]:
     }
 
 
+def _slot_entry(
+    slot: _Slot, files_list: List[_IterationFiles], input_dir: str, selected: bool
+) -> Dict[str, Any]:
+    """Pool task: the fragment entry of one slot, parsing its result files."""
+    if not selected:
+        return _not_reported_entry(slot)
+    return _execution_entry(slot, files_list, input_dir)
+
+
+def _planned_slots(
+    input_dir: str, env: Dict[str, Any]
+) -> List[Tuple[_Slot, List[_IterationFiles]]]:
+    """Every ledger slot, then every (nodes, tasks) of files without one."""
+    scanned = _scan_result_files(input_dir)
+    planned = [
+        (slot, scanned.pop((slot.nodes, slot.tasks), []))
+        for slot in _read_mdtest_ledger(input_dir, env)
+    ]
+    for (nodes, tasks), files_list in sorted(scanned.items()):
+        definition = MdtestDefinition(
+            nodes,
+            tasks,
+            optional_int(env.get("MDTEST_ITERATIONS")),
+            optional_int(env.get("MDTEST_BRANCH_FACTOR")),
+            optional_int(env.get("MDTEST_ITEMS_PER_DIR")),
+        )
+        planned.append((_Slot(None, definition), files_list))
+    return planned
+
+
+ScaleFilters = Tuple[Optional[Set[int]], Optional[Set[int]]]
+
+
+def start_results_fragment(
+    input_dir: str, env: Dict[str, Any], scale: ScaleFilters, pool: Executor
+) -> Callable[[], Dict[str, Any]]:
+    """Submit one parse task per slot; the returned call builds the fragment.
+
+    It describes every ledger execution and result file; those that
+    ``scale`` (--only-nodes, --only-threads) removes are not_reported.
+    """
+    only_nodes, only_threads = scale
+    planned = [
+        (
+            slot,
+            files_list,
+            (only_nodes is None or slot.nodes in only_nodes)
+            and (only_threads is None or slot.tasks in only_threads),
+        )
+        for slot, files_list in _planned_slots(input_dir, env)
+    ]
+    # Beside a ledger, result files outside it are only diagnostics; a
+    # filtered-out one is left out.
+    ledger = any(slot.execution_id for slot, _, _ in planned)
+    tasks = [
+        pool.submit(captured, _slot_entry, slot, files_list, input_dir, selected)
+        for slot, files_list, selected in planned
+        if selected or slot.execution_id or not ledger
+    ]
+
+    def finish() -> Dict[str, Any]:
+        return {
+            "fragment_version": results_json.FRAGMENT_VERSION,
+            "kind": "mdtest",
+            "executions": [replay(task) for task in tasks],
+            "diagnostics": [],
+        }
+
+    return finish
+
+
 def build_results_fragment(
     input_dir: str,
     env: Dict[str, Any],
@@ -2212,222 +2122,232 @@ def build_results_fragment(
     only_threads: Optional[Set[int]] = None,
 ) -> Dict[str, Any]:
     """Describe every ledger execution and result file of one input directory."""
-    scanned = _scan_result_files(input_dir)
-
-    def selected(slot: _Slot) -> bool:
-        return (only_nodes is None or slot.nodes in only_nodes) and (
-            only_threads is None or slot.tasks in only_threads
-        )
-
-    entries = []
-    for slot in _read_mdtest_ledger(input_dir, env):
-        if selected(slot):
-            files_list = scanned.pop((slot.nodes, slot.tasks), [])
-            entries.append(_execution_entry(slot, files_list, input_dir))
-        else:
-            scanned.pop((slot.nodes, slot.tasks), None)
-            entries.append(_not_reported_entry(slot))
-    for (nodes, tasks), files_list in sorted(scanned.items()):
-        slot = _Slot(
-            None,
-            MdtestDefinition(
-                nodes,
-                tasks,
-                optional_int(env.get("MDTEST_ITERATIONS")),
-                optional_int(env.get("MDTEST_BRANCH_FACTOR")),
-                optional_int(env.get("MDTEST_ITEMS_PER_DIR")),
-            ),
-        )
-        if selected(slot):
-            entries.append(_execution_entry(slot, files_list, input_dir))
-    return {
-        "fragment_version": results_json.FRAGMENT_VERSION,
-        "kind": "mdtest",
-        "executions": entries,
-        "diagnostics": [],
-    }
+    return start_results_fragment(
+        input_dir, env, (only_nodes, only_threads), InlineExecutor()
+    )()
 
 
 def validate_json_arguments(args) -> None:
-    """Reject option combinations the JSON export cannot honor."""
-    if args.require_complete and not args.to_json:
-        raise ValueError("--require-complete requires --to-json")
-    if not args.to_json and not args.results_fragment:
-        return
-    if args.to_json and args.results_fragment:
-        raise ValueError("--to-json and --results-fragment are mutually exclusive")
-    if len(set(args.input_dirs)) != 1:
-        raise ValueError("--to-json and --results-fragment need exactly one input dir")
+    """Reject inputs the results document cannot describe."""
+    validate_report_inputs(args.input_dirs, args.output_dir)
+    if args.results_fragment and len(unique_inputs(args.input_dirs)) != 1:
+        raise ValueError("--results-fragment needs exactly one input dir")
 
 
-def json_requested(args) -> bool:
-    """True when this run writes a results fragment or document."""
-    return bool(args.to_json or args.results_fragment)
+def write_json_outputs(
+    args,
+    environments: Dict[str, Dict[str, Any]],
+    comparisons: Optional[List[Dict[str, Any]]] = None,
+    pool: Optional[Executor] = None,
+) -> Dict[str, Any]:
+    """Write the fragment, or the document and report.html; return the document.
 
-
-def write_json_outputs(args, env: Dict[str, Any]) -> bool:
-    """Write the fragment or document; return whether the results are complete."""
-    input_dir = args.input_dirs[0]
-    fragment = build_results_fragment(
-        input_dir,
-        env,
-        parse_int_values_with_ranges(args.only_nodes) if args.only_nodes else None,
-        parse_int_values_with_ranges(args.only_threads) if args.only_threads else None,
-    )
-    if args.results_fragment:
-        results_json.write_fragment(fragment, args.results_fragment)
-        return True
+    For a fragment the document is only assembled, to render the text from.
+    The input directories are parsed in ``pool`` tasks.
+    """
+    scale = _scale_filters(args)
+    started = [
+        (
+            input_dir,
+            start_results_fragment(input_dir, env, scale, pool or InlineExecutor()),
+        )
+        for input_dir, env in environments.items()
+    ]
+    fragments = [(input_dir, finish()) for input_dir, finish in started]
     generator = results_json.generator_block(
-        list(sys.argv),
+        ["utils/extract-mdtest-elbencho.py", *sys.argv[1:]],
         {
             "live_detail": getattr(args, "live_detail", None),
             "shortfall_percent": None,
             "min_slow_windows": None,
+            "normalize_to": args.normalize_to,
             "only_nodes": args.only_nodes,
             "only_threads": args.only_threads,
             "kind": "mdtest",
         },
     )
-    document = results_json.assemble_ordinary_document(
-        Path(input_dir).resolve(), fragment, None, generator
+    document = results_json.assemble_inputs_document(fragments, None, generator)
+    if args.results_fragment:
+        results_json.write_fragment(fragments[0][1], args.results_fragment)
+        return document
+    results_json.publish_document(
+        document,
+        os.path.join(args.output_dir or args.input_dirs[0], "results.json"),
+        comparisons,
+        _mdtest_selection(args),
     )
-    results_json.write_document(
-        document, os.path.join(args.output_dir or input_dir, "results.json")
-    )
-    return results_json.document_is_complete(document)
+    return document
 
 
 # =============================================================================
-# Main
+# Rendering from the results document
 # =============================================================================
 
 
-def main() -> None:
-    """Script entry point."""
-    parser = extract_mdtest_elbencho_parser()
-    args = parser.parse_args()
-    try:
-        validate_analysis_arguments(args)
-        validate_json_arguments(args)
-        route_batch_report(args, "mdtest", sys.argv[1:])
-    except (OSError, ValueError) as error:
-        parser.error(str(error))
+def _seconds(value: Optional[float], scale: float) -> float:
+    return (value or 0.0) / scale
 
-    # Handle test-parse mode
-    if args.test_parse:
-        base_path = args.test_parse.replace(".csv", "").replace(".out", "")
-        csv_path = base_path + ".csv"
-        out_path = base_path + ".out"
 
-        eprint(f"Testing parse of {csv_path} and {out_path}")
-
-        csv_data = parse_csv_file(csv_path)
-        eprint("\nCSV Data:")
-        for op, data in csv_data.items():
-            eprint(
-                f"  {op}: rate={data['rate']:.0f}, "
-                f"elapsed={format_elapsed_time(data['elapsed_sec'])}, "
-                f"lat_avg={data['lat_avg']*1000:.3f}ms"
-            )
-
-        out_data = parse_out_file(out_path)
-        eprint("\nOUT Data (histograms):")
-        for op, hist in out_data.items():
-            if hist:
-                eprint(f"  {op}: {len(hist)} buckets, total count={sum(hist.values())}")
-        return
-
-    environments = {
-        input_dir: load_env_used_yaml(input_dir)
-        for input_dir in dict.fromkeys(args.input_dirs)
+def _phase_fields(name: str, phase: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """IterationMetrics fields of one create, stat or delete phase."""
+    phase = phase or {}
+    latency = phase.get("latency_us") or {}
+    histogram = phase.get("histogram_us") or {"buckets_us": [], "counts": []}
+    command = phase.get("command")
+    return {
+        f"{name}_rate": phase.get("ops_per_s") or 0.0,
+        f"{name}_elapsed_sec": _seconds(phase.get("elapsed_ms"), 1000.0),
+        f"{name}_lat_min": _seconds(latency.get("min"), 1e6),
+        f"{name}_lat_avg": _seconds(latency.get("avg"), 1e6),
+        f"{name}_lat_max": _seconds(latency.get("max"), 1e6),
+        f"{name}_histogram": dict(zip(histogram["buckets_us"], histogram["counts"])),
+        f"{name}_command": shlex.join(command) if command else "",
     }
-    complete = True
-    if json_requested(args):
-        complete = write_json_outputs(args, environments[args.input_dirs[0]])
-    try:
-        _run_text_report(args, environments)
-    except SystemExit as exit_request:
-        # With the JSON written, "nothing to plot" (exit 1) is not a failure.
-        if exit_request.code == 1 and json_requested(args):
-            eprint("No text report produced; the JSON export was written")
-        elif not (args.require_complete and not complete):
-            raise
-    if args.require_complete and not complete:
-        sys.exit(EXIT_INCOMPLETE)
 
 
-def _run_text_report(args, environments: Dict[str, dict]) -> None:
-    """Print the table report and write the plots."""
-    versions: List[Tuple[IterationMetrics, str]] = []
-
-    # Refuse results from different storage targets before parsing or writing.
-    target_sources = [
-        (input_dir, storage_target_from_env(env))
-        for input_dir, env in environments.items()
-    ]
-    target_label = guarded_report_target(target_sources, args.allow_mixed_targets)
-    # Mixing was explicitly allowed: keep same-coordinate results per target.
-    target_groups = (
-        _directories_by_target(environments)
-        if target_label.startswith(MIXED_PREFIX)
-        else None
+def iteration_metrics(
+    coordinates: Dict[str, Any], iteration: Dict[str, Any]
+) -> IterationMetrics:
+    """One complete iteration of a document execution."""
+    phases = {phase["phase"]: phase for phase in iteration["phases"]}
+    values: Dict[str, Any] = {}
+    for name, _ in _JSON_PHASES:
+        values.update(_phase_fields(name, phases.get(name)))
+    return IterationMetrics(
+        node_count=coordinates["nodes"],
+        thread_count=coordinates["tasks_per_node"],
+        datestamp=iteration["datestamp"],
+        iteration=iteration["iteration"],
+        **values,
     )
-    # Discover and parse files
-    file_pairs = discover_files(args.input_dirs, target_groups)
-    eprint(f"Found {len(file_pairs)} file pairs")
 
-    if not file_pairs:
-        eprint("No valid file pairs found")
-        sys.exit(1)
 
-    # Parse all file pairs
-    iterations: List[IterationMetrics] = []
-    for key, (csv_path, out_path) in file_pairs.items():
-        node_count, thread_count, datestamp, iteration = key[:4]
-        m = parse_file_pair(
-            csv_path, out_path, node_count, thread_count, datestamp, iteration
-        )
-        if m:
-            iterations.append(m)
-            versions.append((m, result_version(out_path)))
+def _complete_iterations(
+    document: Dict[str, Any], groups: List[Dict[str, Any]]
+) -> List[Tuple[Dict[str, Any], IterationMetrics, str]]:
+    """(group, metrics, version) of each complete iteration of the groups."""
+    by_id = {group["group_id"]: group for group in groups}
+    found = []
+    for execution in document["executions"]:
+        results = execution.get("results")
+        group = by_id.get(execution["group_id"])
+        if group is None or not results or execution["result_state"] == "not_reported":
+            continue
+        for iteration in results["iterations"]:
+            if iteration["state"] == "complete":
+                metrics = iteration_metrics(execution["coordinates"], iteration)
+                version = iteration.get("producer_version") or UNKNOWN_VERSION
+                found.append((group, metrics, version))
+    return found
 
-    eprint(f"Parsed {len(iterations)} iterations")
 
-    if not iterations:
+def _iteration_key(
+    group: Dict[str, Any], metrics: IterationMetrics, by_target: bool
+) -> Tuple[Any, ...]:
+    """(target or "", nodes, tasks, datestamp, iteration) of one iteration."""
+    space = (group["target"]["name"] or "") if by_target else ""
+    return (
+        space,
+        metrics.node_count,
+        metrics.thread_count,
+        metrics.datestamp,
+        metrics.iteration,
+    )
+
+
+def document_iterations(
+    document: Dict[str, Any], groups: List[Dict[str, Any]], by_target: bool = False
+) -> List[Tuple[IterationMetrics, str]]:
+    """Complete iterations of the groups' reported executions, with versions.
+
+    The same (nodes, tasks, datestamp, iteration) in two groups is ambiguous
+    and skipped, unless ``by_target`` and their targets differ.
+    """
+    found = _complete_iterations(document, groups)
+    first: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    ambiguous = set()
+    for group, metrics, _ in found:
+        key = _iteration_key(group, metrics, by_target)
+        seen = first.setdefault(key, group)
+        if seen is not group:
+            eprint(
+                f"Warning: Duplicate result pair for {key[1:]!r} in "
+                f"{seen.get('source')} and {group.get('source')}; skipping both"
+            )
+            ambiguous.add(key)
+    return [
+        (metrics, version)
+        for group, metrics, version in found
+        if _iteration_key(group, metrics, by_target) not in ambiguous
+    ]
+
+
+def document_configuration(groups: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Reportable mdtest settings across the groups' saved settings."""
+    values_by_key: Dict[str, List[str]] = {key: [] for key in MDTEST_CONFIG_KEYS}
+    for group in groups:
+        _collect_configuration_values(values_by_key, group.get("settings") or {})
+    return _render_configuration_values(values_by_key, "input directories")
+
+
+def _scale_filters(args) -> ScaleFilters:
+    return (
+        validate_integer_filter("--only-nodes", args.only_nodes),
+        validate_integer_filter("--only-threads", args.only_threads),
+    )
+
+
+def _mdtest_selection(
+    args, groups: Optional[FrozenSet[str]] = None
+) -> results_json.ReportSelection:
+    """What report.html shows: the mdtest executions the text tables show."""
+    nodes, threads = _scale_filters(args)
+    return results_json.ReportSelection(
+        kinds=frozenset(["mdtest"]),
+        groups=groups,
+        nodes=frozenset(nodes) if nodes else None,
+        threads=frozenset(threads) if threads else None,
+    )
+
+
+def _mdtest_groups(
+    document: Dict[str, Any], groups: Optional[FrozenSet[str]]
+) -> List[Dict[str, Any]]:
+    """The document's mdtest groups that ``groups`` (None: all) selects."""
+    return [
+        group
+        for group in document["groups"]
+        if group["kind"] == "mdtest" and (groups is None or group["group_id"] in groups)
+    ]
+
+
+def render_text_report(
+    document: Dict[str, Any],
+    args,
+    target_label: str,
+    output_dir: str,
+    groups: Optional[FrozenSet[str]] = None,
+) -> int:
+    """Print the table report and write the plots; 1 with nothing to report."""
+    selected = _mdtest_groups(document, groups)
+    versions = document_iterations(
+        document, selected, target_label.startswith(MIXED_PREFIX)
+    )
+    eprint(f"Found {len(versions)} complete iterations")
+    if not versions:
         eprint("No valid iterations parsed")
-        sys.exit(1)
-
-    # Aggregate
-    aggregated_dict = aggregate_metrics(iterations)
-    aggregated_metrics = list(aggregated_dict.values())
+        return 1
+    aggregated_metrics = list(
+        aggregate_metrics([metric for metric, _ in versions]).values()
+    )
     eprint(f"Aggregated into {len(aggregated_metrics)} (node, thread) groups")
-
-    # Apply filters
     if args.only_nodes or args.only_threads:
-        node_filter = (
-            parse_int_values_with_ranges(args.only_nodes) if args.only_nodes else None
-        )
-        thread_filter = (
-            parse_int_values_with_ranges(args.only_threads)
-            if args.only_threads
-            else None
-        )
-        aggregated_metrics = filter_metrics(
-            aggregated_metrics, node_filter, thread_filter
-        )
+        aggregated_metrics = filter_metrics(aggregated_metrics, *_scale_filters(args))
         eprint(f"After filtering: {len(aggregated_metrics)} groups")
-
     if not aggregated_metrics:
         eprint("No metrics remaining after filtering")
-        sys.exit(1)
-
-    # Determine output directory
-    output_dir = args.output_dir or args.input_dirs[0]
+        return 1
     os.makedirs(output_dir, exist_ok=True)
-
-    test_configuration = load_mdtest_configuration(args.input_dirs, environments)
-
-    # Print output
     produced_by = selected_versions(
         versions,
         aggregated_metrics,
@@ -2438,11 +2358,152 @@ def _run_text_report(args, environments: Dict[str, dict]) -> None:
         with_versions(print_terminal_table, produced_by, target=target_label),
         aggregated_metrics,
         normalize_to=args.normalize_to,
-        test_configuration=test_configuration,
+        test_configuration=document_configuration(selected),
     )
-
-    # Generate plots
     plot_all(aggregated_metrics, output_dir)
+    return 0
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+
+def _test_parse(test_parse: str) -> None:
+    base_path = test_parse.replace(".csv", "").replace(".out", "")
+    csv_path = base_path + ".csv"
+    out_path = base_path + ".out"
+
+    eprint(f"Testing parse of {csv_path} and {out_path}")
+
+    csv_data = parse_csv_file(csv_path)
+    eprint("\nCSV Data:")
+    for op, data in csv_data.items():
+        eprint(
+            f"  {op}: rate={data['rate']:.0f}, "
+            f"elapsed={format_elapsed_time(data['elapsed_sec'])}, "
+            f"lat_avg={data['lat_avg']*1000:.3f}ms"
+        )
+
+    out_data = parse_out_file(out_path)
+    eprint("\nOUT Data (histograms):")
+    for op, hist in out_data.items():
+        if hist:
+            eprint(f"  {op}: {len(hist)} buckets, total count={sum(hist.values())}")
+
+
+def _report_from_json(parser, args) -> int:
+    """Render text, plots and report.html from results documents.
+
+    Several documents render into per-document subdirectories
+    (``document_output_dir``) and share one report.html. A batch document
+    renders like a batch report (group reports and reports.txt).
+    """
+    documents, comparisons, groups = results_json.load_from_json_inputs(parser, args)
+    if not args.batch_group and any(
+        is_batch_document(loaded.data) for loaded in documents
+    ):
+        return report_documents(documents, args, "mdtest")
+    labels = [
+        guarded_document_target(
+            _mdtest_groups(loaded.data, groups), args.allow_mixed_targets
+        )
+        for loaded in documents
+    ]
+    if not args.batch_group:
+        try:
+            results_json.publish_report_html(
+                documents, args.output_dir, comparisons, _mdtest_selection(args, groups)
+            )
+        except ValueError as error:  # a comparison naming unknown sections
+            parser.error(str(error))
+    statuses = []
+    for number, (loaded, label) in enumerate(zip(documents, labels), 1):
+        document_dir = document_output_dir(args.output_dir, number, len(documents))
+        # Valid by now, so the previous report can go, as a render that finds
+        # nothing must not leave it behind.
+        remove_stale_report(document_dir)
+        statuses.append(
+            render_text_report(
+                loaded.data,
+                # Options not given are the document's recorded ones.
+                resolve_report_options(args, "mdtest", recorded_options(loaded.data)),
+                label,
+                document_dir,
+                groups,
+            )
+        )
+    incomplete = args.require_complete and not all(
+        results_json.document_is_complete(loaded.data) for loaded in documents
+    )
+    status = EXIT_INCOMPLETE if incomplete else 0
+    # A document with nothing to report is fine beside ones that have some,
+    # and in a batch group whose filters matched nothing.
+    if 0 not in statuses and not args.batch_group:
+        eprint("No text report produced")
+        return status or 1
+    return status
+
+
+def _parse_pool(args):
+    """The pool for parse tasks; inline within a batch, which has its own."""
+    if args.results_fragment:
+        return contextlib.nullcontext(InlineExecutor())
+    return report_pool()
+
+
+def main() -> None:
+    """Script entry point."""
+    parser = extract_mdtest_elbencho_parser()
+    args = parser.parse_args()
+    try:
+        validate_analysis_arguments(args)
+        if args.from_json:
+            sys.exit(_report_from_json(parser, args))
+        args = resolve_report_options(args, "mdtest")
+        validate_json_arguments(args)
+        route_batch_report(args, "mdtest", sys.argv[1:])
+        comparisons = results_json.load_comparisons(args.comparisons)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+
+    if args.test_parse:
+        _test_parse(args.test_parse)
+        return
+
+    environments = {
+        input_dir: load_env_used_yaml(input_dir)
+        for input_dir in unique_inputs(args.input_dirs)
+    }
+    # Refuse results from different storage targets before parsing or writing.
+    target_label = guarded_report_target(
+        [
+            (input_dir, storage_target_from_env(env))
+            for input_dir, env in environments.items()
+        ],
+        args.allow_mixed_targets,
+    )
+    try:
+        with _parse_pool(args) as pool:
+            document = write_json_outputs(args, environments, comparisons, pool)
+    except ValueError as error:  # a comparison naming unknown sections
+        parser.error(str(error))
+    incomplete = (
+        args.require_complete
+        and not args.results_fragment
+        and not results_json.document_is_complete(document)
+    )
+    status = render_text_report(
+        document, args, target_label, args.output_dir or args.input_dirs[0]
+    )
+    if status:
+        eprint("No text report produced; results.json was written")
+        # An empty report still fails a plain run; in a batch the group's
+        # fragment records why.
+        if not args.results_fragment and not incomplete:
+            sys.exit(1)
+    if incomplete:
+        sys.exit(EXIT_INCOMPLETE)
 
 
 if __name__ == "__main__":

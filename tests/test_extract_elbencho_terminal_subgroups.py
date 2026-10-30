@@ -17,9 +17,7 @@
 
 """Tests for extract-elbencho terminal table subgrouping."""
 
-import tempfile
 import unittest
-from pathlib import Path
 
 from tests.extract_elbencho_test_support import load_extract_elbencho_module
 
@@ -34,7 +32,7 @@ _metric_should_show_csv_phase_dur = getattr(
     _EXTRACT_MOD, "_metric_should_show_csv_phase_dur"
 )
 parse_benchmark_filename = _EXTRACT_MOD.parse_benchmark_filename
-discover_live_csv_files = _EXTRACT_MOD.discover_live_csv_files
+live_file_metadata = getattr(_EXTRACT_MOD, "_live_file_metadata")
 
 
 def _metric(**kwargs) -> ElbenchoMetrics:
@@ -122,7 +120,7 @@ class TestTerminalTableSubgroups(unittest.TestCase):
 
 
 class TestMetricShouldShowCsvPhaseDur(unittest.TestCase):
-    """_metric_should_show_csv_phase_dur (Dur column in text/markdown tables)."""
+    """_metric_should_show_csv_phase_dur (Dur column in text tables)."""
 
     def test_single_big_bio_shows_dur_even_with_timelimit_in_csv(self):
         """BIO single-big read: wall time is one pass, not timelimit — show Dur."""
@@ -189,25 +187,18 @@ class TestSortedUniqueDatestampPathPairs(unittest.TestCase):
         )
 
 
-class TestLiveCSVDiscovery(unittest.TestCase):
-    """Live CSV discovery and sibling benchmark association."""
+class TestLiveCSVMetadata(unittest.TestCase):
+    """Live CSV names give the sibling benchmark's parameters."""
 
-    def test_discovers_only_parseable_live_csv_names(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            valid = (
-                Path(temp_dir)
-                / "elbencho-r64K-c_004-s_008-d_002_20260729Z120000.live.csv"
-            )
-            invalid = Path(temp_dir) / "unrelated.live.csv"
-            valid.write_text("Phase,RuntimeMS\n", encoding="utf-8")
-            invalid.write_text("Phase,RuntimeMS\n", encoding="utf-8")
-            discovered = discover_live_csv_files(temp_dir)
-        self.assertEqual(len(discovered), 1)
-        self.assertEqual(discovered[0].path, str(valid))
-        self.assertEqual(discovered[0].io_size, "r64K")
-        self.assertEqual(discovered[0].nodes, 4)
-        self.assertEqual(discovered[0].threads, 8)
-        self.assertEqual(discovered[0].io_depth, 2)
+    def test_only_parseable_live_csv_names_have_parameters(self):
+        path = "/mnt/test/elbencho-r64K-c_004-s_008-d_002_20260729Z120000.live.csv"
+        metadata = live_file_metadata(path)
+        self.assertEqual(metadata.path, path)
+        self.assertEqual(metadata.io_size, "r64K")
+        self.assertEqual(metadata.nodes, 4)
+        self.assertEqual(metadata.threads, 8)
+        self.assertEqual(metadata.io_depth, 2)
+        self.assertIsNone(live_file_metadata("/mnt/test/unrelated.live.csv"))
 
 
 class TestBenchmarkFilenameParsing(unittest.TestCase):

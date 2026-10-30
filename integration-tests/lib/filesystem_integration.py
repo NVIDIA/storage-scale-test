@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import ipaddress
 import json
 import logging
@@ -2964,7 +2965,6 @@ def _assert_live_report(
             result,
             "--output-dir",
             json_dir,
-            "--to-json",
         ],
         timeout=300,
         check=False,
@@ -2973,7 +2973,7 @@ def _assert_live_report(
         completed.stdout + completed.stderr, encoding="utf-8"
     )
     if completed.returncode:
-        problems.append("extract-filesystem.py --to-json failed")
+        problems.append("extract-filesystem.py failed")
     else:
         document = json.loads((json_dir / "results.json").read_text("utf-8"))
         problems.extend(_live_object_problems(document))
@@ -6191,7 +6191,7 @@ def _mixed_batch_report(
 ) -> None:
     """Exercise the unified front door and keep repeated coordinates separate.
 
-    The report index must also name each group's storage target.
+    report.html must also name each group's storage target.
     """
     rows = _mixed_batch_group_rows(fixture, runtime)
     reports = _batch_report(
@@ -6200,9 +6200,8 @@ def _mixed_batch_report(
         result,
         log_dir,
         tuple(row[0] for row in rows),
-        results_json=True,
     )
-    assert_report_index_targets((reports / "index.md").read_text("utf-8"), rows)
+    assert_report_html_targets((reports / "report.html").read_text("utf-8"), rows)
     _assert_batch_results_json(reports / "results.json", rows)
 
 
@@ -6218,7 +6217,7 @@ def _assert_batch_results_json(path: Path, rows: tuple[GroupRow, ...]) -> None:
     problems = []
     if document.get("schema") != "storage-scale-test/filesystem-batch-results":
         problems.append(f"schema {document.get('schema')!r}")
-    if document.get("schema_version") != "1.0":
+    if not str(document.get("schema_version")).startswith("1."):
         problems.append(f"schema_version {document.get('schema_version')!r}")
     if document.get("batch_outcome", {}).get("complete") is not True:
         problems.append("batch_outcome.complete is not true")
@@ -6266,13 +6265,8 @@ def _batch_report(
     log_dir: Path,
     identities: tuple[str, ...],
     output_name: str = "reports-mixed-batch",
-    *,
-    results_json: bool = False,
 ) -> Path:
-    """Run the unified report front door and require one report per group.
-
-    *results_json* also writes ``results.json`` into the report directory.
-    """
+    """Run the unified report front door and require one report per group."""
     reports = log_dir / output_name
     completed = runner.run(
         [
@@ -6280,7 +6274,6 @@ def _batch_report(
             result,
             "--output-dir",
             reports,
-            *(("--to-json",) if results_json else ()),
         ],
         timeout=600,
         check=False,
@@ -6288,14 +6281,13 @@ def _batch_report(
     (log_dir / "extract-filesystem.log").write_text(
         completed.stdout + completed.stderr, encoding="utf-8"
     )
-    if completed.returncode or not (reports / "index.md").is_file():
+    if completed.returncode or not (reports / "report.html").is_file():
         raise IntegrationTestError(
             "mixed batch reporting failed; see extract-filesystem.log"
         )
-    index = (reports / "index.md").read_text(encoding="utf-8")
     for identity in identities:
         report = reports / "groups" / identity / "report.txt"
-        if identity not in index or not report.is_file() or not report.stat().st_size:
+        if not report.is_file() or not report.stat().st_size:
             raise IntegrationTestError(
                 f"mixed batch group {identity} lacks its separate report"
             )
@@ -6789,23 +6781,19 @@ def assert_batch_group_publication(output: str, group_id: str, name: str) -> Non
         )
 
 
-def assert_report_index_targets(index: str, rows: tuple[GroupRow, ...]) -> None:
-    """Require the batch report index's Target column to name each group's target.
+def assert_report_html_targets(page: str, rows: tuple[GroupRow, ...]) -> None:
+    """Require a report.html section heading naming each group's target.
 
-    Target names here contain no Markdown-escaped characters, so each row begins
-    ``| <group> | <kind> | <name> |``.
+    Headings read ``<h2>N. <target> — <title> <span class="meta">group <id> ·``.
     """
-    if "| Group | Kind | Target |" not in index:
-        raise IntegrationTestError("report index lacks its Target column")
     for group_id, kind, name in rows:
-        row = re.compile(
-            rf"^\| {re.escape(group_id)} \| {re.escape(kind)} \| "
-            rf"{re.escape(name)} \|",
-            re.MULTILINE,
+        heading = re.compile(
+            rf"<h2>\d+\. {re.escape(html.escape(name))} — [^<]*"
+            rf'<span class="meta">group {re.escape(group_id)} '
         )
-        if not row.search(index):
+        if not heading.search(page):
             raise IntegrationTestError(
-                f"report index has no row for group {group_id} ({kind}) naming "
+                f"report.html has no section for group {group_id} ({kind}) naming "
                 f"target {name!r}"
             )
 
@@ -7943,8 +7931,8 @@ def _finish_multi_target(
         tuple(group.group_id for group in expected),
         "reports-multi-target",
     )
-    assert_report_index_targets(
-        (report_root / "index.md").read_text(encoding="utf-8"),
+    assert_report_html_targets(
+        (report_root / "report.html").read_text(encoding="utf-8"),
         tuple((group.group_id, group.kind, group.target.name) for group in expected),
     )
 

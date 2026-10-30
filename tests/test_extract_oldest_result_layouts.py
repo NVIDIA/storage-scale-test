@@ -207,7 +207,7 @@ def test_prebatch_io_directory_exports_read_from_sweep(tmp_path, monkeypatch, ca
     result = write_prebatch_io_dir(tmp_path)
     output = tmp_path / "out"
 
-    assert _run_io(monkeypatch, result, "--to-json", "--output-dir", output) == 0
+    assert _run_io(monkeypatch, result, "--output-dir", output) == 0
     document = _document(output / "results.json")
 
     assert "READ - Seq - DirectIO" in capsys.readouterr().out
@@ -250,7 +250,7 @@ def test_prebatch_io_settings_come_from_env_used_yaml(tmp_path, monkeypatch):
         tmp_path, single_big_file=1, all_nodes_all_data=1, run_to_completion=1
     )
 
-    assert _run_io(monkeypatch, result, "--to-json") == 0
+    assert _run_io(monkeypatch, result) == 0
     document = _document(result / "results.json")
 
     for execution in document["executions"]:
@@ -264,7 +264,7 @@ def test_empty_executions_directory_is_no_io_ledger(tmp_path, monkeypatch):
     result = write_prebatch_io_dir(tmp_path)
     (result / "executions").mkdir()
 
-    assert _run_io(monkeypatch, result, "--to-json") == 0
+    assert _run_io(monkeypatch, result) == 0
     document = _document(result / "results.json")
 
     assert _codes(document) == _NO_LEDGER
@@ -274,7 +274,7 @@ def test_empty_executions_directory_is_no_io_ledger(tmp_path, monkeypatch):
 def test_prebatch_mdtest_directory_exports(tmp_path, capsys):
     result = write_prebatch_mdtest_dir(tmp_path)
 
-    assert _run_mdtest(result, "--to-json") == 0
+    assert _run_mdtest(result) == 0
     document = _document(result / "results.json")
 
     assert _codes(document) == _NO_LEDGER
@@ -301,7 +301,7 @@ def test_empty_executions_directory_is_no_mdtest_ledger(tmp_path, capsys):
     result = write_prebatch_mdtest_dir(tmp_path)
     (result / "executions").mkdir()
 
-    assert _run_mdtest(result, "--to-json") == 0
+    assert _run_mdtest(result) == 0
     document = _document(result / "results.json")
 
     captured = capsys.readouterr()

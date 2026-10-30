@@ -21,6 +21,37 @@ Notable changes in each release. Versions follow [Semantic Versioning](https://s
 see [docs/VERSIONING.md](docs/VERSIONING.md). Each release's notes are its
 section below.
 
+## Unreleased
+
+### Added
+
+- Every filesystem report writes `report.html`: one file with charts, sortable
+  tables, per-run live detail, and comparisons of sections that differ in one
+  setting. Charts load Chart.js from a pinned CDN URL; tables work offline.
+  See [docs/HTML_REPORT.md](docs/HTML_REPORT.md).
+- `--from-json PATH...` renders a report from one or more `results.json`
+  documents, with their recorded options unless given; `--comparisons FILE`
+  forces which sections are compared.
+- `results.json` is schema 1.1, adding the values the text reports read
+  (live domains beyond write/read, producer versions, mdtest commands,
+  settings text).
+
+### Changed (breaking)
+
+- Filesystem reports always write `results.json` (with `--live-detail full`
+  by default), `report.html`, `report.txt`, and PNGs. `--to-json` and
+  `--markdown` are removed from the filesystem reporters; netbench and Warp
+  keep `--markdown`.
+- Several input directories need `--output-dir`, which must not be an input.
+- A batch's `reports/report.html` replaces `reports/index.md`.
+
+### Fixed
+
+- Older result layouts report correctly: an empty `executions/` directory
+  means no ledger, and a pre-batch `env_used.yaml` sets the file layout.
+- Metadata reports reject a malformed `--only-nodes` or `--only-threads`
+  (exit 2) instead of warning and reporting unfiltered.
+
 ## [2.1.0] - 2026-10-29
 
 ### Added

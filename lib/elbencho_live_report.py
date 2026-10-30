@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
+    Callable,
     Dict,
     Iterable,
     Iterator,
@@ -146,13 +147,16 @@ class LiveFileMetadata:
     threads: int
     io_depth: int
     datestamp: str
+    # Keeps outputs apart when several inputs have identically named runs.
+    name_prefix: str = ""
 
     @property
     def stem(self) -> str:
-        """Live CSV basename without the .live.csv suffix."""
+        """Live CSV basename without the .live.csv suffix, after any prefix."""
         suffix = ".live.csv"
         name = Path(self.path).name
-        return name[: -len(suffix)] if name.endswith(suffix) else Path(name).stem
+        base = name[: -len(suffix)] if name.endswith(suffix) else Path(name).stem
+        return self.name_prefix + base
 
 
 class P2Median:
@@ -368,10 +372,15 @@ class DomainAnalysis:
 
 @dataclass
 class LiveAnalysis:
-    """Analysis result for one live CSV file."""
+    """Analysis result for one live CSV file.
+
+    ``rows`` replays the parsed rows for every later pass; None re-reads
+    ``metadata.path``.
+    """
 
     metadata: LiveFileMetadata
     domains: Dict[LiveDomainKey, DomainAnalysis]
+    rows: Optional[Callable[[], Iterator["ParsedRow"]]] = None
 
 
 @dataclass
@@ -538,36 +547,45 @@ def _total_rate_jump_restarted(
     return implied_mib_s > restart_threshold
 
 
-def analyze_live_csv(metadata: LiveFileMetadata) -> LiveAnalysis:
-    """Stream a live CSV once and return bounded first-pass analysis."""
+def iter_live_rows(analysis: LiveAnalysis) -> Iterator[ParsedRow]:
+    """Stream the analysis's parsed rows from its source, once per call."""
+    if analysis.rows is not None:
+        yield from analysis.rows()
+        return
+    path = analysis.metadata.path
+    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+        reader, columns = live_csv_reader(handle, path)
+        yield from iter_parsed_rows(reader, columns)
+
+
+def analyze_live_csv(
+    metadata: LiveFileMetadata,
+    rows: Optional[Callable[[], Iterator[ParsedRow]]] = None,
+) -> LiveAnalysis:
+    """Stream a live CSV (or ``rows``) once and return bounded first-pass analysis."""
+    analysis = LiveAnalysis(metadata=metadata, domains={}, rows=rows)
     states: Dict[LiveDomainKey, _DomainState] = {}
-    with open(metadata.path, "r", encoding="utf-8-sig", newline="") as handle:
-        reader, columns = live_csv_reader(handle, metadata.path)
-        for line_number, parsed in enumerate(
-            iter_parsed_rows(reader, columns), start=2
-        ):
-            key = parsed.key
-            state = states.get(key)
-            if state is None:
-                state = states[key] = _DomainState(analysis=DomainAnalysis(key=key))
-            _advance_buffer(state, parsed.runtime_ms, parsed.iso_timestamp)
-            if parsed.rank == TOTAL_RANK:
-                buffer = state.buffer
-                buffer.aggregate_mib_s = parsed.mib_s
-                buffer.aggregate_iops = parsed.iops
-                buffer.io_latency_us = parsed.io_latency_us
-                buffer.entries_latency_us = parsed.entries_latency_us
-                continue
-            if parsed.client is None or parsed.done_bytes is None:
-                _record_malformed(state.analysis.diagnostics, line_number)
-                continue
-            state.buffer.client_rows[parsed.client] = parsed.done_bytes
+    for line_number, parsed in enumerate(iter_live_rows(analysis), start=2):
+        key = parsed.key
+        state = states.get(key)
+        if state is None:
+            state = states[key] = _DomainState(analysis=DomainAnalysis(key=key))
+        _advance_buffer(state, parsed.runtime_ms, parsed.iso_timestamp)
+        if parsed.rank == TOTAL_RANK:
+            buffer = state.buffer
+            buffer.aggregate_mib_s = parsed.mib_s
+            buffer.aggregate_iops = parsed.iops
+            buffer.io_latency_us = parsed.io_latency_us
+            buffer.entries_latency_us = parsed.entries_latency_us
+            continue
+        if parsed.client is None or parsed.done_bytes is None:
+            _record_malformed(state.analysis.diagnostics, line_number)
+            continue
+        state.buffer.client_rows[parsed.client] = parsed.done_bytes
     for state in states.values():
         _flush_interval(state)
-    return LiveAnalysis(
-        metadata=metadata,
-        domains={key: state.analysis for key, state in states.items()},
-    )
+    analysis.domains = {key: state.analysis for key, state in states.items()}
+    return analysis
 
 
 def _record_malformed(diagnostics: Counter, line_number: int) -> None:
@@ -595,21 +613,19 @@ def collect_selected_client_detail(
     interval_count = len(domain.interval_times)
     rates = {client: [INVALID_RATE] * interval_count for client in selected}
     previous: Dict[LiveClientId, PreviousSample] = {}
-    with open(analysis.metadata.path, "r", encoding="utf-8-sig", newline="") as handle:
-        reader, columns = live_csv_reader(handle, analysis.metadata.path)
-        for parsed in iter_parsed_rows(reader, columns):
-            client = parsed.client
-            if client not in selected_set or parsed.key != domain.key:
-                continue
-            done_bytes = parsed.done_bytes
-            interval = domain.runtime_to_interval.get(parsed.runtime_ms)
-            if done_bytes is None or interval is None:
-                continue
-            prior = previous.get(client)
-            rate = derive_rate(prior, done_bytes, parsed.runtime_ms, interval)
-            if rate is not None:
-                rates[client][interval] = rate
-            previous[client] = PreviousSample(done_bytes, parsed.runtime_ms, interval)
+    for parsed in iter_live_rows(analysis):
+        client = parsed.client
+        if client not in selected_set or parsed.key != domain.key:
+            continue
+        done_bytes = parsed.done_bytes
+        interval = domain.runtime_to_interval.get(parsed.runtime_ms)
+        if done_bytes is None or interval is None:
+            continue
+        prior = previous.get(client)
+        rate = derive_rate(prior, done_bytes, parsed.runtime_ms, interval)
+        if rate is not None:
+            rates[client][interval] = rate
+        previous[client] = PreviousSample(done_bytes, parsed.runtime_ms, interval)
     return SelectedClientDetail(list(selected), rates)
 
 

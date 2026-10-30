@@ -37,9 +37,20 @@ from lib.filesystem_batch import (  # pylint: disable=wrong-import-position
     is_batch_directory,
     reject_batch_descendant_inputs,
     report_batch,
+    report_documents,
 )
 from lib.filesystem_report_options import (  # pylint: disable=wrong-import-position
+    COMPARISONS_FLAG,
+    check_replay_options,
     options_by_kind,
+    validate_from_json,
+)
+from lib.filesystem_results import (  # pylint: disable=wrong-import-position
+    load_comparisons,
+)
+from lib.results_document import (  # pylint: disable=wrong-import-position
+    load_document,
+    recorded_options,
 )
 
 
@@ -48,6 +59,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = extract_filesystem_parser()
     args = parser.parse_args(argv)
     try:
+        load_comparisons(args.comparisons)
+        if args.from_json:
+            return _report_document(args)
         if args.results_dir:
             reject_batch_descendant_inputs([args.results_dir])
         if args.results_dir and is_batch_directory(args.results_dir):
@@ -64,6 +78,16 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as error:
         parser.error(str(error))
     return 1
+
+
+def _report_document(args: argparse.Namespace) -> int:
+    """Render results documents (see ``report_documents``)."""
+    validate_from_json(
+        args.from_json, [args.results_dir] if args.results_dir else [], args.output_dir
+    )
+    documents = [load_document(path) for path in args.from_json]
+    check_replay_options(args, [recorded_options(loaded.data) for loaded in documents])
+    return report_documents(documents, args, args.kind)
 
 
 def _report_ordinary(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
@@ -87,6 +111,8 @@ def _report_ordinary(parser: argparse.ArgumentParser, args: argparse.Namespace) 
         command.append(args.results_dir)
     if args.output_dir:
         command.extend(["--output-dir", args.output_dir])
+    if args.comparisons:
+        command.extend([COMPARISONS_FLAG, args.comparisons])
     return subprocess.run([*command, *options], check=False).returncode
 
 

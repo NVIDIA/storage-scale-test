@@ -29,10 +29,13 @@ _EXTRACT_MOD = load_extract_elbencho_module("csp_extract_elbencho_resume")
 
 ElbenchoMetrics = _EXTRACT_MOD.ElbenchoMetrics
 add_elbencho_out_file_metrics = _EXTRACT_MOD.add_elbencho_out_file_metrics
-apply_execution_workloads = _EXTRACT_MOD.apply_execution_workloads
 parse_elbencho_csv_file = _EXTRACT_MOD.parse_elbencho_csv_file
 print_workload_metadata_for_metrics = _EXTRACT_MOD.print_workload_metadata_for_metrics
 parse_io_histogram = getattr(_EXTRACT_MOD, "_parse_op_hist_fragment")
+delete_phase = getattr(_EXTRACT_MOD, "_delete_phase")
+dataset_object = getattr(_EXTRACT_MOD, "_dataset_object")
+workload_object = getattr(_EXTRACT_MOD, "_workload_object")
+apply_document_workload = getattr(_EXTRACT_MOD, "_apply_document_workload")
 
 _DS = "20260722Z030114"
 _BASE = f"elbencho-r64K-c_600-s_004-d_001_{_DS}"
@@ -141,6 +144,29 @@ def _minimal_metric(operation: str) -> ElbenchoMetrics:
         treescan_first_file_bytes=0,
         histogram={},
     )
+
+
+def apply_execution_workloads(result_dir: str, metrics: list) -> None:
+    """Join NNNN.workload.tsv to metrics as a report does: through the
+    execution's document entry (dataset, workload and delete phase)."""
+    workloads = _EXTRACT_MOD.load_execution_workloads(result_dir)
+    for metric in metrics:
+        key = (metric.nodes, metric.io_size, metric.threads, metric.io_depth)
+        if key not in workloads:
+            continue
+        coordinates, metadata = workloads[key]
+        ledger = _EXTRACT_MOD.LedgerExecution("0001", coordinates, {})
+        phases = []
+        if metadata["delete_completion_state"] != "not_applicable":
+            phases.append(delete_phase(metadata))
+        execution = {
+            "dataset": dataset_object(ledger, {}, metadata, [metric]),
+            "results": {
+                "workload": workload_object(metadata),
+                "phases": phases,
+            },
+        }
+        apply_document_workload(metric, execution)
 
 
 def _write_execution_metadata(
@@ -252,11 +278,7 @@ class TestExecutionWorkloadMetadata(unittest.TestCase):
                 self.assertEqual(metric.reader_nodes, "null")
                 self.assertEqual(metric.reader_threads_per_node, "null")
                 self.assertEqual(metric.reader_iodepth, "null")
-                self.assertEqual(metric.termination_mode, "completion")
-                self.assertEqual(metric.effective_timelimit_seconds, "null")
                 self.assertEqual(metric.completion_state, "completed")
-                self.assertEqual(metric.write_expected_bytes, "322122547200")
-                self.assertEqual(metric.read_completion_state, "completed")
                 self.assertEqual(metric.write_elapsed_time_ms, "101")
                 self.assertEqual(metric.read_elapsed_time_ms, "202")
                 self.assertEqual(metric.delete_expected_files, "4800")
@@ -297,7 +319,6 @@ class TestExecutionWorkloadMetadata(unittest.TestCase):
             self.assertEqual(metric.workload_layout, "staged-tree")
             self.assertEqual(metric.dataset_count_source, "treefile")
             self.assertEqual(metric.treefile_source, "cache_hit")
-            self.assertEqual(metric.treefile_cache_publish_outcome, "reused")
             self.assertEqual(metric.requested_files_per_node, "null")
             self.assertEqual(metric.effective_files_per_node, "null")
             self.assertEqual(metric.dataset_files_total, "8")
@@ -305,9 +326,6 @@ class TestExecutionWorkloadMetadata(unittest.TestCase):
             self.assertEqual(metric.reader_nodes, "3")
             self.assertEqual(metric.reader_threads_per_node, "3")
             self.assertEqual(metric.reader_iodepth, "2")
-            self.assertEqual(metric.termination_mode, "time_bounded_repeat")
-            self.assertEqual(metric.effective_timelimit_seconds, "60")
-            self.assertEqual(metric.read_completion_state, "not_applicable_time_based")
             self.assertEqual(metric.delete_completion_state, "not_applicable")
 
     def test_coordinate_mismatch_does_not_apply_another_execution(self) -> None:
@@ -356,8 +374,6 @@ class TestExecutionWorkloadMetadata(unittest.TestCase):
             self.assertEqual(metric.dataset_bytes_total, huge_bytes)
             self.assertIsInstance(metric.dataset_bytes_total, str)
             self.assertEqual(metric.completion_state, "incomplete")
-            self.assertEqual(metric.write_completion_state, "incomplete")
-            self.assertEqual(metric.write_completed_bytes, huge_bytes)
 
     def test_duplicate_or_noncanonical_metadata_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -27,6 +27,7 @@ from pathlib import Path
 from unittest import mock
 
 from tests.test_extract_mdtest_elbencho import (
+    _BENCH_PATH,
     _DENSE_CSV,
     _DENSE_OUT,
     _EXTRACT_MOD,
@@ -117,6 +118,17 @@ class MdtestResultsJsonCase(unittest.TestCase):
         out.flush()
         return code, out_bytes.getvalue().decode("utf-8"), err.getvalue()
 
+    def second_results(self) -> Path:
+        """A second complete input directory next to the first."""
+        other = self.root / "results2"
+        other.mkdir()
+        (other / "env_used.yaml").write_text(_ENV_USED, encoding="utf-8")
+        for iteration in (1, 2, 3):
+            stem = _stem(2, 8, iteration)
+            (other / f"{stem}.csv").write_text(_DENSE_CSV, encoding="utf-8")
+            (other / f"{stem}.out").write_text(_DENSE_OUT, encoding="utf-8")
+        return other
+
     def fragment(self, *extra) -> dict:
         path = self.root / "fragment.json"
         code, _, err = self.run_main(self.results, "--results-fragment", path, *extra)
@@ -203,6 +215,34 @@ class TestFragment(MdtestResultsJsonCase):
             },
         )
         self.assertEqual(create["latency_method"], "pooled_histogram_bucket")
+
+    def test_phase_commands_are_exported_as_recorded(self) -> None:
+        self.add_complete()
+        phases = self.by_id(self.fragment())["0001"]["results"]["iterations"][0][
+            "phases"
+        ]
+        commands = {phase["phase"]: phase["command"] for phase in phases}
+        self.assertEqual(commands["create"][-1], _BENCH_PATH)
+        self.assertEqual(commands["create"][commands["create"].index("-N") + 1], "1250")
+        self.assertIn("-w", commands["create"])
+        self.assertIn("--stat", commands["stat"])
+        self.assertIn("-F", commands["delete"])
+
+    def test_producer_version_is_per_iteration(self) -> None:
+        self.add_complete()
+        stem = _stem(1, 8, 1)
+        (self.results / f"{stem}.out.project-version").write_text(
+            "2.3.4\n", encoding="utf-8"
+        )
+        entry = self.by_id(self.fragment())["0001"]
+        iterations = entry["results"]["iterations"]
+        self.assertEqual(
+            [item["producer_version"] for item in iterations], ["2.3.4", None, None]
+        )
+        self.assertIn(
+            f"{stem}.out.project-version",
+            [record["path"] for record in entry["result_files"]],
+        )
 
     def test_incomplete_iteration_is_kept_and_excluded_from_aggregate(self) -> None:
         self.add_execution("0001", 1, 8)
@@ -292,12 +332,15 @@ class TestFragment(MdtestResultsJsonCase):
 
 
 class TestOrdinaryDocument(MdtestResultsJsonCase):
-    """--to-json on an ordinary result directory."""
+    """The results document of an ordinary result directory."""
 
     def test_default_path_is_results_json_in_output_dir(self) -> None:
         self.add_complete()
-        code, _, err = self.run_main(self.results, "--to-json")
+        code, _, err = self.run_main(self.results)
         self.assertIn(code, (0, None), err)
+        self.assertTrue((self.results / "report.html").is_file())
+        self.assertIn("Results document saved as", err)
+        self.assertIn("HTML report saved as", err)
         document = json.loads((self.results / "results.json").read_text("utf-8"))
         self.assertEqual(
             document["schema"], "storage-scale-test/filesystem-batch-results"
@@ -306,30 +349,66 @@ class TestOrdinaryDocument(MdtestResultsJsonCase):
         self.assertEqual(document["executions"][0]["ledger_state"], "success")
         self.assertTrue(document["batch_outcome"]["complete"])
 
+    def test_document_records_rendering_options_and_settings_text(self) -> None:
+        self.add_complete()
+        code, _, err = self.run_main(self.results, "--normalize-to", "4")
+        self.assertIn(code, (0, None), err)
+        document = json.loads((self.results / "results.json").read_text("utf-8"))
+        self.assertEqual(document["generator"]["options"]["normalize_to"], 4)
+        self.assertEqual(document["groups"][0]["settings_text"], _ENV_USED)
+
     def test_output_dir_receives_the_document(self) -> None:
         self.add_complete()
         output = self.root / "out"
-        code, _, err = self.run_main(self.results, "--to-json", "--output-dir", output)
+        code, _, err = self.run_main(self.results, "--output-dir", output)
         self.assertIn(code, (0, None), err)
         self.assertTrue((output / "results.json").is_file())
+        self.assertTrue((output / "report.html").is_file())
         self.assertFalse((self.results / "results.json").exists())
 
-    def test_to_json_takes_no_path(self) -> None:
+    def test_to_json_is_no_longer_accepted(self) -> None:
         self.add_complete()
-        code, _, _ = self.run_main(f"--to-json={self.root / 'doc.json'}", self.results)
+        code, _, _ = self.run_main(self.results, "--to-json")
         self.assertEqual(code, 2)
 
-    def test_requires_exactly_one_input_dir(self) -> None:
+    def test_several_inputs_need_an_output_dir(self) -> None:
         self.add_complete()
-        other = self.root / "other"
-        other.mkdir()
-        code, _, err = self.run_main(self.results, other, "--to-json")
+        other = self.second_results()
+        code, _, err = self.run_main(self.results, other)
         self.assertEqual(code, 2, err)
+        self.assertIn("--output-dir is required", err)
 
-    def test_require_complete_without_to_json_is_a_usage_error(self) -> None:
+    def test_output_dir_must_not_be_an_input(self) -> None:
         self.add_complete()
+        other = self.second_results()
+        code, _, err = self.run_main(self.results, other, "--output-dir", other)
+        self.assertEqual(code, 2, err)
+        self.assertIn("choose a separate directory", err)
+
+    def test_several_inputs_make_one_document_with_a_group_each(self) -> None:
+        self.add_complete()
+        other = self.second_results()
+        output = self.root / "out"
+        code, _, err = self.run_main(self.results, other, "--output-dir", output)
+        self.assertIn(code, (0, None), err)
+        document = json.loads((output / "results.json").read_text("utf-8"))
+        groups = document["groups"]
+        self.assertEqual([g["group_id"] for g in groups], ["0001", "0002"])
+        self.assertEqual(
+            [g["source"] for g in groups],
+            [str(self.results.resolve()), str(other.resolve())],
+        )
+        self.assertEqual(document["batch"]["root"], str(self.root.resolve()))
+        self.assertEqual(
+            [g["output_relative"] for g in groups], [self.results.name, other.name]
+        )
+        self.assertTrue((output / "report.html").is_file())
+
+    def test_require_complete_alone_exits_3_when_incomplete(self) -> None:
+        self.add_execution("0001", 1, 8)
+        self.add_iteration(1, 8, 1)
         code, _, _ = self.run_main(self.results, "--require-complete")
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 3)
 
     def test_non_finite_elapsed_makes_the_iteration_incomplete(self) -> None:
         self.add_execution("0001", 1, 8)
@@ -340,7 +419,7 @@ class TestOrdinaryDocument(MdtestResultsJsonCase):
         fields[18] = "nan"  # time ms [last] of the WRITE (create) row
         rows[1] = ",".join(fields)
         self.add_iteration(1, 8, 3, csv_text="\n".join(rows) + "\n")
-        code, _, err = self.run_main(self.results, "--to-json")
+        code, _, err = self.run_main(self.results)
         self.assertIn(code, (0, None), err)
         document = json.loads((self.results / "results.json").read_text("utf-8"))
         iteration = document["executions"][0]["results"]["iterations"][2]
@@ -350,13 +429,13 @@ class TestOrdinaryDocument(MdtestResultsJsonCase):
 
     def test_require_complete_passes_for_complete_results(self) -> None:
         self.add_complete()
-        code, _, err = self.run_main(self.results, "--to-json", "--require-complete")
+        code, _, err = self.run_main(self.results, "--require-complete")
         self.assertIn(code, (0, None), err)
 
     def test_require_complete_exits_3_after_writing_partial_results(self) -> None:
         self.add_execution("0001", 1, 8)
         self.add_iteration(1, 8, 1)
-        code, _, _ = self.run_main(self.results, "--to-json", "--require-complete")
+        code, _, _ = self.run_main(self.results, "--require-complete")
         self.assertEqual(code, 3)
         document = json.loads((self.results / "results.json").read_text("utf-8"))
         self.assertFalse(document["batch_outcome"]["complete"])
@@ -366,11 +445,69 @@ class TestOrdinaryDocument(MdtestResultsJsonCase):
         documents = []
         target = self.results / "results.json"
         for _ in range(2):
-            self.run_main(self.results, "--to-json")
+            self.run_main(self.results)
             document = json.loads(target.read_text("utf-8"))
             document["generator"].pop("generated_at", None)
             documents.append(document)
         self.assertEqual(documents[0], documents[1])
+
+
+class TestScaleFilters(MdtestResultsJsonCase):
+    """A malformed --only-nodes/--only-threads is a usage error, not a hint."""
+
+    BAD = (
+        ("--only-nodes", "nope"),
+        ("--only-threads", "4,x"),
+        ("--only-nodes", "8-4"),
+        ("--only-threads", "1,,2"),
+    )
+
+    def test_malformed_filter_writes_nothing_from_a_directory(self) -> None:
+        self.add_complete()
+        for flag, value in self.BAD:
+            with self.subTest(flag=flag, value=value):
+                code, out, err = self.run_main(
+                    self.results, "--output-dir", self.root / "out", flag, value
+                )
+                self.assertEqual(code, 2, err)
+                self.assertIn(f"invalid {flag} filter", err)
+                self.assertEqual(out, "")
+                self.assertFalse((self.root / "out").exists())
+                self.assertFalse((self.results / "results.json").exists())
+
+    def test_malformed_filter_writes_nothing_from_a_document(self) -> None:
+        self.add_complete()
+        code, _, err = self.run_main(self.results)
+        self.assertIn(code, (0, None), err)
+        for flag, value in self.BAD:
+            with self.subTest(flag=flag, value=value):
+                code, out, err = self.run_main(
+                    "--from-json",
+                    self.results / "results.json",
+                    "--output-dir",
+                    self.root / "out",
+                    flag,
+                    value,
+                )
+                self.assertEqual(code, 2, err)
+                self.assertIn(f"invalid {flag} filter", err)
+                self.assertEqual(out, "")
+                self.assertFalse((self.root / "out").exists())
+
+    def test_valid_lists_and_ranges_still_filter(self) -> None:
+        self.add_complete("0001", 1, 8)
+        self.add_complete("0002", 2, 8)
+        for value, kept in (("1", 1), ("2-3", 1), ("1,2", 2), ("3", 0)):
+            with self.subTest(value=value):
+                code, _, err = self.run_main(
+                    self.results,
+                    "--only-nodes",
+                    value,
+                    "--output-dir",
+                    self.root / "ok",
+                )
+                self.assertEqual(code, 0 if kept else 1, err)
+                self.assertIn(f"Found {3 * kept} complete iterations", err)
 
 
 if __name__ == "__main__":

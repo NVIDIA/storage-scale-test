@@ -17,6 +17,8 @@
 
 """Tests for apply_treescan_from_directory_scan (io_size-specific sibling .out)."""
 
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -121,6 +123,22 @@ class TestTreescanDirectoryScan(unittest.TestCase):
             metrics = [_minimal_metric("r64K")]
             apply_treescan_from_directory_scan(str(tdir), metrics, str(base))
             self.assertEqual(metrics[0].treescan_avg_bytes, 1111)
+
+
+class TestReadFromLine(unittest.TestCase):
+    """Read-from lines skip paths never recorded by pre-batch runs."""
+
+    def test_unknown_read_from_path_is_not_printed(self) -> None:
+        known = _minimal_metric("1M")
+        known.sweep_read_from_path = "/mnt/test/data"
+        unknown = _minimal_metric("1M")
+        unknown.sweep_read_from_path = "unknown"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            _EXTRACT_MOD.print_sweep_auxiliary_lines_for_metrics([known, unknown])
+        self.assertEqual(
+            out.getvalue(), f"Read-from (datestamp {_DS}): /mnt/test/data\n"
+        )
 
 
 if __name__ == "__main__":
