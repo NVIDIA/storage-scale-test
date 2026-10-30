@@ -48,7 +48,8 @@ TOTAL_RANK = "Total"
 MODE_SERVICE = "service"
 MODE_WORKER = "worker"
 INVALID_RATE = None
-SKIPPED_METADATA_PHASES = frozenset({"CREATE", "DELETE", "MKDIR", "STAT"})
+# elbencho's directory and entry phases (PHASENAME_* in its Common.h).
+SKIPPED_METADATA_PHASES = frozenset({"MKDIRS", "RMDIRS", "RMFILES", "STAT", "STATDIRS"})
 OCCURRENCE_RATE_JUMP_MAX_MS = 100
 OCCURRENCE_RATE_JUMP_FACTOR = 4.0
 IO_LATENCY_COLUMN = "Lat IO us"

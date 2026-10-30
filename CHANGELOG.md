@@ -56,6 +56,8 @@ section below.
   (exit 2) instead of warning and reporting unfiltered.
 - Python tools rebuild a repository `.venv` built on another OS (e.g. a
   checkout shared by a container and its host) instead of hanging.
+- IO reports leave out elbencho's directory phases (`MKDIRS`, `RMDIRS`,
+  `RMFILES`, `STAT`), which live CSVs record alongside write and read.
 
 ## [2.1.0] - 2026-10-29
 
