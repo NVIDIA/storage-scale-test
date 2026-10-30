@@ -54,6 +54,8 @@ section below.
   `executions/` directory, an older `env_used.yaml`).
 - Metadata reports reject a malformed `--only-nodes` or `--only-threads`
   (exit 2) instead of warning and reporting unfiltered.
+- Python tools rebuild a repository `.venv` built on another OS (e.g. a
+  checkout shared by a container and its host) instead of hanging.
 
 ## [2.1.0] - 2026-10-29
 
