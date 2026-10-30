@@ -986,6 +986,11 @@ def report_documents(documents: list, args: argparse.Namespace, kind: str) -> in
         )
         for number, loaded, groups in selections
     ]
+    return _combined_status(rendered)
+
+
+def _combined_status(rendered: list[tuple[int, bool]]) -> int:
+    """The exit status of several (status, text written) renders."""
     statuses = [status for status, _ in rendered]
     produced = any(text for _, text in rendered)
     if not produced:
@@ -997,6 +1002,108 @@ def report_documents(documents: list, args: argparse.Namespace, kind: str) -> in
     if not produced:
         return EXIT_INCOMPLETE if EXIT_INCOMPLETE in statuses else 1
     return max(statuses)
+
+
+def report_mixed_directories(
+    directories: dict[str, list[str]], args: argparse.Namespace
+) -> int:
+    """Report IO and metadata result directories together: each kind's
+    engine writes one document under ``<output-dir>/dN``, and both share
+    one report.html, as several ``--from-json`` documents do."""
+    # Deferred so --help and --version work without the reporting dependencies.
+    from lib import filesystem_results  # pylint: disable=import-outside-toplevel
+    from lib.results_document import (  # pylint: disable=import-outside-toplevel
+        load_document,
+    )
+
+    # Validate everything before either engine writes.
+    routed = options_by_kind(args, set(directories))
+    selection = _report_selection(args, "all", None)
+    comparisons = _load_comparisons(args)
+    paths = [
+        Path(document_output_dir(args.output_dir, number, len(directories)))
+        / RESULTS_FILENAME
+        for number in range(1, len(directories) + 1)
+    ]
+    _check_mixed_references(comparisons, directories, paths)
+    # A page left from an earlier run must not outlive this run's documents.
+    html = Path(args.output_dir) / filesystem_results.REPORT_HTML_FILENAME
+    html.unlink(missing_ok=True)
+    rendered = []
+    for path, (kind, inputs) in zip(paths, directories.items()):
+        engine = "extract-mdtest-elbencho.py" if kind == "mdtest" else _IO_ENGINE
+        command = [sys.executable, str(_REPO_ROOT / "utils" / engine), *inputs]
+        # Beside the other kind, a filter matching nothing here is fine.
+        command += ["--output-dir", str(path.parent), BATCH_GROUP_FLAG]
+        status = subprocess.run([*command, *routed[kind]], check=False).returncode
+        rendered.append((status, (path.parent / REPORT_TXT_FILENAME).is_file()))
+    # A failed engine may leave an earlier run's document: no combined page.
+    if all(status in (0, EXIT_INCOMPLETE) for status, _ in rendered):
+        filesystem_results.publish_report_html(
+            [load_document(path) for path in paths],
+            args.output_dir,
+            comparisons,
+            selection,
+        )
+    return _combined_status(rendered)
+
+
+def _check_mixed_references(
+    comparisons: list[dict] | None,
+    directories: dict[str, list[str]],
+    paths: list[Path],
+) -> None:
+    """Reject, before either engine writes, a comparison that mixed
+    directories cannot satisfy: an unknown document or group, or IO compared
+    with metadata. Document N (by number or ``paths[N - 1]``) is the Nth
+    kind; its groups are ``0000`` for one directory, else ``0001`` onward.
+    Section shapes need the parsed results, so they are checked after."""
+    names = sorted(
+        {
+            (name, number)
+            for number, path in enumerate(paths, 1)
+            for name in (str(number), str(path), str(path.resolve()))
+        },
+        key=lambda item: -len(item[0]),
+    )
+    groups = [
+        (
+            {"0000"}
+            if len(inputs) == 1
+            else {f"{n:04d}" for n in range(1, len(inputs) + 1)}
+        )
+        for inputs in directories.values()
+    ]
+    for entry in comparisons or []:
+        documents = {
+            _mixed_reference(reference, names, groups)
+            for reference in entry["sections"]
+        }
+        if len(documents) > 1:
+            raise ValueError(f"comparison {entry['title']!r} compares IO with metadata")
+
+
+def _mixed_reference(
+    reference: str, names: list[tuple[str, int]], groups: list[set[str]]
+) -> int:
+    """The document number of a ``<doc>:<group>[:<shape>]`` reference."""
+    number, group = next(
+        (
+            (index, reference[len(name) + 1 :].split(":", 1)[0])
+            for name, index in names
+            if reference.startswith(f"{name}:")
+        ),
+        (None, ""),
+    )
+    if number is None:
+        raise ValueError(
+            f"section {reference!r}: no such document; IO directories are "
+            "document 1 and metadata directories document 2"
+        )
+    if not group.isdigit() or f"{int(group):04d}" not in groups[number - 1]:
+        known = ", ".join(sorted(groups[number - 1]))
+        raise ValueError(f"section {reference!r}: document {number} has groups {known}")
+    return number
 
 
 @dataclass

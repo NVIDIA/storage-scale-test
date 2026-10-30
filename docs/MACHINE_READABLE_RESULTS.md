@@ -27,22 +27,24 @@ metadata (mdtest) executions. Warp and netbench have no such document.
 ./utils/extract-filesystem.py "$BATCH"                         # $BATCH/reports/results.json
 ./utils/extract-filesystem.py "$BATCH" --output-dir out        # out/results.json
 ./utils/extract-filesystem.py "$BATCH" --require-complete
-./utils/extract-elbencho.py "$DIR"                             # $DIR/results.json
-./utils/extract-elbencho.py "$DIR1" "$DIR2" --output-dir out   # out/results.json
+./utils/extract-filesystem.py "$DIR"                           # $DIR/results.json
+./utils/extract-filesystem.py "$DIR1" "$DIR2" --output-dir out # out/results.json
 ```
 
-The document is always `<output-dir>/results.json`, beside the text reports,
+The document is `<output-dir>/results.json` (IO and metadata directories
+together give two; see below), beside the text reports,
 plots, and [`report.html`](HTML_REPORT.md), which are all rendered from it.
 `--from-json PATH...` renders them again from documents (any schema 1.x) into
 a separate `--output-dir`, without rewriting them. `<output-dir>` defaults to
 `<batch>/reports` for a batch and to the input directory otherwise. The
-document and `report.html` are written to a temporary name and renamed.
+document and `report.html` are replaced atomically.
 
 An ordinary (non-batch) directory uses the same schema. `batch.root` is that
 directory, the manifest fields are `null`, and it has one group, `"0000"`.
 Several input directories need a separate `--output-dir` and give one group
 per input, `"0001"`, `"0002"`, ... in input order; `batch.root` is their
-common parent.
+common parent. IO and metadata directories together give one document per
+kind: `<output-dir>/d1/results.json` (IO) and `d2/results.json` (metadata).
 
 | Option | Meaning |
 | --- | --- |

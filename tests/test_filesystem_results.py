@@ -562,7 +562,7 @@ def _run(manifest, arguments, engine):
     args = extract_filesystem_parser().parse_args([str(manifest.root), *arguments])
     with mock.patch("lib.filesystem_batch._report_group", side_effect=engine):
         return report_batch(
-            args.results_dir,
+            args.results_dirs[0],
             args.kind,
             args.groups,
             args.output_dir,

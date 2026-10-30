@@ -1154,7 +1154,7 @@ def test_unified_ordinary_directory_inference_and_options(tmp_path, unified_repo
 @pytest.mark.parametrize(
     "arguments, message",
     [
-        ([], "results_dir is required"),
+        ([], "RESULTS_DIR is required"),
         (["--test-parse", "raw.csv"], "requires --kind"),
         (["--kind", "io", "--normalize-to", "1", "raw"], "no selected mdtest group"),
     ],
@@ -1166,6 +1166,97 @@ def test_unified_ordinary_option_errors(unified_reporter, capsys, arguments, mes
         engine.assert_not_called()
     assert exited.value.code == 2
     assert message in capsys.readouterr().err
+
+
+def _directory(tmp_path, name):
+    (tmp_path / name).mkdir()
+    return str(tmp_path / name)
+
+
+def test_unified_several_directories_reach_one_engine(tmp_path, unified_reporter):
+    first = _directory(tmp_path, "elbencho-a")
+    second = _directory(tmp_path, "elbencho-b")
+    output = str(tmp_path / "out")
+    with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+        engine.return_value.returncode = 4
+        # Directories may follow options.
+        status = unified_reporter.main(
+            [first, "--output-dir", output, second, "--only-threads=4"]
+        )
+    assert status == 4
+    engine.assert_called_once()
+    command = engine.call_args.args[0]
+    assert command[1].endswith("extract-elbencho.py")
+    assert command[2:5] == [first, second, "--output-dir"]
+    assert command[5] == output
+    assert "--only-threads=4" in command
+
+
+def test_unified_kind_picks_its_directories(tmp_path, unified_reporter):
+    first = _directory(tmp_path, "mdtest-elbencho-a")
+    second = _directory(tmp_path, "elbencho-b")
+    for kind, engine_name, chosen in (
+        ("mdtest", "extract-mdtest-elbencho.py", [first]),
+        ("io", "extract-elbencho.py", [second]),
+    ):
+        with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+            engine.return_value.returncode = 0
+            unified_reporter.main(
+                [first, second, "--kind", kind, "--output-dir", str(tmp_path / "o")]
+            )
+        command = engine.call_args.args[0]
+        assert command[1].endswith(engine_name)
+        assert command[2:3] == chosen and command[3] == "--output-dir"
+
+
+def test_unified_kind_forces_the_engine_for_unrecognised_names(
+    tmp_path, unified_reporter
+):
+    paths = [_directory(tmp_path, name) for name in ("renamed-a", "renamed-b")]
+    with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+        engine.return_value.returncode = 0
+        unified_reporter.main(
+            [*paths, "--kind", "mdtest", "--output-dir", str(tmp_path / "o")]
+        )
+    command = engine.call_args.args[0]
+    assert command[1].endswith("extract-mdtest-elbencho.py")
+    assert command[2:4] == paths
+
+
+def test_unified_several_mdtest_directories_infer_the_engine(
+    tmp_path, unified_reporter
+):
+    paths = [_directory(tmp_path, f"mdtest-elbencho-{n}") for n in "ab"]
+    with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+        engine.return_value.returncode = 0
+        unified_reporter.main([*paths, "--output-dir", str(tmp_path / "o")])
+    assert engine.call_args.args[0][1].endswith("extract-mdtest-elbencho.py")
+
+
+def test_unified_several_directories_usage_errors(tmp_path, unified_reporter, capsys):
+    first = _directory(tmp_path, "elbencho-a")
+    second = _directory(tmp_path, "elbencho-b")
+    meta = _directory(tmp_path, "mdtest-elbencho-c")
+    batch = _create_batch(tmp_path / "batch").root
+    link = tmp_path / "link"
+    link.symlink_to(second)
+    out = ["--output-dir", str(tmp_path / "o")]
+    cases = [
+        ([first, second], "--output-dir is required"),
+        ([first, second, "--output-dir", str(link)], "is an input directory"),
+        ([first, meta, "--only-nodes", "nope", *out], "--only-nodes"),
+        ([first, str(batch), *out], "is a batch"),
+        ([first, str(tmp_path / "missing"), *out], "Input directory not found"),
+        ([first, second, "--groups", "0001", *out], "requires a prepared batch"),
+    ]
+    for arguments, message in cases:
+        with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+            with pytest.raises(SystemExit) as exited:
+                unified_reporter.main(arguments)
+            engine.assert_not_called()
+        assert exited.value.code == 2
+        assert message in capsys.readouterr().err
+    assert not (tmp_path / "o").exists()
 
 
 def test_unified_real_metadata_report_normalizes_metrics(tmp_path, reporting_checkout):
@@ -1632,3 +1723,93 @@ def test_in_process_engine_exit_status_fails_only_nonzero_exits():
             batch_module._in_process_engine(
                 lambda: (_ for _ in ()).throw(OSError("boom"))
             )
+
+
+def test_unified_kind_keeps_renamed_directories(tmp_path, unified_reporter, capsys):
+    named = _directory(tmp_path, "mdtest-elbencho-a")
+    renamed = _directory(tmp_path, "renamed-b")
+    other = _directory(tmp_path, "elbencho-c")
+    out = ["--output-dir", str(tmp_path / "o")]
+    with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+        engine.return_value.returncode = 0
+        unified_reporter.main([named, renamed, other, "--kind", "mdtest", *out])
+    assert engine.call_args.args[0][2:4] == [named, renamed]
+    with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+        with pytest.raises(SystemExit) as exited:
+            unified_reporter.main([other, "--kind", "mdtest", *out])
+        engine.assert_not_called()
+    assert exited.value.code == 2
+    assert "no mdtest result directories" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "references, message",
+    [
+        (["1:0001", "3:0001"], "no such document"),
+        (["1:0001", "2:0002"], "document 2 has groups 0000"),
+        (["1:0001", "o/d3/results.json:0001"], "no such document"),
+        (["1:0001", "2:0000"], "compares IO with metadata"),
+    ],
+)
+def test_mixed_directories_check_comparisons_before_writing(
+    tmp_path, unified_reporter, capsys, references, message
+):
+    paths = [_directory(tmp_path, name) for name in ("elbencho-a", "elbencho-b")]
+    meta = _directory(tmp_path, "mdtest-elbencho-c")
+    comparisons = tmp_path / "pairs.yaml"
+    comparisons.write_text(
+        f"- title: pair\n  sections: {json.dumps(references)}\n", encoding="utf-8"
+    )
+    arguments = [*paths, meta, "--comparisons", str(comparisons)]
+    with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+        with pytest.raises(SystemExit) as exited:
+            unified_reporter.main([*arguments, "--output-dir", str(tmp_path / "o")])
+        engine.assert_not_called()
+    assert exited.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_mixed_directories_skip_the_page_when_an_engine_fails(
+    tmp_path, unified_reporter
+):
+    io_dir = _directory(tmp_path, "elbencho-a")
+    meta = _directory(tmp_path, "mdtest-elbencho-b")
+    output = tmp_path / "o"
+    output.mkdir()
+    (output / "report.html").write_text("earlier run", encoding="utf-8")
+
+    def run(command, check):  # IO fails, metadata succeeds
+        del check
+        return mock.Mock(returncode=0 if "mdtest" in command[1] else 1)
+
+    with mock.patch.object(batch_module.subprocess, "run", side_effect=run):
+        with mock.patch("lib.filesystem_results.publish_report_html") as publish:
+            status = unified_reporter.main([io_dir, meta, "--output-dir", str(output)])
+    assert status == 1
+    publish.assert_not_called()
+    assert not (output / "report.html").exists()
+
+
+def test_mixed_references_accept_document_paths(tmp_path, unified_reporter):
+    inputs = [_directory(tmp_path, n) for n in ("elbencho-a", "elbencho-b")]
+    meta = _directory(tmp_path, "mdtest-elbencho-c")
+    output = tmp_path / "o"
+    pairs = tmp_path / "pairs.yaml"
+    sections = [f"{output}/d1/results.json:0001", "1:0002"]
+    pairs.write_text(f"- title: x\n  sections: {json.dumps(sections)}\n")
+    with mock.patch.object(batch_module.subprocess, "run") as engine:
+        engine.return_value.returncode = 0
+        with mock.patch("lib.results_document.load_document"):
+            with mock.patch("lib.filesystem_results.publish_report_html") as publish:
+                unified_reporter.main(
+                    [
+                        *inputs,
+                        meta,
+                        "--comparisons",
+                        str(pairs),
+                        "--output-dir",
+                        str(output),
+                    ]
+                )
+    assert engine.call_count == 2
+    publish.assert_called_once()

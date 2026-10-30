@@ -62,20 +62,22 @@ Kubernetes runs asynchronously: collect terminal results before reporting.
 ## Reporting
 
 ```bash
-./utils/extract-filesystem.py "$RUN"        # an IO or metadata run, or a batch
+./utils/extract-filesystem.py "$RUN"                            # a run or a batch
+./utils/extract-filesystem.py "$RUN1" "$RUN2" --output-dir out  # several runs, one report
 ```
 
-A filesystem report prints text tables and writes, in the result directory
-(a batch: `<batch>/reports`, or `--output-dir`), `report.txt`, `results.json`
-(with `results.live/`), `report.html`, and PNG plots. Open `report.html` in a
-browser: tables work offline, charts load Chart.js from a CDN. See the
-[HTML report guide](docs/HTML_REPORT.md) for its layout and template names.
+A filesystem report prints text tables and writes `report.html` (open it in a
+browser), `report.txt`, `results.json` (with `results.live/`), and PNG plots.
+They go in the result directory or `--output-dir`; a batch writes to
+`<batch>/reports`, with each group's text and plots under `groups/<id>` and
+all groups' text in `<batch>/reports.txt`. Tables work offline; charts load
+Chart.js from a CDN. See the [HTML report guide](docs/HTML_REPORT.md).
 
-- `--from-json results.json... --output-dir DIR` renders again from documents
-  without the raw results; several documents share one `report.html`.
-- Several result directories (`extract-elbencho.py`, `extract-mdtest-elbencho.py`)
-  also need `--output-dir`.
-- `--comparisons FILE` forces which sections `report.html` compares.
+- Several result directories (IO, metadata, or both) make one report and
+  need `--output-dir`.
+- `--from-json results.json... --output-dir DIR` renders again from saved
+  documents, without the raw results.
+- `--comparisons FILE` chooses sections for `report.html` to compare.
 
 Details: [filesystem reporting](docs/FILESYSTEM_TESTING.md#filesystem-reporting).
 Object and network reports differ; see their guides.

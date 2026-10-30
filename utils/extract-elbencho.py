@@ -5620,11 +5620,18 @@ def _start_raw_report(
             parser.error(str(error))
         sidecars = Path(data[0].live.sidecar_dir or output_dir)
         loaded = document_from_data(document, sidecars.parent)
+        # The document is new, so a report.txt from an earlier run must go
+        # even when nothing matches now (a batch tracks its own).
+        if not args.results_fragment:
+            remove_stale_report(output_dir)
         finish = start_document_render(loaded, output_dir, request, target_label, pool)
         if finish is None:
             if args.results_fragment:
                 # The batch reports a group whose filters matched nothing.
                 return lambda: 0
+            if args.batch_group:
+                # Beside other documents, matching nothing is not an error.
+                return lambda: status
             eprint(f"{NO_TEXT_REPORT}; results.json was written")
             return lambda: status or 1
         return lambda: finish() or status

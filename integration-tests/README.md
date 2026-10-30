@@ -304,7 +304,7 @@ edited copy `-modified`.
 Beyond each scenario's own checks, every test requires successful execution
 records, exact workload totals, ordered worker selection, nonempty benchmark
 output, environment snapshots, and cleanup of generated data directories, and
-runs `utils/extract-elbencho.py` on host-side result copies. Host-side results
+runs the reporting engines on host-side result copies. Host-side results
 and diagnostics stay under the state directory, with timestamped build and step
 logs below its `test-runs/`.
 

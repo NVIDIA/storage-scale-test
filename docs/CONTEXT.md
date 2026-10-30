@@ -260,6 +260,9 @@ collect before resume.
 - With several `--from-json` documents the parent writes `report.html`
   first, so a bad `--comparisons` fails before any output; batch engines
   never see it.
+- Mixed IO and metadata directories run each engine into `dN`; the parent
+  checks options and comparison document/group references first, removes
+  the old `report.html`, and writes the combined page only if both succeed.
 - Replayable options (`ReportOption.recorded`) parse unset so a replay can
   tell them from defaults; call `resolve_report_options` before reading
   them. Text and HTML take the live level from `effective_live_detail`.

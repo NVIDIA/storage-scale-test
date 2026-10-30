@@ -155,8 +155,8 @@ REPORT_OPTIONS = (
     ReportOption(
         "--live-detail",
         "io",
-        "Live CSV detail in results.json; below full, report.html omits "
-        "per-client charts.",
+        "Live CSV detail to keep: none, summary, selected, or full (default). "
+        "Below full, per-client plots and charts are omitted.",
         {"choices": LIVE_DETAIL_LEVELS, "default": "full", "metavar": "LEVEL"},
         recorded="live_detail",
     ),
@@ -184,8 +184,9 @@ INTERNAL_OPTIONS = (
         argparse.SUPPRESS,
         {"metavar": "DIR"},
     ),
-    # One group of a batch document: the batch writes report.html, and a group
-    # with nothing to report is not an error.
+    # A document reported beside others (a batch group, or one kind of mixed
+    # directories): nothing to report is not an error, and when rendering
+    # documents the caller writes report.html.
     ReportOption(
         BATCH_GROUP_FLAG,
         "common",
@@ -272,29 +273,26 @@ def add_report_destination_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--output-dir",
-        help="Report destination (batches: <batch_dir>/reports); required, and "
-        "not an input, with several input directories or --from-json.",
+        help="Where to write the report (default: the input directory, or "
+        "<batch>/reports). Required, and not an input, with several inputs or "
+        "--from-json.",
     )
     parser.add_argument(
         FROM_JSON_FLAG,
         metavar="PATH",
         nargs="+",
         action="extend",
-        help="Render from results.json documents (schema 1.x) instead of input "
-        "directories; --output-dir must not be a document's directory. "
-        "Several documents share one report.html; document N renders its "
-        f"text and PNGs under <output-dir>/{DOCUMENT_DIR_PREFIX}N/ (batch "
-        "layout inside for batches), with groups still named by their IDs. "
-        "Rendering options not given take each document's recorded values; "
-        f"{SHORTFALL_FLAG} and --client-min-slow-windows cannot change.",
+        help="Render again from saved results.json documents instead of raw "
+        "results; options not given keep each document's recorded values. "
+        "Several documents share one report.html, with document N's text and "
+        f"PNGs in <output-dir>/{DOCUMENT_DIR_PREFIX}N/.",
     )
     parser.add_argument(
         COMPARISONS_FLAG,
         metavar="FILE",
-        help="YAML file forcing comparison sets in report.html: a list of "
-        "{title, sections: ['<doc>:<group>[:<shape>]', ...]}, <doc> being the "
-        "1-based --from-json document (raw inputs and batches are document 1) "
-        "and <group> the group ID (0000 for one result directory).",
+        help="YAML file of sections report.html must compare: a list of "
+        "{title, sections: ['<doc>:<group>[:<shape>]', ...]}. See "
+        "docs/FILESYSTEM_TESTING.md#comparisons.",
     )
 
 

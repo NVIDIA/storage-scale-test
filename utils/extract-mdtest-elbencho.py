@@ -2307,6 +2307,7 @@ def _mdtest_selection(
         groups=groups,
         nodes=frozenset(nodes) if nodes else None,
         threads=frozenset(threads) if threads else None,
+        normalize_to=getattr(args, "normalize_to", None),
     )
 
 
@@ -2493,14 +2494,17 @@ def main() -> None:
         and not args.results_fragment
         and not results_json.document_is_complete(document)
     )
-    status = render_text_report(
-        document, args, target_label, args.output_dir or args.input_dirs[0]
-    )
+    output_dir = args.output_dir or args.input_dirs[0]
+    # The document is new, so a report.txt from an earlier run must go even
+    # when nothing matches now (a batch tracks its own).
+    if not args.results_fragment:
+        remove_stale_report(output_dir)
+    status = render_text_report(document, args, target_label, output_dir)
     if status:
         eprint("No text report produced; results.json was written")
         # An empty report still fails a plain run; in a batch the group's
-        # fragment records why.
-        if not args.results_fragment and not incomplete:
+        # fragment records why, and beside other documents it is fine.
+        if not (args.results_fragment or args.batch_group or incomplete):
             sys.exit(1)
     if incomplete:
         sys.exit(EXIT_INCOMPLETE)

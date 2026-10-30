@@ -234,6 +234,69 @@ def test_mdtest_and_batch_schema_1_0_documents_render(tmp_path):
         assert (output / "groups" / group / REPORT).is_file()
 
 
+def test_io_and_metadata_directories_report_together(tmp_path):
+    io_dir = write_prebatch_io_dir(_mkdir(tmp_path / "io"))
+    md_dir = write_prebatch_mdtest_dir(_mkdir(tmp_path / "md"))
+    output = tmp_path / "out"
+    done = _run(FILESYSTEM, md_dir, io_dir, OUTPUT_DIR, output)
+    # IO first, each kind's engine in its own document directory.
+    assert _document(output / "d1" / RESULTS)["groups"][0]["kind"] == "io"
+    assert _document(output / "d2" / RESULTS)["groups"][0]["kind"] == "mdtest"
+    assert (output / "d1" / REPORT).is_file() and (output / "d2" / REPORT).is_file()
+    page = (output / HTML).read_text(encoding="utf-8")
+    # One report.html holds both documents' sections.
+    assert re.search(r'id="d1-g\d{4}-', page) and re.search(r'id="d2-g\d{4}-md-', page)
+    assert "error" not in done.stderr.lower()
+
+
+def test_one_kind_may_match_nothing_beside_the_other(tmp_path):
+    io_dir = write_prebatch_io_dir(_mkdir(tmp_path / "io"))
+    md_dir = write_prebatch_mdtest_dir(_mkdir(tmp_path / "md"))
+    output = tmp_path / "out"
+    # IO runs 64 threads per node, metadata 16 tasks.
+    _run(FILESYSTEM, io_dir, md_dir, OUTPUT_DIR, output, "--only-threads", "64")
+    assert (output / "d1" / REPORT).is_file()
+    assert (output / "d2" / RESULTS).is_file() and not (output / "d2" / REPORT).exists()
+    assert (output / HTML).is_file()
+    done = _run(
+        FILESYSTEM,
+        io_dir,
+        md_dir,
+        OUTPUT_DIR,
+        output,
+        "--only-threads",
+        "7",
+        check=False,
+    )
+    assert done.returncode == 1 and NO_TEXT in done.stderr
+
+
+def test_unknown_section_shape_leaves_no_earlier_page(tmp_path, single_run):
+    output = tmp_path / "out"
+    _run(IO, single_run, OUTPUT_DIR, output)
+    pairs = tmp_path / "pairs.yaml"
+    pairs.write_text(
+        '- title: x\n  sections: ["1:0000:nope", "1:0000"]\n', encoding="utf-8"
+    )
+    done = _run(
+        FILESYSTEM,
+        single_run,
+        OUTPUT_DIR,
+        output,
+        "--comparisons",
+        pairs,
+        check=False,
+    )
+    assert done.returncode == 2 and "nope" in done.stderr
+    # The new document stays; the page of the previous run does not.
+    assert (output / RESULTS).is_file() and not (output / HTML).exists()
+
+
+def _mkdir(path):
+    path.mkdir()
+    return path
+
+
 # -- report.html selection ----------------------------------------------------
 
 

@@ -110,7 +110,7 @@ literal duplicates an existing one.
 5. Prefer the alternate quote character inside f-string expressions when it
    improves readability; Python 3.12 supports either form.
 6. Run analysis tools through their executable Python entry points (e.g.
-   `utils/extract-elbencho.py`). They bootstrap the pinned runtime environment
+   `utils/extract-filesystem.py`). They bootstrap the pinned runtime environment
    automatically; `--help` and `--version` use only the standard library.
 
 ## Shell

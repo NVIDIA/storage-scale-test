@@ -1002,6 +1002,8 @@ raw results → parse (process pool) → results.json + results.live/
 - **`--from-json`.** Skips the parse and renders from one or more documents;
   `--only-*` filters apply at render time. Several documents share one
   `report.html`, each rendering its text and PNGs under `<output-dir>/dN/`.
+  IO and metadata directories reported together use the same layout, one
+  document per kind.
 - **Report model.** `lib/report_html/` builds a renderer-neutral model of
   sections, numbered figures and tables, and stable anchors, then renders one
   HTML file; see [HTML_REPORT.md](HTML_REPORT.md). Chart.js is referenced by
@@ -1033,7 +1035,7 @@ references.
 All analysis scripts support filtering to reduce clutter:
 
 ```bash
-./utils/extract-elbencho.py --only-sizes 4K --only-sizes 1M --only-threads 32,64 results/
+./utils/extract-filesystem.py --only-sizes 4K --only-sizes 1M --only-threads 32,64 results/
 ./utils/extract-warp.py --only-sizes 16MiB --only-threads 64,128 results/
 ```
 

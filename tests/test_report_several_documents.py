@@ -21,6 +21,7 @@ All values are invented.
 """
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -568,6 +569,17 @@ def test_output_dir_guardrails(tmp_path, documents):
     missing = _run(IO, FROM_JSON, alpha, beta, check=False)
     assert missing.returncode == 2
     assert "--output-dir is required" in missing.stderr
+
+
+def test_front_door_reports_several_directories_as_one_document(tmp_path, documents):
+    results = [
+        documents["root"] / name / f"elbencho-{_DS}" for name in ("alpha", "beta")
+    ]
+    output = tmp_path / "out"
+    _run(FILESYSTEM, *results, MIXED, OUTPUT_DIR, output)
+    document = json.loads((output / RESULTS).read_text(encoding="utf-8"))
+    assert [group["group_id"] for group in document["groups"]] == ["0001", "0002"]
+    assert (output / HTML).is_file()
 
 
 def test_a_document_subdirectory_may_not_hold_another_documents_render(tmp_path):
