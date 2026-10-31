@@ -17,44 +17,46 @@ limitations under the License.
 
 # Machine-readable results
 
-`--to-json` writes one versioned JSON document for a filesystem report: what
-was meant to run, what ran, and what it measured. It covers IO and metadata
-(mdtest) executions. Warp and netbench have no such document.
+Every filesystem report writes one versioned JSON document, `results.json`:
+what was meant to run, what ran, and what it measured. It covers IO and
+metadata (mdtest) executions. Warp and netbench have no such document.
 
 ## Producing it
 
 ```bash
-./utils/extract-filesystem.py "$BATCH" --to-json                       # $BATCH/reports/results.json
-./utils/extract-filesystem.py "$BATCH" --to-json --output-dir out      # out/results.json
-./utils/extract-filesystem.py "$BATCH" --to-json --live-detail full --require-complete
-./utils/extract-elbencho.py "$DIR" --to-json                           # $DIR/results.json
+./utils/extract-filesystem.py "$BATCH"                         # $BATCH/reports/results.json
+./utils/extract-filesystem.py "$BATCH" --output-dir out        # out/results.json
+./utils/extract-filesystem.py "$BATCH" --require-complete
+./utils/extract-filesystem.py "$DIR"                           # $DIR/results.json
+./utils/extract-filesystem.py "$DIR1" "$DIR2" --output-dir out # out/results.json
 ```
 
-The document is always `<output-dir>/results.json`, beside the text reports.
-`<output-dir>` defaults to `<batch>/reports` for a batch and to the input
-directory otherwise.
+The document is `<output-dir>/results.json` (IO and metadata directories
+together give two; see below), beside the text reports,
+plots, and [`report.html`](HTML_REPORT.md), which are all rendered from it.
+`--from-json PATH...` renders them again from documents (any schema 1.x) into
+a separate `--output-dir`, without rewriting them. `<output-dir>` defaults to
+`<batch>/reports` for a batch and to the input directory otherwise. The
+document and `report.html` are replaced atomically.
 
 An ordinary (non-batch) directory uses the same schema. `batch.root` is that
 directory, the manifest fields are `null`, and it has one group, `"0000"`.
+Several input directories need a separate `--output-dir` and give one group
+per input, `"0001"`, `"0002"`, ... in input order; `batch.root` is their
+common parent. IO and metadata directories together give one document per
+kind: `<output-dir>/d1/results.json` (IO) and `d2/results.json` (metadata).
 
 | Option | Meaning |
 | --- | --- |
-| `--to-json` | Also write the document. |
-| `--live-detail LEVEL` | `none`, `summary` (default), `selected`, or `full`. IO only. See [Live detail](#live-detail). |
-| `--require-complete` | Requires `--to-json`. Exit 3 after writing if `batch_outcome.complete` is false. |
+| `--live-detail LEVEL` | `none`, `summary`, `selected`, or `full` (default). IO only. See [Live detail](#live-detail). |
+| `--require-complete` | Exit 3 after writing if `batch_outcome.complete` is false. |
 
 Report filters (`--only-*`, `--groups`, `--kind`) apply and are recorded in
 `generator.options`.
 
-| Exit | Meaning |
-| --- | --- |
-| 0 | Document written. |
-| 1 | A group report or fragment failed, or the document could not be written. Takes precedence over 3. |
-| 2 | Usage error. |
-| 3 | `--require-complete` and `batch_outcome.complete` is false. |
-
 Gate on the document, not the exit status. Without `--require-complete`, an
-incomplete batch exits 0.
+incomplete batch exits 0; all statuses are in
+[filesystem reporting](FILESYSTEM_TESTING.md#exit-statuses).
 
 The document is plain JSON. Live sidecars are always `.jsonl.zst`. Each
 recorded `sha256` and `size_bytes` describes the stored bytes.
@@ -84,8 +86,8 @@ recorded `sha256` and `size_bytes` describes the stored bytes.
 
 | Field | Content |
 | --- | --- |
-| `schema`, `schema_version` | `storage-scale-test/filesystem-batch-results`, `"MAJOR.MINOR"` (currently `"1.0"`). |
-| `generator` | `tool`, `version`, `generated_at` (UTC), `command`, `options` (`live_detail`, `shortfall_percent`, `min_slow_windows`, `only_nodes`, `only_threads`, `only_sizes`, `only_iodepths`, `groups`, `kind`; `null` when unused). |
+| `schema`, `schema_version` | `storage-scale-test/filesystem-batch-results`, `"MAJOR.MINOR"` (currently `"1.1"`). |
+| `generator` | `tool`, `version`, `generated_at` (UTC), `command`, `options` (`live_detail`, `shortfall_percent`, `min_slow_windows`, `client_max_timeseries_lines`, `client_max_heatmap_rows`, `no_dual_y_axis`, `normalize_to`, `only_nodes`, `only_threads`, `only_sizes`, `only_iodepths`, `groups`, `kind`; `null` when unused). |
 | `batch` | `root`, `datestamp`, `manifest_version`, `manifest_sha256`, `sealed`, `substrate`. |
 | `batch_outcome` | `complete`; `executions` counts (`total` plus one per `ledger_state`); `results` counts (one per `result_state`); `groups_reported`; `groups_not_reported`. |
 | `groups` | One object per batch group. |
@@ -104,11 +106,14 @@ it first. Filters never drop executions: a filtered execution is listed as
 | `group_id`, `kind` | `kind` is `io` or `mdtest`. |
 | `label` | Always `null` for now. |
 | `output_relative` | The group's output directory. |
+| `source` | Absolute path of the group's result directory. |
 | `target` | `{"name", "recorded"}`: the storage target name and whether the run recorded it. |
 | `settings_sha256` | `env_used_sh`, `env_used_yaml`. |
 | `env_override` | Override files and the variables they set, or `null`. |
 | `settings` | The group's `env_used.yaml`, as parsed. |
+| `settings_text` | The same file, verbatim; `null` if unreadable. |
 | `execution_ids` | The group's executions, in order. |
+| `unpaired_live` | [Live objects](#live-object) for every domain of the group's live CSVs that have no result pair. |
 
 ## Executions
 
@@ -125,6 +130,7 @@ otherwise.
 | `coordinates` | Test parameters; see below. |
 | `coordinate_key` | Identifies the test point across batches. Excludes the target, a group property. |
 | `dataset` | IO only. |
+| `producer_version` | IO only: the version recorded beside the `.out` file (`<name>.out.project-version`, listed in `result_files`), or `null`. Metadata records it per iteration. |
 | `result_files` | `{"path", "sha256", "size_bytes"}` for each raw result file. |
 | `log` | Relative path of the execution log, or `null`. |
 | `results` | IO or metadata results. |
@@ -151,7 +157,7 @@ otherwise.
 | `report_failed` | any | The group's report failed (`missing`). |
 | `definition_unreadable` | any | The execution definition could not be parsed; `coordinates` is `null`. |
 | `execution_unmatched` | `diagnostics` | Result files match no ledger execution. |
-| `no_execution_ledger` | `diagnostics` | An ordinary directory has no `executions/`; ledger state is `unknown`. |
+| `no_execution_ledger` | `diagnostics` | An ordinary directory has no `executions/NNNN.sh`; ledger state is `unknown`. |
 
 `phase_missing`, `percentiles_missing`, `rates_missing`, and
 `completion_incomplete` make an IO execution `partial`.
@@ -178,14 +184,26 @@ and `dio` or `bio`.
 
 `source` (`generated` or `read_from`), `read_from`,
 `kubernetes_mapped_read_from`, `write_only_data_dir`, `layout`, `files_total`,
-`bytes_total`, `treefile_source`, and `scanned_file_sizes`
-(`count`, `avg_bytes`, `min_bytes`, `max_bytes`; `null` when no scan ran).
+`bytes_total`, `treefile_source`, `scanned_file_sizes`
+(`count`, `avg_bytes`, `min_bytes`, `max_bytes`; `null` when no scan ran), and
+`first_file_bytes` (size of the first file, when only that was logged).
+
+From `workload.tsv`, all `null` without it: `count_source`
+(`configuration` or `treefile`), `files_per_node` (`requested`, `effective`),
+and `reader` (`nodes`, `threads_per_node`, `io_depth`). `files_total` and
+`bytes_total` are `null` while pending.
 
 ### IO results
 
 `results.phases` has one object per phase that ran, in run order (`write`,
-`read`, `delete`), and `results.workload` holds the termination and cleanup
-states (`null` for layouts that record none).
+`read`, `delete`). `results.additional_live_domains` has a
+[live object](#live-object) for each live CSV domain not in `phases[].live`,
+ordered by phase, `mix_type` and `occurrence` (`[]` without one).
+`results.datestamp` is the result files' datestamp.
+`results.workload` (`null` for layouts without `workload.tsv`) holds
+`termination_mode`, `completion_state`, `failure_cleanup_state`, and the
+elapsed times `write_elapsed_ms`, `read_elapsed_ms`, `write_delete_elapsed_ms`
+and `lifecycle_elapsed_ms`.
 
 | Phase field | Content |
 | --- | --- |
@@ -193,7 +211,7 @@ states (`null` for layouts that record none).
 | `elbencho_first` | `ops_per_s`, `bytes_per_s`, `elapsed_ms`: elbencho's `[first]` column, the aggregate from phase start until the fastest worker thread finished. |
 | `elbencho_last` | The same fields from the `[last]` column: until the slowest worker thread finished. |
 | `latency_us` | `min`, `avg`, `max`, `p1`, `p50`, `p75`, `p99`. A missing percentile is `null`. |
-| `histogram_us`, `work`, `configured_time_limit_s`, `command`, `live` | Latency histogram; expected and completed files and bytes; the configured limit; the recorded argv; the [live object](#live-object). |
+| `histogram_us`, `work`, `file_size_bytes`, `configured_time_limit_s`, `command`, `live` | Latency histogram; expected and completed files and bytes; the CSV file size (`null` if none); the configured limit; the recorded argv; the [live object](#live-object). |
 
 The `delete` phase has only `phase`, `completion_state`, `work`, and
 `elapsed_ms`.
@@ -206,10 +224,11 @@ whole fleet sustained.
 Coordinates are `nodes`, `tasks_per_node`, `branch_factor`, `items_per_dir`,
 and `iterations`. The key looks like `md/c002/t064/b4/i1000`.
 
-`results.iterations` lists every iteration: `iteration`, `datestamp`, `state`
-(`complete` or `incomplete`), `problems`, and `phases` (`create`, `stat`,
-`delete`, each with `ops_per_s`, `elapsed_ms`, `latency_us` of
-`min`/`avg`/`max`, and `histogram_us`). `results.aggregate` uses only complete
+`results.iterations` lists every iteration: `iteration`, `datestamp`,
+`producer_version`, `state` (`complete` or `incomplete`), `problems`, and
+`phases` (`create`, `stat`, `delete`, each with `ops_per_s`, `elapsed_ms`,
+`latency_us` of `min`/`avg`/`max`, `histogram_us`, and `command`, the recorded
+argv). `results.aggregate` uses only complete
 iterations: `iterations_expected`, `iterations_used`, and per phase `ops_per_s`
 (`mean`, `stddev`, `min`, `max`), `mean_elapsed_ms`, `latency_us`
 (`p0`, `p50`, `p90`, `p99`, `p100`), and `latency_method`
@@ -218,7 +237,10 @@ iterations: `iterations_expected`, `iterations_used`, and per phase `ops_per_s`
 ## Live detail
 
 Live data comes from elbencho live CSVs, which IO sweeps capture unless
-`ELBENCHO_LIVE_CSV_EXTENDED=0`. A domain is one execution and phase.
+`ELBENCHO_LIVE_CSV_EXTENDED=0`. A domain is one phase, mix type and
+occurrence of a live CSV. `phases[].live` holds the first domain of its
+phase; `additional_live_domains` holds the rest (`sync`, mixed and repeated
+phases), so together they list every domain, each once.
 
 | `--live-detail` | Per domain |
 | --- | --- |
@@ -226,6 +248,8 @@ Live data comes from elbencho live CSVs, which IO sweeps capture unless
 | `summary` | Aggregate and fleet series, distribution statistics, every client's summary, diagnostics. |
 | `selected` | `summary`, plus inline one-interval rates for the clients the report selects: persistent and transient slow clients, then representatives (bounded by `--client-max-timeseries-lines` and `--client-max-heatmap-rows`). |
 | `full` | `summary`, plus every client's rates in a sidecar. |
+
+Below `full`, `report.html` omits per-client charts.
 
 Without an analysis, `live` is `{"reason": R}` with `R` one of `not_captured`,
 `not_requested`, or `unreadable`.
@@ -237,15 +261,16 @@ Without an analysis, `live` is `{"reason": R}` with `R` one of `not_captured`,
 | `source` | `path`, `sha256`, `size_bytes` of the live CSV. |
 | `configured_interval_ms` | `ELBENCHO_LIVEINT`, or `null`. |
 | `client_mode` | `worker` or `service`; see below. |
-| `domain` | `phase`, `mix_type`, `occurrence`. Further domains of a phase are counted in `diagnostics.additional_domains`. |
+| `domain` | `phase`, `mix_type`, `occurrence`. In `phases[].live`, further domains of the phase are counted in `diagnostics.additional_domains`. |
+| `phase_context` | From the phase's result pair, else `null`: `first_ms`, `last_ms` (elbencho `[first]`/`[last]` times), `block_size_bytes`, `final_avg_latency_us`. |
 | `intervals`, `clients` | Counts. |
-| `steady` | `start_ms`, `end_ms`, `end_source` (`elbencho_first`), and `reason` (`null`, `no_first_time`, `too_short`, or `no_steady_state`). See [live reports](FILESYSTEM_TESTING.md#live-client-and-latency-reports). |
-| `aggregate_series` | Columnar: `elapsed_ms`, `bytes_per_s`, `ops_per_s`, `io_latency_avg_us` (fleet mean IO latency); `null` is a missing or invalid sample. |
+| `steady` | `start_ms`, `end_ms`, `end_source` (`elbencho_first`), `reason` (`null`, `no_first_time`, `too_short`, or `no_steady_state`), and `interval_ms`, the live interval used. See [live reports](FILESYSTEM_TESTING.md#live-client-and-latency-reports). |
+| `aggregate_series` | Columnar: `elapsed_ms`, `bytes_per_s`, `ops_per_s`, `io_latency_avg_us` (fleet mean IO latency), `entries_latency_avg_us`, `clock_skew_ms`; `null` is a missing or invalid sample. `start_time` is the first sample's `ISO Date`, verbatim. |
 | `fleet_series` | Columnar per-interval client statistics: `elapsed_ms`, `client_count`, `bytes_per_s_p10`, `_p50`, `_p90`, `_mean`, `_stddev`. |
 | `fairness` | `null` without a steady window; else `interval`, `5s`, and `30s`, each `null` or `{window_ms, windows, jain {min, p10, p50}, jain_min_at_ms, share_below_0_95, min_over_median_p10, floor_p50, series {end_ms, clients, jain}}` over the windows inside the steady window. `min_over_median_p10` is the p10 of each window's slowest-client ratio; `floor_p50` is the expected Jain floor. |
 | `latency` | `null` without steady latency; else `p50_us`, `p90_us`, `max_us`, `max_over_p50`, `cv`, `steady_mean_us` (op-weighted), `final_avg_us` (from `.out`), and Spearman `rho_jain_latency` and `rho_latency_throughput` over 5 s windows (`null` under 6). |
 | `distribution` | Imbalance without per-client data: `client_mean_bytes_per_s` (`min`, `p10`, `p50`, `p90`, `max`, `cv`), `min_over_median`, `max_over_median`, `final_done_bytes` (`min`, `p50`, `max`, `cv`), `finish_elapsed_ms` (`min`, `p50`, `max`), `persistent_clients`, `transient_clients` (`null` when the steady window is unavailable). |
-| `clients_summary` | `{"columns": [...], "rows": [[...]]}`, one row per client: `client`, `rank`, `service`, `kubernetes_node`, `kubernetes_pod`, `class`, `mean_bytes_per_s`, `median_bytes_per_s`, `mean_ratio_to_fleet_median`, `steady_bytes_per_s`, `steady_ratio`, `worst_5s_ratio`, `worst_5s_elapsed_ms`, `worst_30s_ratio`, `worst_30s_elapsed_ms`, `short_5s_share`, `final_done_bytes`, `finish_elapsed_ms`, `valid_samples`, `missing_samples`, `invalid_samples`. |
+| `clients_summary` | `{"columns": [...], "rows": [[...]]}`, one row per client: `client`, `rank`, `service`, `kubernetes_node`, `kubernetes_pod`, `class`, `mean_bytes_per_s`, `median_bytes_per_s`, `mean_ratio_to_fleet_median`, `steady_bytes_per_s`, `steady_ratio`, `worst_5s_ratio`, `worst_5s_elapsed_ms`, `worst_30s_ratio`, `worst_30s_elapsed_ms`, `short_5s_share`, `final_done_bytes`, `finish_elapsed_ms`, `valid_samples`, `missing_samples`, `invalid_samples`, `short_5s_windows`, `steady_5s_windows`, `first_progress_elapsed_ms`. |
 | `client_series` | `null` at `summary`; at `selected`, inline `clients`, `elapsed_ms`, and `bytes_per_s` (one list per client); at `full`, a sidecar reference `{"path", "sha256", "size_bytes", "clients", "intervals"}`. |
 | `diagnostics` | `missing_samples`, `counter_resets`, `non_adjacent_samples`, and possibly `additional_domains`. |
 
@@ -254,11 +279,17 @@ Without an analysis, `live` is `{"reason": R}` with `R` one of `not_captured`,
 `class` is `persistent`, `transient`, or `ok`, by the rules in
 [live reports](FILESYSTEM_TESTING.md#live-client-and-latency-reports); it and
 the steady and worst-window columns are `null` without steady data.
-`short_5s_share` is the share of steady 5 s windows below 1 - S.
+`short_5s_share` is `short_5s_windows` (steady 5 s windows below 1 - S) over
+`steady_5s_windows`. `first_progress_elapsed_ms` is the first interval with
+`DoneBytes` above 0.
 
 `final_done_bytes` is a client's last cumulative `DoneBytes` (its work share
 in time-bounded runs). `finish_elapsed_ms` is the first interval at which it
 reached that value (the straggler signal in completion-bound runs).
+
+elbencho stamps samples from two clocks, so sample `i`'s `ISO Date` is
+`start_time` plus `elapsed_ms[i] - elapsed_ms[0] + clock_skew_ms[i]` ms, in
+`start_time`'s format (`live_timestamp` in `lib/elbencho_live_results.py`).
 
 ### Client mode
 
@@ -271,18 +302,23 @@ the collected `executions/<id>.workers.tsv`; elsewhere they are `null`.
 
 ### Sidecars
 
-At `full`, each domain writes `results.live/<execution_id>.<phase>.jsonl.zst`
-beside the document, referenced by `client_series.path`.
-Earlier sidecars in that directory are removed before a batch export. Each is
+At `full`, each domain writes
+`results.live/<execution_id>.<phase>[.<mix_type>][.occ<N>].jsonl.zst` beside
+the document, referenced by `client_series.path`. An unpaired live CSV uses
+its name and 12 hex digits of its SHA-256 instead of the execution ID.
+Earlier sidecars in that directory are removed before each export. Each is
 zstd-compressed JSON Lines in source order:
 
 ```json
-{"schema": "storage-scale-test/live-client-series", "schema_version": "1.0", "execution_id": "0014", "phase": "write", "clients": ["host001 [rank 0]", "..."]}
-{"elapsed_ms": 1000, "bytes_per_s": [null, 1320000000, 1290000000]}
+{"schema": "storage-scale-test/live-client-series", "schema_version": "1.1", "execution_id": "0014", "phase": "write", "mix_type": "", "occurrence": 0, "clients": ["host001 [rank 0]", "..."]}
+{"elapsed_ms": 1000, "bytes_per_s": [null, 1320000000, 1290000000], "done_bytes_delta": [1048576, 1320000000, 1290000000]}
 ```
 
-`bytes_per_s[i]` belongs to `clients[i]`; `null` is a missing or invalid
-sample.
+`bytes_per_s[i]` and `done_bytes_delta[i]` belong to `clients[i]`;
+`bytes_per_s` is `null` for a missing or invalid sample. `done_bytes_delta`
+(1.1) is `DoneBytes` minus the client's previous sample (the first is
+absolute; negative after a counter reset), `null` without a sample. Summing it
+rebuilds the counters every live report and statistic is computed from.
 
 ### Size
 
@@ -457,7 +493,14 @@ jq -r '.executions[] | [.execution_id, (tojson | length)] | @tsv' "$R" | sort -k
 Both are JSON Schema 2020-12. `schema_version` is `MAJOR.MINOR`. A minor
 version only adds optional fields or enum values; a major version renames,
 removes, or changes the meaning or unit of a field, and its schema file name
-changes. Check the major version; ignore unknown fields.
+changes. Check the major version; ignore unknown fields. Version 1.1 added
+`settings_text`, `producer_version`, `file_size_bytes`, `first_file_bytes`, the
+workload fields, `command` on metadata phases, the rendering options,
+`additional_live_domains`, `unpaired_live`, and the live fields `phase_context`,
+`steady.interval_ms`, `entries_latency_avg_us`, `start_time`,
+`clock_skew_ms`, and three `clients_summary` columns; treat them as absent in
+1.0 documents. Sidecar 1.1 added `mix_type`, `occurrence`, and
+`done_bytes_delta`.
 
 ## Example
 

@@ -184,7 +184,7 @@ class TestLiveAggregateAnalysis(LiveCSVTestCase):
             _row(2000, "Total", 2 * MIB, mib_s=1),
             _row(2000, 0, 2 * MIB),
         ]
-        for phase in ("STAT", "CREATE", "MKDIR", "DELETE"):
+        for phase in ("MKDIRS", "RMDIRS", "RMFILES", "STAT", "STATDIRS"):
             rows.extend(
                 [
                     _row(1000, "Total", 0, phase=phase, mib_s=0, iops=0, entries_s=50),

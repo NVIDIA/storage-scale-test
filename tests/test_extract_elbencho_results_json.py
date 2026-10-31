@@ -25,7 +25,9 @@ from pathlib import Path
 import pytest
 
 from lib import elbencho_live_results as live_results
+from lib import filesystem_results as results_json
 from lib.elbencho_live_report import LIVE_CSV_COLUMNS
+from lib.report_html import CHART_JS_URL
 from tests.extract_elbencho_test_support import load_extract_elbencho_module
 from tests.test_extract_elbencho_resume import _write_execution_metadata
 from tests.test_extract_mdtest_elbencho import _CSV_FIELDS as MDTEST_CSV_FIELDS
@@ -192,22 +194,14 @@ def _live_request(level="summary", sidecar=None):
 
 
 def _fragment(result_dir, *, filters=None, level="summary", sidecar=None):
-    """Parse a directory the way main() does and build its fragment."""
-    pairs = {}
-    for csv_path in sorted(result_dir.glob("*.csv")):
-        if csv_path.name.endswith(".live.csv"):
-            continue
-        base = str(csv_path)[: -len(".csv")]
-        pairs[base] = _EXTRACT.parse_elbencho_files(base)
+    """Build a directory's fragment the way main() does."""
     env = {"ELBENCHO_LIVEINT": 500, "KUBECTL_MAPPED_READ_FROM": "/mnt/mapped/dataset"}
-    metrics = [metric for items in pairs.values() for metric in items]
-    _EXTRACT.apply_execution_workloads(str(result_dir), metrics)
     data = _EXTRACT.IoResultsInput(
         str(result_dir),
         env,
         filters or _EXTRACT.ReportFilters(),
         _live_request(level, sidecar),
-        pairs,
+        _EXTRACT.discover_result_bases(str(result_dir)),
     )
     return _EXTRACT.build_io_fragment(data)
 
@@ -406,6 +400,10 @@ def test_read_from_staged_tree_dataset(tmp_path):
             "min_bytes": 512,
             "max_bytes": 2048,
         },
+        "first_file_bytes": None,
+        "count_source": "treefile",
+        "files_per_node": {"requested": None, "effective": None},
+        "reader": {"nodes": None, "threads_per_node": None, "io_depth": None},
     }
     assert entry["result_state"] == "complete"
     assert [p["phase"] for p in entry["results"]["phases"]] == ["read"]
@@ -444,7 +442,78 @@ def test_delete_phase_and_workload_from_workload_tsv(tmp_path):
         "completion_state": "completed",
         "failure_cleanup_state": "not_needed",
         "lifecycle_elapsed_ms": 350,
+        "write_elapsed_ms": 101,
+        "read_elapsed_ms": 202,
+        "write_delete_elapsed_ms": 132,
     }
+
+
+def test_workload_line_fields_and_result_datestamp(tmp_path):
+    _write_execution_metadata(
+        tmp_path,
+        "0001",
+        requested="8",
+        effective="6",
+        reader_nodes="2",
+        reader_threads="4",
+        reader_depth="2",
+    )
+    metadata = tmp_path / "executions" / "0001.workload.tsv"
+    text = metadata.read_text(encoding="utf-8")
+    metadata.write_text(
+        text.replace("dataset_files_total\t4800", "dataset_files_total\tpending"),
+        encoding="utf-8",
+    )
+    _write_ledger(tmp_path, "0001", ELBENCHO_FILE_LAYOUT="shared-directory")
+    _write_result(tmp_path)
+    entry = _entry(_fragment(tmp_path), "0001")
+
+    dataset = entry["dataset"]
+    assert dataset["count_source"] == "configuration"
+    assert dataset["files_total"] is None  # pending
+    assert dataset["files_per_node"] == {"requested": 8, "effective": 6}
+    assert dataset["reader"] == {"nodes": 2, "threads_per_node": 4, "io_depth": 2}
+    assert entry["results"]["datestamp"] == _DS
+    assert entry["results"]["workload"]["write_elapsed_ms"] == 101
+
+
+def test_workload_fields_are_null_without_workload_tsv(tmp_path):
+    _write_ledger(tmp_path, "0001")
+    _write_result(tmp_path)
+    dataset = _entry(_fragment(tmp_path), "0001")["dataset"]
+
+    assert dataset["count_source"] is None
+    assert dataset["files_per_node"] is None and dataset["reader"] is None
+
+
+def test_phase_file_size_and_first_file_size(tmp_path):
+    _write_ledger(tmp_path, "0001")
+    _write_result(tmp_path, extra_out="Treescan first file size (bytes): 4194304\n")
+    entry = _entry(_fragment(tmp_path), "0001")
+
+    assert [p["file_size_bytes"] for p in entry["results"]["phases"]] == [
+        1073741824
+    ] * 2
+    assert entry["dataset"]["first_file_bytes"] == 4194304
+    assert entry["dataset"]["scanned_file_sizes"] is None
+
+
+def test_producer_version_is_recorded_beside_the_out_file(tmp_path):
+    _write_ledger(tmp_path, "0001")
+    _write_ledger(tmp_path, "0002", threads=8)
+    base = _write_result(tmp_path)
+    _write_result(tmp_path, threads=8)
+    Path(f"{base}.out.project-version").write_text("2.3.4\n", encoding="utf-8")
+    fragment = _fragment(tmp_path)
+
+    recorded = _entry(fragment, "0001")
+    assert recorded["producer_version"] == "2.3.4"
+    assert [Path(r["path"]).suffix for r in recorded["result_files"]] == [
+        ".csv",
+        ".out",
+        ".project-version",
+    ]
+    assert _entry(fragment, "0002")["producer_version"] is None
 
 
 def test_incomplete_phase_is_reported(tmp_path):
@@ -580,7 +649,7 @@ def _patch_reports(monkeypatch):
     monkeypatch.setattr(
         _EXTRACT, "print_terminal_table", lambda *_args, **_kw: print("TABLE")
     )
-    monkeypatch.setattr(_EXTRACT, "_report_one_live_file", lambda *_args: True)
+    monkeypatch.setattr(_EXTRACT, "_live_render_task", lambda *_args: (True, []))
 
 
 def _run_main(monkeypatch, *arguments):
@@ -603,7 +672,7 @@ def test_ordinary_document_is_written_and_valid(tmp_path, monkeypatch, capsys):
     result = _ordinary_dir(tmp_path)
     output = tmp_path / "out" / "results.json"
 
-    _run_main(monkeypatch, str(result), "--to-json", "--output-dir", str(output.parent))
+    _run_main(monkeypatch, str(result), "--output-dir", str(output.parent))
     document = json.loads(output.read_text(encoding="utf-8"))
     validate_results_document(document)
 
@@ -613,8 +682,14 @@ def test_ordinary_document_is_written_and_valid(tmp_path, monkeypatch, capsys):
     states = {e["execution_id"]: e["result_state"] for e in document["executions"]}
     assert states == {"0001": "complete", "0002": "missing"}
     assert document["batch_outcome"]["complete"] is False
-    assert document["generator"]["options"]["live_detail"] == "summary"
+    assert document["generator"]["options"]["live_detail"] == "full"
     assert document["generator"]["options"]["kind"] == "io"
+    options = document["generator"]["options"]
+    assert options["client_max_timeseries_lines"] == 10
+    assert options["client_max_heatmap_rows"] == 50
+    assert options["no_dual_y_axis"] is False
+    assert options["normalize_to"] is None
+    assert document["groups"][0]["settings_text"] == _ENV_USED
 
 
 def test_default_path_and_determinism(tmp_path, monkeypatch):
@@ -622,20 +697,20 @@ def test_default_path_and_determinism(tmp_path, monkeypatch):
     result = _ordinary_dir(tmp_path)
     destination = result / "results.json"
 
-    _run_main(monkeypatch, str(result), "--to-json")
+    _run_main(monkeypatch, str(result))
     first = json.loads(destination.read_text(encoding="utf-8"))
-    _run_main(monkeypatch, str(result), "--to-json")
+    _run_main(monkeypatch, str(result))
     second = json.loads(destination.read_text(encoding="utf-8"))
     first["generator"].pop("generated_at")
     second["generator"].pop("generated_at")
     assert first == second
 
 
-def test_to_json_takes_no_path(tmp_path, monkeypatch):
+def test_to_json_is_an_unknown_argument(tmp_path, monkeypatch):
     _patch_reports(monkeypatch)
     result = _ordinary_dir(tmp_path)
     with pytest.raises(SystemExit) as raised:
-        _run_main(monkeypatch, f"--to-json={tmp_path / 'doc.json'}", str(result))
+        _run_main(monkeypatch, str(result), "--to-json")
     assert raised.value.code == 2
 
 
@@ -645,7 +720,7 @@ def test_require_complete_exits_three_after_writing(tmp_path, monkeypatch):
     output = result / "results.json"
 
     with pytest.raises(SystemExit) as raised:
-        _run_main(monkeypatch, str(result), "--to-json", "--require-complete")
+        _run_main(monkeypatch, str(result), "--require-complete")
     assert raised.value.code == 3
     assert output.is_file()
 
@@ -655,7 +730,7 @@ def test_require_complete_passes_when_complete(tmp_path, monkeypatch):
     result = _ordinary_dir(tmp_path)
     (result / "executions" / "0002.sh").unlink()
     (result / "executions" / "0002.status").unlink()
-    _run_main(monkeypatch, str(result), "--to-json", "--require-complete")
+    _run_main(monkeypatch, str(result), "--require-complete")
     validate_results_document(
         json.loads((result / "results.json").read_text(encoding="utf-8"))
     )
@@ -672,7 +747,6 @@ def test_fragment_mode_writes_fragment_only(tmp_path, monkeypatch):
         str(result),
         "--results-fragment",
         str(fragment_path),
-        "--to-json",
         "--only-threads",
         "8",
     )
@@ -684,20 +758,39 @@ def test_fragment_mode_writes_fragment_only(tmp_path, monkeypatch):
     assert states == {"0001": "not_reported", "0002": "missing"}
 
 
-def test_to_json_requires_exactly_one_input_dir(tmp_path, monkeypatch):
+def test_results_fragment_requires_exactly_one_input_dir(tmp_path, monkeypatch, capsys):
     _patch_reports(monkeypatch)
     first = _ordinary_dir(tmp_path)
+    (tmp_path / "other").mkdir()
+    second = _ordinary_dir(tmp_path / "other")
     with pytest.raises(SystemExit) as raised:
-        _run_main(monkeypatch, str(first), str(first), "--to-json")
+        _run_main(
+            monkeypatch,
+            str(first),
+            str(second),
+            "--results-fragment",
+            str(tmp_path / "frag.json"),
+            "--output-dir",
+            str(tmp_path / "out"),
+        )
     assert raised.value.code == 2
+    assert "exactly one input directory" in capsys.readouterr().err
 
 
-def test_options_absent_leaves_no_results_files(tmp_path, monkeypatch):
+def test_plain_run_writes_document_and_html(tmp_path, monkeypatch, capsys):
     _patch_reports(monkeypatch)
     result = _ordinary_dir(tmp_path)
+    base = next(result.glob("*.csv")).with_suffix("")
+    _live_csv(f"{base}.live.csv")
     _run_main(monkeypatch, str(result))
-    assert not (result / "results.json").exists()
-    assert not (result / "results.live").exists()
+
+    document = json.loads((result / "results.json").read_text(encoding="utf-8"))
+    validate_results_document(document)
+    assert document["generator"]["options"]["live_detail"] == "full"
+    assert (result / "report.html").is_file()
+    assert any((result / "results.live").glob("*.jsonl.zst"))
+    err = capsys.readouterr().err
+    assert "Results document saved as" in err and "HTML report saved as" in err
 
 
 def test_full_live_document_validates_and_sidecar_path_is_relative(
@@ -712,9 +805,6 @@ def test_full_live_document_validates_and_sidecar_path_is_relative(
     _run_main(
         monkeypatch,
         str(result),
-        "--to-json",
-        "--live-detail",
-        "full",
         "--output-dir",
         str(output),
     )
@@ -731,6 +821,62 @@ def test_full_live_document_validates_and_sidecar_path_is_relative(
     assert (output / series["path"]).is_file()
 
 
+def test_additional_and_unpaired_live_domains_in_the_document(tmp_path, monkeypatch):
+    _patch_reports(monkeypatch)
+    result = _ordinary_dir(tmp_path)
+    base = next(result.glob("*.csv")).with_suffix("")
+    _live_csv(f"{base}.live.csv", clients=3)
+    _live_csv(tmp_path / "sync.csv", clients=3, phase="SYNC")
+    sync_rows = (tmp_path / "sync.csv").read_text(encoding="utf-8").split("\n", 1)[1]
+    with open(f"{base}.live.csv", "a", encoding="utf-8", newline="") as handle:
+        handle.write(sync_rows)
+    unpaired = result / f"elbencho-1M-c_001-s_016-d_001_{_DS}.live.csv"
+    _live_csv(unpaired, clients=2, phase="READ")
+    output = tmp_path / "out"
+    arguments = [str(result)]
+
+    _run_main(monkeypatch, *arguments, "--output-dir", str(output))
+    document = json.loads((output / "results.json").read_text(encoding="utf-8"))
+    validate_results_document(document)
+
+    results = next(
+        e["results"] for e in document["executions"] if e["execution_id"] == "0001"
+    )
+    write = _phase({"results": results}, "write")["live"]
+    assert write["client_series"]["path"] == "results.live/0001.write.jsonl.zst"
+    (sync,) = results["additional_live_domains"]
+    assert sync["domain"] == {"phase": "sync", "mix_type": "", "occurrence": 0}
+    assert sync["client_series"]["path"] == "results.live/0001.sync.jsonl.zst"
+    assert (output / sync["client_series"]["path"]).is_file()
+    (orphan,) = document["groups"][0]["unpaired_live"]
+    assert orphan["source"]["path"] == unpaired.name
+    assert orphan["phase_context"] is None
+    digest = orphan["source"]["sha256"][:12]
+    assert orphan["client_series"]["path"] == (
+        f"results.live/{unpaired.name[: -len('.live.csv')]}.{digest}.read.jsonl.zst"
+    )
+    assert (output / orphan["client_series"]["path"]).is_file()
+
+    filtered = tmp_path / "filtered"
+    _run_main(
+        monkeypatch, *arguments, "--only-threads", "4", "--output-dir", str(filtered)
+    )
+    document = json.loads((filtered / "results.json").read_text(encoding="utf-8"))
+    assert document["groups"][0]["unpaired_live"] == []
+
+
+def test_unreadable_unpaired_live_csv_is_a_diagnostic(tmp_path):
+    _write_ledger(tmp_path, "0001")
+    _write_result(tmp_path)
+    (tmp_path / f"elbencho-1M-c_001-s_016-d_001_{_DS}.live.csv").write_text(
+        "a,b\n1,2\n", encoding="utf-8"
+    )
+    fragment = _fragment(tmp_path)
+    assert fragment["unpaired_live"] == []
+    assert [d["code"] for d in fragment["diagnostics"]] == ["live_csv_unreadable"]
+    assert _entry(fragment, "0001")["results"]["additional_live_domains"] == []
+
+
 def test_unparseable_definition_stays_in_the_ordinary_document(tmp_path, monkeypatch):
     _patch_reports(monkeypatch)
     result = _ordinary_dir(tmp_path)
@@ -740,7 +886,7 @@ def test_unparseable_definition_stays_in_the_ordinary_document(tmp_path, monkeyp
     (result / "executions" / "0002.status").write_text("FAILED\n", encoding="utf-8")
 
     with pytest.raises(SystemExit) as raised:
-        _run_main(monkeypatch, str(result), "--to-json", "--require-complete")
+        _run_main(monkeypatch, str(result), "--require-complete")
     assert raised.value.code == 3
     document = json.loads((result / "results.json").read_text(encoding="utf-8"))
     validate_results_document(document)
@@ -770,7 +916,7 @@ def test_blank_first_rates_are_null_and_partial(tmp_path, monkeypatch):
         writer.writerows(rows)
 
     with pytest.raises(SystemExit) as raised:
-        _run_main(monkeypatch, str(result), "--to-json", "--require-complete")
+        _run_main(monkeypatch, str(result), "--require-complete")
     assert raised.value.code == 3
     document = json.loads((result / "results.json").read_text(encoding="utf-8"))
     validate_results_document(document)
@@ -785,7 +931,7 @@ def test_blank_first_rates_are_null_and_partial(tmp_path, monkeypatch):
     ]
 
 
-def test_directory_without_results_exits_by_completeness(tmp_path, monkeypatch):
+def test_directory_without_results_exits_by_completeness(tmp_path, monkeypatch, capsys):
     _patch_reports(monkeypatch)
     result = tmp_path / f"elbencho-{_DS}"
     result.mkdir()
@@ -794,16 +940,15 @@ def test_directory_without_results_exits_by_completeness(tmp_path, monkeypatch):
     (result / "executions" / "0001.status").write_text("PENDING\n", encoding="utf-8")
 
     with pytest.raises(SystemExit) as raised:
-        _run_main(monkeypatch, str(result), "--to-json")
-    assert raised.value.code == 0
+        _run_main(monkeypatch, str(result))
+    assert raised.value.code == 1
+    assert "results.json was written" in capsys.readouterr().err
+    assert (result / "report.html").is_file()
     with pytest.raises(SystemExit) as raised:
-        _run_main(monkeypatch, str(result), "--to-json", "--require-complete")
+        _run_main(monkeypatch, str(result), "--require-complete")
     assert raised.value.code == 3
     document = json.loads((result / "results.json").read_text(encoding="utf-8"))
     assert document["batch_outcome"]["executions"]["pending"] == 1
-    with pytest.raises(SystemExit) as raised:
-        _run_main(monkeypatch, str(result))
-    assert raised.value.code == 1
 
 
 def _rewrite_csv(result, change):
@@ -833,7 +978,7 @@ def test_zero_milliseconds_is_measured_and_blank_is_null(tmp_path, monkeypatch):
             row["time ms [last]"] = "soon"
 
     _rewrite_csv(result, change)
-    _run_main(monkeypatch, str(result), "--to-json")
+    _run_main(monkeypatch, str(result))
     document = json.loads((result / "results.json").read_text(encoding="utf-8"))
     validate_results_document(document)
     execution = next(e for e in document["executions"] if e["execution_id"] == "0001")
@@ -861,7 +1006,7 @@ def test_non_finite_live_totals_become_null_samples(tmp_path, monkeypatch):
         writer.writeheader()
         writer.writerows(rows)
 
-    _run_main(monkeypatch, str(result), "--to-json")
+    _run_main(monkeypatch, str(result))
     document = json.loads((result / "results.json").read_text(encoding="utf-8"))
     validate_results_document(document)
     execution = next(e for e in document["executions"] if e["execution_id"] == "0001")
@@ -869,3 +1014,135 @@ def test_non_finite_live_totals_become_null_samples(tmp_path, monkeypatch):
     series = write["live"]["aggregate_series"]
     assert series["ops_per_s"] == [100.0, None, 100.0, None]
     assert series["bytes_per_s"] == [300 * 1048576, 300 * 1048576, None, 300 * 1048576]
+
+
+def test_stale_live_sidecars_are_removed(tmp_path, monkeypatch):
+    _patch_reports(monkeypatch)
+    result = _ordinary_dir(tmp_path)
+    stale = result / "results.live" / "stale.jsonl.zst"
+    stale.parent.mkdir()
+    stale.write_bytes(b"old")
+    _run_main(monkeypatch, str(result))
+    assert not stale.exists()
+
+
+@pytest.mark.parametrize("failing", ["serialize", "replace"])
+def test_failed_write_leaves_no_document_or_temp_file(tmp_path, monkeypatch, failing):
+    _patch_reports(monkeypatch)
+    result = _ordinary_dir(tmp_path)
+
+    def broken(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    if failing == "serialize":
+        monkeypatch.setattr(results_json, "serialize", broken)
+    else:
+        monkeypatch.setattr(results_json.os, "replace", broken)
+    with pytest.raises(OSError):
+        _run_main(monkeypatch, str(result))
+    assert not (result / "results.json").exists()
+    assert not list(result.glob(".results-*"))
+
+
+def _two_inputs(tmp_path):
+    """Two ordinary directories under distinct parents, each with a live CSV."""
+
+    def make(name):
+        parent = tmp_path / name
+        parent.mkdir()
+        result = _ordinary_dir(parent)
+        base = next(result.glob("*.csv")).with_suffix("")
+        _live_csv(f"{base}.live.csv")
+        return result
+
+    return make("alpha"), make("beta")
+
+
+def test_several_inputs_make_one_document_with_a_group_each(tmp_path, monkeypatch):
+    _patch_reports(monkeypatch)
+    first, second = _two_inputs(tmp_path)
+    output = tmp_path / "out"
+    _run_main(monkeypatch, str(first), str(second), "--output-dir", str(output))
+    document = json.loads((output / "results.json").read_text(encoding="utf-8"))
+    validate_results_document(document)
+
+    root = tmp_path.resolve()
+    assert document["batch"]["root"] == str(root)
+    groups = document["groups"]
+    assert [g["group_id"] for g in groups] == ["0001", "0002"]
+    assert [g["source"] for g in groups] == [
+        str(first.resolve()),
+        str(second.resolve()),
+    ]
+    relatives = [g["output_relative"] for g in groups]
+    assert relatives == [str(p.resolve().relative_to(root)) for p in (first, second)]
+    sidecars = set()
+    for group, relative in zip(groups, relatives):
+        entries = [
+            e for e in document["executions"] if e["group_id"] == group["group_id"]
+        ]
+        assert {e["execution_id"] for e in entries} == {"0001", "0002"}
+        for entry in entries:
+            assert all(
+                f["path"].startswith(relative + "/") for f in entry["result_files"]
+            )
+        write = _phase(next(e for e in entries if e["execution_id"] == "0001"), "write")
+        path = write["live"]["client_series"]["path"]
+        assert path.startswith(f"results.live/{group['group_id']}.")
+        assert (output / path).is_file()
+        sidecars.add(path)
+    assert len(sidecars) == 2
+    assert (output / "report.html").is_file()
+
+
+def test_several_inputs_need_a_separate_output_dir(tmp_path, monkeypatch, capsys):
+    _patch_reports(monkeypatch)
+    first, second = _two_inputs(tmp_path)
+    link = tmp_path / "link"
+    link.symlink_to(second, target_is_directory=True)
+    inputs = (str(first), str(second))
+
+    with pytest.raises(SystemExit) as raised:
+        _run_main(monkeypatch, *inputs)
+    assert raised.value.code == 2
+    assert "--output-dir is required" in capsys.readouterr().err
+    for output in (second, link):
+        with pytest.raises(SystemExit) as raised:
+            _run_main(monkeypatch, *inputs, "--output-dir", str(output))
+        assert raised.value.code == 2
+        assert "choose a separate directory" in capsys.readouterr().err
+    assert not (second / "results.json").exists()
+
+    inside = first / "reports"
+    _run_main(monkeypatch, *inputs, "--output-dir", str(inside))
+    assert (inside / "results.json").is_file()
+
+
+def test_missing_input_directory_is_a_usage_error(tmp_path, monkeypatch, capsys):
+    _patch_reports(monkeypatch)
+    with pytest.raises(SystemExit) as raised:
+        _run_main(monkeypatch, str(tmp_path / "absent"))
+    assert raised.value.code == 2
+    assert "Input directory not found" in capsys.readouterr().err
+
+
+def test_require_complete_alone_decides_the_exit_status(tmp_path, monkeypatch):
+    _patch_reports(monkeypatch)
+    result = _ordinary_dir(tmp_path)
+    with pytest.raises(SystemExit) as raised:
+        _run_main(monkeypatch, str(result), "--require-complete")
+    assert raised.value.code == 3
+    (result / "executions" / "0002.sh").unlink()
+    (result / "executions" / "0002.status").unlink()
+    _run_main(monkeypatch, str(result), "--require-complete")
+
+
+def test_engine_built_document_renders_the_html_report(tmp_path, monkeypatch):
+    _patch_reports(monkeypatch)
+    result = _ordinary_dir(tmp_path)
+    base = next(result.glob("*.csv")).with_suffix("")
+    _live_csv(f"{base}.live.csv")
+    _run_main(monkeypatch, str(result))
+    html = (result / "report.html").read_text(encoding="utf-8")
+    assert CHART_JS_URL in html
+    assert 'id="g0000-' in html

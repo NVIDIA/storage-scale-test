@@ -144,6 +144,21 @@ def test_write_document_is_compact_and_deterministic(tmp_path):
     assert [p.name for p in plain.parent.iterdir()] == ["r.json"]
 
 
+def test_publish_warns_about_unmatched_result_files(tmp_path, capsys):
+    unmatched = results.problem(
+        results.EXECUTION_UNMATCHED, "group 0000: result files match no ledger"
+    )
+    document = {"diagnostics": [unmatched, results.problem("other", "quiet")]}
+    with mock.patch.object(results, "publish_report_html") as html, mock.patch(
+        "lib.results_document.load_document"
+    ):
+        results.publish_document(document, tmp_path / "results.json")
+    html.assert_called_once()
+    err = capsys.readouterr().err
+    assert "Warning: not reported: group 0000: result files match no ledger" in err
+    assert "quiet" not in err
+
+
 def test_write_document_failure_keeps_previous_file(tmp_path):
     path = tmp_path / "r.json"
     results.write_document({"ok": True}, str(path))
@@ -477,7 +492,7 @@ def _ordinary_dir(tmp_path, ledger):
 def test_ordinary_document_with_ledger(tmp_path):
     root = _ordinary_dir(tmp_path, ledger=True)
     fragment = _fragment("io", _execution("0001"))
-    document = results.assemble_ordinary_document(root, fragment, None, GENERATOR)
+    document = results.assemble_inputs_document([(root, fragment)], None, GENERATOR)
     validate_results_document(document)
     assert document["batch"] == {
         "root": str(root.resolve()),
@@ -503,7 +518,7 @@ def test_ordinary_document_with_ledger(tmp_path):
 def test_ordinary_document_without_ledger_is_never_complete(tmp_path):
     root = _ordinary_dir(tmp_path, ledger=False)
     fragment = _fragment("io", _execution(None))
-    document = results.assemble_ordinary_document(root, fragment, None, GENERATOR)
+    document = results.assemble_inputs_document([(root, fragment)], None, GENERATOR)
     validate_results_document(document)
     execution = document["executions"][0]
     assert execution["execution_id"] is None
@@ -547,7 +562,7 @@ def _run(manifest, arguments, engine):
     args = extract_filesystem_parser().parse_args([str(manifest.root), *arguments])
     with mock.patch("lib.filesystem_batch._report_group", side_effect=engine):
         return report_batch(
-            args.results_dir,
+            args.results_dirs[0],
             args.kind,
             args.groups,
             args.output_dir,
@@ -557,14 +572,29 @@ def _run(manifest, arguments, engine):
 
 def test_batch_writes_default_document(tmp_path):
     manifest = _complete_batch(tmp_path)
-    assert (
-        _run(manifest, ["--to-json", "--require-complete"], _engine(_full_fragments))
-        == 0
-    )
+    assert _run(manifest, ["--require-complete"], _engine(_full_fragments)) == 0
     document = json.loads((manifest.root / "reports" / "results.json").read_text())
     validate_results_document(document)
     assert results.document_is_complete(document)
-    assert document["generator"]["options"]["live_detail"] == "summary"
+    assert document["generator"]["options"]["live_detail"] == "full"
+    assert (manifest.root / "reports" / results.REPORT_HTML_FILENAME).is_file()
+    for group in manifest.groups:
+        saved = (manifest.group_path(group) / "env_used.yaml").read_text("utf-8")
+        record = next(g for g in document["groups"] if g["group_id"] == group.group_id)
+        assert record["settings_text"] == saved
+
+
+def test_batch_document_records_rendering_options(tmp_path):
+    manifest = _complete_batch(tmp_path)
+    arguments = ["--client-max-heatmap-rows", "20", "--normalize-to", "4"]
+    assert _run(manifest, arguments, _engine(_full_fragments)) == 0
+    options = json.loads((manifest.root / "reports" / "results.json").read_text())[
+        "generator"
+    ]["options"]
+    assert options["client_max_heatmap_rows"] == 20
+    assert options["client_max_timeseries_lines"] == 10
+    assert options["normalize_to"] == 4
+    assert options["no_dual_y_axis"] is False
 
 
 def test_batch_forwards_fragment_and_live_dir_options(tmp_path):
@@ -578,7 +608,7 @@ def test_batch_forwards_fragment_and_live_dir_options(tmp_path):
             _full_fragments(None, group), output / "results.fragment.json"
         )
 
-    _run(manifest, ["--to-json", "--live-detail", "full"], engine)
+    _run(manifest, ["--live-detail", "full"], engine)
     reports = manifest.root / "reports"
     assert seen["io"] == [
         "--live-detail=full",
@@ -593,28 +623,30 @@ def test_batch_forwards_fragment_and_live_dir_options(tmp_path):
 def test_batch_document_follows_output_dir(tmp_path):
     manifest = _complete_batch(tmp_path)
     output = tmp_path / "elsewhere"
-    arguments = ["--to-json", "--output-dir", str(output)]
+    arguments = ["--output-dir", str(output)]
     assert _run(manifest, arguments, _engine(_full_fragments)) == 0
     validate_results_document(json.loads((output / "results.json").read_text()))
+    assert (output / results.REPORT_HTML_FILENAME).is_file()
     assert not (manifest.root / "reports" / "results.json").exists()
 
 
-def test_batch_to_json_takes_no_path(tmp_path):
+def test_to_json_is_no_longer_accepted(tmp_path):
     manifest = _complete_batch(tmp_path)
-    with pytest.raises(SystemExit):
-        _run(manifest, [f"--to-json={tmp_path / 'doc.json'}"], _engine(_full_fragments))
+    with pytest.raises(SystemExit) as stopped:
+        _run(manifest, ["--to-json"], _engine(_full_fragments))
+    assert stopped.value.code == 2
 
 
 def test_require_complete_exit_status_and_precedence(tmp_path):
     manifest = _complete_batch(tmp_path)
     partial = lambda _m, g: _fragment(g.kind, _execution(g.group_id, "partial"))
-    assert _run(manifest, ["--to-json"], _engine(partial)) == 0
-    assert _run(manifest, ["--to-json", "--require-complete"], _engine(partial)) == 3
+    assert _run(manifest, [], _engine(partial)) == 0
+    assert _run(manifest, ["--require-complete"], _engine(partial)) == 3
     document = json.loads((manifest.root / "reports" / "results.json").read_text())
     assert not results.document_is_complete(document)
     # A reporting failure (1) wins over incomplete (3).
     engine = mock.Mock(side_effect=ValueError("bad"))
-    assert _run(manifest, ["--to-json", "--require-complete"], engine) == 1
+    assert _run(manifest, ["--require-complete"], engine) == 1
     document = json.loads((manifest.root / "reports" / "results.json").read_text())
     assert {e["problems"][0]["code"] for e in document["executions"]} == {
         results.REPORT_FAILED
@@ -624,19 +656,17 @@ def test_require_complete_exit_status_and_precedence(tmp_path):
 def test_pending_batch_writes_document_and_exits_by_completeness(tmp_path):
     manifest = _create_batch(tmp_path / "batch", kinds=("io", "mdtest"))
     engine = mock.Mock(side_effect=AssertionError("no group has results"))
-    assert _run(manifest, ["--to-json"], engine) == 0
-    assert _run(manifest, ["--to-json", "--require-complete"], engine) == 3
+    assert _run(manifest, [], engine) == 0
+    assert _run(manifest, ["--require-complete"], engine) == 3
     document = json.loads((manifest.root / "reports" / "results.json").read_text())
     validate_results_document(document)
     assert document["batch_outcome"]["executions"]["pending"] == 2
     assert not results.document_is_complete(document)
-    # Without a document, an empty report is still a failure.
-    assert _run(manifest, [], engine) == 1
 
 
 def test_missing_fragment_from_successful_engine_fails_the_run(tmp_path):
     manifest = _complete_batch(tmp_path)
-    assert _run(manifest, ["--to-json"], _engine(lambda *_: None)) == 1
+    assert _run(manifest, [], _engine(lambda *_: None)) == 1
 
 
 def test_stale_fragment_is_not_reused(tmp_path):
@@ -647,7 +677,7 @@ def test_stale_fragment_is_not_reused(tmp_path):
     assert (
         _run(
             manifest,
-            ["--to-json"],
+            [],
             _engine(
                 lambda m, g: None if g.group_id == "0001" else _full_fragments(m, g)
             ),
@@ -656,23 +686,68 @@ def test_stale_fragment_is_not_reused(tmp_path):
     )
 
 
-def test_require_complete_without_to_json_is_a_usage_error(tmp_path):
-    manifest = _complete_batch(tmp_path)
-    args = extract_filesystem_parser().parse_args(
-        [str(manifest.root), "--require-complete"]
-    )
-    with pytest.raises(ValueError, match="requires --to-json"):
-        report_batch(args.results_dir, analysis_args=args)
-
-
-def test_without_to_json_nothing_changes(tmp_path):
+def test_batch_without_options_always_requests_fragments_and_html(tmp_path):
     manifest = _complete_batch(tmp_path)
     seen = []
 
-    def engine(_m, _group, _s, output, options, **_kwargs):
+    def engine(_m, group, _s, output, options, **_kwargs):
         seen.append(options)
         (output / "report.txt").write_text("x", encoding="utf-8")
+        results.write_fragment(
+            _full_fragments(None, group), output / "results.fragment.json"
+        )
 
     assert _run(manifest, [], engine) == 0
-    assert seen == [[], []]
-    assert not (manifest.root / "reports" / "results.json").exists()
+    assert all(o[0].startswith("--results-fragment=") for o in seen)
+    reports = manifest.root / "reports"
+    assert (reports / "results.json").is_file()
+    assert (reports / results.REPORT_HTML_FILENAME).is_file()
+    assert not (reports / "index.md").exists()
+
+
+def test_batch_removes_stale_live_sidecars(tmp_path):
+    manifest = _complete_batch(tmp_path)
+    live = manifest.root / "reports" / "results.live"
+    live.mkdir(parents=True)
+    (live / "old.jsonl.zst").write_bytes(b"x")
+    assert _run(manifest, [], _engine(_full_fragments)) == 0
+    assert not (live / "old.jsonl.zst").exists()
+
+
+# -- several input directories ------------------------------------------------
+
+
+def _input_dir(parent, name):
+    root = parent / name
+    root.mkdir(parents=True)
+    (root / "env_used.yaml").write_text("EXECUTION_SUBSTRATE: ssh\n", encoding="utf-8")
+    return root
+
+
+def test_assemble_inputs_document_groups_several_inputs(tmp_path):
+    first = _input_dir(tmp_path, "elbencho-20260930Z120000")
+    second = _input_dir(tmp_path, "elbencho-20261001Z120000")
+    inputs = [
+        (second, _fragment("io")),
+        (first, _fragment("mdtest")),
+    ]
+    document = results.assemble_inputs_document(inputs, None, GENERATOR)
+    validate_results_document(document)
+    assert document["batch"]["root"] == str(tmp_path.resolve())
+    groups = document["groups"]
+    assert [g["group_id"] for g in groups] == ["0001", "0002"]
+    assert [g["kind"] for g in groups] == ["io", "mdtest"]
+    assert [g["source"] for g in groups] == [str(second), str(first)]
+    assert [g["output_relative"] for g in groups] == [second.name, first.name]
+
+
+def test_assemble_inputs_document_single_input_stays_group_zero(tmp_path):
+    root = _input_dir(tmp_path, "elbencho-20260930Z120000")
+    document = results.assemble_inputs_document(
+        [(root, _fragment("io"))], None, GENERATOR
+    )
+    validate_results_document(document)
+    (group,) = document["groups"]
+    assert (group["group_id"], group["output_relative"]) == ("0000", ".")
+    assert group["source"] == str(root.resolve())
+    assert document["batch"]["root"] == str(root.resolve())

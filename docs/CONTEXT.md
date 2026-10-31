@@ -210,7 +210,8 @@ Operation is in [FILESYSTEM_TESTING.md](FILESYSTEM_TESTING.md). Invariants:
 - A cell succeeds only with nonempty, nonsymlink result pairs and an atomic
   completion marker written after all phases and cleanup.
 - When a metadata ledger exists, the analyzer counts only `SUCCESS` cells;
-  legacy result directories without one remain readable.
+  legacy result directories without one remain readable. An `executions/`
+  directory without any `NNNN.sh` is no ledger (both engines).
 - Metadata phases use `-s 0` without `-b 0`: Elbencho 3.2 rejects zero block
   sizes even for zero-byte files.
 
@@ -242,15 +243,36 @@ collect before resume.
 - Batch `reports.txt` exists only with at least two eligible owned reports;
   filtered runs rebuild it from fresh and retained owned reports, excluding
   failed or unowned ones.
-- `--to-json` fragments are internal; `report_batch` assembles the document.
-  Filters and failed groups never drop executions. Every execution carries
+- Only pool parse tasks read raw result files; text, PNGs, live reports and
+  HTML render from the document (or engine fragment), so `--only-*` applies
+  at render time. Engines parse, then render, so a batch keeps one pool full.
+  Fragments are internal; `report_batch` assembles the batch document.
+- Filters and failed groups never drop executions. Every execution carries
   `coordinates` and `coordinate_key`; `dataset`/`results` only when parsed.
+- Live outputs replay from sidecar `done_bytes_delta` (exact `DoneBytes`);
+  rates alone drift (rounding, gaps, resets). Below `full`, text uses the
+  stored fairness summary. Renderers read 1.1 fields with `.get`.
+- Pass the same `ReportSelection` to every `report.html` write so HTML shows
+  what text shows. Template names and anchors are user-facing references.
+- `report_html/pairing.py`'s docstring defines which settings block, imply
+  or are only noted in comparisons. `lib/setting_relevance.py` is the single
+  source of truth for which settings apply to a run.
+- With several `--from-json` documents the parent writes `report.html`
+  first, so a bad `--comparisons` fails before any output; batch engines
+  never see it.
+- Mixed IO and metadata directories run each engine into `dN`; the parent
+  checks options and comparison document/group references first, removes
+  the old `report.html`, and writes the combined page only if both succeed.
+- Replayable options (`ReportOption.recorded`) parse unset so a replay can
+  tell them from defaults; call `resolve_report_options` before reading
+  them. Text and HTML take the live level from `effective_live_detail`.
 - Live fairness ends the steady window at elbencho `[first]` and compares
   clients by ratio to the fleet median, not z-scores; analysis streams the
-  live CSV in at most three passes.
+  live CSV (or replayed sidecar, `LiveAnalysis.rows`) in at most three passes.
 - Report pool tasks pickle as module `extract_elbencho` (`lib/report_pool.py`
-  loads it in workers; the script runs `main` from that module). Tests run
-  tasks inline via `tests/conftest.py`, so monkeypatches still apply.
+  loads it in workers; the script runs `main` from that module). mdtest parse
+  tasks run inline inside a batch (no nested pool). Tests run tasks inline via
+  `tests/conftest.py`, so monkeypatches still apply.
 
 Inspect large JSON/JSON.zst without printing complete datasets:
 

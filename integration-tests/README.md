@@ -237,8 +237,8 @@ the `GROUP_<NNNN>_KIND`, `GROUP_<NNNN>_TARGET`, and `SEGMENT_COUNT`,
 `SEGMENT_<i>_NAMESPACE` (`<i>` counts from 0), and `SEGMENT_<i>_STATE` status
 keys (and no `TARGET_<i>_*` keys); one Lease per claim
 and one coordinator Job per namespace; successful cells with result files; run
-trees on both claims before collection and none after; the report index's Target
-column; and no tool-owned Lease, Job, DaemonSet, NetworkPolicy, Pod,
+trees on both claims before collection and none after; the `report.html` section
+headings' targets; and no tool-owned Lease, Job, DaemonSet, NetworkPolicy, Pod,
 ServiceAccount, Role, or RoleBinding left in either namespace. The scenario sets
 `KUBECTL_SEQUENCER_POLL_SECONDS=2` so the sequencer hands off promptly.
 `kubectl-multi-target-unbound` renders `b.env` with a scenario-owned claim that
@@ -274,11 +274,11 @@ submission to print `GROUP_<gid>_TARGET` and the legacy `GROUP_TARGET` (and no
 `GROUP_<NNNN>_KIND` and `GROUP_<NNNN>_TARGET` for every group (the other two
 groups carry the derived name), each group's `env_used.yaml` to record its name,
 its `target_file` (path, SHA-256 of the file, and the variables it set; `null`
-for groups without one) and the workload override files in order, and the report
-index's Target column to name each group's target. The report step also runs
-`extract-filesystem.py --to-json` and requires `results.json` to show a complete
-batch: one group per identity, every execution `success`/`complete`, and
-elbencho first/last rates on each IO execution.
+for groups without one) and the workload override files in order, and the `report.html` section
+headings to name each group's target. The report step also requires
+`results.json` to show a complete batch: one group per identity, every
+execution `success`/`complete`, and elbencho first/last rates on each IO
+execution.
 
 Tests run a real deployment archive: the harness snapshots the tracked source
 once, builds it with the zero-argument `utils/build_tarball.sh`, and caches the
@@ -304,7 +304,7 @@ edited copy `-modified`.
 Beyond each scenario's own checks, every test requires successful execution
 records, exact workload totals, ordered worker selection, nonempty benchmark
 output, environment snapshots, and cleanup of generated data directories, and
-runs `utils/extract-elbencho.py` on host-side result copies. Host-side results
+runs the reporting engines on host-side result copies. Host-side results
 and diagnostics stay under the state directory, with timestamped build and step
 logs below its `test-runs/`.
 

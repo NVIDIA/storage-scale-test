@@ -652,7 +652,7 @@ export ELBENCHO_SCALE_IO_SIZES=("r4K" "1M" "4M" "8M" "16M")
 
 Use the single-node results to identify which size maximizes throughput,
 then narrow down for multi-node runs. Filter the report afterward with
-`utils/extract-elbencho.py --only-sizes ...`.
+`utils/extract-filesystem.py --only-sizes ...`.
 
 3. **Compare nearby sizes.** When documentation suggests a size (e.g., 1M
    or 16M), testing both that value and one step larger or smaller can

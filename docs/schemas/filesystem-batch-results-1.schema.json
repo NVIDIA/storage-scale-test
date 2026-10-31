@@ -289,6 +289,10 @@
             "live_detail": true,
             "shortfall_percent": true,
             "min_slow_windows": true,
+            "client_max_timeseries_lines": true,
+            "client_max_heatmap_rows": true,
+            "no_dual_y_axis": true,
+            "normalize_to": true,
             "only_nodes": true,
             "only_threads": true,
             "only_sizes": true,
@@ -421,6 +425,16 @@
         "output_relative": {
           "type": "string"
         },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "target": {
           "$ref": "#/$defs/target"
         },
@@ -468,10 +482,26 @@
         "settings": {
           "type": "object"
         },
+        "settings_text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "execution_ids": {
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "unpaired_live": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/live"
           }
         }
       },
@@ -652,6 +682,17 @@
             }
           ]
         },
+        "file_size_bytes": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "configured_time_limit_s": {
           "anyOf": [
             {
@@ -683,10 +724,26 @@
     "io_results": {
       "type": "object",
       "properties": {
+        "datestamp": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "phases": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/io_phase"
+          }
+        },
+        "additional_live_domains": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/live"
           }
         },
         "workload": {
@@ -752,6 +809,19 @@
               "type": "null"
             }
           ]
+        },
+        "command": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -762,6 +832,16 @@
           "type": "integer"
         },
         "datestamp": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "producer_version": {
           "anyOf": [
             {
               "type": "string"
@@ -881,6 +961,16 @@
           "anyOf": [
             {
               "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "producer_version": {
+          "anyOf": [
+            {
+              "type": "string"
             },
             {
               "type": "null"
@@ -1109,6 +1199,64 @@
             "occurrence"
           ]
         },
+        "phase_context": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "first_ms": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "last_ms": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "block_size_bytes": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "final_avg_latency_us": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "first_ms",
+                "last_ms",
+                "block_size_bytes",
+                "final_avg_latency_us"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "intervals": {
           "type": "integer"
         },
@@ -1159,6 +1307,42 @@
                 "anyOf": [
                   {
                     "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "entries_latency_avg_us": {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "start_time": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "clock_skew_ms": {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "integer"
                   },
                   {
                     "type": "null"
@@ -1344,6 +1528,9 @@
               "type": "null"
             }
           ]
+        },
+        "interval_ms": {
+          "type": "integer"
         }
       }
     },

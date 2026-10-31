@@ -17,6 +17,10 @@
 
 """Script to analyze elbencho filesystem benchmark results.
 
+Pool tasks parse the result files into the results document; every table,
+plot and live report renders from that document (``start_document_render``),
+also for ``--from-json``.
+
 Optional fields capture nv-elbencho-sweep / _elbencho_functions.sh log lines when
 present in .out files: write-only dir, read-from path, treescan stats (raw + parsed).
 Treescan may appear only in per-task job .out files; when the aggregate CSV .out
@@ -33,13 +37,12 @@ import glob
 import math
 import os
 import re
-import shlex
 import sys
 from pathlib import Path
 import traceback
 from collections import defaultdict
-from concurrent.futures import Executor
-from dataclasses import dataclass, field
+from concurrent.futures import Executor, Future
+from dataclasses import dataclass, field, fields, replace
 from functools import partial
 from itertools import chain
 from typing import (
@@ -76,12 +79,32 @@ import numpy as np
 
 # Local import after sys.path: repo root must be on path first.
 # pylint: disable=wrong-import-position
-from lib.report_provenance import ResultVersions, result_version, with_versions
-from lib.report_pool import captured, load_engine, replay, report_pool
+from lib.project_version import UNKNOWN as UNKNOWN_VERSION
+from lib.report_provenance import (
+    VERSION_SUFFIX,
+    recorded_result_version,
+    with_versions,
+)
+from lib.report_pool import (
+    InlineExecutor,
+    captured,
+    load_engine,
+    replay,
+    report_pool,
+)
 from lib.env_used_yaml import apply_env_used_to_metrics, load_env_used_yaml
-from lib.filesystem_batch import route_batch_report
+from lib.filesystem_batch import (
+    is_batch_document,
+    report_documents,
+    route_batch_report,
+)
 from lib.filesystem_report_options import (
+    document_output_dir,
+    resolve_report_options,
+    unique_inputs,
     validate_analysis_arguments,
+    validate_integer_filter,
+    validate_report_inputs,
 )
 from lib import filesystem_results as results_json
 from lib import filesystem_coordinates as fs_coordinates
@@ -95,15 +118,21 @@ from lib.filesystem_coordinates import (
     phase_plan,
     plan_runs_phase,
 )
-from lib.elbencho_live_results import LiveCSVError, build_live_objects
+from lib.elbencho_live_results import LiveCSVError, LiveObjects, build_live_objects
 from lib.elbencho_live_results import load_workers_tsv, null_live
+from lib.elbencho_live_results import (
+    analyze_document_live,
+    document_aggregate_domain,
+    document_phase_context,
+    document_steady,
+    live_domain_key,
+)
 from lib.elbencho_live_report import (
     DomainAnalysis,
     LiveAnalysis,
     LiveClientId,
     LiveDomainKey,
     LiveFileMetadata,
-    analyze_live_csv,
     write_client_summaries,
 )
 from lib.elbencho_live_plots import (
@@ -113,13 +142,12 @@ from lib.elbencho_live_plots import (
     plot_fairness_timeseries,
 )
 from lib.elbencho_live_steady import (
+    CLASS_ORDER,
     CLASS_PERSISTENT,
     CLASS_TRANSIENT,
     LatencySummary,
     PhaseContext,
-    REASON_NO_FIRST_TIME,
-    REASON_NO_STEADY_STATE,
-    REASON_TOO_SHORT,
+    STEADY_REASON_TEXT,
     SteadyAnalysis,
     SteadyWindow,
     WindowSummary,
@@ -127,19 +155,36 @@ from lib.elbencho_live_steady import (
     WINDOW_30S,
     WINDOW_5S,
     WINDOW_INTERVAL,
+    WINDOW_LABELS,
+    WINDOW_SECONDS,
     analyze_steady,
     classified_clients,
     collect_windowed_client_detail,
     select_heatmap_rows,
+    window_length_intervals,
 )
 from lib.join_datestamps import join_datestamps, join_datestamps_for_filename
-from lib.reporting_common import PNG_SAVE_OPTIONS, histogram_axis_ranges
+from lib.parse_only_sizes import parse_only_sizes_filter
+from lib.reporting_common import (
+    PNG_SAVE_OPTIONS,
+    histogram_axis_ranges,
+    natural_key,
+)
+from lib.results_document import (
+    LoadedDocument,
+    document_from_data,
+    effective_live_detail,
+    recorded_options,
+    sidecar_path,
+)
 from lib.stdout_report_file import (  # pylint: disable=wrong-import-position
     REPORT_TXT_FILENAME,
     mirror_stdout_to_file,
+    remove_stale_report,
 )
 from lib.storage_target import (
     StorageTarget,
+    guarded_document_target,
     guarded_report_target,
     storage_target_from_env,
 )
@@ -302,12 +347,11 @@ class ElbenchoMetrics:
     configured_files_per_node: str = ""
     configured_file_size: str = ""
 
-    # Explicit per-execution workload metadata. Counts remain strings so the
-    # metadata null marker stays distinct from a valid zero-file staged tree.
+    # The Workload/Lifecycle line fields of the execution's workload.tsv, as
+    # recorded there: the null marker stays distinct from a valid zero.
     workload_layout: str = ""
     dataset_count_source: str = ""
     treefile_source: str = ""
-    treefile_cache_publish_outcome: str = ""
     requested_files_per_node: str = ""
     effective_files_per_node: str = ""
     dataset_files_total: str = ""
@@ -315,24 +359,10 @@ class ElbenchoMetrics:
     reader_nodes: str = ""
     reader_threads_per_node: str = ""
     reader_iodepth: str = ""
-    files_per_reader_node: str = ""
-    termination_mode: str = ""
-    configured_duration_seconds: str = ""
-    effective_timelimit_seconds: str = ""
     completion_state: str = ""
     failure_cleanup_state: str = ""
-    write_expected_files: str = ""
-    write_expected_bytes: str = ""
-    write_completed_files: str = ""
-    write_completed_bytes: str = ""
     write_elapsed_time_ms: str = ""
-    write_completion_state: str = ""
-    read_expected_files: str = ""
-    read_expected_bytes: str = ""
-    read_completed_files: str = ""
-    read_completed_bytes: str = ""
     read_elapsed_time_ms: str = ""
-    read_completion_state: str = ""
     delete_expected_files: str = ""
     delete_completed_files: str = ""
     delete_elapsed_time_ms: str = ""
@@ -719,29 +749,6 @@ def load_execution_workloads(
     return workloads
 
 
-def _apply_execution_workload(
-    metric: ElbenchoMetrics,
-    coordinates: ExecutionCoordinates,
-    metadata: Dict[str, str],
-) -> None:
-    """Apply one complete explicit workload record to a joined metric."""
-    metric.workload_layout = _execution_workload_layout(coordinates, metadata)
-    for key in _WORKLOAD_METADATA_KEYS:
-        setattr(metric, key, metadata[key])
-
-
-def apply_execution_workloads(result_dir: str, metrics: List[ElbenchoMetrics]) -> None:
-    """Join NNNN.workload.tsv records to parsed metrics through NNNN.sh."""
-    workloads = load_execution_workloads(result_dir)
-    for metric in metrics:
-        key = _execution_coordinate_key(
-            metric.nodes, metric.io_size, metric.threads, metric.io_depth
-        )
-        workload = workloads.get(key)
-        if workload:
-            _apply_execution_workload(metric, *workload)
-
-
 def metric_display_file_size_bytes(metric: ElbenchoMetrics) -> int:
     """Bytes to show in File Size headers: treescan avg, else first-file, else CSV."""
     if metric.treescan_avg_bytes > 0:
@@ -810,7 +817,9 @@ def print_sweep_auxiliary_lines_for_metrics(op_metrics: List[ElbenchoMetrics]) -
     for ds, path in _sorted_unique_datestamp_path_pairs(
         op_metrics, "sweep_read_from_path"
     ):
-        print(f"Read-from (datestamp {ds}): {path}")
+        # Pre-batch read-only runs that never recorded a path say "unknown".
+        if path != "unknown":
+            print(f"Read-from (datestamp {ds}): {path}")
 
 
 def print_workload_metadata_for_metrics(op_metrics: List[ElbenchoMetrics]) -> None:
@@ -1133,42 +1142,6 @@ def strip_hosts_from_command(command: str) -> str:
     result = re.sub(r"\s*--hosts\s+\S+", "", result)
     result = re.sub(r"\s*--hosts=\S+", "", result)
     return result
-
-
-def parse_size_string(size_str: str) -> Tuple[str, str]:
-    """Parse size string, returning write_size and read_size.
-
-    Preserves the optional 'r' prefix which indicates random IO.
-    For formats like "1M,4K", returns ("1M", "4K").
-    For formats like "r1M,4K", returns ("r1M", "4K").
-    For single value formats like "r4K", returns ("r4K", "r4K").
-    """
-    if "," in size_str:
-        write_size, read_size = size_str.split(",", 1)
-        return write_size, read_size
-    return size_str, size_str
-
-
-def parse_size_with_order(size_str: str) -> Tuple[str, str]:
-    """Parse size string with optional random prefix, returning order and clean size.
-
-    Args:
-        size_str: Size string that may have 'r' prefix (e.g., "r4K", "1M", "r10M")
-
-    Returns:
-        Tuple of (order, clean_size) where:
-        - order is "Rand" or "Seq"
-        - clean_size is the size without the 'r' prefix
-
-    Examples:
-        "r4K" -> ("Rand", "4K")
-        "4K" -> ("Seq", "4K")
-        "1M" -> ("Seq", "1M")
-        "r1M" -> ("Rand", "1M")
-    """
-    if size_str.startswith("r"):
-        return ("Rand", size_str[1:])
-    return ("Seq", size_str)
 
 
 def normalize_time(time_str: str) -> float:
@@ -2666,45 +2639,6 @@ def plot_metrics(
                     )
 
 
-def filter_metrics(
-    metrics: List[ElbenchoMetrics],
-    only_sizes: Optional[Set[str]] = None,
-    only_threads: Optional[Set[int]] = None,
-    only_nodes: Optional[Set[int]] = None,
-    only_iodepths: Optional[Set[int]] = None,
-) -> List[ElbenchoMetrics]:
-    """Filter metrics based on IO sizes, thread counts, node counts, and IO depths.
-
-    Args:
-        metrics: List of ElbenchoMetrics objects to filter
-        only_sizes: Set of IO size strings to include (e.g., {'1M', '4K', '1M,4K'})
-        only_threads: Set of thread counts to include
-        only_nodes: Set of node counts to include
-        only_iodepths: Set of IO depth values to include
-
-    Returns:
-        Filtered list of ElbenchoMetrics objects
-    """
-    if not metrics:
-        return []
-
-    filtered = metrics.copy()
-
-    if only_sizes:
-        filtered = [m for m in filtered if m.io_size in only_sizes]
-
-    if only_threads:
-        filtered = [m for m in filtered if m.threads in only_threads]
-
-    if only_nodes:
-        filtered = [m for m in filtered if m.nodes in only_nodes]
-
-    if only_iodepths:
-        filtered = [m for m in filtered if m.io_depth in only_iodepths]
-
-    return filtered
-
-
 # Helper function to format latency values with significant digits and decimal alignment
 def format_with_sig_figs(value: float, sig_figs: int = 3) -> str:
     """Format a number with a specific number of significant figures.
@@ -2761,7 +2695,7 @@ def format_with_sig_figs(value: float, sig_figs: int = 3) -> str:
 
 
 # Function to align decimal points in a column
-def align_decimal_points(values: List[str], markdown: bool) -> List[str]:
+def align_decimal_points(values: List[str]) -> List[str]:
     """Align decimal points in a column of values.
 
     Args:
@@ -2780,28 +2714,18 @@ def align_decimal_points(values: List[str], markdown: bool) -> List[str]:
             max_before_decimal = max(max_before_decimal, len(before))
             max_after_decimal = max(max_after_decimal, len(after))
 
-    # Align each value
+    # Align each value with fixed-width alignment
     aligned_values = []
     for val in values:
         if "." in val:
             before, after = val.split(".")
             # Right-align the part before decimal, left-align the part after decimal
-            if markdown:
-                # For Markdown, just use the original values without extra spaces
-                aligned = f"{before}.{after}"
-            else:
-                # For console output, use fixed-width alignment
-                aligned = f"{before.rjust(max_before_decimal)}.{after.ljust(max_after_decimal)}"
+            aligned = (
+                f"{before.rjust(max_before_decimal)}.{after.ljust(max_after_decimal)}"
+            )
         else:
             # For integer values, right-align and add spaces for where decimal point would be
-            if markdown:
-                # For Markdown, just use the original values without extra spaces
-                aligned = val
-            else:
-                # For console output, use fixed-width alignment
-                aligned = (
-                    f"{val.rjust(max_before_decimal)}{' ' * (1 + max_after_decimal)}"
-                )
+            aligned = f"{val.rjust(max_before_decimal)}{' ' * (1 + max_after_decimal)}"
 
         aligned_values.append(aligned)
 
@@ -2831,8 +2755,10 @@ def _terminal_table_subgroup_key(metric: ElbenchoMetrics) -> Tuple[Any, ...]:
 
 def _terminal_table_bucket_sort_key(key: Tuple[Any, ...]) -> Tuple[Any, ...]:
     """Sort order between subgroup buckets: dio before bio, then SN/MN, seq/rand, duration, workload."""
-    is_mn, dio, rand_io, dur, workload = key
-    return (-dio, is_mn, rand_io, dur, workload)
+    is_mn, dio, rand_io, dur, (kind, value) = key
+    if isinstance(value, str):
+        value = natural_key(value)
+    return (-dio, is_mn, rand_io, dur, (kind, value))
 
 
 def _terminal_table_row_sort_key(metric: ElbenchoMetrics) -> Tuple[int, int, int, str]:
@@ -3012,12 +2938,12 @@ def print_terminal_table(
                     rows.append(row)
 
                 # Align the decimal points in GB/s column
-                aligned_gb_s_col = align_decimal_points(gb_s_col, False)
+                aligned_gb_s_col = align_decimal_points(gb_s_col)
 
                 # Align the decimal points in latency columns
                 aligned_latency_cols = []
                 for lat_col in latency_cols:
-                    aligned_latency_cols.append(align_decimal_points(lat_col, False))
+                    aligned_latency_cols.append(align_decimal_points(lat_col))
 
                 # Calculate column widths
                 col_widths = [len(h) for h in table_headers]
@@ -3120,269 +3046,6 @@ def print_terminal_table(
     print("")  # Add blank line at end
 
 
-def print_markdown_table(
-    metrics: List[ElbenchoMetrics], no_dual_y_axis: bool = False
-) -> None:
-    """Print formatted metrics table in Markdown format.
-
-    Args:
-        metrics: List of ElbenchoMetrics objects to display
-        no_dual_y_axis: If True, reference separate single-axis plots instead of dual y-axis plots
-    """
-    if not metrics:
-        print("No metrics to display")
-        return
-
-    clustered_metrics = cluster_metrics_for_reporting(metrics)
-
-    # Create a main heading for all data
-    print("# Elbencho Benchmark Results")
-
-    # Create a list of unique runs performed
-    unique_sn_runs = set()  # (io_size, dio_bio, datestamp, threads, io_depths) tuples
-    unique_mn_runs = (
-        set()
-    )  # (io_size, dio_bio, datestamp, max_nodes, threads, io_depths) tuples
-
-    for is_multi_node, by_mn in clustered_metrics.items():
-        for operation, by_op_metrics in by_mn.items():
-            for direct_io, annotated_size_groups in by_op_metrics.items():
-                for annotated_size_group in annotated_size_groups:
-                    for io_size, metric_list in annotated_size_group[
-                        "metrics_by_size"
-                    ].items():
-                        if not is_multi_node:
-                            unique_sn_runs.add(
-                                (
-                                    io_size,
-                                    direct_io,
-                                    metric_list[0].datestamp,
-                                    ",".join(
-                                        sorted({str(m.threads) for m in metric_list})
-                                    ),
-                                    ",".join(
-                                        sorted(
-                                            {str(m.io_depth) for m in metric_list},
-                                            key=int,
-                                        )
-                                    ),
-                                )
-                            )
-                        else:
-                            unique_mn_runs.add(
-                                (
-                                    io_size,
-                                    direct_io,
-                                    metric_list[0].datestamp,
-                                    max(m.nodes for m in metric_list),
-                                    ",".join(
-                                        sorted({str(m.threads) for m in metric_list})
-                                    ),
-                                    ",".join(
-                                        sorted(
-                                            {str(m.io_depth) for m in metric_list},
-                                            key=int,
-                                        )
-                                    ),
-                                )
-                            )
-
-    if unique_sn_runs:
-        # Sort unique single-node runs by dio_bio, IO size (write phase value), datestamp
-        # (direct io first, so we "not" the boolean)
-        unique_sn_runs = sorted(
-            unique_sn_runs,
-            key=lambda t: (not t[1], get_size_in_bytes(t[0], "WRITE"), t[2]),
-        )
-
-        # Print list of unique runs
-        print("\n# Unique Single-Node Runs Performed")
-        print("\n| Mode | Wr | Rd | Datestamp | Threads | IODepths |")
-        print("|:-----|:-------|:-------|:----------|:---------------|:---------|")
-
-        for io_size, direct_io, datestamp, threads, io_depths in unique_sn_runs:
-            # Parse the IO size string to get write and read components
-            write_size, read_size = parse_size_string(io_size)
-
-            # Parse order and clean size for write
-            write_order, write_size_clean = parse_size_with_order(write_size)
-
-            # Parse order and clean size for read
-            read_order, read_size_clean = parse_size_with_order(read_size)
-
-            # Format columns
-            io_mode = "DirectIO" if direct_io else "BufferedIO"
-            write_col = f"{write_order} {write_size_clean}"
-            read_col = f"{read_order} {read_size_clean}"
-
-            print(
-                f"| {io_mode} | {write_col} | {read_col} | {datestamp} | {threads} | {io_depths} |"
-            )
-
-    if unique_mn_runs:
-        # Sort unique multi-node runs by dio_bio, IO size (write phase value), datestamp
-        # (direct io first, so we "not" the boolean)
-        unique_mn_runs = sorted(
-            unique_mn_runs,
-            key=lambda t: (not t[1], get_size_in_bytes(t[0], "WRITE"), t[2]),
-        )
-
-        # Print list of unique runs
-        print("\n# Unique Multi-Node Runs Performed")
-        print("\n| Mode | Wr | Rd | Datestamp | Max Nodes | Threads | IODepths |")
-        print(
-            "|:-----|:-------|:-------|:----------|:---------------|:-------------|:---------|"
-        )
-
-        for (
-            io_size,
-            direct_io,
-            datestamp,
-            max_nodes,
-            threads,
-            io_depths,
-        ) in unique_mn_runs:
-            # Parse the IO size string to get write and read components
-            write_size, read_size = parse_size_string(io_size)
-
-            # Parse order and clean size for write
-            write_order, write_size_clean = parse_size_with_order(write_size)
-
-            # Parse order and clean size for read
-            read_order, read_size_clean = parse_size_with_order(read_size)
-
-            # Format columns
-            io_mode = "DirectIO" if direct_io else "BufferedIO"
-            write_col = f"{write_order} {write_size_clean}"
-            read_col = f"{read_order} {read_size_clean}"
-
-            print(
-                f"| {io_mode} | {write_col} | {read_col} | {datestamp} | {max_nodes} | {threads} | {io_depths} |"
-            )
-
-    # Metrics are grouped by sn/mn, operation type, dio/bio, and then by size group
-    for is_multi_node, by_mn in clustered_metrics.items():
-        for operation, by_op_metrics in by_mn.items():
-            for direct_io, annotated_size_groups in by_op_metrics.items():
-                sn_mn_str = "MN" if is_multi_node else "SN"
-
-                # Create a subsection for this operation
-                print(
-                    f"\n# {sn_mn_str} {operation} Operation ({'DirectIO' if direct_io else 'BufferedIO'})"
-                )
-
-                for annotated_size_group in annotated_size_groups:
-                    # Get random_io from first metric (should be same for all in group)
-                    first_metrics = next(
-                        iter(annotated_size_group["metrics_by_size"].values())
-                    )
-                    random_io = first_metrics[0].random_io
-
-                    group_name = annotated_size_group["group_name"]
-                    size_group_list = annotated_size_group["size_group"]
-                    # Create group heading
-                    if len(size_group_list) == 1:
-                        group_heading = f"IO Size: {size_group_list[0]}"
-                    else:
-                        # Join all sizes with forward slashes for the heading
-                        group_heading = f"IO Size: {' / '.join(size_group_list)}"
-
-                    # Print the section heading
-                    print(f"\n## {group_heading}")
-
-                    # Add image placeholders for charts
-                    print("\n### Charts")
-                    print("\n*Insert the following images here:*\n")
-
-                    metadata = plot_metadata(
-                        is_multi_node, direct_io, random_io, annotated_size_group
-                    )
-
-                    # Determine which images to reference based on no_dual_y_axis flag
-                    if no_dual_y_axis:
-                        # Generate references for 3 single-axis plots
-                        if get_size_in_bytes(size_group_list[-1], operation) <= 2**16:
-                            # Small IO - IOPS is more relevant
-                            image_types = [
-                                ("iops", f"IOPS vs. {metadata['x_label']}"),
-                            ]
-                        else:
-                            # Large IO - Bandwidth is more relevant
-                            image_types = [
-                                ("bw", f"Bandwidth vs. {metadata['x_label']}"),
-                            ]
-                        # Always add latency for no-dual-y-axis mode
-                        image_types.append(
-                            ("latency", f"Latency vs. {metadata['x_label']}")
-                        )
-                    else:
-                        # Original logic - dual axis plots
-                        if get_size_in_bytes(size_group_list[-1], operation) <= 2**16:
-                            image_types = [
-                                (
-                                    "iops-latency",
-                                    f"IOPS/Latency vs. {metadata['x_label']}",
-                                ),
-                            ]
-                        else:
-                            image_types = [
-                                (
-                                    "bw-latency",
-                                    f"Bandwidth/Latency vs. {metadata['x_label']}",
-                                ),
-                            ]
-                    # Only include scaling efficiency plots for multi-node cases
-                    if is_multi_node:
-                        image_types.append(
-                            (
-                                "bw-efficiency",
-                                f"Throughput Scale Efficiency vs. {metadata['x_label']}",
-                            )
-                        )
-                    image_types.append(("latency-hist", "Latency Histogram"))
-
-                    # Print image filenames as a list
-                    for img_type, img_desc in image_types:
-                        img_filename = plot_filename(
-                            metadata["sn_or_mn"],
-                            operation,
-                            group_name,
-                            metadata["dio_or_bio"],
-                            img_type,
-                            metadata["datestamps"],
-                        )
-                        print(f"* **{img_desc}**: `{img_filename}`")
-
-                    # Create performance metrics section
-                    print(
-                        f"\n### Performance Metrics ({' / '.join(annotated_size_group['size_group'])})"
-                    )
-
-                    # Process each IO size within this group separately for metrics tables
-                    for io_size in annotated_size_group["metrics_by_size"]:
-                        print_markdown_metrics_table_and_command(
-                            annotated_size_group["metrics_by_size"][io_size],
-                            io_size,
-                            operation,
-                        )
-
-    # Add metrics explanation at the end
-    print("\n# Metrics Explanation")
-    print("\n* **IOPS**: Input/Output Operations Per Second")
-    print("* **AvgBW**: Average Bandwidth in GB/s")
-    print("* **Gb/s**: Gigabits per second conversion of the bandwidth")
-    print("* **Latency metrics**: All latency values are in milliseconds (ms)")
-    print("  * **MinLat/AvgLat/MaxLat**: Minimum, Average, and Maximum latency")
-    print(
-        "  * **99%**: 99th percentile latency (representative of worst-case performance)"
-    )
-    print(
-        "* **Dur**: Phase duration from CSV ``time ms [first]`` (aligned with elbencho "
-        "``[first]`` throughput/IOPS)"
-    )
-    print("* **DurTot**: Total wall time from CSV ``time ms [last]`` (last completion)")
-
-
 def test_parse(base_filename: str) -> None:
     """Test the parse_elbencho_file function on a specific file."""
     # Strip any extension
@@ -3447,65 +3110,6 @@ def test_parse(base_filename: str) -> None:
         print()
 
 
-# Helper function to parse value lists with ranges
-def parse_int_values_with_ranges(value_str: str) -> Set[int]:
-    """Parse a strict comma-separated list of integers or inclusive ranges.
-
-    A report filter is an operator request, not a best-effort hint.  Silently
-    dropping a malformed token can turn a narrow report into an unfiltered
-    report, so invalid syntax raises ``ValueError`` for the CLI to report.
-    """
-    if not value_str or not value_str.strip():
-        raise ValueError("filter must not be empty")
-
-    result: Set[int] = set()
-    for raw_part in value_str.split(","):
-        part = raw_part.strip()
-        if not part:
-            raise ValueError("empty filter item")
-        pieces = part.split("-")
-        if len(pieces) > 2 or not all(piece.isdigit() for piece in pieces):
-            raise ValueError(f"invalid integer or range: {part}")
-        start = int(pieces[0])
-        end = int(pieces[-1])
-        if len(pieces) == 2 and start > end:
-            raise ValueError(f"range start exceeds end: {part}")
-        result.update(range(start, end + 1))
-    return result
-
-
-_REPORT_SIZE_FILTER_RE = re.compile(r"^r?[0-9]+[KMG](,r?[0-9]+[KMG])?$")
-
-
-def parse_only_sizes_filter(values: Optional[List[str]]) -> Optional[Set[str]]:
-    """Parse and validate repeated ``--only-sizes`` filter arguments."""
-    if not values:
-        return None
-
-    result: Set[str] = set()
-    for raw_value in values:
-        parts = raw_value.split(";")
-        if any(not part.strip() for part in parts):
-            raise ValueError("size filter contains an empty item")
-        for part in parts:
-            size = part.strip()
-            if not _REPORT_SIZE_FILTER_RE.fullmatch(size):
-                raise ValueError(f"invalid IO size: {size}")
-            result.add(size)
-    return result
-
-
-def _parse_report_integer_filter(
-    parser: argparse.ArgumentParser, option_name: str, value: str
-) -> Set[int]:
-    """Parse one integer filter and convert syntax errors to CLI errors."""
-    try:
-        return parse_int_values_with_ranges(value)
-    except ValueError as exc:
-        parser.error(f"invalid {option_name} filter: {exc}")
-    return set()  # ``parser.error`` raises; keeps static type checkers happy.
-
-
 def parse_benchmark_filename(filename: str) -> Optional[Dict[str, Any]]:
     """Parse an elbencho benchmark filename to extract parameters.
 
@@ -3538,46 +3142,6 @@ def parse_benchmark_filename(filename: str) -> Optional[Dict[str, Any]]:
         ),  # Default to 1 for old format
         "datestamp": datestamp,
     }
-
-
-def discover_live_csv_files(input_dir: str) -> List[LiveFileMetadata]:
-    """Discover live CSVs and associate them with sibling benchmark parameters."""
-    discovered = []
-    for filepath in sorted(glob.glob(os.path.join(input_dir, "*.live.csv"))):
-        basename = os.path.basename(filepath)
-        sibling_stem = basename[: -len(".live.csv")]
-        params = parse_benchmark_filename(sibling_stem)
-        if not params:
-            eprint(f"Warning: Ignoring live CSV with unrecognized name: {filepath}")
-            continue
-        discovered.append(
-            LiveFileMetadata(
-                path=filepath,
-                io_size=params["io_size"],
-                nodes=params["nodes"],
-                threads=params["threads"],
-                io_depth=params["io_depth"],
-                datestamp=params["datestamp"],
-            )
-        )
-    return discovered
-
-
-def _live_metadata_matches_filters(
-    metadata: LiveFileMetadata,
-    size_filter: Optional[Set[str]],
-    thread_filter: Optional[Set[int]],
-    node_filter: Optional[Set[int]],
-    iodepth_filter: Optional[Set[int]],
-) -> bool:
-    """Return whether one live file passes the aggregate-report CLI filters."""
-    checks = (
-        size_filter is None or metadata.io_size in size_filter,
-        thread_filter is None or metadata.threads in thread_filter,
-        node_filter is None or metadata.nodes in node_filter,
-        iodepth_filter is None or metadata.io_depth in iodepth_filter,
-    )
-    return all(checks)
 
 
 @dataclass(frozen=True)
@@ -3632,14 +3196,6 @@ def _live_metrics_key(item: Any) -> Tuple[Any, ...]:
     )
 
 
-def live_phase_contexts(
-    metadata: LiveFileMetadata, metrics: Sequence[ElbenchoMetrics]
-) -> Dict[str, PhaseContext]:
-    """Contexts of the metrics that belong to one live CSV."""
-    key = _live_metrics_key(metadata)
-    return phase_contexts([m for m in metrics if _live_metrics_key(m) == key])
-
-
 def _fmt(value: Optional[float], spec: str) -> str:
     return NO_VALUE if value is None else format(value, spec)
 
@@ -3689,12 +3245,6 @@ def format_live_fairness_line(stem: str, label: str, steady: LiveFairness) -> st
 
 
 LiveRowKey = Tuple[Any, ...]
-
-_STEADY_REASON_TEXT = {
-    REASON_NO_FIRST_TIME: "no elbencho [first] time",
-    REASON_TOO_SHORT: "phase too short",
-    REASON_NO_STEADY_STATE: "throughput never settled",
-}
 
 
 @dataclass(frozen=True)
@@ -3796,7 +3346,7 @@ def _live_table_columns(
         for start, end in zip(starts, ends)
     ]
     for index in (6, 7):
-        columns[index] = align_decimal_points(columns[index], False)
+        columns[index] = align_decimal_points(columns[index])
     return [
         [str(metric.nodes) for metric in metrics],
         [str(metric.threads) for metric in metrics],
@@ -3887,58 +3437,11 @@ def print_live_fairness_table(
         print(_render_header_groups([(value, 1) for value in values], widths))
     for metric, steady in rows:
         if not steady.window.available:
-            reason = _STEADY_REASON_TEXT.get(steady.window.reason, steady.window.reason)
+            reason = STEADY_REASON_TEXT.get(steady.window.reason, steady.window.reason)
             print(
                 f"No steady window for Nodes {metric.nodes}, Thrds "
                 f"{metric.threads}, IODep {metric.io_depth}: {reason}"
             )
-
-
-def _env_for_live(environments: Dict[str, dict], path: str) -> dict:
-    directory = os.path.normpath(os.path.dirname(path))
-    for input_dir, env in environments.items():
-        if os.path.normpath(input_dir) == directory:
-            return env
-    return {}
-
-
-def _report_one_live_file(  # pylint: disable=too-many-arguments,too-many-positional-arguments
-    metadata: LiveFileMetadata,
-    output_dir: str,
-    options: LiveReportOptions,
-    configured_interval_ms: Optional[int],
-    contexts: Dict[str, PhaseContext],
-    fairness: List[Tuple[LiveFileMetadata, LiveDomainKey, LiveFairness]],
-) -> bool:
-    """Analyze one live CSV; write the live reports and collect its fairness."""
-    analysis = analyze_live_csv(metadata)
-    eprint(f"Analyzed live CSV: {metadata.path}")
-    if not analysis.domains:
-        eprint(f"Warning: No valid live domains found in {metadata.path}")
-        return False
-    for domain_key in sorted(analysis.domains):
-        domain = analysis.domains[domain_key]
-        context = contexts.get(domain_key.phase.lower()) or PhaseContext(
-            None, None, None, None
-        )
-        steady = analyze_steady(
-            analysis,
-            domain,
-            context,
-            configured_interval_ms,
-            options.shortfall_percent,
-            options.min_slow_windows,
-        )
-        # Phases such as SYNC move no data and have no aggregate CSV row.
-        if domain_key.phase.lower() in contexts or domain_key.phase.upper() in (
-            "WRITE",
-            "READ",
-        ):
-            fairness.append((metadata, domain_key, LiveFairness.of(steady)))
-        _report_live_domain(
-            analysis, metadata, domain_key, domain, steady, output_dir, options
-        )
-    return True
 
 
 def _report_live_domain(  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -4030,16 +3533,15 @@ def _report_live_client_domain(  # pylint: disable=too-many-arguments,too-many-p
             eprint(f"Generated live per-client plot: {report_path}")
 
 
-def emit_live_fairness(lines: List[str], markdown: bool, output_dir: str) -> None:
-    """Print the Live fairness block; append it to report.txt outside markdown."""
+def emit_live_fairness(lines: List[str], output_dir: str) -> None:
+    """Print the Live fairness block and append it to report.txt."""
     if not lines:
         return
     block = "\n".join(["", LIVE_FAIRNESS_HEADING, *lines, ""])
     print(block)
-    if not markdown:
-        report_path = os.path.join(output_dir, REPORT_TXT_FILENAME)
-        with open(report_path, "a", encoding="utf-8") as handle:
-            handle.write(block + "\n")
+    report_path = os.path.join(output_dir, REPORT_TXT_FILENAME)
+    with open(report_path, "a", encoding="utf-8") as handle:
+        handle.write(block + "\n")
 
 
 def _elbencho_find_last_operation_section(
@@ -4514,218 +4016,6 @@ def parse_elbencho_files(base_filename: str) -> List[ElbenchoMetrics]:
     return metrics
 
 
-def print_markdown_metrics_table_and_command(
-    size_metrics: List[ElbenchoMetrics],
-    io_size: str,
-    operation: str,
-) -> None:
-    """Print a markdown table for a set of metrics and a representative command.
-
-    Args:
-        size_metrics: List of metrics for this IO size and operation
-        io_size: IO size string (full string like "5M,4K")
-        operation: Operation type (READ or WRITE)
-        headers: Column headers for the table
-    """
-    # Sort metrics by nodes, then by (io_depth * threads, threads)
-    size_metrics.sort(key=lambda m: (m.nodes, m.io_depth * m.threads, m.threads))
-
-    # Determine IO mode for this specific size and operation
-    io_mode = (
-        "DirectIO (dio)"
-        if any(m.direct_io == 1 for m in size_metrics)
-        else "BufferedIO (bio)"
-    )
-
-    # Determine IO order for this specific size and operation
-    io_order = "Rand" if any(m.random_io == 1 for m in size_metrics) else "Seq"
-
-    # Get the operation-specific IO size
-    write_size, read_size = parse_size_string(io_size)
-    op_specific_size = write_size if operation == "WRITE" else read_size
-    display_fs = metric_display_file_size_bytes(size_metrics[0])
-    fs_label_txt = bytes_to_elbencho_size_string(display_fs) if display_fs > 0 else "0"
-    fs_prefix = file_size_header_prefix_for_metrics(size_metrics)
-    anad_suffix = _all_nodes_all_data_suffix(size_metrics)
-    datestamp = size_metrics[0].datestamp
-    print_sweep_auxiliary_lines_for_metrics(size_metrics)
-    print_workload_metadata_for_metrics(size_metrics)
-    # Print IO size header for this specific size
-    print(
-        f"\nIO Size: **{op_specific_size}** - "
-        f"{fs_prefix}**{fs_label_txt}{anad_suffix}** - "
-        f"Operation: **{operation}** - "
-        f"IO Order: **{io_order}** - "
-        f"IO Mode: **{io_mode}** - "
-        f"Datestamp: **{datestamp}**\n"
-    )
-
-    # Define table headers with shortened names for better readability
-    # For markdown, remove the 50% and 75% latency columns to make the table more compact
-    md_base_headers = [
-        "Nodes",
-        "Thrds",
-        "IODep",
-        "IOPS",
-        "AvgBW(GB/s)",
-        "Gb/s",
-        "MinLat (ms)",
-        "AvgLat (ms)",
-        "MaxLat (ms)",
-        "99% (ms)",
-    ]
-    show_dur_md = any(_metric_should_show_csv_phase_dur(m) for m in size_metrics)
-    table_headers = md_base_headers + (["Dur", "DurTot"] if show_dur_md else [])
-
-    # Prepare data rows with raw values
-    rows = []
-
-    # Collect columns that need decimal alignment: GB/s + 4 latency columns for markdown
-    gb_s_col = []
-    latency_cols = [[] for _ in range(4)]
-
-    for metric in size_metrics:
-        # Convert and format GB/s value
-        gb_s_value = mb_s_to_gb_s(metric.throughput_mb_s)
-        gb_s_fmt = format_gb_s(gb_s_value)
-        gb_s_col.append(gb_s_fmt)
-
-        # Convert latency values to ms for display
-        min_lat_ms = metric.min_lat_sec * 1000
-        avg_lat_ms = metric.avg_lat_sec * 1000
-        max_lat_ms = metric.max_lat_sec * 1000
-        lat_pct_99_ms = metric.lat_pct_99 * 1000
-
-        # Format all values
-        min_lat_fmt = format_with_sig_figs(min_lat_ms)
-        avg_lat_fmt = format_with_sig_figs(avg_lat_ms)
-        max_lat_fmt = format_with_sig_figs(max_lat_ms)
-        lat_pct_99_fmt = format_with_sig_figs(lat_pct_99_ms)
-
-        # Store formatted latency values for alignment
-        latency_cols[0].append(min_lat_fmt)
-        latency_cols[1].append(avg_lat_fmt)
-        latency_cols[2].append(max_lat_fmt)
-        latency_cols[3].append(lat_pct_99_fmt)
-
-        # Store other non-latency metrics (except GB/s which needs alignment)
-        base_row = [
-            str(metric.nodes),
-            str(metric.threads),
-            str(metric.io_depth),
-            f"{int(metric.iops):,d}",
-            None,  # Placeholder for GB/s (will be filled after alignment)
-            f"{metric.throughput_gbps:.2f}",
-        ]
-
-        # Add placeholders for latency columns
-        row = base_row + [None, None, None, None]  # 4 placeholder values for markdown
-        if show_dur_md:
-            row.append(None)
-            row.append(None)
-        rows.append(row)
-
-    # Align the decimal points in GB/s column
-    aligned_gb_s_col = align_decimal_points(gb_s_col, True)
-
-    # Align the decimal points in latency columns
-    aligned_latency_cols = []
-    for lat_col in latency_cols:
-        aligned_latency_cols.append(align_decimal_points(lat_col, True))
-
-    # Calculate column widths
-    col_widths = [len(h) for h in table_headers]
-
-    # Update widths for non-aligned columns (excluding GB/s at index 4 and latency at indices 6+)
-    for row in rows:
-        for i, val in enumerate(row[:6]):
-            if val is not None and i != 4:  # Skip GB/s placeholder at index 4
-                col_widths[i] = max(col_widths[i], len(val))
-
-    # Update width for aligned GB/s column (index 4)
-    for val in aligned_gb_s_col:
-        col_widths[4] = max(col_widths[4], len(val))
-
-    # Update widths for aligned latency columns
-    for i, aligned_col in enumerate(aligned_latency_cols):
-        col_index = 6 + i  # Latency columns start at index 6
-        if col_index < len(col_widths):  # Make sure we don't go out of bounds
-            for val in aligned_col:
-                col_widths[col_index] = max(col_widths[col_index], len(val))
-
-    # Apply aligned GB/s values to rows (index 4)
-    for row_idx, row in enumerate(rows):
-        row[4] = aligned_gb_s_col[row_idx]
-
-    # Apply aligned latency values to rows
-    for row_idx, row in enumerate(rows):
-        for col_idx, aligned_col in enumerate(aligned_latency_cols):
-            row[6 + col_idx] = aligned_col[row_idx]  # Latency columns start at index 6
-
-    if show_dur_md:
-        dur_col = len(md_base_headers)
-        dur_tot_col = dur_col + 1
-        for row_idx, row in enumerate(rows):
-            metric = size_metrics[row_idx]
-            if _metric_should_show_csv_phase_dur(metric):
-                dur_str = format_dur_xmys_ms(metric.phase_first_duration_ms)
-                dur_tot_str = format_dur_xmys_ms(metric.phase_wall_duration_ms)
-            else:
-                dur_str = ""
-                dur_tot_str = ""
-            row[dur_col] = dur_str
-            row[dur_tot_col] = dur_tot_str
-            col_widths[dur_col] = max(col_widths[dur_col], len(dur_str))
-            col_widths[dur_tot_col] = max(col_widths[dur_tot_col], len(dur_tot_str))
-
-    # Ensure minimum widths
-    min_widths = [5, 5, 5, 8, 12, 5, 10, 10, 10, 7]  # 10 columns for markdown
-    if show_dur_md:
-        min_widths.append(3)
-        min_widths.append(6)
-    for i, col_width in enumerate(col_widths):
-        if i < len(min_widths):  # Make sure we don't go out of bounds
-            col_widths[i] = max(col_width, min_widths[i])
-
-    # Print markdown table header
-    header_line = " | ".join(table_headers)
-    print(f"| {header_line} |")
-
-    # Print separator line with proper alignment
-    separator = []
-    for i, width in enumerate(col_widths):
-        if i <= 2:  # Text columns (Nodes, Threads, IODep)
-            separator.append(":" + "-" * (width - 1))
-        else:  # Numeric columns (right-aligned)
-            separator.append("-" * (width - 1) + ":")
-    separator_line = " | ".join(separator)
-    print(f"| {separator_line} |")
-
-    # Print data rows
-    ncols = len(table_headers)
-    for row in rows:
-        data_line = " | ".join(row[:ncols])
-        print(f"| {data_line} |")
-
-    # Add the Elbencho Command section
-    print("\n**Representative Elbencho Command**")
-
-    # Extract command from the first metric that has a non-empty command
-    command = ""
-    for metric in size_metrics:
-        if metric.command and metric.command.strip():
-            command = metric.command.strip()
-            break
-
-    # If we found a command, print it in a monospace font (using markdown code block)
-    if command:
-        print("\n```")
-        print(command)
-        print("```")
-    else:
-        print("\n*Command information not available*")
-
-
 # --- Machine-readable results (fragment / document) --------------------------
 
 PHASE_DELETE = "delete"
@@ -4743,7 +4033,8 @@ LIVE_NOT_REQUESTED = "not_requested"
 LIVE_UNREADABLE = "unreadable"
 LIVE_SUFFIX = ".live.csv"
 LIVE_LEVEL_NONE = "none"
-RESULT_EXTENSIONS = (".csv", ".out", LIVE_SUFFIX)
+LIVE_LEVEL_FULL = "full"
+RESULT_EXTENSIONS = (".csv", ".out", ".out" + VERSION_SUFFIX, LIVE_SUFFIX)
 RESULTS_LIVE_DIRNAME = "results.live"
 RESULTS_DEFAULT_FILENAME = "results.json"
 EXIT_INCOMPLETE = 3
@@ -4761,7 +4052,7 @@ class ReportFilters:
     iodepths: Optional[Set[int]] = None
 
     def allows(self, nodes: int, io_size: str, threads: int, io_depth: int) -> bool:
-        """Apply the same truthiness semantics as ``filter_metrics``."""
+        """True when every non-empty filter contains the coordinate."""
         return all(
             (
                 not self.sizes or io_size in self.sizes,
@@ -4782,6 +4073,8 @@ class LiveRequest:
     selection_limits: Tuple[int, int]
     sidecar_dir: Optional[str]
     configured_interval_ms: Optional[int]
+    # Keeps sidecar names unique when several inputs share one document.
+    sidecar_group: str = ""
 
 
 @dataclass(frozen=True)
@@ -4801,7 +4094,8 @@ class IoResultsInput:
     env: dict
     filters: ReportFilters
     live: LiveRequest
-    pairs: Dict[str, List[ElbenchoMetrics]]
+    # Base filenames (path without .csv/.out) of the result pairs.
+    bases: List[str]
 
 
 def load_io_ledger(input_dir: str) -> List[LedgerExecution]:
@@ -4861,6 +4155,28 @@ def _scanned_file_sizes(metric: Optional[ElbenchoMetrics]) -> Optional[dict]:
     }
 
 
+def _dataset_workload_fields(metadata: Optional[Dict[str, str]]) -> dict:
+    """Dataset fields only workload.tsv records; all null without it."""
+    if metadata is None:
+        return {
+            "count_source": None,
+            "files_per_node": None,
+            "reader": None,
+        }
+    return {
+        "count_source": _workload_enum(metadata, "dataset_count_source"),
+        "files_per_node": {
+            "requested": _workload_int(metadata, "requested_files_per_node"),
+            "effective": _workload_int(metadata, "effective_files_per_node"),
+        },
+        "reader": {
+            "nodes": _workload_int(metadata, "reader_nodes"),
+            "threads_per_node": _workload_int(metadata, "reader_threads_per_node"),
+            "io_depth": _workload_int(metadata, "reader_iodepth"),
+        },
+    }
+
+
 def _dataset_object(
     ledger: LedgerExecution,
     env: dict,
@@ -4889,6 +4205,15 @@ def _dataset_object(
         "scanned_file_sizes": _scanned_file_sizes(
             next((m for m in metrics if m.treescan_file_count > 0), first)
         ),
+        "first_file_bytes": next(
+            (
+                m.treescan_first_file_bytes
+                for m in metrics
+                if m.treescan_first_file_bytes
+            ),
+            None,
+        ),
+        **_dataset_workload_fields(metadata),
     }
 
 
@@ -4900,13 +4225,6 @@ def _rate_object(
         "bytes_per_s": results_json.mib_s_to_bytes_per_s(mib_s),
         "elapsed_ms": elapsed_ms,
     }
-
-
-def _argv(command: str) -> List[str]:
-    try:
-        return shlex.split(command)
-    except ValueError:
-        return command.split()
 
 
 def _phase_work(metadata: Optional[Dict[str, str]], phase: str) -> Optional[dict]:
@@ -4955,8 +4273,9 @@ def _metric_phase(metric: ElbenchoMetrics, metadata: Optional[Dict[str, str]]) -
         "latency_us": _latency_object(metric),
         "histogram_us": results_json.histogram_columnar(metric.histogram, 1e6),
         "work": _phase_work(metadata, phase),
+        "file_size_bytes": metric.file_size_bytes or None,
         "configured_time_limit_s": metric.io_duration_sec or None,
-        "command": _argv(metric.raw_command or metric.command),
+        "command": results_json.command_argv(metric.raw_command or metric.command),
         "live": None,
     }
 
@@ -4983,6 +4302,11 @@ def _workload_object(metadata: Optional[Dict[str, str]]) -> Optional[dict]:
         "completion_state": _workload_enum(metadata, "completion_state"),
         "failure_cleanup_state": _workload_enum(metadata, "failure_cleanup_state"),
         "lifecycle_elapsed_ms": _workload_int(metadata, "lifecycle_elapsed_time_ms"),
+        "write_elapsed_ms": _workload_int(metadata, "write_elapsed_time_ms"),
+        "read_elapsed_ms": _workload_int(metadata, "read_elapsed_time_ms"),
+        "write_delete_elapsed_ms": _workload_int(
+            metadata, "write_delete_elapsed_time_ms"
+        ),
     }
 
 
@@ -5056,17 +4380,18 @@ def _phase_problems(
 
 
 def _live_objects(
-    base_filename: str,
+    pair: Tuple[str, List[ElbenchoMetrics]],
     execution_id: Optional[str],
     data: IoResultsInput,
-) -> Tuple[Dict[str, dict], Optional[str], List[dict]]:
-    """Return (live object per phase, default reason when absent, problems)."""
+) -> Tuple[LiveObjects, Optional[str], List[dict]]:
+    """Return (live objects, default reason when absent, problems)."""
+    base_filename, metrics = pair
     live = data.live
     if live.level == LIVE_LEVEL_NONE:
-        return {}, LIVE_NOT_REQUESTED, []
+        return LiveObjects({}, []), LIVE_NOT_REQUESTED, []
     live_path = base_filename + LIVE_SUFFIX
     if not os.path.isfile(live_path):
-        return {}, LIVE_NOT_CAPTURED, []
+        return LiveObjects({}, []), LIVE_NOT_CAPTURED, []
     workers_path = os.path.join(
         data.input_dir, "executions", f"{execution_id}.workers.tsv"
     )
@@ -5076,18 +4401,18 @@ def _live_objects(
             os.path.relpath(live_path, data.input_dir),
             live.level,
             live.configured_interval_ms,
-            phase_contexts(data.pairs.get(base_filename, [])),
+            phase_contexts(metrics),
             (live.shortfall_percent, live.min_slow_windows),
             live.selection_limits,
             live.sidecar_dir,
-            execution_id or os.path.basename(base_filename),
+            live.sidecar_group + (execution_id or os.path.basename(base_filename)),
             execution_id,
             load_workers_tsv(workers_path) if execution_id else None,
         )
     except LiveCSVError as exc:
         detail = f"live CSV could not be analyzed: {exc}"
         return (
-            {},
+            LiveObjects({}, []),
             LIVE_UNREADABLE,
             [results_json.problem(results_json.LIVE_CSV_UNREADABLE, detail)],
         )
@@ -5096,22 +4421,31 @@ def _live_objects(
 
 def _results_object(
     ledger: LedgerExecution,
-    base_filename: str,
-    metrics: List[ElbenchoMetrics],
+    pair: Tuple[str, List[ElbenchoMetrics]],
     metadata: Optional[Dict[str, str]],
     data: IoResultsInput,
 ) -> Tuple[dict, List[dict]]:
-    objects, reason, problems = _live_objects(base_filename, ledger.execution_id, data)
-    phases = []
-    for metric in sorted(metrics, key=lambda m: PHASE_ORDER.index(m.operation.lower())):
-        entry = _metric_phase(metric, metadata)
-        entry["live"] = objects.get(entry["phase"]) or null_live(reason or "")
-        phases.append(entry)
+    objects, reason, problems = _live_objects(pair, ledger.execution_id, data)
+    base_filename, metrics = pair
+    phases = [
+        _metric_phase(metric, metadata)
+        for metric in sorted(
+            metrics, key=lambda m: PHASE_ORDER.index(m.operation.lower())
+        )
+    ]
+    attached, additional = objects.split({entry["phase"] for entry in phases})
+    for entry in phases:
+        entry["live"] = attached.get(entry["phase"]) or null_live(reason or "")
     plan = phase_plan(ledger.exports)
     if PHASE_DELETE in _expected_phases(plan, metadata):
         phases.append(_delete_phase(metadata or {}))
     problems = _phase_problems(plan, metadata, phases) + problems
-    return {"phases": phases, "workload": _workload_object(metadata)}, problems
+    return {
+        "datestamp": _datestamp(base_filename) or None,
+        "phases": phases,
+        "additional_live_domains": additional,
+        "workload": _workload_object(metadata),
+    }, problems
 
 
 def _result_files(base_filename: str, input_dir: str) -> List[dict]:
@@ -5152,13 +4486,14 @@ def _execution_entry(
         "coordinates": coordinates,
         "coordinate_key": key,
         "dataset": _dataset_object(ledger, data.env, metadata, metrics),
+        "producer_version": None,
         "result_state": STATE_MISSING,
         "problems": [],
         "result_files": [],
         "results": None,
     }
     coords = ledger.coordinates
-    if ledger.execution_id and not data.filters.allows(
+    if not data.filters.allows(
         coords.nodes, coords.io_size, coords.threads, coords.io_depth
     ):
         entry["result_state"] = STATE_NOT_REPORTED
@@ -5175,8 +4510,9 @@ def _execution_entry(
             )
         ]
         return entry
+    entry["producer_version"] = recorded_result_version(base_filename + ".out")
     entry["results"], entry["problems"] = _results_object(
-        ledger, base_filename, metrics, metadata, data
+        ledger, (base_filename, metrics), metadata, data
     )
     entry["result_state"] = _entry_state(entry["problems"])
     return entry
@@ -5192,7 +4528,7 @@ def _pair_key_from_name(base_filename: str) -> Optional[Tuple[int, str, int, int
 
 
 def _match_pairs(
-    ledger: List[LedgerExecution], pairs: Dict[str, List[ElbenchoMetrics]]
+    ledger: List[LedgerExecution], pairs: Iterable[str]
 ) -> Tuple[Dict[str, str], List[str]]:
     """Map execution_id -> base_filename (newest datestamp wins) and the leftovers."""
     by_key = {
@@ -5222,15 +4558,40 @@ def _datestamp(base_filename: str) -> str:
     return params["datestamp"] if params else ""
 
 
+# env_used.yaml flags (setting, ledger export) that stand in for the ledger.
+_ENV_USED_LEDGER_FLAGS = (
+    ("ELBENCHO_SINGLE_BIG_FILE", "ELBENCHO_SINGLE_BIG_FILE"),
+    ("ELBENCHO_ALL_NODES_ACCESS_ALL_DATA", "ELBENCHO_ALL_NODES_ACCESS_ALL_DATA"),
+    ("run_to_completion_option", "run_to_completion"),
+)
+
+
 def _synthetic_ledger(
-    base_filename: str, metrics: List[ElbenchoMetrics]
+    base_filename: str, metrics: List[ElbenchoMetrics], env: dict
 ) -> Optional[LedgerExecution]:
     """Describe a result pair that matches no ledger execution."""
     params = parse_benchmark_filename(os.path.basename(base_filename))
     if params is None:
         return None
+    coordinates = ExecutionCoordinates(
+        params["nodes"],
+        params["io_size"],
+        params["threads"],
+        params["io_depth"],
+        str(env.get("ELBENCHO_FILE_LAYOUT") or ""),
+    )
+    return LedgerExecution(None, coordinates, _synthetic_exports(metrics, env))
+
+
+def _synthetic_exports(metrics: List[ElbenchoMetrics], env: dict) -> Dict[str, str]:
+    """Ledger exports implied by a pre-batch pair's metrics and env_used.yaml."""
     operations = {metric.operation.upper() for metric in metrics}
-    exports = {"dio_or_bio": "dio"}
+    exports = {
+        export: "1"
+        for setting, export in _ENV_USED_LEDGER_FLAGS
+        if str(env.get(setting)) == "1"
+    }
+    exports["dio_or_bio"] = "dio"
     if metrics:
         exports["dio_or_bio"] = "dio" if metrics[0].direct_io else "bio"
     if operations == {"WRITE"}:
@@ -5238,63 +4599,160 @@ def _synthetic_ledger(
     if metrics and all(metric.random_io for metric in metrics):
         exports["use_random"] = "1"
     if operations == {"READ"}:
-        exports[ENV_SWEEP_READ_FROM] = next(
+        read_from = next(
             (m.sweep_read_from_path for m in metrics if m.sweep_read_from_path),
-            "unknown",
+            env.get("sweep_read_from"),
         )
-    coordinates = ExecutionCoordinates(
-        params["nodes"], params["io_size"], params["threads"], params["io_depth"], ""
-    )
-    return LedgerExecution(None, coordinates, exports)
+        exports[ENV_SWEEP_READ_FROM] = str(read_from or "unknown")
+    return exports
 
 
-def build_io_fragment(data: IoResultsInput) -> dict:
-    """Build the fragment (one entry per ledger execution plus unmatched pairs)."""
+def _unpaired_live_paths(data: IoResultsInput) -> List[str]:
+    """Live CSVs of the input directory without a result pair, filtered."""
+    paths = []
+    paired = set(data.bases)
+    for path in sorted(glob.glob(os.path.join(data.input_dir, "*" + LIVE_SUFFIX))):
+        base_filename = path[: -len(LIVE_SUFFIX)]
+        params = parse_benchmark_filename(os.path.basename(base_filename))
+        if params is None or base_filename in paired:
+            continue
+        if data.filters.allows(
+            params["nodes"], params["io_size"], params["threads"], params["io_depth"]
+        ):
+            paths.append(path)
+    return paths
+
+
+def _unpaired_live(path: str, data: IoResultsInput) -> Tuple[List[dict], List[dict]]:
+    """Every domain of one unpaired live CSV, or a diagnostic when unreadable."""
+    live = data.live
+    try:
+        built = build_live_objects(
+            path,
+            os.path.relpath(path, data.input_dir),
+            live.level,
+            live.configured_interval_ms,
+            {},
+            (live.shortfall_percent, live.min_slow_windows),
+            live.selection_limits,
+            live.sidecar_dir,
+            None,
+            None,
+            None,
+        )
+    except LiveCSVError as exc:
+        detail = f"live CSV could not be analyzed: {exc}"
+        return [], [results_json.problem(results_json.LIVE_CSV_UNREADABLE, detail)]
+    return built.split(())[1], []
+
+
+# (ledger execution, or None for a pair without one; base filename of the
+# result pair to parse, if any; workload metadata).
+PlannedExecution = Tuple[
+    Optional[LedgerExecution], Optional[str], Optional[Dict[str, str]]
+]
+
+
+def _plan_io_executions(data: IoResultsInput) -> List[PlannedExecution]:
+    """One plan per fragment execution entry; nothing is parsed yet."""
     ledger = load_io_ledger(data.input_dir)
     workloads = load_execution_workloads(data.input_dir)
-    matched, unmatched = _match_pairs(ledger, data.pairs)
-    executions = []
+    matched, unmatched = _match_pairs(ledger, data.bases)
+    planned: List[PlannedExecution] = []
     for item in ledger:
+        coords = item.coordinates
         key = _execution_coordinate_key(
-            item.coordinates.nodes,
-            item.coordinates.io_size,
-            item.coordinates.threads,
-            item.coordinates.io_depth,
+            coords.nodes, coords.io_size, coords.threads, coords.io_depth
         )
         metadata = workloads[key][1] if key in workloads else None
         base_filename = matched.get(item.execution_id)
-        pair = (base_filename, data.pairs[base_filename]) if base_filename else None
-        executions.append(_execution_entry(item, pair, metadata, data))
-    for base_filename in unmatched:
-        metrics = data.pairs[base_filename]
-        synthetic = _synthetic_ledger(base_filename, metrics)
-        if synthetic is None:
-            continue
-        coords = synthetic.coordinates
-        if data.filters.allows(
+        if not data.filters.allows(
             coords.nodes, coords.io_size, coords.threads, coords.io_depth
         ):
-            executions.append(
-                _execution_entry(synthetic, (base_filename, metrics), None, data)
+            base_filename = None  # reported as not_reported, never parsed
+        planned.append((item, base_filename, metadata))
+    for base_filename in unmatched:
+        params = parse_benchmark_filename(os.path.basename(base_filename))
+        # Without a ledger the pairs are the executions: one the filters
+        # remove is parsed too (for its coordinates), then not_reported.
+        if params is not None and (
+            not ledger
+            or data.filters.allows(
+                params["nodes"],
+                params["io_size"],
+                params["threads"],
+                params["io_depth"],
             )
+        ):
+            planned.append((None, base_filename, None))
+    return planned
+
+
+def _parse_result_pair(base_filename: str) -> List[ElbenchoMetrics]:
+    """Parse one .csv/.out pair; a failure leaves it without phases."""
+    try:
+        return parse_elbencho_files(base_filename)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        eprint(f"Error parsing {base_filename}: {e}")
+        return []
+
+
+def _execution_task(planned: PlannedExecution, data: IoResultsInput) -> Optional[dict]:
+    """Pool task: parse one result pair into its entry, live objects and sidecars."""
+    ledger, base_filename, metadata = planned
+    metrics = _parse_result_pair(base_filename) if base_filename else []
+    if ledger is None:
+        ledger = _synthetic_ledger(base_filename or "", metrics, data.env)
+        if ledger is None:
+            return None
+    pair = (base_filename, metrics) if base_filename else None
+    return _execution_entry(ledger, pair, metadata, data)
+
+
+def _io_fragment(
+    executions: List[Optional[dict]], unpaired: List[Tuple[List[dict], List[dict]]]
+) -> dict:
     return {
         "fragment_version": results_json.FRAGMENT_VERSION,
         "kind": "io",
-        "executions": executions,
-        "diagnostics": [],
+        "executions": [entry for entry in executions if entry is not None],
+        "unpaired_live": [item for objects, _ in unpaired for item in objects],
+        "diagnostics": [item for _, problems in unpaired for item in problems],
     }
 
 
-def _report_output_dir(args: argparse.Namespace) -> str:
-    """Directory that receives plots, report.txt and the default results path."""
-    return args.output_dir or (args.input_dirs[0] if args.input_dirs else ".")
+def _io_tasks(
+    data: IoResultsInput, pool: Executor
+) -> Tuple[List[Future], List[Future]]:
+    """Submit one pool task per execution entry and per unpaired live CSV.
+
+    Each task parses only its own result pair, never the whole input.
+    """
+    slim = replace(data, bases=[])
+    entries = [
+        pool.submit(captured, _execution_task, planned, slim)
+        for planned in _plan_io_executions(data)
+    ]
+    unpaired = []
+    if data.live.level != LIVE_LEVEL_NONE:
+        unpaired = [
+            pool.submit(captured, _unpaired_live, path, slim)
+            for path in _unpaired_live_paths(data)
+        ]
+    return entries, unpaired
 
 
-def results_requested(args: argparse.Namespace) -> bool:
-    """True when a results fragment or document was asked for."""
-    return bool(getattr(args, "results_fragment", None)) or getattr(
-        args, "to_json", False
+def build_io_fragment(data: IoResultsInput, pool: Optional[Executor] = None) -> dict:
+    """Build the fragment (one entry per ledger execution plus unmatched pairs)."""
+    entries, unpaired = _io_tasks(data, pool or InlineExecutor())
+    return _io_fragment(
+        [replay(task) for task in entries], [replay(task) for task in unpaired]
     )
+
+
+def _report_output_dir(args: argparse.Namespace) -> str:
+    """Directory that receives plots, report.txt and the results document."""
+    return args.output_dir or (args.input_dirs[0] if args.input_dirs else ".")
 
 
 def _configured_interval_ms(env: dict) -> Optional[int]:
@@ -5305,12 +4763,14 @@ def _configured_interval_ms(env: dict) -> Optional[int]:
     return value if value > 0 else None
 
 
-def _live_request(args: argparse.Namespace, env: dict, output_dir: str) -> LiveRequest:
+def _live_request(
+    args: argparse.Namespace, env: dict, output_dir: str, sidecar_group: str = ""
+) -> LiveRequest:
     sidecar_dir = getattr(args, "results_live_dir", None) or os.path.join(
         output_dir, RESULTS_LIVE_DIRNAME
     )
     return LiveRequest(
-        level=getattr(args, "live_detail", "summary"),
+        level=getattr(args, "live_detail", "full"),
         shortfall_percent=args.client_shortfall_percent,
         min_slow_windows=args.client_min_slow_windows,
         selection_limits=(
@@ -5319,14 +4779,18 @@ def _live_request(args: argparse.Namespace, env: dict, output_dir: str) -> LiveR
         ),
         sidecar_dir=sidecar_dir,
         configured_interval_ms=_configured_interval_ms(env),
+        sidecar_group=sidecar_group,
     )
 
 
 def _generator_options(args: argparse.Namespace) -> dict:
     return {
-        "live_detail": getattr(args, "live_detail", "summary"),
+        "live_detail": getattr(args, "live_detail", "full"),
         "shortfall_percent": args.client_shortfall_percent,
         "min_slow_windows": args.client_min_slow_windows,
+        "client_max_timeseries_lines": args.client_max_timeseries_lines,
+        "client_max_heatmap_rows": args.client_max_heatmap_rows,
+        "no_dual_y_axis": bool(args.no_dual_y_axis),
         "only_nodes": args.only_nodes or None,
         "only_threads": args.only_threads or None,
         "only_sizes": args.only_sizes or None,
@@ -5335,37 +4799,72 @@ def _generator_options(args: argparse.Namespace) -> dict:
     }
 
 
-def emit_io_results(
-    args: argparse.Namespace, data: IoResultsInput, output_dir: str
-) -> int:
-    """Write the fragment or results document; return the process exit status."""
-    live = data.live
-    if live.level == "full" and live.sidecar_dir:
-        os.makedirs(live.sidecar_dir, exist_ok=True)
-    fragment = build_io_fragment(data)
-    fragment_path = getattr(args, "results_fragment", None)
-    if fragment_path:
-        results_json.write_fragment(fragment, fragment_path)
-        return 0
+@dataclass(frozen=True)
+class IoPublish:
+    """How the raw run publishes its document and report.html."""
+
+    comparisons: Optional[List[dict]] = None
+    selection: Optional[results_json.ReportSelection] = None
+
+
+def _start_io_results(
+    args: argparse.Namespace,
+    inputs: List[IoResultsInput],
+    pool: Executor,
+    publish: IoPublish = IoPublish(),
+) -> Callable[[], Tuple[dict, int]]:
+    """Submit the document's parse tasks; the returned call assembles it.
+
+    That call writes the fragment, or the document and report.html, and
+    returns the document (also assembled for a fragment, to render from) and
+    the exit status.
+    """
+    live = inputs[0].live
+    if not getattr(args, "results_fragment", None) and live.sidecar_dir:
+        # A batch clears its shared sidecar directory itself.
+        results_json.clear_live_sidecars(Path(live.sidecar_dir))
+    started = [(data, *_io_tasks(data, pool)) for data in inputs]
+    return partial(_finish_io_results, args, started, publish)
+
+
+def _finish_io_results(
+    args: argparse.Namespace,
+    started: List[Tuple[IoResultsInput, List[Future], List[Future]]],
+    publish: IoPublish,
+) -> Tuple[dict, int]:
+    """Assemble the document from its parse tasks and write it (see above)."""
+    inputs = [data for data, _, _ in started]
+    fragments = [
+        _io_fragment(
+            [replay(task) for task in entries], [replay(task) for task in unpaired]
+        )
+        for _, entries, unpaired in started
+    ]
+    live = inputs[0].live
     live_dir = (
         Path(live.sidecar_dir) if live.level == "full" and live.sidecar_dir else None
     )
-    document = results_json.assemble_ordinary_document(
-        Path(data.input_dir),
-        fragment,
+    document = results_json.assemble_inputs_document(
+        [(data.input_dir, fragment) for data, fragment in zip(inputs, fragments)],
         live_dir,
         results_json.generator_block(
             ["utils/extract-elbencho.py", *sys.argv[1:]], _generator_options(args)
         ),
     )
-    results_json.write_document(
-        document, os.path.join(output_dir, RESULTS_DEFAULT_FILENAME)
+    fragment_path = getattr(args, "results_fragment", None)
+    if fragment_path:
+        results_json.write_fragment(fragments[0], fragment_path)
+        return document, 0
+    results_json.publish_document(
+        document,
+        os.path.join(_report_output_dir(args), RESULTS_DEFAULT_FILENAME),
+        publish.comparisons,
+        publish.selection,
     )
-    if getattr(
+    incomplete = getattr(
         args, "require_complete", False
-    ) and not results_json.document_is_complete(document):
-        return EXIT_INCOMPLETE
-    return 0
+    ) and not results_json.document_is_complete(document)
+    return document, EXIT_INCOMPLETE if incomplete else 0
 
 
 def _load_input_environments(input_dirs: List[str]) -> Dict[str, dict]:
@@ -5383,246 +4882,486 @@ def _target_sources(
     ]
 
 
-def main() -> None:
-    """Script entry point."""
-    with report_pool() as pool:
-        status = start_report(sys.argv[1:], pool)()
-    if status:
-        sys.exit(status)
+# --- Rendering from the results document --------------------------------------
+
+NO_TEXT_REPORT = "No text report produced"
 
 
-def start_report(argv: List[str], pool: Executor) -> Callable[[], int]:
-    """Parse and submit one report's pool work; the returned call finishes it.
+@dataclass(frozen=True)
+class RenderRequest:
+    """Which groups and executions of a document a report shows, and how."""
 
-    Calling it waits for that work, prints the tables, and returns the exit
-    status. A batch starts every group before finishing any, keeping the
-    pool full across groups.
+    filters: ReportFilters
+    live: LiveReportOptions
+    no_dual_y_axis: bool
+    groups: Optional[FrozenSet[str]] = None
+    # Capped by the document's own level (effective_live_detail).
+    live_detail: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class LiveRender:
+    """One live CSV's domains: (live object, sidecar path; None below full)."""
+
+    metadata: LiveFileMetadata
+    domains: List[Tuple[dict, Optional[str]]]
+
+
+def _render_groups(document: dict, request: RenderRequest) -> List[dict]:
+    return [
+        group
+        for group in document["groups"]
+        if group["kind"] == "io"
+        and (request.groups is None or group["group_id"] in request.groups)
+    ]
+
+
+def _reported_executions(document: dict) -> Dict[str, List[dict]]:
+    """Executions with results, by group (filters are applied by the caller)."""
+    by_group: Dict[str, List[dict]] = defaultdict(list)
+    for execution in document["executions"]:
+        if execution.get("results") and execution["result_state"] != (
+            STATE_NOT_REPORTED
+        ):
+            by_group[execution["group_id"]].append(execution)
+    return by_group
+
+
+def _coordinates_allowed(filters: ReportFilters, coordinates: dict) -> bool:
+    return filters.allows(
+        coordinates["nodes"],
+        coordinates["io_size_spec"],
+        coordinates["threads_per_node"],
+        coordinates["io_depth"],
+    )
+
+
+def _seconds(value_us: Optional[float]) -> float:
+    return (value_us or 0.0) / 1e6
+
+
+def _execution_datestamp(execution: dict) -> str:
+    """The run's datestamp; a schema 1.0 document has it only in file names."""
+    datestamp = execution["results"].get("datestamp")
+    if datestamp is not None:
+        return datestamp
+    for record in execution.get("result_files") or []:
+        name = re.sub(CSV_OUT_EXT_RE, "", os.path.basename(record["path"]))
+        params = parse_benchmark_filename(name)
+        if params is not None:
+            return params["datestamp"]
+    return ""
+
+
+def _phase_file_size(phase: dict, settings: dict) -> int:
+    """The phase's file size; schema 1.0 lacks it: the command's --size, else
+    ELBENCHO_FILE_SIZE."""
+    if "file_size_bytes" in phase:
+        return phase["file_size_bytes"] or 0
+    argv = phase.get("command") or []
+    for flag, value in zip(argv, argv[1:]):
+        if flag in ("-s", "--size"):
+            return fs_coordinates.elbencho_size_bytes(value) or 0
+    size = str(settings.get("ELBENCHO_FILE_SIZE") or "")
+    return fs_coordinates.elbencho_size_bytes(size) or 0
+
+
+def _phase_metric(
+    execution: dict, phase: dict, result_dir: str, settings: dict
+) -> ElbenchoMetrics:
+    """The table row of one write or read phase of a document execution."""
+    coords = execution["coordinates"]
+    dataset = execution["dataset"] or {}
+    first, last = phase["elbencho_first"], phase["elbencho_last"]
+    latency = phase["latency_us"]
+    mib_s = (first["bytes_per_s"] or 0) / 1048576
+    scanned = dataset.get("scanned_file_sizes") or {}
+    histogram = phase["histogram_us"]
+    return ElbenchoMetrics(
+        nodes=coords["nodes"],
+        io_size=coords["io_size_spec"],
+        threads=coords["threads_per_node"],
+        io_depth=coords["io_depth"],
+        operation=phase["phase"].upper(),
+        datestamp=_execution_datestamp(execution),
+        is_multi_node=False,
+        command="",
+        file_size_bytes=_phase_file_size(phase, settings),
+        direct_io=int(bool(coords["direct_io"])),
+        random_io=int(coords.get(f"{phase['phase']}_access") == "random"),
+        iops=first["ops_per_s"] or 0.0,
+        throughput_mib_s=mib_s,
+        throughput_mb_s=normalize_throughput_to_mb(mib_s),
+        throughput_gbps=mib_to_gbps(mib_s),
+        min_lat_sec=_seconds(latency["min"]),
+        avg_lat_sec=_seconds(latency["avg"]),
+        max_lat_sec=_seconds(latency["max"]),
+        lat_pct_1=_seconds(latency["p1"]),
+        lat_pct_50=_seconds(latency["p50"]),
+        lat_pct_75=_seconds(latency["p75"]),
+        lat_pct_99=_seconds(latency["p99"]),
+        io_duration_sec=phase["configured_time_limit_s"] or 0,
+        phase_wall_duration_ms=last["elapsed_ms"] or 0,
+        phase_first_duration_ms=first["elapsed_ms"] or 0,
+        time_ms_first=first["elapsed_ms"],
+        time_ms_last=last["elapsed_ms"],
+        write_only_data_dir=dataset.get("write_only_data_dir") or "",
+        sweep_read_from_path=dataset.get("read_from") or "",
+        treescan_file_count=scanned.get("count", 0),
+        treescan_avg_bytes=scanned.get("avg_bytes", 0),
+        treescan_min_bytes=scanned.get("min_bytes", 0),
+        treescan_max_bytes=scanned.get("max_bytes", 0),
+        treescan_first_file_bytes=dataset.get("first_file_bytes") or 0,
+        result_dir=result_dir,
+        histogram={
+            bucket / 1e6: count
+            for bucket, count in zip(histogram["buckets_us"], histogram["counts"])
+        },
+    )
+
+
+def _tsv(value: Any, missing: str = WORKLOAD_NULL) -> str:
+    """A workload.tsv value as recorded (null, or pending for dataset totals)."""
+    return missing if value is None else str(value)
+
+
+def _apply_document_workload(metric: ElbenchoMetrics, execution: dict) -> None:
+    """Set the Workload/Lifecycle line fields from the execution's workload.
+
+    Fields that schema 1.0 lacks are reported as not recorded.
     """
-    parser = extract_elbencho_parser()
-    args = parser.parse_args(argv)
-    try:
-        validate_analysis_arguments(args)
-        route_batch_report(args, "io", argv)
-    except (OSError, ValueError) as error:
-        parser.error(str(error))
-    if not args.input_dirs and not args.test_parse:
-        parser.error(
-            "at least one input directory is required unless using --test-parse"
-        )
-    if results_requested(args) and len(args.input_dirs) != 1:
-        parser.error("--to-json requires exactly one input directory")
+    results, dataset = execution["results"], execution["dataset"] or {}
+    workload = results["workload"]
+    if workload is None or not dataset.get("layout"):
+        return
+    delete = next((p for p in results["phases"] if p["phase"] == PHASE_DELETE), None)
+    work = (delete or {}).get("work") or {}
+    files = dataset.get("files_per_node") or {}
+    reader = dataset.get("reader") or {}
+    values = {
+        "workload_layout": dataset["layout"],
+        "dataset_count_source": _tsv(dataset.get("count_source")),
+        "treefile_source": _tsv(dataset.get("treefile_source")),
+        "requested_files_per_node": _tsv(files.get("requested")),
+        "effective_files_per_node": _tsv(files.get("effective")),
+        "dataset_files_total": _tsv(dataset.get("files_total"), "pending"),
+        "dataset_bytes_total": _tsv(dataset.get("bytes_total"), "pending"),
+        "reader_nodes": _tsv(reader.get("nodes")),
+        "reader_threads_per_node": _tsv(reader.get("threads_per_node")),
+        "reader_iodepth": _tsv(reader.get("io_depth")),
+        "write_elapsed_time_ms": _tsv(workload.get("write_elapsed_ms")),
+        "read_elapsed_time_ms": _tsv(workload.get("read_elapsed_ms")),
+        "delete_expected_files": _tsv(work.get("expected_files")),
+        "delete_completed_files": _tsv(work.get("completed_files")),
+        "delete_elapsed_time_ms": _tsv((delete or {}).get("elapsed_ms")),
+        "delete_completion_state": _tsv(
+            delete.get("completion_state") if delete else WORKLOAD_NOT_APPLICABLE
+        ),
+        "write_delete_elapsed_time_ms": _tsv(workload.get("write_delete_elapsed_ms")),
+        "lifecycle_elapsed_time_ms": _tsv(workload.get("lifecycle_elapsed_ms")),
+        "completion_state": _tsv(workload.get("completion_state")),
+        "failure_cleanup_state": _tsv(workload.get("failure_cleanup_state")),
+    }
+    for name, value in values.items():
+        setattr(metric, name, value)
 
-    # Handle test-parse mode
-    if args.test_parse:
-        test_parse(args.test_parse)
-        return lambda: 0
 
-    metrics = []
-    versions = ResultVersions()
+def _group_result_dir(document: dict, group: dict) -> str:
+    """The directory that identifies a group's runs (matches its live CSVs)."""
+    root = document["batch"]["root"]
+    return os.path.normpath(os.path.join(root, group["output_relative"]))
 
-    # Refuse results from different storage targets before parsing or writing.
-    environments = _load_input_environments(args.input_dirs)
-    target_label = guarded_report_target(
-        _target_sources(environments),
-        args.allow_mixed_targets,
+
+def document_io_metrics(
+    document: dict, groups: List[dict], filters: ReportFilters
+) -> Tuple[List[ElbenchoMetrics], List[str], bool]:
+    """Table rows, their producer versions, and whether any precede filtering."""
+    reported = _reported_executions(document)
+    metrics: List[ElbenchoMetrics] = []
+    versions: List[str] = []
+    had_metrics = False
+    for group in groups:
+        rows = _group_metric_rows(document, group, reported.get(group["group_id"], []))
+        had_metrics = had_metrics or bool(rows)
+        for execution, metric in rows:
+            if _coordinates_allowed(filters, execution["coordinates"]):
+                metrics.append(metric)
+                versions.append(execution.get("producer_version") or UNKNOWN_VERSION)
+    return metrics, versions, had_metrics
+
+
+def _group_metric_rows(
+    document: dict, group: dict, executions: List[dict]
+) -> List[Tuple[dict, ElbenchoMetrics]]:
+    """(execution, table row) of each write and read phase of one group."""
+    result_dir = _group_result_dir(document, group)
+    settings = group.get("settings") or {}
+    rows = [
+        (execution, _phase_metric(execution, phase, result_dir, settings))
+        for execution in executions
+        for phase in execution["results"]["phases"]
+        if phase["phase"] in (PHASE_WRITE, PHASE_READ)
+    ]
+    group_metrics = [metric for _, metric in rows]
+    multi_node = any(metric.nodes > 1 for metric in group_metrics)
+    for metric in group_metrics:
+        metric.is_multi_node = multi_node
+    apply_env_used_to_metrics(settings, group_metrics)
+    for execution, metric in rows:
+        _apply_document_workload(metric, execution)
+    return rows
+
+
+def _execution_lives(results: dict) -> List[dict]:
+    """Every analyzed live domain of one execution."""
+    attached = [
+        phase["live"]
+        for phase in results["phases"]
+        if isinstance(phase.get("live"), dict) and "domain" in phase["live"]
+    ]
+    return attached + list(results.get("additional_live_domains") or [])
+
+
+def _live_file_metadata(path: str, name_prefix: str = "") -> Optional[LiveFileMetadata]:
+    params = parse_benchmark_filename(os.path.basename(path)[: -len(LIVE_SUFFIX)])
+    if params is None:
+        return None
+    return LiveFileMetadata(
+        path=path,
+        io_size=params["io_size"],
+        nodes=params["nodes"],
+        threads=params["threads"],
+        io_depth=params["io_depth"],
+        datestamp=params["datestamp"],
+        name_prefix=name_prefix,
     )
 
-    # Parse elbencho files from input directories (if any)
-    live_files = []
-    result_pairs: Dict[str, List[ElbenchoMetrics]] = {}
-    for input_dir in args.input_dirs:
-        discovered_live_files = discover_live_csv_files(input_dir)
-        live_files.extend(discovered_live_files)
-        eprint(f"Found {len(discovered_live_files)} live CSV files in {input_dir}")
-        # Get a list of all elbencho output files in the directory
-        dir_metrics = []
-        base_filenames = set()
-        for ext in ["csv", "out"]:
-            pattern = os.path.join(input_dir, f"*.{ext}")
-            for filepath in glob.glob(pattern):
-                basename = os.path.basename(filepath)
-                base_no_ext = re.sub(CSV_OUT_EXT_RE, "", basename)
-                if not parse_benchmark_filename(base_no_ext):
-                    continue
-                base_filename = re.sub(CSV_OUT_EXT_RE, "", filepath)
-                base_filenames.add(base_filename)
 
-        eprint(
-            f"Found {len(base_filenames)} unique benchmark file pairs in {input_dir}"
-        )
+def _sidecar_file(loaded: LoadedDocument, live: dict) -> Optional[str]:
+    """The live object's ``full`` sidecar, or None below full."""
+    ref = live.get("client_series")
+    if not isinstance(ref, dict) or "sha256" not in ref:
+        return None
+    return str(sidecar_path(loaded, ref))
 
-        for base_filename in base_filenames:
-            result_pairs[base_filename] = []
-            try:
-                file_metrics = parse_elbencho_files(base_filename)
-                result_pairs[base_filename] = file_metrics
-                dir_metrics.extend(file_metrics)
-                versions.add(file_metrics, result_version(base_filename + ".out"))
-            except Exception as e:  # pylint: disable=broad-exception-caught
-                eprint(f"Error parsing {base_filename}: {e}")
 
-        apply_env_used_to_metrics(environments[input_dir], dir_metrics)
-        apply_execution_workloads(input_dir, dir_metrics)
+@dataclass
+class _LiveSelection:
+    """Live objects by live CSV; whether any precede filtering; how many
+    selected live CSVs could not be analyzed."""
 
-        # Set multi-node flag if any node count is greater than 1
-        if any(m.nodes > 1 for m in dir_metrics):
-            for m in dir_metrics:
-                m.is_multi_node = True
-
-        metrics.extend(dir_metrics)
-
-    # Print summary of metrics extracted from directories
-    if args.input_dirs:
-        eprint(
-            f"Extracted {len(metrics)} metrics from all files in the input directories"
-        )
-
-    had_aggregate_metrics = bool(metrics)
-    had_live_files = bool(live_files)
-
-    # With --to-json the results export is still written instead (the ledger
-    # then reports every execution as missing, pending or not reported).
-    deferred_error = False
-
-    # Verify that all metrics have a datestamp
-    if metrics:
-        missing_datestamps = [i for i, m in enumerate(metrics) if not m.datestamp]
-        if missing_datestamps:
-            eprint(f"ERROR: Missing datestamp in {len(missing_datestamps)} metrics")
-            eprint(f"First missing datestamp at index: {missing_datestamps[0]}")
-            sys.exit(1)
-    elif not live_files:
-        eprint("ERROR: No metrics found")
-        if not results_requested(args):
-            sys.exit(1)
-        deferred_error = True
-
-    # Filter metrics based on command-line options
-    thread_filter = None
-    node_filter = None
-    size_filter = None
-    iodepth_filter = None
-    filters = ReportFilters()
-    filter_requested = bool(
-        args.only_threads or args.only_sizes or args.only_nodes or args.only_iodepths
+    by_source: DefaultDict[str, List[dict]] = field(
+        default_factory=lambda: defaultdict(list)
     )
-    if filter_requested:
-        thread_filter = (
-            None
-            if not args.only_threads
-            else _parse_report_integer_filter(
-                parser, "--only-threads", args.only_threads
-            )
-        )
-        node_filter = (
-            None
-            if not args.only_nodes
-            else _parse_report_integer_filter(parser, "--only-nodes", args.only_nodes)
-        )
-        try:
-            size_filter = parse_only_sizes_filter(args.only_sizes)
-        except ValueError as exc:
-            parser.error(f"invalid --only-sizes filter: {exc}")
-        iodepth_filter = (
-            None
-            if not args.only_iodepths
-            else _parse_report_integer_filter(
-                parser, "--only-iodepths", args.only_iodepths
-            )
-        )
+    found: bool = False
+    unreadable: int = 0
 
-        metrics = filter_metrics(
-            metrics, size_filter, thread_filter, node_filter, iodepth_filter
-        )
-        eprint(f"After filtering, {len(metrics)} metrics remain")
-        live_files = [
-            metadata
-            for metadata in live_files
-            if _live_metadata_matches_filters(
-                metadata,
-                size_filter,
-                thread_filter,
-                node_filter,
-                iodepth_filter,
-            )
-        ]
-        eprint(f"After filtering, {len(live_files)} live CSV files remain")
 
-        filters = ReportFilters(size_filter, thread_filter, node_filter, iodepth_filter)
-        if had_aggregate_metrics and not metrics:
-            eprint("ERROR: Filters matched no aggregate metrics")
-            deferred_error = True
-        elif had_live_files and not live_files:
-            eprint("ERROR: Filters matched no live CSV files")
-            deferred_error = True
-        if deferred_error and not results_requested(args):
-            sys.exit(1)
-
-    # Match plot output directory (used for report.txt and plots)
-    output_dir = _report_output_dir(args)
-
-    exit_status = 0
-    if results_requested(args):
-        input_dir = args.input_dirs[0]
-        exit_status = emit_io_results(
-            args,
-            IoResultsInput(
-                input_dir,
-                environments[input_dir],
-                filters,
-                _live_request(args, environments[input_dir], output_dir),
-                result_pairs,
-            ),
-            output_dir,
-        )
-    if deferred_error and not getattr(args, "results_fragment", None):
-        # The written document records why nothing was reported, so its
-        # completeness, not the empty text report, decides the exit status.
-        eprint("No text report produced; the JSON export was written")
-        sys.exit(exit_status)
-    os.makedirs(output_dir, exist_ok=True)
-
-    finish = _start_reports(
-        args,
-        metrics,
-        live_files,
-        output_dir,
-        versions,
-        (target_label, environments),
-        pool,
+def _unreadable_live(execution: dict) -> bool:
+    return any(
+        item["code"] == results_json.LIVE_CSV_UNREADABLE
+        for item in execution["problems"]
     )
 
-    def done() -> int:
-        finish()
-        return exit_status
 
-    return done
+def _select_group_lives(
+    group: dict, executions: List[dict], filters: ReportFilters, selection
+) -> None:
+    """Add one group's live objects to ``selection``."""
+    for execution in executions:
+        allowed = _coordinates_allowed(filters, execution["coordinates"])
+        lives = _execution_lives(execution["results"])
+        unreadable = _unreadable_live(execution)
+        selection.found = selection.found or bool(lives) or unreadable
+        if not allowed:
+            continue
+        selection.unreadable += unreadable
+        for live in lives:
+            selection.by_source[live["source"]["path"]].append(live)
+    for live in group.get("unpaired_live") or []:
+        selection.found = True
+        metadata = _live_file_metadata(live["source"]["path"])
+        if metadata is not None and filters.allows(
+            metadata.nodes, metadata.io_size, metadata.threads, metadata.io_depth
+        ):
+            selection.by_source[live["source"]["path"]].append(live)
 
 
-def _live_file_task(
+def document_live_renders(
+    loaded: LoadedDocument,
+    groups: List[dict],
+    filters: ReportFilters,
+    level: str = LIVE_LEVEL_FULL,
+) -> Tuple[List[LiveRender], _LiveSelection]:
+    """Live CSVs to render, in input order, and what was selected, as a raw
+    run at live detail ``level`` would."""
+    document = loaded.data
+    reported = _reported_executions(document)
+    renders: List[LiveRender] = []
+    selection = _LiveSelection()
+    if level == LIVE_LEVEL_NONE:
+        return renders, selection
+    full = level == LIVE_LEVEL_FULL
+    root = document["batch"]["root"]
+    # Like the sidecars: several input directories share one output directory
+    # (a batch renders each group into its own). By the document, not the
+    # --groups selection, so a group's names never depend on what else is shown.
+    several = not is_batch_document(document) and (
+        sum(group["kind"] == "io" for group in document["groups"]) > 1
+    )
+    for group in groups:
+        selection.by_source.clear()
+        _select_group_lives(
+            group, reported.get(group["group_id"], []), filters, selection
+        )
+        prefix = f"{group['group_id']}." if several else ""
+        for source in sorted(selection.by_source, key=natural_key):
+            metadata = _live_file_metadata(
+                os.path.normpath(os.path.join(root, source)), prefix
+            )
+            if metadata is None:
+                continue
+            domains = sorted(
+                (
+                    (live, _sidecar_file(loaded, live) if full else None)
+                    for live in selection.by_source[source]
+                ),
+                key=lambda item: live_domain_key(item[0]),
+            )
+            renders.append(LiveRender(metadata, domains))
+    return renders, selection
+
+
+def _document_window_summary(label: str, window: Optional[dict]):
+    if window is None:
+        return None
+    jain = window["jain"]
+    return WindowSummary(
+        label=label,
+        window_ms=window["window_ms"],
+        windows=window["windows"],
+        jain_min=jain["min"],
+        jain_p10=jain["p10"],
+        jain_p50=jain["p50"],
+        jain_min_at_ms=window["jain_min_at_ms"],
+        share_below_0_95=window["share_below_0_95"],
+        min_over_median_p10=window["min_over_median_p10"],
+        floor_p50=window["floor_p50"],
+    )
+
+
+def _document_class_counts(live: dict) -> Dict[str, int]:
+    summary = live["clients_summary"]
+    column = summary["columns"].index("class")
+    counts = {name: 0 for name in CLASS_ORDER}
+    for row in summary["rows"]:
+        if row[column] in counts:
+            counts[row[column]] += 1
+    return counts
+
+
+def _document_fairness(live: dict, options: LiveReportOptions) -> LiveFairness:
+    """A live object's fairness summary, without its per-client series."""
+    steady = document_steady(live, options.shortfall_percent, options.min_slow_windows)
+    latency = live.get("latency")
+    windows = live.get("fairness") or {}
+    return LiveFairness(
+        steady.window,
+        steady.interval_ms,
+        (
+            None
+            if latency is None
+            else LatencySummary(
+                **{item.name: latency[item.name] for item in fields(LatencySummary)}
+            )
+        ),
+        {
+            label: window_length_intervals(
+                WINDOW_SECONDS.get(label, 0.0), steady.interval_ms
+            )
+            * steady.interval_ms
+            for label in WINDOW_LABELS
+        },
+        {
+            label: _document_window_summary(label, windows.get(label))
+            for label in WINDOW_LABELS
+        },
+        _document_class_counts(live),
+    )
+
+
+def _render_live_summary(
     metadata: LiveFileMetadata,
+    live: dict,
     output_dir: str,
     options: LiveReportOptions,
-    configured_interval_ms: Optional[int],
-    contexts: Dict[str, PhaseContext],
+) -> LiveFairness:
+    """Below full detail: the aggregate plot and the stored fairness summary."""
+    steady = document_steady(live, options.shortfall_percent, options.min_slow_windows)
+    path = plot_aggregate_timeseries(
+        metadata, document_aggregate_domain(live), steady, output_dir
+    )
+    if path:
+        eprint(f"Generated live aggregate plot: {path}")
+    return _document_fairness(live, options)
+
+
+def _render_live_domain(
+    metadata: LiveFileMetadata,
+    live: dict,
+    sidecar: Optional[str],
+    output_dir: str,
+    options: LiveReportOptions,
+) -> LiveFairness:
+    """Write one domain's live reports and return its fairness summary."""
+    if sidecar is None:
+        return _render_live_summary(metadata, live, output_dir, options)
+    try:
+        analysis, domain = analyze_document_live(live, sidecar, metadata)
+    except ValueError as exc:  # also ResultsDocumentError
+        eprint(f"Cannot replay live sidecar {sidecar}: {exc}")
+        return _render_live_summary(metadata, live, output_dir, options)
+    if domain is None:
+        raise ValueError(f"{sidecar} has no {live_domain_key(live).label} rows")
+    steady = analyze_steady(
+        analysis,
+        domain,
+        document_phase_context(live),
+        live["configured_interval_ms"],
+        options.shortfall_percent,
+        options.min_slow_windows,
+    )
+    _report_live_domain(
+        analysis, metadata, domain.key, domain, steady, output_dir, options
+    )
+    return LiveFairness.of(steady)
+
+
+def _live_render_task(
+    render: LiveRender, output_dir: str, options: LiveReportOptions
 ) -> Tuple[bool, List[Tuple[LiveFileMetadata, LiveDomainKey, LiveFairness]]]:
     """Pool task: write one live CSV's reports; return success and fairness."""
     fairness: List[Tuple[LiveFileMetadata, LiveDomainKey, LiveFairness]] = []
     try:
-        reported = _report_one_live_file(
-            metadata, output_dir, options, configured_interval_ms, contexts, fairness
-        )
+        for live, sidecar in render.domains:
+            steady = _render_live_domain(
+                render.metadata, live, sidecar, output_dir, options
+            )
+            key = live_domain_key(live)
+            # Phases such as SYNC move no data and have no aggregate CSV row.
+            if live.get("phase_context") is not None or key.phase in ("WRITE", "READ"):
+                fairness.append((render.metadata, key, steady))
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        eprint(f"Error reporting live CSV {metadata.path}: {exc}")
+        eprint(f"Error reporting live CSV {render.metadata.path}: {exc}")
         traceback.print_exc()
         return False, []
-    return reported, fairness
+    eprint(f"Rendered live CSV: {render.metadata.path}")
+    return True, fairness
 
 
 def _split_live_fairness(
     fairness: List[Tuple[LiveFileMetadata, LiveDomainKey, LiveFairness]],
     metrics: List[ElbenchoMetrics],
-    markdown: bool,
 ) -> Tuple[Dict[LiveRowKey, LiveFairness], List[str]]:
     """Domains shown under a terminal table row, and lines for all others."""
     row_keys = {live_row_key(metric, metric.operation) for metric in metrics}
@@ -5631,7 +5370,7 @@ def _split_live_fairness(
     for metadata, domain_key, steady in fairness:
         key = live_row_key(metadata, domain_key.phase)
         plain = not domain_key.mix_type and not domain_key.occurrence
-        if not markdown and plain and key in row_keys:
+        if plain and key in row_keys:
             live[key] = steady
         else:
             lines.append(
@@ -5640,75 +5379,372 @@ def _split_live_fairness(
     return live, lines
 
 
-def _start_reports(  # pylint: disable=too-many-arguments,too-many-positional-arguments
-    args: argparse.Namespace,
-    metrics: List[ElbenchoMetrics],
-    live_files: List[LiveFileMetadata],
+def _render_problem(
+    rendered: Tuple[int, int], had_metrics: bool, had_lives: bool
+) -> Optional[str]:
+    """Why a report has nothing to show, or None."""
+    metrics, lives = rendered
+    if not had_metrics and not had_lives:
+        return "No metrics found"
+    if had_metrics and not metrics:
+        return "Filters matched no aggregate metrics"
+    if had_lives and not lives:
+        return "Filters matched no live CSV files"
+    return None
+
+
+def start_document_render(
+    loaded: LoadedDocument,
     output_dir: str,
-    versions: ResultVersions,
-    target_and_environments: Tuple[Any, Dict[str, dict]],
+    request: RenderRequest,
+    target_label: str,
     pool: Executor,
-) -> Callable[[], None]:
-    """Submit the live reports and plots; the returned call prints the tables."""
-    target_label, environments = target_and_environments
-    options = LiveReportOptions(
-        args.client_shortfall_percent,
-        args.client_min_slow_windows,
-        args.client_max_timeseries_lines,
-        args.client_max_heatmap_rows,
+) -> Optional[Callable[[], int]]:
+    """Submit the plots and live reports of a document's IO groups.
+
+    The returned call prints the tables (and writes report.txt) and returns
+    the exit status. None, after an error message, when there is nothing to
+    report.
+    """
+    groups = _render_groups(loaded.data, request)
+    metrics, versions, had_metrics = document_io_metrics(
+        loaded.data, groups, request.filters
     )
-    live_tasks = [
-        pool.submit(
-            captured,
-            _live_file_task,
-            metadata,
-            output_dir,
-            options,
-            _configured_interval_ms(_env_for_live(environments, metadata.path)),
-            live_phase_contexts(metadata, metrics),
+    lives, selection = document_live_renders(
+        loaded,
+        groups,
+        request.filters,
+        effective_live_detail(loaded.data, request.live_detail),
+    )
+    attempted = len(lives) + selection.unreadable
+    eprint(f"Reporting {len(metrics)} metrics and {attempted} live CSV files")
+    problem = _render_problem((len(metrics), attempted), had_metrics, selection.found)
+    if problem:
+        eprint(f"ERROR: {problem}")
+        return None
+    os.makedirs(output_dir, exist_ok=True)
+    if any(sidecar is None for render in lives for _, sidecar in render.domains):
+        eprint(
+            "Live detail is below full: live client plots and summaries are omitted."
         )
-        for metadata in live_files
+    live_tasks = [
+        pool.submit(captured, _live_render_task, render, output_dir, request.live)
+        for render in lives
     ]
     plots = (
-        pool.submit(captured, plot_metrics, metrics, output_dir, args.no_dual_y_axis)
+        pool.submit(captured, plot_metrics, metrics, output_dir, request.no_dual_y_axis)
         if metrics
         else None
     )
 
-    def finish() -> None:
+    def finish() -> int:
         fairness: List[Tuple[LiveFileMetadata, LiveDomainKey, LiveFairness]] = []
-        successful_live_reports = 0
+        successful = 0
         for task in live_tasks:
             reported, entries = replay(task)
-            successful_live_reports += reported
+            successful += reported
             fairness.extend(entries)
-        live, fairness_lines = _split_live_fairness(fairness, metrics, args.markdown)
+        live, fairness_lines = _split_live_fairness(fairness, metrics)
         if metrics:
-            if args.markdown:
-                with_versions(
-                    print_markdown_table,
-                    versions.of(metrics),
-                    markdown=True,
-                    target=target_label,
-                )(metrics, args.no_dual_y_axis)
-            else:
-                mirror_stdout_to_file(
-                    os.path.join(output_dir, REPORT_TXT_FILENAME),
-                    with_versions(
-                        print_terminal_table, versions.of(metrics), target=target_label
-                    ),
-                    metrics,
-                    live,
-                )
+            mirror_stdout_to_file(
+                os.path.join(output_dir, REPORT_TXT_FILENAME),
+                with_versions(print_terminal_table, versions, target=target_label),
+                metrics,
+                live,
+            )
         if plots is not None:
             replay(plots)
             eprint(f"Generated plots saved in {output_dir}")
-        emit_live_fairness(fairness_lines, args.markdown, output_dir)
-        if live_files and not successful_live_reports:
+        emit_live_fairness(fairness_lines, output_dir)
+        if attempted and not successful:
             eprint("ERROR: No live CSV reports were generated")
-            sys.exit(1)
+            return 1
+        return 0
 
     return finish
+
+
+def _report_filters(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> ReportFilters:
+    """The --only-* filters; a malformed one is a usage error."""
+    sizes = None
+    try:
+        sizes = parse_only_sizes_filter(args.only_sizes)
+    except ValueError as exc:
+        parser.error(f"invalid --only-sizes filter: {exc}")
+    try:
+        threads = validate_integer_filter("--only-threads", args.only_threads)
+        nodes = validate_integer_filter("--only-nodes", args.only_nodes)
+        iodepths = validate_integer_filter("--only-iodepths", args.only_iodepths)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return ReportFilters(sizes, threads, nodes, iodepths)
+
+
+def _render_request(
+    args: argparse.Namespace,
+    filters: ReportFilters,
+    groups: Optional[FrozenSet[str]] = None,
+) -> RenderRequest:
+    return RenderRequest(
+        filters,
+        LiveReportOptions(
+            args.client_shortfall_percent,
+            args.client_min_slow_windows,
+            args.client_max_timeseries_lines,
+            args.client_max_heatmap_rows,
+        ),
+        bool(args.no_dual_y_axis),
+        groups,
+        getattr(args, "live_detail", None),
+    )
+
+
+def discover_result_bases(input_dir: str) -> List[str]:
+    """Base filenames (without .csv/.out) of the benchmark result pairs."""
+    bases = set()
+    for ext in ("csv", "out"):
+        for filepath in glob.glob(os.path.join(input_dir, f"*.{ext}")):
+            name = re.sub(CSV_OUT_EXT_RE, "", os.path.basename(filepath))
+            if parse_benchmark_filename(name):
+                bases.add(re.sub(CSV_OUT_EXT_RE, "", filepath))
+    eprint(f"Found {len(bases)} unique benchmark file pairs in {input_dir}")
+    return sorted(bases)
+
+
+def main() -> None:
+    """Script entry point."""
+    with report_pool() as pool:
+        status = start_report(sys.argv[1:], pool)()()
+    if status:
+        sys.exit(status)
+
+
+Stage = Callable[[], Callable[[], int]]
+
+
+def start_report(argv: List[str], pool: Executor) -> Stage:
+    """Parse arguments and submit one report's parse work.
+
+    Calling the result waits for that work, writes the results document and
+    submits the plots and live reports; calling what it returns waits for
+    those, prints the tables, and returns the exit status. A batch starts
+    every group, then submits every group's rendering, then finishes each in
+    order, keeping the pool full across groups.
+    """
+    parser = extract_elbencho_parser()
+    args = parser.parse_args(argv)
+    try:
+        validate_analysis_arguments(args)
+        if args.from_json:
+            return _start_from_json(parser, args, pool)
+        args = resolve_report_options(args, "io")
+        route_batch_report(args, "io", argv)
+        validate_report_inputs(args.input_dirs, args.output_dir)
+        comparisons = results_json.load_comparisons(args.comparisons)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    if not args.input_dirs and not args.test_parse:
+        parser.error(
+            "at least one input directory is required unless using --test-parse"
+        )
+    if args.results_fragment and len(unique_inputs(args.input_dirs)) != 1:
+        parser.error("--results-fragment requires exactly one input directory")
+    if args.test_parse:
+        test_parse(args.test_parse)
+        return lambda: lambda: 0
+    return _start_raw_report(parser, args, pool, comparisons)
+
+
+def _io_selection(
+    args: argparse.Namespace,
+    filters: ReportFilters,
+    groups: Optional[FrozenSet[str]] = None,
+) -> results_json.ReportSelection:
+    """What report.html shows: the IO executions the text tables show."""
+
+    def frozen(values: Optional[Set[Any]]) -> Optional[FrozenSet[Any]]:
+        return frozenset(values) if values else None
+
+    return results_json.ReportSelection(
+        kinds=frozenset(["io"]),
+        groups=groups,
+        nodes=frozen(filters.nodes),
+        threads=frozen(filters.threads),
+        sizes=frozen(filters.sizes),
+        iodepths=frozen(filters.iodepths),
+        live_detail=getattr(args, "live_detail", None),
+    )
+
+
+def _io_inputs(
+    args: argparse.Namespace,
+    environments: Dict[str, dict],
+    filters: ReportFilters,
+    output_dir: str,
+) -> List[IoResultsInput]:
+    """One parse input per input directory, in order."""
+    several = len(environments) > 1
+    return [
+        IoResultsInput(
+            input_dir,
+            env,
+            filters,
+            _live_request(args, env, output_dir, f"{number:04d}." if several else ""),
+            discover_result_bases(input_dir),
+        )
+        for number, (input_dir, env) in enumerate(environments.items(), 1)
+    ]
+
+
+def _start_raw_report(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    pool: Executor,
+    comparisons: Optional[List[dict]],
+) -> Stage:
+    """Submit the parse work of raw input directories (see start_report)."""
+    # Refuse results from different storage targets before parsing or writing.
+    environments = _load_input_environments(unique_inputs(args.input_dirs))
+    target_label = guarded_report_target(
+        _target_sources(environments),
+        args.allow_mixed_targets,
+    )
+    filters = _report_filters(parser, args)
+    output_dir = _report_output_dir(args)
+    data = _io_inputs(args, environments, filters, output_dir)
+    request = _render_request(args, filters)
+    finish_results = _start_io_results(
+        args, data, pool, IoPublish(comparisons, _io_selection(args, filters))
+    )
+
+    def render() -> Callable[[], int]:
+        try:
+            document, status = finish_results()
+        except ValueError as error:  # a comparison naming unknown sections
+            parser.error(str(error))
+        sidecars = Path(data[0].live.sidecar_dir or output_dir)
+        loaded = document_from_data(document, sidecars.parent)
+        # The document is new, so a report.txt from an earlier run must go
+        # even when nothing matches now (a batch tracks its own).
+        if not args.results_fragment:
+            remove_stale_report(output_dir)
+        finish = start_document_render(loaded, output_dir, request, target_label, pool)
+        if finish is None:
+            if args.results_fragment:
+                # The batch reports a group whose filters matched nothing.
+                return lambda: 0
+            if args.batch_group:
+                # Beside other documents, matching nothing is not an error.
+                return lambda: status
+            eprint(f"{NO_TEXT_REPORT}; results.json was written")
+            return lambda: status or 1
+        return lambda: finish() or status
+
+    return render
+
+
+def _publish_from_json_html(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    documents: List[LoadedDocument],
+    comparisons: Optional[List[dict]],
+    selection: results_json.ReportSelection,
+) -> None:
+    try:
+        results_json.publish_report_html(
+            documents, args.output_dir, comparisons, selection
+        )
+    except ValueError as error:  # a comparison naming unknown sections
+        parser.error(str(error))
+
+
+def _start_document_renders(
+    output_dir: str,
+    documents: List[LoadedDocument],
+    labels: List[str],
+    requests: List[RenderRequest],
+    pool: Executor,
+) -> List[Callable[[], int]]:
+    """Start each document's rendering; those with nothing to report are left out.
+
+    Arguments and selection are valid by now, so each document's previous
+    report.txt can go: a render that finds nothing must not leave it behind.
+    """
+    finishes = []
+    for number, (loaded, label, request) in enumerate(
+        zip(documents, labels, requests), 1
+    ):
+        document_dir = document_output_dir(output_dir, number, len(documents))
+        remove_stale_report(document_dir)
+        finishes.append(
+            start_document_render(loaded, document_dir, request, label, pool)
+        )
+    return [finish for finish in finishes if finish is not None]
+
+
+def _start_from_json(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, pool: Executor
+) -> Stage:
+    """Render text, PNGs and report.html from results documents.
+
+    Several documents render into per-document subdirectories
+    (``document_output_dir``) and share one report.html. A batch document
+    renders like a batch report (group reports and reports.txt).
+    """
+    documents, comparisons, groups = results_json.load_from_json_inputs(parser, args)
+    batches = [loaded for loaded in documents if is_batch_document(loaded.data)]
+    if batches and not args.batch_group:
+        raise SystemExit(report_documents(documents, args, "io"))
+    filters = _report_filters(parser, args)
+    # Options not given are each document's recorded ones.
+    requests = [
+        _render_request(
+            resolve_report_options(args, "io", recorded_options(loaded.data)),
+            filters,
+            groups,
+        )
+        for loaded in documents
+    ]
+    labels = [
+        guarded_document_target(
+            _render_groups(loaded.data, request), args.allow_mixed_targets
+        )
+        for loaded, request in zip(documents, requests)
+    ]
+    incomplete = not all(
+        results_json.document_is_complete(loaded.data) for loaded in documents
+    )
+
+    def render() -> Callable[[], int]:
+        status = EXIT_INCOMPLETE if args.require_complete and incomplete else 0
+        if not args.batch_group:
+            _publish_from_json_html(
+                parser,
+                args,
+                documents,
+                comparisons,
+                _io_selection(args, filters, groups),
+            )
+        finishes = _start_document_renders(
+            args.output_dir, documents, labels, requests, pool
+        )
+        if not finishes:
+            empty = _no_text_status(args, status)
+            return lambda: empty
+        return lambda: next((r for r in [f() for f in finishes] if r), 0) or status
+
+    return render
+
+
+def _no_text_status(args: argparse.Namespace, status: int) -> int:
+    """The exit status with nothing to report: in a batch group, filters
+    matching nothing is not an error; elsewhere it is 1 (or 3)."""
+    if args.batch_group:
+        return status
+    eprint(NO_TEXT_REPORT)
+    return status or 1
 
 
 if __name__ == "__main__":

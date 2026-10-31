@@ -41,19 +41,23 @@ def prepare_report_runtime(
 def extract_filesystem_parser() -> argparse.ArgumentParser:
     """Build the extract-filesystem command line without runtime dependencies."""
     parser = argparse.ArgumentParser(
-        usage="%(prog)s [OPTIONS] [RESULTS_DIR]",
+        usage="%(prog)s [OPTIONS] [RESULTS_DIR ...]",
         description="Report filesystem results; options apply only to matching groups.",
-        epilog="Parse-only mode requires --kind io|mdtest; not valid for batches.",
+        epilog="--test-parse needs --kind io or --kind mdtest; not valid for batches.",
         allow_abbrev=False,
     )
     parser.add_argument(
-        "results_dir", nargs="?", help="Batch or ordinary results directory."
+        "results_dirs",
+        metavar="RESULTS_DIR",
+        nargs="*",
+        help="One batch, or one or more result directories: IO, metadata, or "
+        "both (several make one report and need --output-dir).",
     )
     parser.add_argument(
         "--kind",
         choices=("all", "io", "mdtest"),
         default="all",
-        help="Workload selection (default: all).",
+        help="Report only IO or only metadata results (default: all).",
     )
     add_report_destination_arguments(parser)
     add_analysis_arguments(parser, "all", explicit_only=True)
@@ -64,7 +68,10 @@ def extract_filesystem_parser() -> argparse.ArgumentParser:
 def extract_elbencho_parser() -> argparse.ArgumentParser:
     """Build the extract-elbencho command line without runtime dependencies."""
     parser = argparse.ArgumentParser(
-        description="Analyze elbencho results",
+        description=(
+            "Analyze elbencho results. Internal engine of extract-filesystem.py; "
+            "run that instead."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -81,7 +88,10 @@ def extract_elbencho_parser() -> argparse.ArgumentParser:
 def extract_mdtest_elbencho_parser() -> argparse.ArgumentParser:
     """Build the extract-mdtest-elbencho command line without runtime dependencies."""
     parser = argparse.ArgumentParser(
-        description="Analyze mdtest-elbencho metadata benchmark results.",
+        description=(
+            "Analyze mdtest-elbencho metadata benchmark results. Internal engine "
+            "of extract-filesystem.py; run that instead."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(

@@ -21,7 +21,7 @@ import argparse
 from collections import Counter
 from concurrent.futures import Executor
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 import hashlib
 import io
@@ -35,24 +35,26 @@ import sys
 import tempfile
 import traceback
 from typing import Any, Callable
-from urllib.parse import quote
 
 from lib.filesystem_report_options import (
     BATCH_CONSUMED_FLAGS,
+    BATCH_GROUP_FLAG,
+    COMPARISONS_FLAG,
+    FROM_JSON_FLAG,
     LIVE_DETAIL_FLAG,
     REPORT_OPTIONS,
     RESULTS_FRAGMENT_FLAG,
     RESULTS_LIVE_DIR_FLAG,
-    TO_JSON_FLAG,
+    document_output_dir,
     options_by_kind,
 )
 from lib.filesystem_snapshot_summary import format_io_snapshot_summary
 from lib.report_pool import load_engine, report_pool, report_workers, run_command
 from lib.report_provenance import VERSION_SUFFIX
+from lib.stdout_report_file import REPORT_TXT_FILENAME
 from lib.storage_target import (
     UNKNOWN_TARGET,
     StorageTarget,
-    describe_storage_target,
     storage_target_from_env,
 )
 
@@ -72,7 +74,10 @@ COMBINED_REPORT_FILENAME = "reports.txt"
 RESULTS_FILENAME = "results.json"
 RESULTS_FRAGMENT_FILENAME = "results.fragment.json"
 RESULTS_LIVE_DIRNAME = "results.live"
+GROUPS_DIRNAME = "groups"
 EXIT_INCOMPLETE = 3
+# A group outcome for a report this run generated.
+REPORTED = "Reported"
 NO_MATCHING_RESULTS_TEXT = "No results matched the report filters.\n"
 KINDS = ("all", "io", "mdtest")
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -138,7 +143,7 @@ def reject_batch_descendant_inputs(paths: list[str]) -> None:
                 continue
             relative = candidate.relative_to(ancestor)
             group_option = ""
-            if len(relative.parts) >= 2 and relative.parts[0] == "groups":
+            if len(relative.parts) >= 2 and relative.parts[0] == GROUPS_DIRNAME:
                 identifier = relative.parts[1]
                 if re.fullmatch(r"[0-9]{4}", identifier):
                     group_option = f" --groups {identifier}"
@@ -456,17 +461,16 @@ def _selected_groups(
     )
 
 
-def _markdown_link(label: str, target: Path, output: Path) -> str:
-    return f"[{label}]({quote(os.path.relpath(target, output), safe='/')})"
-
-
 @dataclass(frozen=True)
 class ResultsRequest:
-    """A requested ``--to-json`` document for a batch report."""
+    """How a batch report writes its results document and report.html."""
 
     require_complete: bool
     options: dict
     command: tuple[str, ...]
+    comparisons: list[dict] | None = None
+    # A lib.filesystem_results.ReportSelection; None shows everything.
+    selection: Any = None
 
 
 def _option_default(flag: str):
@@ -478,10 +482,8 @@ def _option_default(flag: str):
 
 def _results_request(
     args: argparse.Namespace | None, kind: str, groups: str | None
-) -> ResultsRequest | None:
-    """Describe the document requested by parsed arguments; None when absent."""
-    if not getattr(args, "to_json", False):
-        return None
+) -> ResultsRequest:
+    """Describe the document from parsed arguments, or defaults without them."""
     options = {
         key: getattr(args, key, None)
         for key in ("only_nodes", "only_threads", "only_sizes", "only_iodepths")
@@ -492,19 +494,38 @@ def _results_request(
     for key in ("shortfall_percent", "min_slow_windows"):
         flag = "--client-" + key.replace("_", "-")
         options[key] = getattr(args, f"client_{key}", None) or _option_default(flag)
+    for key in ("client_max_timeseries_lines", "client_max_heatmap_rows"):
+        flag = "--" + key.replace("_", "-")
+        options[key] = getattr(args, key, None) or _option_default(flag)
+    options["no_dual_y_axis"] = bool(getattr(args, "no_dual_y_axis", False))
+    options["normalize_to"] = getattr(args, "normalize_to", None)
     options.update(groups=groups, kind=kind)
     return ResultsRequest(
         bool(getattr(args, "require_complete", False)),
         options,
         tuple(sys.argv),
+        _load_comparisons(args),
+        _report_selection(args, kind, groups),
     )
 
 
-def _engine_results_options(
-    request: ResultsRequest | None, report_dir: Path, live_dir: Path, kind: str
-) -> list[str]:
-    if request is None:
-        return []
+def _load_comparisons(args: argparse.Namespace | None) -> list[dict] | None:
+    """The parsed ``--comparisons`` file (ValueError when invalid), if any."""
+    # Deferred so --help and --version work without the reporting dependencies.
+    from lib import filesystem_results  # pylint: disable=import-outside-toplevel
+
+    return filesystem_results.load_comparisons(getattr(args, "comparisons", None))
+
+
+def _report_selection(args: argparse.Namespace | None, kind: str, groups: str | None):
+    """What report.html shows: the groups, kind and filters of the text."""
+    # Deferred so --help and --version work without the reporting dependencies.
+    from lib import filesystem_results  # pylint: disable=import-outside-toplevel
+
+    return filesystem_results.ReportSelection.from_args(args, kind, groups)
+
+
+def _engine_results_options(report_dir: Path, live_dir: Path, kind: str) -> list[str]:
     options = [f"{RESULTS_FRAGMENT_FLAG}={report_dir / RESULTS_FRAGMENT_FILENAME}"]
     if kind == "io":
         options.append(f"{RESULTS_LIVE_DIR_FLAG}={live_dir}")
@@ -518,7 +539,89 @@ def _without_consumed(options: list[str]) -> list[str]:
     ]
 
 
-def report_batch(  # pylint: disable=too-many-locals
+@dataclass
+class _GroupReports:
+    """What a batch's group reports produced, by group ID."""
+
+    outcomes: dict[str, str] = field(default_factory=dict)
+    fragments: dict[str, dict | None] = field(default_factory=dict)
+    report_failed: set[str] = field(default_factory=set)
+    failed: bool = False
+
+    def record(self, group_id: str, finished: tuple[str, bool, bool], output: Path):
+        """Keep one finished group's outcome and fragment."""
+        result, generated, group_failed = finished
+        self.outcomes[group_id] = result
+        fragment, broken = _collect_fragment(_group_dir(output, group_id), generated)
+        self.fragments[group_id] = fragment
+        if group_failed or broken:
+            self.report_failed.add(group_id)
+        self.failed = self.failed or group_failed or broken
+
+
+def _group_dir(output: Path, group_id: str) -> Path:
+    return output / GROUPS_DIRNAME / group_id
+
+
+def _routed_options(
+    analysis_args: argparse.Namespace | None,
+    kinds: set[str],
+    routed: dict[str, list[str]] | None = None,
+) -> dict[str, list[str]]:
+    """Each kind's engine options from parsed arguments, if any; ``routed``
+    are already validated against a wider selection of ``kinds``."""
+    if analysis_args is None:
+        return {}
+    if routed is None:
+        routed = options_by_kind(analysis_args, kinds)
+    return {kind: _without_consumed(options) for kind, options in routed.items()}
+
+
+def _announce_workers(groups: int) -> None:
+    workers = report_workers()
+    if workers > 1 and groups > 1:
+        print(
+            f"Reporting {groups} groups with {workers} worker processes; "
+            "each group's output prints once it and earlier groups finish.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _run_group_reports(
+    manifest: BatchManifest,
+    selected: tuple[BatchGroup, ...],
+    output: Path,
+    options_for: Callable[[BatchGroup], list[str]],
+) -> _GroupReports:
+    """Report every selected group on one pool, printing them in order."""
+    reports = _GroupReports()
+    live_dir = output / RESULTS_LIVE_DIRNAME
+    _announce_workers(len(selected))
+    with report_pool() as pool:
+        # Start every group, then submit every group's rendering, before
+        # finishing any, so the pool stays full.
+        started = []
+        for group in selected:
+            options = [
+                *options_for(group),
+                *_engine_results_options(
+                    _group_dir(output, group.group_id), live_dir, group.kind
+                ),
+            ]
+            sink, prepare = _start_group_report(
+                manifest, group, output, options, pool=pool
+            )
+            started.append((group, sink, prepare))
+        prepared = [(group, sink, prepare()) for group, sink, prepare in started]
+        for group, sink, finish in prepared:
+            finished = finish()
+            sink.emit()
+            reports.record(group.group_id, finished, output)
+    return reports
+
+
+def report_batch(
     path: str | Path,
     kind: str = "all",
     groups: str | None = None,
@@ -528,10 +631,10 @@ def report_batch(  # pylint: disable=too-many-locals
     analysis_args: argparse.Namespace | None = None,
     results_args: argparse.Namespace | None = None,
 ) -> int:
-    """Generate independent group reports and an index; retain partial successes.
+    """Generate independent group reports, the results document and report.html.
 
-    ``results_args`` names a parsed namespace whose ``--to-json`` family selects
-    the results document when ``engine_options`` are forwarded verbatim.
+    Partial successes are retained. ``results_args`` names a parsed namespace
+    whose document options apply when ``engine_options`` are forwarded verbatim.
     """
     manifest = read_batch_manifest(path)
     selected = _selected_groups(manifest, kind, groups)
@@ -540,86 +643,467 @@ def report_batch(  # pylint: disable=too-many-locals
     if analysis_args is not None and hasattr(analysis_args, "test_parse"):
         raise ValueError("--test-parse cannot report a prepared batch")
     request = _results_request(results_args or analysis_args, kind, groups)
-    routed = (
-        {
-            k: _without_consumed(v)
-            for k, v in options_by_kind(
-                analysis_args, {group.kind for group in selected}
-            ).items()
-        }
-        if analysis_args is not None
-        else {}
-    )
+    routed = _routed_options(analysis_args, {group.kind for group in selected})
     output = Path(output_dir).resolve() if output_dir else manifest.root / "reports"
     output.mkdir(parents=True, exist_ok=True)
-    live_dir = output / RESULTS_LIVE_DIRNAME
-    if request is not None:
-        _clear_live_sidecars(live_dir)
-    outcomes = {}
-    generated = 0
-    failed = False
-    fragments: dict[str, dict | None] = {}
-    report_failed: set[str] = set()
-    workers = report_workers()
-    if workers > 1 and len(selected) > 1:
-        print(
-            f"Reporting {len(selected)} groups with {workers} worker processes; "
-            "each group's output prints once it and earlier groups finish.",
-            file=sys.stderr,
-            flush=True,
-        )
-    with report_pool() as pool:
-        # Start every group before finishing any, so the pool stays full.
-        started = []
-        for group in selected:
-            report_dir = output / "groups" / group.group_id
-            options = [
-                *routed.get(group.kind, engine_options or []),
-                *_engine_results_options(request, report_dir, live_dir, group.kind),
-            ]
-            sink, finish = _start_group_report(
-                manifest,
-                group,
-                output,
-                options,
-                reset_fragment=request is not None,
-                pool=pool,
-            )
-            started.append((group, sink, finish))
-        for group, sink, finish in started:
-            result, group_generated, group_failed = finish()
-            sink.emit()
-            generated += group_generated
-            failed = failed or group_failed
-            outcomes[group.group_id] = result
-            if request is not None:
-                report_dir = output / "groups" / group.group_id
-                fragment, broken = _collect_fragment(report_dir, group_generated)
-                fragments[group.group_id] = fragment
-                if group_failed or broken:
-                    report_failed.add(group.group_id)
-                    failed = failed or broken
-    combined = (
-        output / COMBINED_REPORT_FILENAME
-        if output_dir
-        else manifest.root / COMBINED_REPORT_FILENAME
+    _clear_live_sidecars(output / RESULTS_LIVE_DIRNAME)
+    reports = _run_group_reports(
+        manifest,
+        selected,
+        output,
+        lambda group: routed.get(group.kind, engine_options or []),
     )
+    combined = (output if output_dir else manifest.root) / COMBINED_REPORT_FILENAME
+    failed = reports.failed
     try:
-        _write_combined_report(manifest, output, outcomes, combined)
+        _write_combined_report(manifest, output, reports.outcomes, combined)
     except (OSError, ValueError) as error:
         print(f"Combined report: {error}", file=sys.stderr)
         failed = True
-        combined = None
-    _write_report_index(manifest, output, outcomes, combined)
-    if request is None:
-        return int(failed or not generated)
-    complete = _write_results_document(
-        manifest, selected, fragments, report_failed, output, request
-    )
+    complete = _write_results_document(manifest, selected, reports, output, request)
+    for group in selected:
+        # The document now holds every fragment.
+        (_group_dir(output, group.group_id) / RESULTS_FRAGMENT_FILENAME).unlink(
+            missing_ok=True
+        )
     # With a document, nothing successful yet is incompleteness, not failure.
     if failed or complete is None:
         return 1
     return EXIT_INCOMPLETE if request.require_complete and not complete else 0
+
+
+def _document_groups(document: dict, kind: str, groups: str | None) -> list[dict]:
+    """The document groups --kind and --groups select, in document order."""
+    if kind not in KINDS:
+        raise ValueError(f"Unknown filesystem workload kind: {kind}")
+    selected_ids = None if groups is None else set(groups.split(","))
+    known_ids = {group["group_id"] for group in document["groups"]}
+    if selected_ids is not None and (not selected_ids or not selected_ids <= known_ids):
+        raise ValueError(f"Unknown document groups: {groups}")
+    selected = [
+        group
+        for group in document["groups"]
+        if (kind == "all" or group["kind"] == kind)
+        and (selected_ids is None or group["group_id"] in selected_ids)
+    ]
+    if not selected:
+        raise ValueError("No document groups match --kind and --groups")
+    return selected
+
+
+def _document_group_report(
+    path: Path, group: dict, output: Path, options: list[str], pool: Executor
+) -> tuple[GroupOutput, Callable[[], Callable[[], bool]]]:
+    """Start rendering one group of a document into ``groups/<id>``.
+
+    Calling the result submits the rendering; calling what that returns
+    finishes it and says whether it succeeded.
+    """
+    sink = GroupOutput()
+    report_dir = _group_dir(output, group["group_id"])
+
+    def failed(error: Exception) -> bool:
+        sink.stderr += f"Group {group['group_id']}: {error}\n"
+        return False
+
+    def finish(wait: Callable[[], None]) -> bool:
+        try:
+            wait()
+            report = report_dir / REPORT_TXT_FILENAME
+            if not report.exists():
+                _publish_report_text(report, NO_MATCHING_RESULTS_TEXT)
+        except _REPORT_ERRORS as error:
+            return failed(error)
+        return True
+
+    try:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        # The engine replaces a previous report.txt once its request is valid.
+        argv = [
+            FROM_JSON_FLAG,
+            str(path),
+            "--groups",
+            group["group_id"],
+            "--output-dir",
+            str(report_dir),
+            BATCH_GROUP_FLAG,
+            *options,
+        ]
+        with sink.capture():
+            stage = _captured_stages(
+                _start_engine(group["kind"], argv, pool), sink, lambda: None
+            )
+    except _REPORT_ERRORS as error:
+        return sink, partial(partial, failed, error)
+
+    def prepare() -> Callable[[], bool]:
+        try:
+            return partial(finish, stage())
+        except _REPORT_ERRORS as error:
+            return partial(failed, error)
+
+    return sink, prepare
+
+
+def _document_combined_report(document: dict, groups: list[dict], output: Path) -> None:
+    """reports.txt for the rendered groups of a document (two or more)."""
+    destination = output / COMBINED_REPORT_FILENAME
+    destination.unlink(missing_ok=True)
+    reports = [
+        (group, _group_dir(output, group["group_id"]) / REPORT_TXT_FILENAME)
+        for group in groups
+    ]
+    reports = [(group, report) for group, report in reports if report.is_file()]
+    if len(reports) < 2:
+        return
+    sections = []
+    for group, report in reports:
+        target = group["target"]
+        sections.append(
+            _combined_section(
+                (group["group_id"], group["kind"]),
+                StorageTarget(target["name"], target["recorded"]),
+                (
+                    report,
+                    Path(group.get("source") or document["batch"]["root"]) / ENV_YAML,
+                ),
+                group.get("settings_text") or "",
+                group.get("settings") or {},
+            )
+        )
+    _publish_report_text(destination, "".join(sections) + "\n")
+
+
+def report_batch_document(
+    path: str | Path,
+    kind: str = "all",
+    groups: str | None = None,
+    output_dir: str | Path | None = None,
+    *,
+    analysis_args: argparse.Namespace | None = None,
+    publish_html: bool = True,
+    routed: dict[str, list[str]] | None = None,
+) -> int:
+    """Render a batch results document like a batch report: group reports,
+    ``reports.txt`` and ``report.html`` under ``output_dir``.
+
+    ``publish_html=False`` leaves ``report.html`` to the caller, which renders
+    several documents into one and passes their ``routed`` options, validated
+    against every document's groups.
+    """
+    # Deferred so --help and --version work without the reporting dependencies.
+    from lib import filesystem_results  # pylint: disable=import-outside-toplevel
+    from lib.results_document import (  # pylint: disable=import-outside-toplevel
+        load_document,
+    )
+
+    path = Path(path)
+    loaded = load_document(path)
+    selected = _document_groups(loaded.data, kind, groups)
+    if output_dir is None:
+        raise ValueError(f"--output-dir is required with {FROM_JSON_FLAG}")
+    output = Path(output_dir).resolve()
+    comparisons = _load_comparisons(analysis_args)
+    routed = _routed_options(
+        analysis_args, {group["kind"] for group in selected}, routed
+    )
+    if publish_html:
+        # First, so an invalid comparison fails before any output is written.
+        filesystem_results.publish_report_html(
+            [loaded],
+            output,
+            comparisons,
+            _report_selection(analysis_args, kind, groups),
+        )
+    output.mkdir(parents=True, exist_ok=True)
+    failed = False
+    with report_pool() as pool:
+        started = [
+            _document_group_report(
+                path, group, output, routed.get(group["kind"], []), pool
+            )
+            for group in selected
+        ]
+        prepared = [(sink, prepare()) for sink, prepare in started]
+        for sink, finish in prepared:
+            failed = not finish() or failed
+            sink.emit()
+    _document_combined_report(loaded.data, selected, output)
+    if failed:
+        return 1
+    complete = filesystem_results.document_is_complete(loaded.data)
+    require = bool(getattr(analysis_args, "require_complete", False))
+    return EXIT_INCOMPLETE if require and not complete else 0
+
+
+def is_batch_document(document: dict) -> bool:
+    """True for the results document of a prepared batch."""
+    return document["batch"].get("manifest_version") is not None
+
+
+def _selected_document_ids(
+    document: dict, kind: str, wanted: set[str] | None
+) -> list[str]:
+    return [
+        group["group_id"]
+        for group in document["groups"]
+        if kind in ("all", group["kind"])
+        and (wanted is None or group["group_id"] in wanted)
+    ]
+
+
+def _document_selections(
+    documents: list, kind: str, groups: str | None
+) -> list[tuple[int, Any, str | None]]:
+    """(number, document, --groups for it) of the documents with anything
+    selected by ``kind`` and ``groups``; an ID known to no document is an error."""
+    wanted = set(groups.split(",")) if groups else None
+    known = {group["group_id"] for doc in documents for group in doc.data["groups"]}
+    if wanted and not wanted <= known:
+        raise ValueError(f"Unknown document groups: {','.join(sorted(wanted - known))}")
+    selections = []
+    for number, loaded in enumerate(documents, 1):
+        ids = _selected_document_ids(loaded.data, kind, wanted)
+        if ids:
+            selections.append((number, loaded, ",".join(ids) if wanted else None))
+    if not selections:
+        raise ValueError("No document groups match --kind and --groups")
+    return selections
+
+
+def _render_batch_document(
+    args: argparse.Namespace,
+    kind: str,
+    loaded: Any,
+    output_dir: str,
+    groups: str | None,
+    routed: dict[str, list[str]] | None,
+) -> tuple[int, bool]:
+    """Render a batch document without report.html; (status, any text)."""
+    status = report_batch_document(
+        loaded.path,
+        kind,
+        groups,
+        output_dir,
+        analysis_args=args,
+        publish_html=False,
+        routed=routed,
+    )
+    output = Path(output_dir).resolve()
+    produced = any(
+        (_group_dir(output, group["group_id"]) / REPORT_TXT_FILENAME).is_file()
+        for group in _document_groups(loaded.data, kind, groups)
+    )
+    return status, produced
+
+
+def _render_document(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    args: argparse.Namespace,
+    kind: str,
+    loaded: Any,
+    output_dir: str,
+    groups: str | None,
+    publish: bool,
+    routed: dict[str, list[str]] | None = None,
+) -> tuple[int, bool]:
+    """Render one document into ``output_dir``: (exit status, whether text was
+    written). Without ``publish`` the caller writes report.html. ``routed``
+    are the options by kind, validated against all of several documents'
+    groups; one document validates its own."""
+    if is_batch_document(loaded.data):
+        if not publish:
+            return _render_batch_document(
+                args, kind, loaded, output_dir, groups, routed
+            )
+        status = report_batch_document(
+            loaded.path, kind, groups, output_dir, analysis_args=args
+        )
+        return status, True
+    if kind == "all":
+        kind = min((group["kind"] for group in loaded.data["groups"]), default="io")
+    engine = "extract-mdtest-elbencho.py" if kind == "mdtest" else _IO_ENGINE
+    command = [
+        sys.executable,
+        str(_REPO_ROOT / "utils" / engine),
+        FROM_JSON_FLAG,
+        str(loaded.path),
+        "--output-dir",
+        output_dir,
+    ]
+    if groups:
+        command.extend(["--groups", groups])
+    if not publish:
+        # Nothing to report in one document is fine among several.
+        command.append(BATCH_GROUP_FLAG)
+    elif args.comparisons:
+        command.extend([COMPARISONS_FLAG, args.comparisons])
+    options = (routed or options_by_kind(args, {kind}))[kind]
+    # The engine replaces the previous report once its request is valid, so
+    # a usage error keeps it and a report here is this run's.
+    status = subprocess.run([*command, *options], check=False).returncode
+    return status, (Path(output_dir) / REPORT_TXT_FILENAME).is_file()
+
+
+def report_documents(documents: list, args: argparse.Namespace, kind: str) -> int:
+    """Render loaded ``--from-json`` documents into ``args.output_dir``.
+
+    One renders through its engine or, for a batch, like a batch report;
+    several render into per-document subdirectories sharing one report.html.
+    """
+    # Deferred so --help and --version work without the reporting dependencies.
+    from lib import filesystem_results  # pylint: disable=import-outside-toplevel
+
+    if len(documents) == 1:
+        return _render_document(
+            args, kind, documents[0], args.output_dir, args.groups, True
+        )[0]
+    selections = _document_selections(documents, kind, args.groups)
+    # An option must match a group of some document, not of each.
+    routed = options_by_kind(
+        args,
+        {
+            group["kind"]
+            for _, loaded, groups in selections
+            for group in _document_groups(loaded.data, kind, groups)
+        },
+    )
+    # Before any rendering, so an invalid comparison writes nothing else.
+    filesystem_results.publish_report_html(
+        documents,
+        args.output_dir,
+        _load_comparisons(args),
+        _report_selection(args, kind, args.groups),
+    )
+    rendered = [
+        _render_document(
+            args,
+            kind,
+            loaded,
+            document_output_dir(args.output_dir, number, len(documents)),
+            groups,
+            False,
+            routed,
+        )
+        for number, loaded, groups in selections
+    ]
+    return _combined_status(rendered)
+
+
+def _combined_status(rendered: list[tuple[int, bool]]) -> int:
+    """The exit status of several (status, text written) renders."""
+    statuses = [status for status, _ in rendered]
+    produced = any(text for _, text in rendered)
+    if not produced:
+        print("No text report produced", file=sys.stderr)
+    # A failure outranks incompleteness (exit 3), which outranks no text.
+    failure = next((s for s in statuses if s not in (0, EXIT_INCOMPLETE)), None)
+    if failure is not None:
+        return failure
+    if not produced:
+        return EXIT_INCOMPLETE if EXIT_INCOMPLETE in statuses else 1
+    return max(statuses)
+
+
+def report_mixed_directories(
+    directories: dict[str, list[str]], args: argparse.Namespace
+) -> int:
+    """Report IO and metadata result directories together: each kind's
+    engine writes one document under ``<output-dir>/dN``, and both share
+    one report.html, as several ``--from-json`` documents do."""
+    # Deferred so --help and --version work without the reporting dependencies.
+    from lib import filesystem_results  # pylint: disable=import-outside-toplevel
+    from lib.results_document import (  # pylint: disable=import-outside-toplevel
+        load_document,
+    )
+
+    # Validate everything before either engine writes.
+    routed = options_by_kind(args, set(directories))
+    selection = _report_selection(args, "all", None)
+    comparisons = _load_comparisons(args)
+    paths = [
+        Path(document_output_dir(args.output_dir, number, len(directories)))
+        / RESULTS_FILENAME
+        for number in range(1, len(directories) + 1)
+    ]
+    _check_mixed_references(comparisons, directories, paths)
+    # A page left from an earlier run must not outlive this run's documents.
+    html = Path(args.output_dir) / filesystem_results.REPORT_HTML_FILENAME
+    html.unlink(missing_ok=True)
+    rendered = []
+    for path, (kind, inputs) in zip(paths, directories.items()):
+        engine = "extract-mdtest-elbencho.py" if kind == "mdtest" else _IO_ENGINE
+        command = [sys.executable, str(_REPO_ROOT / "utils" / engine), *inputs]
+        # Beside the other kind, a filter matching nothing here is fine.
+        command += ["--output-dir", str(path.parent), BATCH_GROUP_FLAG]
+        status = subprocess.run([*command, *routed[kind]], check=False).returncode
+        rendered.append((status, (path.parent / REPORT_TXT_FILENAME).is_file()))
+    # A failed engine may leave an earlier run's document: no combined page.
+    if all(status in (0, EXIT_INCOMPLETE) for status, _ in rendered):
+        filesystem_results.publish_report_html(
+            [load_document(path) for path in paths],
+            args.output_dir,
+            comparisons,
+            selection,
+        )
+    return _combined_status(rendered)
+
+
+def _check_mixed_references(
+    comparisons: list[dict] | None,
+    directories: dict[str, list[str]],
+    paths: list[Path],
+) -> None:
+    """Reject, before either engine writes, a comparison that mixed
+    directories cannot satisfy: an unknown document or group, or IO compared
+    with metadata. Document N (by number or ``paths[N - 1]``) is the Nth
+    kind; its groups are ``0000`` for one directory, else ``0001`` onward.
+    Section shapes need the parsed results, so they are checked after."""
+    names = sorted(
+        {
+            (name, number)
+            for number, path in enumerate(paths, 1)
+            for name in (str(number), str(path), str(path.resolve()))
+        },
+        key=lambda item: -len(item[0]),
+    )
+    groups = [
+        (
+            {"0000"}
+            if len(inputs) == 1
+            else {f"{n:04d}" for n in range(1, len(inputs) + 1)}
+        )
+        for inputs in directories.values()
+    ]
+    for entry in comparisons or []:
+        documents = {
+            _mixed_reference(reference, names, groups)
+            for reference in entry["sections"]
+        }
+        if len(documents) > 1:
+            raise ValueError(f"comparison {entry['title']!r} compares IO with metadata")
+
+
+def _mixed_reference(
+    reference: str, names: list[tuple[str, int]], groups: list[set[str]]
+) -> int:
+    """The document number of a ``<doc>:<group>[:<shape>]`` reference."""
+    number, group = next(
+        (
+            (index, reference[len(name) + 1 :].split(":", 1)[0])
+            for name, index in names
+            if reference.startswith(f"{name}:")
+        ),
+        (None, ""),
+    )
+    if number is None:
+        raise ValueError(
+            f"section {reference!r}: no such document; IO directories are "
+            "document 1 and metadata directories document 2"
+        )
+    if not group.isdigit() or f"{int(group):04d}" not in groups[number - 1]:
+        known = ", ".join(sorted(groups[number - 1]))
+        raise ValueError(f"section {reference!r}: document {number} has groups {known}")
+    return number
 
 
 @dataclass
@@ -649,10 +1133,11 @@ class GroupOutput:
 
 
 def _clear_live_sidecars(live_dir: Path) -> None:
-    """Remove sidecars of an earlier export; this run rewrites the document."""
-    if live_dir.is_dir():
-        for stale in live_dir.glob("*.jsonl.zst"):
-            stale.unlink(missing_ok=True)
+    from lib.filesystem_results import (  # pylint: disable=import-outside-toplevel
+        clear_live_sidecars,
+    )
+
+    clear_live_sidecars(live_dir)
 
 
 def _collect_fragment(report_dir: Path, generated: bool) -> tuple[dict | None, bool]:
@@ -670,15 +1155,14 @@ def _collect_fragment(report_dir: Path, generated: bool) -> tuple[dict | None, b
         return None, True
 
 
-def _write_results_document(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+def _write_results_document(
     manifest: BatchManifest,
     selected: tuple[BatchGroup, ...],
-    fragments: dict[str, dict | None],
-    report_failed: set[str],
+    reports: _GroupReports,
     output: Path,
     request: ResultsRequest,
 ) -> bool | None:
-    """Assemble and write the document; return completeness, None on failure."""
+    """Write the document and report.html; return completeness, None on failure."""
     from lib import filesystem_results  # pylint: disable=import-outside-toplevel
 
     destination = output / RESULTS_FILENAME
@@ -686,12 +1170,14 @@ def _write_results_document(  # pylint: disable=too-many-arguments,too-many-posi
         document = filesystem_results.assemble_batch_document(
             manifest,
             selected,
-            fragments,
-            report_failed,
+            reports.fragments,
+            reports.report_failed,
             output / RESULTS_LIVE_DIRNAME,
             filesystem_results.generator_block(list(request.command), request.options),
         )
-        filesystem_results.write_document(document, destination)
+        filesystem_results.publish_document(
+            document, destination, request.comparisons, request.selection
+        )
     except (OSError, ValueError) as error:
         print(f"Results document: {error}", file=sys.stderr)
         return None
@@ -701,19 +1187,24 @@ def _write_results_document(  # pylint: disable=too-many-arguments,too-many-posi
 _REPORT_ERRORS = (OSError, ValueError, subprocess.CalledProcessError)
 
 
+GroupFinish = Callable[[], tuple[str, bool, bool]]
+# An engine's first stage submits its rendering and returns its second stage.
+EngineStage = Callable[[], Callable[[], None] | None]
+
+
 def _start_group_report(  # pylint: disable=too-many-arguments
     manifest: BatchManifest,
     group: BatchGroup,
     output: Path,
     options: list[str],
     *,
-    reset_fragment: bool,
     pool: Executor,
-) -> tuple[GroupOutput, Callable[[], tuple[str, bool, bool]]]:
-    """Start one group's report; the returned call finishes it.
+) -> tuple[GroupOutput, Callable[[], GroupFinish]]:
+    """Start one group's report.
 
-    Failures stay within the group. Its output and errors go to the
-    returned GroupOutput.
+    Calling the result submits the group's rendering; calling what that
+    returns finishes it. Failures stay within the group. Its output and
+    errors go to the returned GroupOutput.
     """
     sink = GroupOutput()
 
@@ -721,20 +1212,19 @@ def _start_group_report(  # pylint: disable=too-many-arguments
         sink.stderr += f"Group {group.group_id}: {error}\n"
         return "Reporting failed", False, True
 
-    if reset_fragment:
-        # A stale fragment must never stand in for this run's evidence.
-        (output / "groups" / group.group_id / RESULTS_FRAGMENT_FILENAME).unlink(
-            missing_ok=True
-        )
+    # A stale fragment must never stand in for this run's evidence.
+    (_group_dir(output, group.group_id) / RESULTS_FRAGMENT_FILENAME).unlink(
+        missing_ok=True
+    )
     successful = tuple(
         execution
         for execution in manifest.group_executions(group.group_id)
         if execution_status(manifest, execution) == SUCCESS
     )
     if not successful:
-        return sink, lambda: ("No successful results", False, False)
-    report_dir = output / "groups" / group.group_id
-    report = report_dir / "report.txt"
+        return sink, lambda: lambda: ("No successful results", False, False)
+    report_dir = _group_dir(output, group.group_id)
+    report = report_dir / REPORT_TXT_FILENAME
     try:
         report_dir.mkdir(parents=True, exist_ok=True)
         # Invalidate prior evidence before an engine can partially overwrite it.
@@ -744,13 +1234,16 @@ def _start_group_report(  # pylint: disable=too-many-arguments
             manifest, group, successful, report_dir, options, sink=sink, pool=pool
         )
     except _REPORT_ERRORS as error:
-        return sink, partial(failed, error)
+        return sink, partial(partial, failed, error)
 
-    def finish() -> tuple[str, bool, bool]:
+    def finish(rendering: Callable[[], None] | None) -> tuple[str, bool, bool]:
         try:
-            if pending is not None:
-                pending()
-            if reset_fragment and not report.exists():
+            if rendering is not None:
+                rendering()
+            if (
+                not report.exists()
+                and (report_dir / RESULTS_FRAGMENT_FILENAME).exists()
+            ):
                 # An engine whose filters matched nothing exits 0 with only a
                 # fragment; the group still needs a report to bind its identity to.
                 _publish_report_text(report, NO_MATCHING_RESULTS_TEXT)
@@ -760,9 +1253,16 @@ def _start_group_report(  # pylint: disable=too-many-arguments
             )
         except _REPORT_ERRORS as error:
             return failed(error)
-        return _markdown_link("report", report, output), True, False
+        return REPORTED, True, False
 
-    return sink, finish
+    def prepare() -> GroupFinish:
+        try:
+            rendering = pending() if pending is not None else None
+        except _REPORT_ERRORS as error:
+            return partial(failed, error)
+        return partial(finish, rendering)
+
+    return sink, prepare
 
 
 def _report_identity(manifest: BatchManifest, group: BatchGroup, report: Path) -> str:
@@ -791,52 +1291,6 @@ def _has_owned_report(manifest: BatchManifest, group: BatchGroup, report: Path) 
         return False
 
 
-def _write_report_index(
-    manifest: BatchManifest,
-    output: Path,
-    outcomes: dict[str, str],
-    combined: Path | None = None,
-) -> None:
-    """Rebuild all committed rows, retaining reports untouched by filtered runs."""
-    lines = [
-        "# Filesystem batch reports",
-        "",
-        f"Batch: `{manifest.root.name}`",
-        "",
-        "| Group | Kind | Target | Saved settings | Cell states | Reports |",
-        "| --- | --- | --- | --- | --- | --- |",
-    ]
-    if combined is not None and combined.is_file():
-        lines[4:4] = [_markdown_link("Combined report", combined, output), ""]
-    for group in manifest.groups:
-        counts = Counter(
-            execution_status(manifest, execution)
-            for execution in manifest.group_executions(group.group_id)
-        )
-        report = output / "groups" / group.group_id / "report.txt"
-        result = outcomes.get(group.group_id)
-        if result is None:
-            result = (
-                _markdown_link("report", report, output)
-                if _has_owned_report(manifest, group, report)
-                else "Not generated" if counts[SUCCESS] else "No successful results"
-            )
-        source = manifest.group_path(group)
-        settings = " / ".join(
-            _markdown_link(name, source / name, output)
-            for name in (ENV_SHELL, ENV_YAML)
-        )
-        states = ", ".join(
-            f"{state}: {count}" for state, count in sorted(counts.items())
-        )
-        target = _markdown_cell(_group_target(manifest, group))
-        lines.append(
-            f"| {group.group_id} | {group.kind} | {target} | {settings} | "
-            f"{states} | {result} |"
-        )
-    _publish_report_text(output / "index.md", "\n".join(lines) + "\n")
-
-
 def _single_line(text: str) -> str:
     return text.replace("\r", " ").replace("\n", " ")
 
@@ -860,34 +1314,6 @@ def _group_storage_target(manifest: BatchManifest, group: BatchGroup) -> Storage
     return storage_target_from_env(snapshot)
 
 
-def _group_target(manifest: BatchManifest, group: BatchGroup) -> str:
-    """Describe the storage target saved with the group; unknown when unreadable."""
-    return _single_line(describe_storage_target(_group_storage_target(manifest, group)))
-
-
-_CELL_ESCAPES = (
-    ("\\", "\\\\"),
-    ("|", "\\|"),
-    ("`", "\\`"),
-    ("&", "&amp;"),
-    ("<", "&lt;"),
-    ("\r", " "),
-    ("\n", " "),
-)
-
-
-def _markdown_cell(text: str) -> str:
-    """Render text literally inside one GitHub-flavored Markdown table cell.
-
-    Backslash is escaped first so the backslashes added for ``|`` and the
-    backtick are not themselves doubled. ``&`` and ``<`` become entities so a
-    name cannot form an entity reference, tag or autolink.
-    """
-    for character, replacement in _CELL_ESCAPES:
-        text = text.replace(character, replacement)
-    return text
-
-
 def _write_combined_report(
     manifest: BatchManifest,
     output: Path,
@@ -899,9 +1325,9 @@ def _write_combined_report(
     destination.unlink(missing_ok=True)
     eligible = []
     for group in manifest.groups:
-        report = output / "groups" / group.group_id / "report.txt"
+        report = _group_dir(output, group.group_id) / REPORT_TXT_FILENAME
         result = outcomes.get(group.group_id)
-        if result is not None and result != _markdown_link("report", report, output):
+        if result is not None and result != REPORTED:
             continue
         if _has_owned_report(manifest, group, report):
             eligible.append((group, report))
@@ -911,21 +1337,43 @@ def _write_combined_report(
     for group, report in eligible:
         source = manifest.group_path(group) / ENV_YAML
         environment = _verify_digest(source, group.yaml_digest).decode("utf-8")
-        content = _read_regular(report).decode("utf-8")
-        settings_label = (
-            f"Group {group.group_id} ({group.kind}) — Saved settings: {source}"
-        )
-        if group.kind == "mdtest":
-            annotated = _report_settings_block(environment, settings_label) + content
-        else:
-            snapshot = _parse_report_snapshot(environment, source)
-            annotated = format_io_snapshot_summary(snapshot) + "\n" + content
         sections.append(
-            f"\n\n{'=' * 80}\nGroup {group.group_id} ({group.kind}) "
-            f"target: {_quoted_target_label(_group_storage_target(manifest, group))}\n"
-            f"Report: {report}\nSaved settings: {source}\n\n" + annotated
+            _combined_section(
+                (group.group_id, group.kind),
+                _group_storage_target(manifest, group),
+                (report, source),
+                environment,
+                (
+                    None
+                    if group.kind == "mdtest"
+                    else (_parse_report_snapshot(environment, source))
+                ),
+            )
         )
     _publish_report_text(destination, "".join(sections) + "\n")
+
+
+def _combined_section(
+    identity: tuple[str, str],
+    target: StorageTarget,
+    paths: tuple[Path, Path],
+    environment: str,
+    snapshot: dict | None,
+) -> str:
+    """One group of reports.txt: (group ID, kind), (report, saved settings)."""
+    group_id, kind = identity
+    report, source = paths
+    content = _read_regular(report).decode("utf-8")
+    if kind == "mdtest":
+        settings_label = f"Group {group_id} ({kind}) — Saved settings: {source}"
+        annotated = _report_settings_block(environment, settings_label) + content
+    else:
+        annotated = format_io_snapshot_summary(snapshot or {}) + "\n" + content
+    return (
+        f"\n\n{'=' * 80}\nGroup {group_id} ({kind}) "
+        f"target: {_quoted_target_label(target)}\n"
+        f"Report: {report}\nSaved settings: {source}\n\n" + annotated
+    )
 
 
 def _parse_report_snapshot(environment: str, source: Path) -> dict:
@@ -956,10 +1404,14 @@ def _report_settings_block(environment: str, settings_label: str = "") -> str:
 
 def _publish_report_text(destination: Path, content: str) -> None:
     """Publish complete report evidence without leaving partial files on interruption."""
+    # Deferred so --help and --version work without the reporting dependencies.
+    from lib import filesystem_results  # pylint: disable=import-outside-toplevel
+
     descriptor, temporary = tempfile.mkstemp(prefix=".index-", dir=destination.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(content)
+            filesystem_results.set_published_mode(stream.fileno())
         os.replace(temporary, destination)
     finally:
         Path(temporary).unlink(missing_ok=True)
@@ -974,11 +1426,11 @@ def _report_group(  # pylint: disable=too-many-arguments
     *,
     sink: GroupOutput,
     pool: Executor,
-) -> Callable[[], None]:
+) -> EngineStage:
     """Stage one group's inputs and start its reporter on the pool.
 
-    The returned call waits for the reporter, capturing its output into
-    ``sink``.
+    Calling the result submits the reporter's rendering; calling what that
+    returns waits for the reporter. Both capture its output into ``sink``.
     """
     temporary = tempfile.mkdtemp(prefix="filesystem-report-")
     try:
@@ -986,21 +1438,37 @@ def _report_group(  # pylint: disable=too-many-arguments
         stage_group_inputs(manifest, group, inputs, successful)
         argv = [str(inputs), "--output-dir", str(output), *engine_options]
         with sink.capture():
-            wait = _start_engine(group.kind, argv, pool)
+            stage = _start_engine(group.kind, argv, pool)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
+    return _captured_stages(stage, sink, partial(shutil.rmtree, temporary, True))
 
-    def finish() -> None:
+
+def _captured_stages(
+    stage: EngineStage, sink: GroupOutput, cleanup: Callable[[], Any]
+) -> EngineStage:
+    """Run an engine's two stages inside ``sink``; ``cleanup`` follows either."""
+
+    def prepare() -> Callable[[], None]:
         try:
             with sink.capture():
-                wait()
-        finally:
-            shutil.rmtree(temporary, ignore_errors=True)
-        if "--markdown" in engine_options:
-            (output / "report.txt").write_text(sink.stdout, encoding="utf-8")
+                wait = stage()
+        except BaseException:
+            cleanup()
+            raise
 
-    return finish
+        def finish() -> None:
+            try:
+                if wait is not None:
+                    with sink.capture():
+                        wait()
+            finally:
+                cleanup()
+
+        return finish
+
+    return prepare
 
 
 _IO_ENGINE = "extract-elbencho.py"
@@ -1019,17 +1487,26 @@ def _in_process_engine(call: Callable[[], Any]) -> Any:
         raise ValueError(f"{_IO_ENGINE} failed: {error}") from error
 
 
-def _start_engine(kind: str, argv: list[str], pool: Executor) -> Callable[[], None]:
-    """Start a group's reporter: elbencho in this process, mdtest as a task."""
+def _start_engine(kind: str, argv: list[str], pool: Executor) -> EngineStage:
+    """Start a group's reporter: elbencho in this process, mdtest as a task.
+
+    Calling the result submits the rendering (elbencho); calling what it
+    returns waits for the reporter.
+    """
     if kind == "io":
-        finish = _in_process_engine(lambda: load_engine().start_report(argv, pool))
+        render = _in_process_engine(lambda: load_engine().start_report(argv, pool))
 
-        def wait_io() -> None:
-            status = _in_process_engine(finish) if finish is not None else None
-            if status:
-                raise ValueError(f"{_IO_ENGINE} exited with status {status}")
+        def prepare_io() -> Callable[[], None]:
+            finish = _in_process_engine(render) if render is not None else None
 
-        return wait_io
+            def wait_io() -> None:
+                status = _in_process_engine(finish) if finish is not None else None
+                if status:
+                    raise ValueError(f"{_IO_ENGINE} exited with status {status}")
+
+            return wait_io
+
+        return prepare_io
     command = [
         sys.executable,
         str(_REPO_ROOT / "utils" / "extract-mdtest-elbencho.py"),
@@ -1043,7 +1520,7 @@ def _start_engine(kind: str, argv: list[str], pool: Executor) -> Callable[[], No
         sys.stderr.write(completed.stderr)
         completed.check_returncode()
 
-    return wait_mdtest
+    return lambda: wait_mdtest
 
 
 def route_batch_report(args: argparse.Namespace, kind: str, argv: list[str]) -> bool:
@@ -1064,19 +1541,21 @@ def route_batch_report(args: argparse.Namespace, kind: str, argv: list[str]) -> 
     index = 0
     while index < len(argv):
         argument = argv[index]
-        if argument in ("--groups", "--output-dir"):
+        if argument in ("--groups", "--output-dir", COMPARISONS_FLAG):
             index += 2
             continue
-        if argument.startswith(("--groups=", "--output-dir=")) or argument in (
-            TO_JSON_FLAG,
-            "--require-complete",
+        if argument.startswith(
+            ("--groups=", "--output-dir=", f"{COMPARISONS_FLAG}=")
+        ) or argument in (
+            *BATCH_CONSUMED_FLAGS,
             batches[0],
         ):
             index += 1
             continue
         options.append(argument)
         index += 1
-    extra = {"results_args": args} if getattr(args, "to_json", False) else {}
     raise SystemExit(
-        report_batch(batches[0], kind, args.groups, args.output_dir, options, **extra)
+        report_batch(
+            batches[0], kind, args.groups, args.output_dir, options, results_args=args
+        )
     )

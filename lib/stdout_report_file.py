@@ -49,6 +49,13 @@ class TeeTextIO:
         return getattr(self._streams[0], "mode", "w")
 
 
+def remove_stale_report(output_dir: str) -> None:
+    """Drop a previous ``report.txt``; the caller has validated its request, so
+    a usage error never deletes the report it leaves behind."""
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(os.path.join(output_dir, REPORT_TXT_FILENAME))
+
+
 def _ensure_parent_dir(path: str) -> None:
     directory = os.path.dirname(os.path.abspath(path))
     if directory:

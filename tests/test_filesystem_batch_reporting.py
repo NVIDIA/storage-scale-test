@@ -40,6 +40,7 @@ from lib.filesystem_batch import (
     ENV_YAML,
     MANIFEST_FILENAME,
     REPORT_IDENTITY_FILENAME,
+    RESULTS_FRAGMENT_FILENAME,
     SEAL_FILENAME,
     SUCCESS,
     is_batch_directory,
@@ -49,10 +50,14 @@ from lib.filesystem_batch import (
     stage_group_inputs,
 )
 from lib.filesystem_report_options import (
+    INTEGER_FILTER_FLAGS,
     REPORT_OPTIONS,
+    RESULTS_FRAGMENT_FLAG,
+    RESULTS_LIVE_DIR_FLAG,
     add_analysis_arguments,
     options_by_kind,
 )
+from lib.storage_target import describe_storage_target
 
 DATESTAMP = "20260930Z120000"
 IO_STEM = f"elbencho-1M-c_001-s_001-d_001_{DATESTAMP}"
@@ -117,6 +122,28 @@ def _publish_result(manifest, group, status=SUCCESS):
             "Saved treescan evidence", encoding="utf-8"
         )
     return path
+
+
+def _write_fragment(destination, kind):
+    """Write the minimal results fragment a successful engine leaves behind."""
+    fragment = {
+        "fragment_version": 1,
+        "kind": kind,
+        "executions": [],
+        "diagnostics": [],
+    }
+    (destination / RESULTS_FRAGMENT_FILENAME).write_text(
+        json.dumps(fragment), encoding="utf-8"
+    )
+
+
+def _without_results_flags(options):
+    """Engine options minus the results flags every batch run appends."""
+    return [
+        option
+        for option in options
+        if not option.startswith((RESULTS_FRAGMENT_FLAG, RESULTS_LIVE_DIR_FLAG))
+    ]
 
 
 def _replace_manifest(root, before, after):
@@ -287,17 +314,17 @@ def test_reports_keep_repeated_coordinates_separate_and_count_failed_cells(tmp_p
         output_dir = Path(argv[2])
         assert output_dir.name == identifier
         (output_dir / "report.txt").write_text(identifier, encoding="utf-8")
+        _write_fragment(output_dir, "io")
         return lambda: None
 
     with mock.patch.object(batch_module, "_start_engine", side_effect=engine):
         assert report_batch(manifest.root, output_dir=output) == 0
     assert sorted(called) == ["0001", "0003"]
-    index = (output / "index.md").read_text(encoding="utf-8")
-    assert "FAILED: 1" in index
-    assert "No successful results" in index
-    assert "groups/0001/report.txt" in index
-    assert "groups/0003/report.txt" in index
-    assert "%20" in index and "%27" in index
+    assert (output / "results.json").is_file()
+    assert (output / "report.html").is_file()
+    assert (output / "groups/0001/report.txt").is_file()
+    assert (output / "groups/0003/report.txt").is_file()
+    assert not (output / "groups/0002/report.txt").exists()
     assert not (output / "groups/0001/executions").exists()
 
 
@@ -311,25 +338,25 @@ def test_report_failure_retains_successful_other_group(tmp_path):
         if output.name == "0001":
             raise ValueError("extract-elbencho.py exited with status 1")
         (output / "report.txt").write_text("retained", encoding="utf-8")
+        _write_fragment(output, "io")
         return lambda: None
 
     with mock.patch.object(batch_module, "_start_engine", side_effect=engine):
         assert report_batch(manifest.root) == 1
-    assert (manifest.root / "reports/groups/0002/report.txt").exists()
-    assert "Reporting failed" in (manifest.root / "reports/index.md").read_text(
-        encoding="utf-8"
-    )
+    reports = manifest.root / "reports"
+    assert (reports / "groups/0002/report.txt").exists()
+    assert (reports / "report.html").is_file()
+    assert "report_failed" in (reports / "results.json").read_text(encoding="utf-8")
 
 
 def test_selection_and_no_successful_results(tmp_path):
     manifest = _create_batch(tmp_path / "batch")
-    with mock.patch("lib.filesystem_batch.subprocess.run") as engine:
-        assert report_batch(manifest.root, kind="mdtest", groups="0002") == 1
+    with mock.patch.object(batch_module, "_report_group") as engine:
+        # Nothing succeeded and nothing failed; the document records it.
+        assert report_batch(manifest.root, kind="mdtest", groups="0002") == 0
         engine.assert_not_called()
-    index = (manifest.root / "reports/index.md").read_text(encoding="utf-8")
-    assert "| 0002 | mdtest |" in index
-    assert "| 0001 | io |" in index
-    assert "PENDING: 1" in index
+    assert (manifest.root / "reports/results.json").is_file()
+    assert (manifest.root / "reports/report.html").is_file()
     with pytest.raises(ValueError, match="Unknown batch groups"):
         report_batch(manifest.root, groups="9999")
 
@@ -353,8 +380,9 @@ def test_unified_reporter_routes_common_and_kind_specific_options(
     called = {}
 
     def report(_manifest, group, _successful, output, options, **_kwargs):
-        called[group.group_id] = options
+        called[group.group_id] = _without_results_flags(options)
         (output / "report.txt").write_text(group.kind, encoding="utf-8")
+        _write_fragment(output, group.kind)
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
         assert (
@@ -367,7 +395,6 @@ def test_unified_reporter_routes_common_and_kind_specific_options(
                     "--only-sizes",
                     "1M,r4K;4K",
                     "--only-sizes=1M",
-                    "--markdown",
                     "--no-dual-y-axis",
                     "--client-max-heatmap-rows",
                     "12",
@@ -376,7 +403,7 @@ def test_unified_reporter_routes_common_and_kind_specific_options(
             )
             == 0
         )
-    common = {"--only-nodes=1,2", "--markdown", "--allow-mixed-targets"}
+    common = {"--only-nodes=1,2", "--allow-mixed-targets"}
     assert set(called["0002"]) == common | {"--normalize-to=1"}
     assert set(called["0001"]) == common | {
         "--only-sizes=1M,r4K;4K",
@@ -392,17 +419,16 @@ def test_all_analysis_options_share_registration_and_routing(option):
     parser = argparse.ArgumentParser()
     add_analysis_arguments(parser, "all", explicit_only=True)
     value = "3" if "type" in option.settings else "a path,with spaces"
+    if option.flag in INTEGER_FILTER_FLAGS:
+        value = "3,5-6"
     if "choices" in option.settings:
         value = option.settings["choices"][-1]
     arguments = [option.flag]
     if option.settings.get("action") != "store_true":
         arguments.append(value)
-    # --require-complete is only valid together with --to-json.
-    prefix = ["--to-json"] if option.flag == "--require-complete" else []
-    args = parser.parse_args([*prefix, *arguments])
+    args = parser.parse_args(arguments)
     routed = options_by_kind(args, {"io", "mdtest"})
     expected = arguments[:1] if len(arguments) == 1 else [f"{option.flag}={value}"]
-    expected = [*prefix, *expected]
     if option.settings.get("type") is float:
         expected = [f"{option.flag}=3.0"]
     for kind in ("io", "mdtest"):
@@ -443,9 +469,7 @@ def test_unified_option_errors_precede_report_mutation(
     assert not (manifest.root / "reports").exists()
 
 
-def test_filtered_reports_preserve_other_kinds_groups_and_index(
-    tmp_path, unified_reporter
-):
+def test_filtered_reports_preserve_other_kinds_and_groups(tmp_path, unified_reporter):
     manifest = _create_batch(tmp_path / "batch")
     for group in manifest.groups:
         _publish_result(manifest, group)
@@ -454,6 +478,7 @@ def test_filtered_reports_preserve_other_kinds_groups_and_index(
     def report(_manifest, group, _successful, output, options, **_kwargs):
         calls.append(group.group_id)
         (output / "report.txt").write_text(str(options), encoding="utf-8")
+        _write_fragment(output, group.kind)
 
     output = tmp_path / "custom reports"
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
@@ -507,20 +532,21 @@ def test_filtered_reports_preserve_other_kinds_groups_and_index(
         ["0001", "0003"],
         "0001",
     ]
-    index = (output / "index.md").read_text(encoding="utf-8")
     for identifier in ("0001", "0002", "0003"):
-        assert f"groups/{identifier}/report.txt" in index
-        assert f"| {identifier} |" in index
-    assert not list(output.glob(".index-*"))
+        assert (output / "groups" / identifier / "report.txt").is_file()
+    combined = (output / "reports.txt").read_text(encoding="utf-8")
+    for identifier in ("0001", "0002", "0003"):
+        assert f"Group {identifier} " in combined
 
 
-def test_failed_filtered_report_retains_other_report_links(tmp_path):
+def test_failed_filtered_report_retains_other_reports(tmp_path):
     manifest = _create_batch(tmp_path / "batch")
     for group in manifest.groups:
         _publish_result(manifest, group)
 
     def report(_manifest, group, _successful, output, _options, **_kwargs):
         (output / "report.txt").write_text(group.kind, encoding="utf-8")
+        _write_fragment(output, group.kind)
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
         assert report_batch(manifest.root) == 0
@@ -528,10 +554,11 @@ def test_failed_filtered_report_retains_other_report_links(tmp_path):
         "lib.filesystem_batch._report_group", side_effect=ValueError("bad report")
     ):
         assert report_batch(manifest.root, groups="0002") == 1
-    index = (manifest.root / "reports/index.md").read_text(encoding="utf-8")
-    assert "Reporting failed" in index
-    assert "groups/0001/report.txt" in index
-    assert "groups/0003/report.txt" in index
+    reports = manifest.root / "reports"
+    assert "report_failed" in (reports / "results.json").read_text(encoding="utf-8")
+    assert (reports / "groups/0001/report.txt").is_file()
+    assert (reports / "groups/0003/report.txt").is_file()
+    assert not (reports / "groups/0002/report.txt").exists()
 
 
 def test_shared_report_destination_does_not_retain_another_batch(tmp_path):
@@ -543,25 +570,21 @@ def test_shared_report_destination_does_not_retain_another_batch(tmp_path):
         for group in manifest.groups:
             _publish_result(manifest, group)
 
-    def report(manifest, _group, _successful, destination, _options, **_kwargs):
+    def report(manifest, group, _successful, destination, _options, **_kwargs):
         (destination / "report.txt").write_text(str(manifest.root), encoding="utf-8")
+        _write_fragment(destination, group.kind)
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
         assert report_batch(first.root, output_dir=output) == 0
+        assert str(first.root) in (output / "reports.txt").read_text(encoding="utf-8")
         assert report_batch(second.root, groups="0001", output_dir=output) == 0
-        index = (output / "index.md").read_text(encoding="utf-8")
-        assert "groups/0001/report.txt" in index
-        assert "groups/0002/report.txt" not in index
-        assert "groups/0003/report.txt" not in index
+        # Only the second batch's group 0001 is owned, so no aggregate remains.
         assert not (output / "reports.txt").exists()
         assert report_batch(second.root, groups="0002", output_dir=output) == 0
-    index = (output / "index.md").read_text(encoding="utf-8")
-    assert "groups/0001/report.txt" in index
-    assert "groups/0002/report.txt" in index
-    assert "groups/0003/report.txt" not in index
     combined = (output / "reports.txt").read_text(encoding="utf-8")
     assert str(first.root) not in combined
     assert str(second.root) in combined
+    assert "Group 0003 " not in combined
 
 
 @pytest.mark.parametrize("fault", ["missing", "corrupt", "overwritten", "failed"])
@@ -573,6 +596,7 @@ def test_filtered_report_rejects_unproven_retained_content(tmp_path, fault):
 
     def report(_manifest, group, _successful, output, _options, **_kwargs):
         (output / "report.txt").write_text(group.kind, encoding="utf-8")
+        _write_fragment(output, group.kind)
 
     output = manifest.root / "reports"
     marker = output / "groups/0002" / REPORT_IDENTITY_FILENAME
@@ -591,10 +615,11 @@ def test_filtered_report_rejects_unproven_retained_content(tmp_path, fault):
                 assert report_batch(manifest.root, groups="0002") == 1
             assert not marker.exists()
         assert report_batch(manifest.root, groups="0001") == 0
-    index = (output / "index.md").read_text(encoding="utf-8")
-    assert "groups/0001/report.txt" in index
-    assert "groups/0002/report.txt" not in index
-    assert "groups/0003/report.txt" in index
+    # The omnibus holds only reports whose identity still proves ownership.
+    combined = (manifest.root / "reports.txt").read_text(encoding="utf-8")
+    assert "Group 0001 " in combined
+    assert "Group 0002 " not in combined
+    assert "Group 0003 " in combined
 
 
 def test_retained_report_accepts_canonical_batch_alias(tmp_path):
@@ -607,12 +632,13 @@ def test_retained_report_accepts_canonical_batch_alias(tmp_path):
 
     def report(_manifest, group, _successful, output, _options, **_kwargs):
         (output / "report.txt").write_text(group.kind, encoding="utf-8")
+        _write_fragment(output, group.kind)
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
         assert report_batch(manifest.root) == 0
         assert report_batch(alias, groups="0001") == 0
-    index = (manifest.root / "reports/index.md").read_text(encoding="utf-8")
-    assert "groups/0002/report.txt" in index
+    combined = (manifest.root / "reports.txt").read_text(encoding="utf-8")
+    assert "Group 0002 " in combined
 
 
 def test_successful_engine_without_report_cannot_certify_prior_content(tmp_path):
@@ -620,37 +646,22 @@ def test_successful_engine_without_report_cannot_certify_prior_content(tmp_path)
     manifest = _create_batch(tmp_path / "batch", kinds=("io",))
     _publish_result(manifest, manifest.groups[0])
 
-    def report(_manifest, _group, _successful, output, _options, **_kwargs):
+    def report(_manifest, group, _successful, output, _options, **_kwargs):
         (output / "report.txt").write_text("original", encoding="utf-8")
+        _write_fragment(output, group.kind)
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
         assert report_batch(manifest.root) == 0
     with mock.patch("lib.filesystem_batch._report_group"):
         assert report_batch(manifest.root) == 1
     output = manifest.root / "reports"
-    assert "Reporting failed" in (output / "index.md").read_text(encoding="utf-8")
-    assert not (output / "groups/0001" / REPORT_IDENTITY_FILENAME).exists()
+    assert "report_failed" in (output / "results.json").read_text(encoding="utf-8")
+    assert not (output / "groups/0001/report.txt").exists()
 
 
-def test_interrupted_index_publication_preserves_previous_index(tmp_path):
-    manifest = _create_batch(tmp_path / "batch", kinds=("io",))
-    output = manifest.root / "reports"
-    output.mkdir()
-    index = output / "index.md"
-    index.write_text("previous complete index", encoding="utf-8")
-    with mock.patch(
-        "lib.filesystem_batch.os.replace", side_effect=OSError("full disk")
-    ):
-        with pytest.raises(OSError, match="full disk"):
-            report_batch(manifest.root)
-    assert index.read_text(encoding="utf-8") == "previous complete index"
-    assert not list(output.glob(".index-*"))
-
-
-@pytest.mark.parametrize("markdown", [False, True])
 @pytest.mark.parametrize("custom_output", [False, True])
 def test_omnibus_report_preserves_tables_with_each_saved_environment(
-    tmp_path, markdown, custom_output
+    tmp_path, custom_output
 ):
     """IO summaries and raw metadata settings precede each intact group report."""
     manifest = _create_batch(tmp_path / "batch", kinds=("io", "mdtest"))
@@ -662,17 +673,7 @@ def test_omnibus_report_preserves_tables_with_each_saved_environment(
     contents = {}
     for group in manifest.groups:
         identifier = group.group_id
-        if markdown:
-            first_header = f"| Nodes | {identifier} first metric |"
-            second_header = f"| Nodes | {identifier} second metric |"
-            contents[identifier] = (
-                f"# Group {identifier} results\n\n"
-                "```text\n# Example command\n"
-                "| Example | Value |\n| --- | --- |\n| fake | row |\n```\n\n"
-                f"## First table\n\n{first_header}\n| --- | --- |\n| 1 | 10 |\n\n"
-                f"## Second table\n\n{second_header}\n| --- | --- |\n| 1 | 20 |\n"
-            )
-        elif group.kind == "io":
+        if group.kind == "io":
             first_header = f"Nodes | Thrds | {identifier} first metric"
             second_header = f"Nodes | Thrds | {identifier} second metric"
             contents[identifier] = (
@@ -699,6 +700,7 @@ def test_omnibus_report_preserves_tables_with_each_saved_environment(
         (destination / "report.txt").write_text(
             contents[group.group_id], encoding="utf-8"
         )
+        _write_fragment(destination, group.kind)
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
         assert report_batch(manifest.root, output_dir=output) == 0
@@ -724,13 +726,10 @@ def test_omnibus_report_preserves_tables_with_each_saved_environment(
             encoding="utf-8"
         ) == contents[group.group_id]
     assert "\n\n" in combined
-    if markdown:
-        assert combined.count("| Example | Value |\n| --- | --- |\n| fake | row |") == 2
-    else:
-        assert "MDTEST_ITERATIONS  1" in combined
-        assert "# Create: elbencho --mkdir" in combined
-    index = (report_root / "index.md").read_text(encoding="utf-8")
-    assert "reports.txt" in index
+    assert "MDTEST_ITERATIONS  1" in combined
+    assert "# Create: elbencho --mkdir" in combined
+    assert (report_root / "results.json").is_file()
+    assert (report_root / "report.html").is_file()
     if not custom_output:
         assert not (report_root / "reports.txt").exists()
 
@@ -757,26 +756,13 @@ def _targeted_batch(tmp_path):
 
 def _fake_report(_manifest, group, _successful, destination, _options, **_kwargs):
     (destination / "report.txt").write_text(group.group_id, encoding="utf-8")
+    _write_fragment(destination, group.kind)
 
 
-def test_index_and_omnibus_name_each_groups_storage_target(tmp_path):
+def test_omnibus_names_each_groups_storage_target(tmp_path):
     manifest = _targeted_batch(tmp_path)
     with mock.patch("lib.filesystem_batch._report_group", side_effect=_fake_report):
         assert report_batch(manifest.root) == 0
-    index = (manifest.root / "reports/index.md").read_text(encoding="utf-8")
-    assert "| Group | Kind | Target | Saved settings | Cell states | Reports |" in index
-    assert "| --- | --- | --- | --- | --- | --- |" in index
-    rows = {
-        line.split(" | ")[0].strip("| "): line.split(" | ")[2]
-        for line in index.splitlines()
-        if line.startswith("| 000")
-    }
-    assert rows == {
-        "0001": "lustre-a",
-        "0002": "/mnt/w,/mnt/x (derived)",
-        "0003": "a\\|b (derived)/c",
-        "0004": "unknown",
-    }
     combined = (manifest.root / "reports.txt").read_text(encoding="utf-8")
     for header in (
         'Group 0001 (io) target: "lustre-a"\n',
@@ -793,41 +779,12 @@ def test_unreadable_group_snapshot_is_an_unknown_target(tmp_path):
     broken = manifest.group_path(manifest.groups[0]) / ENV_YAML
     broken.write_text("STORAGE_TARGET_NAME: tampered\n", encoding="utf-8")
     # The digest no longer matches, so the saved target cannot be trusted.
-    assert batch_module._group_target(manifest, manifest.groups[0]) == "unknown"
+    group = manifest.groups[0]
+    target = batch_module._group_storage_target(manifest, group)
+    assert describe_storage_target(target) == "unknown"
     broken.unlink()
-    assert batch_module._group_target(manifest, manifest.groups[0]) == "unknown"
-
-
-@pytest.mark.parametrize(
-    "text, expected",
-    [
-        ("plain/name", "plain/name"),
-        ("a|b", "a\\|b"),
-        ("a\\|b", "a\\\\\\|b"),
-        ("trailing\\", "trailing\\\\"),
-        ("`code`", "\\`code\\`"),
-        ("<b>x</b>", "&lt;b>x&lt;/b>"),
-        ("&lt; literal", "&amp;lt; literal"),
-        ("two\nlines\r", "two lines "),
-    ],
-)
-def test_markdown_cell_renders_names_literally(text, expected):
-    # pylint: disable=protected-access
-    assert batch_module._markdown_cell(text) == expected
-
-
-def test_index_row_keeps_a_hostile_target_name_in_one_cell(tmp_path):
-    manifest = _create_batch(
-        tmp_path / "batch",
-        kinds=("io",),
-        snapshots={"0001": "STORAGE_TARGET_NAME: 'a\\|b`c<d'\n"},
-    )
-    _publish_result(manifest, manifest.groups[0])
-    with mock.patch("lib.filesystem_batch._report_group", side_effect=_fake_report):
-        assert report_batch(manifest.root) == 0
-    index = (manifest.root / "reports/index.md").read_text(encoding="utf-8")
-    row = next(line for line in index.splitlines() if line.startswith("| 0001"))
-    assert row.split(" | ")[2] == "a\\\\\\|b\\`c&lt;d"
+    target = batch_module._group_storage_target(manifest, group)
+    assert describe_storage_target(target) == "unknown"
 
 
 def test_filtered_omnibus_retains_owned_reports_and_removes_stale_output(tmp_path):
@@ -839,8 +796,10 @@ def test_filtered_omnibus_retains_owned_reports_and_removes_stale_output(tmp_pat
 
     def report(_manifest, group, _successful, destination, options, **_kwargs):
         (destination / "report.txt").write_text(
-            f"Group {group.group_id}: {options}\n", encoding="utf-8"
+            f"Group {group.group_id}: {_without_results_flags(options)}\n",
+            encoding="utf-8",
         )
+        _write_fragment(destination, group.kind)
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
         assert report_batch(manifest.root) == 0
@@ -863,26 +822,40 @@ def test_filtered_omnibus_retains_owned_reports_and_removes_stale_output(tmp_pat
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
         assert report_batch(manifest.root, groups="0001") == 0
     assert not omnibus.exists()
-    assert "reports.txt" not in (manifest.root / "reports/index.md").read_text(
-        encoding="utf-8"
-    )
 
 
 def test_single_group_batch_does_not_write_omnibus(tmp_path):
     manifest = _create_batch(tmp_path / "batch", kinds=("io",))
     _publish_result(manifest, manifest.groups[0])
 
-    def report(_manifest, _group, _successful, destination, _options, **_kwargs):
+    def report(_manifest, group, _successful, destination, _options, **_kwargs):
         (destination / "report.txt").write_text("single report\n", encoding="utf-8")
+        _write_fragment(destination, group.kind)
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
         assert report_batch(manifest.root) == 0
     assert not (manifest.root / "reports.txt").exists()
 
 
-@pytest.mark.parametrize("markdown", [False, True])
+def test_batch_report_writes_document_and_html_and_clears_stale_live_sidecars(
+    tmp_path,
+):
+    manifest = _create_batch(tmp_path / "batch")
+    for group in manifest.groups:
+        _publish_result(manifest, group)
+    output = manifest.root / "reports"
+    stale = output / "results.live/old.jsonl.zst"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"stale sidecar")
+    with mock.patch("lib.filesystem_batch._report_group", side_effect=_fake_report):
+        assert report_batch(manifest.root) == 0
+    assert json.loads((output / "results.json").read_text("utf-8"))["batch"]
+    assert (output / "report.html").is_file()
+    assert not stale.exists()
+
+
 def test_omnibus_keeps_actual_metadata_reports_together_by_saved_environment(
-    tmp_path, markdown
+    tmp_path,
 ):
     """Actual metadata reports stay contiguous beneath their own override settings."""
     manifest = _create_batch(tmp_path / "batch", kinds=("io", "mdtest", "mdtest"))
@@ -952,12 +925,7 @@ def test_omnibus_keeps_actual_metadata_reports_together_by_saved_environment(
             if group.kind == "io":
                 io_reporter.print_terminal_table([io_metric])
             else:
-                printer = (
-                    metadata_reporter.print_markdown_report
-                    if markdown
-                    else metadata_reporter.print_terminal_table
-                )
-                printer(
+                metadata_reporter.print_terminal_table(
                     [metadata_metric],
                     test_configuration={"MDTEST_ITERATIONS": group.group_id},
                 )
@@ -965,6 +933,7 @@ def test_omnibus_keeps_actual_metadata_reports_together_by_saved_environment(
         (destination / "report.txt").write_text(
             contents[group.group_id], encoding="utf-8"
         )
+        _write_fragment(destination, group.kind)
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
         assert report_batch(manifest.root) == 0
@@ -1001,6 +970,7 @@ def test_failed_omnibus_publication_removes_stale_report_and_keeps_group_reports
 
     def report(_manifest, group, _successful, destination, _options, **_kwargs):
         (destination / "report.txt").write_text(group.group_id, encoding="utf-8")
+        _write_fragment(destination, group.kind)
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
         assert report_batch(manifest.root) == 0
@@ -1015,10 +985,7 @@ def test_failed_omnibus_publication_removes_stale_report_and_keeps_group_reports
         with mock.patch("lib.filesystem_batch.os.replace", side_effect=replace):
             assert report_batch(manifest.root) == 1
     assert not omnibus.exists()
-    index = (manifest.root / "reports/index.md").read_text(encoding="utf-8")
-    assert "reports.txt" not in index
     for group in manifest.groups:
-        assert f"groups/{group.group_id}/report.txt" in index
         assert (
             manifest.root / "reports/groups" / group.group_id / "report.txt"
         ).exists()
@@ -1034,8 +1001,10 @@ def test_failed_stale_omnibus_deletion_does_not_link_old_tables(tmp_path, capsys
 
     def report(_manifest, group, _successful, destination, options, **_kwargs):
         (destination / "report.txt").write_text(
-            f"Group {group.group_id}: {options}\n", encoding="utf-8"
+            f"Group {group.group_id}: {_without_results_flags(options)}\n",
+            encoding="utf-8",
         )
+        _write_fragment(destination, group.kind)
 
     real_unlink = Path.unlink
 
@@ -1053,10 +1022,7 @@ def test_failed_stale_omnibus_deletion_does_not_link_old_tables(tmp_path, capsys
             assert report_batch(manifest.root, engine_options=["fresh"]) == 1
     assert omnibus.read_bytes() == previous
     assert "fresh" not in omnibus.read_text(encoding="utf-8")
-    index = (manifest.root / "reports/index.md").read_text(encoding="utf-8")
-    assert "reports.txt" not in index
     for group in manifest.groups:
-        assert f"groups/{group.group_id}/report.txt" in index
         assert (
             manifest.root / "reports/groups" / group.group_id / "report.txt"
         ).read_text(encoding="utf-8") == f"Group {group.group_id}: ['fresh']\n"
@@ -1065,9 +1031,8 @@ def test_failed_stale_omnibus_deletion_does_not_link_old_tables(tmp_path, capsys
     assert str(omnibus) in diagnostic
 
 
-@pytest.mark.parametrize("markdown", [False, True])
-def test_omnibus_keeps_real_io_report_titles_and_tables_adjacent(tmp_path, markdown):
-    """One summary precedes unchanged real WRITE/READ reports in either format."""
+def test_omnibus_keeps_real_io_report_titles_and_tables_adjacent(tmp_path):
+    """One summary precedes unchanged real WRITE/READ reports."""
     manifest = _create_batch(tmp_path / "batch", kinds=("io", "io"))
     repository = Path(__file__).resolve().parents[1]
     renderer = """
@@ -1083,7 +1048,7 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 metric = module.ElbenchoMetrics(
-    nodes=int(sys.argv[3]), io_size="1M", threads=1, io_depth=1,
+    nodes=int(sys.argv[2]), io_size="1M", threads=1, io_depth=1,
     operation="WRITE", datestamp="20260930Z120000", is_multi_node=True,
     command="elbencho --write --read", file_size_bytes=1024**3,
     direct_io=1, random_io=0, iops=100, throughput_mib_s=100,
@@ -1091,8 +1056,7 @@ metric = module.ElbenchoMetrics(
     min_lat_sec=0.001, avg_lat_sec=0.002, max_lat_sec=0.003,
     lat_pct_1=0.001, lat_pct_50=0.002, lat_pct_75=0.002, lat_pct_99=0.003,
 )
-printer = module.print_markdown_table if sys.argv[2] == "True" else module.print_terminal_table
-printer([metric, replace(metric, operation="READ")])
+module.print_terminal_table([metric, replace(metric, operation="READ")])
 """
     contents = {}
     for group in manifest.groups:
@@ -1103,7 +1067,6 @@ printer([metric, replace(metric, operation="READ")])
                 "-c",
                 renderer,
                 str(repository),
-                str(markdown),
                 group.group_id,
             ],
             check=True,
@@ -1116,6 +1079,7 @@ printer([metric, replace(metric, operation="READ")])
         (destination / "report.txt").write_text(
             contents[group.group_id], encoding="utf-8"
         )
+        _write_fragment(destination, group.kind)
 
     with mock.patch("lib.filesystem_batch._report_group", side_effect=report):
         assert report_batch(manifest.root) == 0
@@ -1144,7 +1108,14 @@ def test_unified_front_door_delegates_test_parse(tmp_path, unified_reporter, kin
         engine.return_value.returncode = 7
         assert (
             unified_reporter.main(
-                ["--kind", kind, "--test-parse", str(path), option, "--markdown"]
+                [
+                    "--kind",
+                    kind,
+                    "--test-parse",
+                    str(path),
+                    option,
+                    "--allow-mixed-targets",
+                ]
             )
             == 7
         )
@@ -1154,7 +1125,7 @@ def test_unified_front_door_delegates_test_parse(tmp_path, unified_reporter, kin
     )
     assert f"--test-parse={path}" in command
     assert option in command
-    assert "--markdown" in command
+    assert "--allow-mixed-targets" in command
 
 
 def test_unified_ordinary_directory_inference_and_options(tmp_path, unified_reporter):
@@ -1183,7 +1154,7 @@ def test_unified_ordinary_directory_inference_and_options(tmp_path, unified_repo
 @pytest.mark.parametrize(
     "arguments, message",
     [
-        ([], "results_dir is required"),
+        ([], "RESULTS_DIR is required"),
         (["--test-parse", "raw.csv"], "requires --kind"),
         (["--kind", "io", "--normalize-to", "1", "raw"], "no selected mdtest group"),
     ],
@@ -1195,6 +1166,97 @@ def test_unified_ordinary_option_errors(unified_reporter, capsys, arguments, mes
         engine.assert_not_called()
     assert exited.value.code == 2
     assert message in capsys.readouterr().err
+
+
+def _directory(tmp_path, name):
+    (tmp_path / name).mkdir()
+    return str(tmp_path / name)
+
+
+def test_unified_several_directories_reach_one_engine(tmp_path, unified_reporter):
+    first = _directory(tmp_path, "elbencho-a")
+    second = _directory(tmp_path, "elbencho-b")
+    output = str(tmp_path / "out")
+    with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+        engine.return_value.returncode = 4
+        # Directories may follow options.
+        status = unified_reporter.main(
+            [first, "--output-dir", output, second, "--only-threads=4"]
+        )
+    assert status == 4
+    engine.assert_called_once()
+    command = engine.call_args.args[0]
+    assert command[1].endswith("extract-elbencho.py")
+    assert command[2:5] == [first, second, "--output-dir"]
+    assert command[5] == output
+    assert "--only-threads=4" in command
+
+
+def test_unified_kind_picks_its_directories(tmp_path, unified_reporter):
+    first = _directory(tmp_path, "mdtest-elbencho-a")
+    second = _directory(tmp_path, "elbencho-b")
+    for kind, engine_name, chosen in (
+        ("mdtest", "extract-mdtest-elbencho.py", [first]),
+        ("io", "extract-elbencho.py", [second]),
+    ):
+        with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+            engine.return_value.returncode = 0
+            unified_reporter.main(
+                [first, second, "--kind", kind, "--output-dir", str(tmp_path / "o")]
+            )
+        command = engine.call_args.args[0]
+        assert command[1].endswith(engine_name)
+        assert command[2:3] == chosen and command[3] == "--output-dir"
+
+
+def test_unified_kind_forces_the_engine_for_unrecognised_names(
+    tmp_path, unified_reporter
+):
+    paths = [_directory(tmp_path, name) for name in ("renamed-a", "renamed-b")]
+    with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+        engine.return_value.returncode = 0
+        unified_reporter.main(
+            [*paths, "--kind", "mdtest", "--output-dir", str(tmp_path / "o")]
+        )
+    command = engine.call_args.args[0]
+    assert command[1].endswith("extract-mdtest-elbencho.py")
+    assert command[2:4] == paths
+
+
+def test_unified_several_mdtest_directories_infer_the_engine(
+    tmp_path, unified_reporter
+):
+    paths = [_directory(tmp_path, f"mdtest-elbencho-{n}") for n in "ab"]
+    with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+        engine.return_value.returncode = 0
+        unified_reporter.main([*paths, "--output-dir", str(tmp_path / "o")])
+    assert engine.call_args.args[0][1].endswith("extract-mdtest-elbencho.py")
+
+
+def test_unified_several_directories_usage_errors(tmp_path, unified_reporter, capsys):
+    first = _directory(tmp_path, "elbencho-a")
+    second = _directory(tmp_path, "elbencho-b")
+    meta = _directory(tmp_path, "mdtest-elbencho-c")
+    batch = _create_batch(tmp_path / "batch").root
+    link = tmp_path / "link"
+    link.symlink_to(second)
+    out = ["--output-dir", str(tmp_path / "o")]
+    cases = [
+        ([first, second], "--output-dir is required"),
+        ([first, second, "--output-dir", str(link)], "is an input directory"),
+        ([first, meta, "--only-nodes", "nope", *out], "--only-nodes"),
+        ([first, str(batch), *out], "is a batch"),
+        ([first, str(tmp_path / "missing"), *out], "Input directory not found"),
+        ([first, second, "--groups", "0001", *out], "requires a prepared batch"),
+    ]
+    for arguments, message in cases:
+        with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+            with pytest.raises(SystemExit) as exited:
+                unified_reporter.main(arguments)
+            engine.assert_not_called()
+        assert exited.value.code == 2
+        assert message in capsys.readouterr().err
+    assert not (tmp_path / "o").exists()
 
 
 def test_unified_real_metadata_report_normalizes_metrics(tmp_path, reporting_checkout):
@@ -1218,7 +1280,6 @@ def test_unified_real_metadata_report_normalizes_metrics(tmp_path, reporting_che
             "2",
             "--only-threads",
             "4",
-            "--markdown",
             str(manifest.root),
         ],
         capture_output=True,
@@ -1228,7 +1289,7 @@ def test_unified_real_metadata_report_normalizes_metrics(tmp_path, reporting_che
     assert completed.returncode == 0, completed.stdout + completed.stderr
     report = manifest.root / "reports/groups/0001/report.txt"
     assert "normalized to 1 node" in report.read_text(encoding="utf-8")
-    assert "- Produced by storage-scale-test: v1.2.3\n" in report.read_text()
+    assert "Produced by storage-scale-test: v1.2.3\n" in report.read_text()
 
 
 def test_legacy_reporter_batch_routing_forwards_options(tmp_path):
@@ -1257,6 +1318,7 @@ def test_legacy_reporter_batch_routing_forwards_options(tmp_path):
         "0001,0003",
         "saved",
         ["--only-nodes", "1", "--allow-mixed-targets"],
+        results_args=args,
     )
     args.input_dirs.append(str(tmp_path))
     with pytest.raises(ValueError, match="sole raw"):
@@ -1275,7 +1337,10 @@ def _real_mdtest_batch(root):
 
 
 def _assert_real_engine_accepted_the_flag(run, manifest):
-    command = run.call_args.args[0]
+    # Not the last call: the version lookup also goes through ``run``.
+    command = next(
+        call.args[0] for call in run.call_args_list if call.args[0][0] == sys.executable
+    )
     assert Path(command[1]).name == "extract-mdtest-elbencho.py"
     assert "--allow-mixed-targets" in command
     report = manifest.root / "reports/groups/0001/report.txt"
@@ -1289,7 +1354,7 @@ def test_allow_mixed_targets_reaches_the_real_engine_from_route_batch_report(
     args = argparse.Namespace(
         input_dirs=[str(manifest.root)], groups=None, output_dir=None
     )
-    argv = ["--allow-mixed-targets", "--markdown", str(manifest.root)]
+    argv = ["--allow-mixed-targets", str(manifest.root)]
     with (
         mock.patch.object(batch_module, "_REPO_ROOT", reporting_checkout),
         mock.patch("lib.filesystem_batch.subprocess.run", wraps=subprocess.run) as run,
@@ -1309,7 +1374,7 @@ def test_allow_mixed_targets_reaches_the_real_engine_from_report_batch(
 
     manifest = _real_mdtest_batch(tmp_path / "batch")
     args = extract_filesystem_parser().parse_args(
-        ["--allow-mixed-targets", "--markdown", str(manifest.root)]
+        ["--allow-mixed-targets", str(manifest.root)]
     )
     with (
         mock.patch.object(batch_module, "_REPO_ROOT", reporting_checkout),
@@ -1347,7 +1412,6 @@ def test_mdtest_engine_guards_mixed_targets_with_the_real_engine(
         sys.executable,
         str(reporting_checkout / "utils/extract-mdtest-elbencho.py"),
         *inputs,
-        "--markdown",
         "--output-dir",
         str(tmp_path / "reports"),
     ]
@@ -1361,7 +1425,7 @@ def test_mdtest_engine_guards_mixed_targets_with_the_real_engine(
         check=False,
     )
     assert allowed.returncode == 0, allowed.stderr
-    assert '- Storage target: mixed: "lustre-a", "weka-b"' in allowed.stdout
+    assert 'Storage target: mixed: "lustre-a", "weka-b"' in allowed.stdout
 
 
 def test_ordinary_reporter_routing_is_unchanged(tmp_path):
@@ -1370,21 +1434,6 @@ def test_ordinary_reporter_routing_is_unchanged(tmp_path):
     args.groups = "0001"
     with pytest.raises(ValueError, match="requires a prepared batch"):
         route_batch_report(args, "io", [])
-
-
-def test_markdown_batch_reports_have_persistent_report_file(tmp_path):
-    manifest = _create_batch(tmp_path / "batch", kinds=("io",))
-    _publish_result(manifest, manifest.groups[0])
-    markdown = "# Saved Markdown\n"
-    with mock.patch.object(
-        batch_module,
-        "_start_engine",
-        return_value=lambda: print(markdown, end=""),
-    ):
-        assert report_batch(manifest.root, engine_options=["--markdown"]) == 0
-    assert (manifest.root / "reports/groups/0001/report.txt").read_text(
-        encoding="utf-8"
-    ) == markdown
 
 
 @pytest.fixture(name="reporting_checkout")
@@ -1518,7 +1567,7 @@ def test_group_whose_executions_are_all_filtered_out_still_succeeds(
     )
     _replace_manifest(manifest.root, old_digest, _digest(definition))
     args = extract_filesystem_parser().parse_args(
-        ["--to-json", "--only-nodes", "9", str(manifest.root)]
+        ["--only-nodes", "9", str(manifest.root)]
     )
     with (
         mock.patch.object(batch_module, "_REPO_ROOT", reporting_checkout),
@@ -1604,6 +1653,7 @@ def test_groups_all_start_before_any_finishes_and_print_in_order(tmp_path, capsy
             events.append(f"finish {group}")
             print(f"table {group}")
             (Path(argv[2]) / "report.txt").write_text(group, encoding="utf-8")
+            _write_fragment(Path(argv[2]), "io")
 
         return wait
 
@@ -1620,12 +1670,17 @@ def test_groups_all_start_before_any_finishes_and_print_in_order(tmp_path, capsy
     ]
     captured = capsys.readouterr()
     assert captured.out == "table 0001\ntable 0002\ntable 0003\n"
-    assert captured.err.splitlines() == [
+    lines = captured.err.splitlines()
+    assert lines[:4] == [
         "Reporting 3 groups with 3 worker processes; each group's output prints "
         "once it and earlier groups finish.",
         "progress 0001",
         "progress 0002",
         "progress 0003",
+    ]
+    assert [line.split(" saved as ")[0] for line in lines[4:]] == [
+        "Results document",
+        "HTML report",
     ]
 
 
@@ -1644,6 +1699,7 @@ def test_group_failure_is_reported_in_its_place(tmp_path, capsys):
                 raise ValueError("extract-elbencho.py exited with status 2")
             print("table")
             (output / "report.txt").write_text("ok", encoding="utf-8")
+            _write_fragment(output, "io")
 
         return wait
 
@@ -1651,7 +1707,9 @@ def test_group_failure_is_reported_in_its_place(tmp_path, capsys):
         assert report_batch(manifest.root) == 1
     captured = capsys.readouterr()
     assert captured.out == "partial\ntable\n"
-    assert captured.err == ("Group 0001: extract-elbencho.py exited with status 2\n")
+    assert captured.err.splitlines()[0] == (
+        "Group 0001: extract-elbencho.py exited with status 2"
+    )
 
 
 def test_in_process_engine_exit_status_fails_only_nonzero_exits():
@@ -1665,3 +1723,93 @@ def test_in_process_engine_exit_status_fails_only_nonzero_exits():
             batch_module._in_process_engine(
                 lambda: (_ for _ in ()).throw(OSError("boom"))
             )
+
+
+def test_unified_kind_keeps_renamed_directories(tmp_path, unified_reporter, capsys):
+    named = _directory(tmp_path, "mdtest-elbencho-a")
+    renamed = _directory(tmp_path, "renamed-b")
+    other = _directory(tmp_path, "elbencho-c")
+    out = ["--output-dir", str(tmp_path / "o")]
+    with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+        engine.return_value.returncode = 0
+        unified_reporter.main([named, renamed, other, "--kind", "mdtest", *out])
+    assert engine.call_args.args[0][2:4] == [named, renamed]
+    with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+        with pytest.raises(SystemExit) as exited:
+            unified_reporter.main([other, "--kind", "mdtest", *out])
+        engine.assert_not_called()
+    assert exited.value.code == 2
+    assert "no mdtest result directories" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "references, message",
+    [
+        (["1:0001", "3:0001"], "no such document"),
+        (["1:0001", "2:0002"], "document 2 has groups 0000"),
+        (["1:0001", "o/d3/results.json:0001"], "no such document"),
+        (["1:0001", "2:0000"], "compares IO with metadata"),
+    ],
+)
+def test_mixed_directories_check_comparisons_before_writing(
+    tmp_path, unified_reporter, capsys, references, message
+):
+    paths = [_directory(tmp_path, name) for name in ("elbencho-a", "elbencho-b")]
+    meta = _directory(tmp_path, "mdtest-elbencho-c")
+    comparisons = tmp_path / "pairs.yaml"
+    comparisons.write_text(
+        f"- title: pair\n  sections: {json.dumps(references)}\n", encoding="utf-8"
+    )
+    arguments = [*paths, meta, "--comparisons", str(comparisons)]
+    with mock.patch.object(unified_reporter.subprocess, "run") as engine:
+        with pytest.raises(SystemExit) as exited:
+            unified_reporter.main([*arguments, "--output-dir", str(tmp_path / "o")])
+        engine.assert_not_called()
+    assert exited.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_mixed_directories_skip_the_page_when_an_engine_fails(
+    tmp_path, unified_reporter
+):
+    io_dir = _directory(tmp_path, "elbencho-a")
+    meta = _directory(tmp_path, "mdtest-elbencho-b")
+    output = tmp_path / "o"
+    output.mkdir()
+    (output / "report.html").write_text("earlier run", encoding="utf-8")
+
+    def run(command, check):  # IO fails, metadata succeeds
+        del check
+        return mock.Mock(returncode=0 if "mdtest" in command[1] else 1)
+
+    with mock.patch.object(batch_module.subprocess, "run", side_effect=run):
+        with mock.patch("lib.filesystem_results.publish_report_html") as publish:
+            status = unified_reporter.main([io_dir, meta, "--output-dir", str(output)])
+    assert status == 1
+    publish.assert_not_called()
+    assert not (output / "report.html").exists()
+
+
+def test_mixed_references_accept_document_paths(tmp_path, unified_reporter):
+    inputs = [_directory(tmp_path, n) for n in ("elbencho-a", "elbencho-b")]
+    meta = _directory(tmp_path, "mdtest-elbencho-c")
+    output = tmp_path / "o"
+    pairs = tmp_path / "pairs.yaml"
+    sections = [f"{output}/d1/results.json:0001", "1:0002"]
+    pairs.write_text(f"- title: x\n  sections: {json.dumps(sections)}\n")
+    with mock.patch.object(batch_module.subprocess, "run") as engine:
+        engine.return_value.returncode = 0
+        with mock.patch("lib.results_document.load_document"):
+            with mock.patch("lib.filesystem_results.publish_report_html") as publish:
+                unified_reporter.main(
+                    [
+                        *inputs,
+                        meta,
+                        "--comparisons",
+                        str(pairs),
+                        "--output-dir",
+                        str(output),
+                    ]
+                )
+    assert engine.call_count == 2
+    publish.assert_called_once()

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end: a realistic prepared batch through ``extract-filesystem.py --to-json``."""
+"""End-to-end: a realistic prepared batch through ``extract-filesystem.py``."""
 
 import hashlib
 import json
@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from lib.filesystem_batch import ENV_SHELL, ENV_YAML, MANIFEST_FILENAME
+from lib.report_html import CHART_JS_URL
 from tests.test_extract_elbencho_results_json import _DS, _live_csv, _write_result
 from tests.test_extract_mdtest_elbencho import _DENSE_CSV, _DENSE_OUT
 from tests.test_extract_mdtest_results_json import _truncated_csv, _truncated_out
@@ -175,7 +176,7 @@ def _export(batch, *arguments, output=None, check=True):
 @pytest.fixture(name="exported", scope="module")
 def exported_fixture(batch, tmp_path_factory):
     output = tmp_path_factory.mktemp("e2e-out") / "out"
-    _export(batch, "--to-json", "--live-detail", "full", output=output)
+    _export(batch, "--live-detail", "full", output=output)
     document = json.loads((output / "results.json").read_text("utf-8"))
     return batch, output, document
 
@@ -202,6 +203,12 @@ def test_document_validates_and_reports_batch_outcome(exported):
         "0002",
         "0003",
     ]
+
+
+def test_report_html_is_written_beside_the_document(exported):
+    _, output, _ = exported
+    html = (output / "report.html").read_text("utf-8")
+    assert CHART_JS_URL in html
 
 
 def test_ledger_and_result_states_per_execution(exported):
@@ -288,7 +295,7 @@ def test_paths_are_relative_to_batch_root_and_hashes_match(exported):
 
 def test_require_complete_writes_then_exits_incomplete(batch, tmp_path):
     output = tmp_path / "out"
-    done = _export(batch, "--to-json", "--require-complete", output=output, check=False)
+    done = _export(batch, "--require-complete", output=output, check=False)
     assert done.returncode == EXIT_INCOMPLETE, done.stderr
     document = json.loads((output / "results.json").read_text("utf-8"))
     validate_results_document(document)

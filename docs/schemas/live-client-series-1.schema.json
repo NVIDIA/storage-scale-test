@@ -35,6 +35,13 @@
         "phase": {
           "type": "string"
         },
+        "mix_type": {
+          "type": "string"
+        },
+        "occurrence": {
+          "type": "integer",
+          "minimum": 0
+        },
         "clients": {
           "type": "array",
           "items": {
@@ -58,6 +65,19 @@
           "minimum": 0
         },
         "bytes_per_s": {
+          "type": "array",
+          "items": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "done_bytes_delta": {
           "type": "array",
           "items": {
             "anyOf": [

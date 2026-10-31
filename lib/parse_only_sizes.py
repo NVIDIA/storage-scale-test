@@ -17,9 +17,11 @@
 
 """Parse --only-sizes CLI values (append + optional semicolon lists)."""
 
+import re
 from typing import List, Optional, Set
 
 _SIZE_LIST_SEP = ";"
+_SIZE_FILTER_RE = re.compile(r"^r?[0-9]+[KMG](,r?[0-9]+[KMG])?$")
 
 
 def _parts_from_append_token(token: str) -> List[str]:
@@ -54,3 +56,25 @@ def parse_only_sizes_arg(values: Optional[List[str]]) -> Optional[Set[str]]:
             result.add(part)
 
     return result if result else None
+
+
+def parse_only_sizes_filter(values: Optional[List[str]]) -> Optional[Set[str]]:
+    """Parse and validate repeated ``--only-sizes`` filter arguments.
+
+    Unlike ``parse_only_sizes_arg``, a malformed size raises ``ValueError``:
+    a report filter is an operator request, not a best-effort hint.
+    """
+    if not values:
+        return None
+
+    result: Set[str] = set()
+    for raw_value in values:
+        parts = raw_value.split(_SIZE_LIST_SEP)
+        if any(not part.strip() for part in parts):
+            raise ValueError("size filter contains an empty item")
+        for part in parts:
+            size = part.strip()
+            if not _SIZE_FILTER_RE.fullmatch(size):
+                raise ValueError(f"invalid IO size: {size}")
+            result.add(size)
+    return result

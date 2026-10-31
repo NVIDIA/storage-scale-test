@@ -31,6 +31,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import subprocess
@@ -40,6 +41,12 @@ import tempfile
 MINIMUM_PYTHON = (3, 12)
 STAMP_NAME = ".requirements.sha256"
 _LOCK_NAME = ".bootstrap.lock"
+# Set before re-executing; seeing it again means the re-exec did not land in
+# .venv (e.g. one built on another OS), so stop instead of looping.
+_REEXEC_ENV = "STORAGE_SCALE_TEST_REEXEC"
+# Stamps record the platform: a .venv shared by two OSes (a container and its
+# host) holds the other OS's binaries under the same site-packages path.
+_PLATFORM = f"{sys.platform}-{platform.machine()}"
 _PIN_RE = re.compile(r"^([A-Za-z0-9_.-]+)==([^\s;]+)(?:\s*#.*)?$")
 _PROBE = """import importlib.metadata as metadata, importlib.util, json, sys
 pins = json.loads(sys.argv[1])
@@ -156,9 +163,32 @@ def _write_stamp(stamp: Path, digest: str) -> None:
 
 def _stamp_matches(stamp: Path, digest: str) -> bool:
     try:
-        return stamp.read_text(encoding="utf-8").strip() == digest
+        return stamp.read_text(encoding="utf-8").strip() == f"{digest} {_PLATFORM}"
     except FileNotFoundError:
         return False
+
+
+def _built_elsewhere(stamp: Path) -> bool:
+    """True when the stamp names another platform (older stamps name none)."""
+    try:
+        fields = stamp.read_text(encoding="utf-8").split()
+    except FileNotFoundError:
+        return False
+    return len(fields) == 2 and fields[1] != _PLATFORM
+
+
+def _clear_environment(venv_dir: Path) -> None:
+    """Remove another platform's environment, keeping the held lock file."""
+    print(
+        "Rebuilding virtual environment built on another platform...", file=sys.stderr
+    )
+    for entry in venv_dir.iterdir():
+        if entry.name == _LOCK_NAME:
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
 
 
 def _environment_state(venv_dir: Path, pins: dict[str, str]) -> tuple[bool, bool, bool]:
@@ -186,6 +216,8 @@ def ensure_environment(repo_root: Path, requirements_file: Path | None = None) -
     stamp = venv_dir / STAMP_NAME
     python = venv_dir / "bin" / "python"
     with _environment_lock(venv_dir):
+        if _built_elsewhere(stamp):
+            _clear_environment(venv_dir)
         supported, packages_current, has_pip = _environment_state(venv_dir, pins)
         if supported and packages_current and _stamp_matches(stamp, digest):
             return python
@@ -212,7 +244,7 @@ def ensure_environment(repo_root: Path, requirements_file: Path | None = None) -
         )
         if not _probe(python, pins)[1]:
             raise RuntimeError("Installed packages do not match the requirements pins")
-        _write_stamp(stamp, digest)
+        _write_stamp(stamp, f"{digest} {_PLATFORM}")
     return python
 
 
@@ -240,6 +272,13 @@ def ensure_runtime(script_path: str) -> None:
             sys.version_info[:2] < MINIMUM_PYTHON
             or Path(sys.prefix).resolve() != python.parent.parent.resolve()
         ):
+            if os.environ.get(_REEXEC_ENV) == str(python):
+                raise RuntimeError(
+                    f"{python} did not start inside {python.parent.parent}; it may "
+                    "have been built on another OS or host. Remove that directory "
+                    "and run again."
+                )
+            os.environ[_REEXEC_ENV] = str(python)
             os.execv(str(python), [str(python), script_path, *sys.argv[1:]])
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         raise SystemExit(

@@ -24,8 +24,10 @@ See ``docs/MACHINE_READABLE_RESULTS.md``.
 
 from __future__ import annotations
 
+import argparse
 from collections import Counter
 import copy
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -33,10 +35,15 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
+import sys
 import tempfile
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from lib.filesystem_coordinates import definition_coordinates
+from lib.filesystem_report_options import validate_integer_filter
+from lib.parse_only_sizes import parse_only_sizes_filter
+from lib.reporting_common import natural_key
 
 # Document and fragment keys used in several places.
 K_EXECUTION_ID = "execution_id"
@@ -51,13 +58,16 @@ K_KIND = "kind"
 K_DEFINITION = "definition_sha256"
 K_GROUP_ID = "group_id"
 K_DEFINITION_PATH = "definition_path"
+K_LIVE_DOMAINS = "additional_live_domains"
+K_UNPAIRED_LIVE = "unpaired_live"
 
 SCHEMA = "storage-scale-test/filesystem-batch-results"
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 LIVE_SCHEMA = "storage-scale-test/live-client-series"
-LIVE_SCHEMA_VERSION = "1.0"
+LIVE_SCHEMA_VERSION = "1.1"
 FRAGMENT_VERSION = 1
 LIVE_DETAIL_LEVELS = ("none", "summary", "selected", "full")
+REPORT_HTML_FILENAME = "report.html"
 TOOL_NAME = "storage-scale-test"
 ZSTD_LEVEL = 3
 
@@ -82,6 +92,10 @@ GENERATOR_OPTION_KEYS = (
     "live_detail",
     "shortfall_percent",
     "min_slow_windows",
+    "client_max_timeseries_lines",
+    "client_max_heatmap_rows",
+    "no_dual_y_axis",
+    "normalize_to",
     "only_nodes",
     "only_threads",
     "only_sizes",
@@ -159,6 +173,14 @@ def histogram_columnar(
     }
 
 
+def command_argv(command: str) -> list[str]:
+    """Split a recorded command line into argv, tolerating unbalanced quotes."""
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
 def problem(code: str, detail: str, phase: str | None = None) -> dict[str, Any]:
     """Build a ``problems`` entry; ``phase`` is always present."""
     return {"code": code, "detail": detail, "phase": phase}
@@ -199,6 +221,25 @@ def _zstd():
     return zstandard
 
 
+def _umask() -> int:
+    try:
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith("Umask:"):
+                    return int(line.split()[1], 8)
+    except (OSError, ValueError, IndexError):
+        pass
+    # Elsewhere the umask can only be read by setting it; restore it at once.
+    mask = os.umask(0o022)
+    os.umask(mask)
+    return mask
+
+
+def set_published_mode(descriptor: int) -> None:
+    """Give a ``mkstemp`` file (0600) the mode a plain ``open`` would."""
+    os.fchmod(descriptor, 0o666 & ~_umask())
+
+
 def _atomic_write(path: str | os.PathLike, data: bytes) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -208,6 +249,7 @@ def _atomic_write(path: str | os.PathLike, data: bytes) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
+            set_published_mode(stream.fileno())
         os.replace(temporary, target)
     finally:
         Path(temporary).unlink(missing_ok=True)
@@ -221,6 +263,169 @@ def write_document(document: dict, path: str | os.PathLike) -> None:
 def write_fragment(fragment: dict, path: str | os.PathLike) -> None:
     """Write an engine fragment atomically as plain JSON."""
     _atomic_write(path, serialize(fragment).encode("utf-8"))
+
+
+def clear_live_sidecars(live_dir: Path) -> None:
+    """Remove sidecars of an earlier document; this run rewrites the document."""
+    if live_dir.is_dir():
+        for stale in live_dir.glob("*.jsonl.zst"):
+            stale.unlink(missing_ok=True)
+
+
+def load_comparisons(path: str | os.PathLike | None) -> list[dict] | None:
+    """The validated comparison file at ``path``; ValueError when invalid."""
+    if not path:
+        return None
+    # Deferred: only HTML reports need the renderer (and PyYAML).
+    from lib.report_html import (  # pylint: disable=import-outside-toplevel
+        load_comparison_file,
+    )
+
+    return load_comparison_file(path)
+
+
+def _integers(flag: str, value: str | None) -> frozenset[int] | None:
+    return frozenset(validate_integer_filter(flag, value) or ()) or None
+
+
+@dataclass(frozen=True)
+class ReportSelection:  # pylint: disable=too-many-instance-attributes
+    """What a report shows: ``--kind``, ``--groups``, ``--only-*``,
+    ``--live-detail`` and ``--normalize-to``, the same for text and
+    ``report.html``.
+
+    ``None`` selects everything (and keeps each document's live detail and
+    normalization).
+    Sizes and IO depths apply to IO executions; mdtest threads are tasks.
+    """
+
+    kinds: frozenset[str] | None = None
+    groups: frozenset[str] | None = None
+    nodes: frozenset[int] | None = None
+    threads: frozenset[int] | None = None
+    sizes: frozenset[str] | None = None
+    iodepths: frozenset[int] | None = None
+    live_detail: str | None = None
+    normalize_to: int | None = None
+
+    @classmethod
+    def from_args(
+        cls, args: Any, kind: str = "all", groups: str | None = None
+    ) -> "ReportSelection":
+        """The selection of parsed report arguments; ValueError when invalid."""
+        sizes = parse_only_sizes_filter(getattr(args, "only_sizes", None))
+        return cls(
+            kinds=None if kind == "all" else frozenset([kind]),
+            groups=frozenset(groups.split(",")) if groups else None,
+            nodes=_integers("--only-nodes", getattr(args, "only_nodes", None)),
+            threads=_integers("--only-threads", getattr(args, "only_threads", None)),
+            sizes=frozenset(sizes) if sizes else None,
+            iodepths=_integers("--only-iodepths", getattr(args, "only_iodepths", None)),
+            live_detail=getattr(args, "live_detail", None),
+            normalize_to=getattr(args, "normalize_to", None),
+        )
+
+    def _coordinates(self, kind: str) -> tuple[tuple[Any, str], ...]:
+        if kind == "mdtest":
+            return ((self.nodes, "nodes"), (self.threads, "tasks_per_node"))
+        return (
+            (self.nodes, "nodes"),
+            (self.threads, "threads_per_node"),
+            (self.sizes, "io_size_spec"),
+            (self.iodepths, "io_depth"),
+        )
+
+    def keeps(self, group: Mapping[str, Any], execution: Mapping[str, Any]) -> bool:
+        """True when ``execution`` of ``group`` is selected."""
+        if self.kinds and group[K_KIND] not in self.kinds:
+            return False
+        if self.groups is not None and group[K_GROUP_ID] not in self.groups:
+            return False
+        coordinates = execution.get("coordinates") or {}
+        return all(
+            not allowed or coordinates.get(key) in allowed
+            for allowed, key in self._coordinates(group[K_KIND])
+        )
+
+    def keep_execution(self) -> Callable[[dict, dict], bool] | None:
+        """``keeps``, or None when every execution is selected."""
+        filters = (self.kinds, self.nodes, self.threads, self.sizes, self.iodepths)
+        if self.groups is None and not any(filters):
+            return None
+        return self.keeps
+
+
+def publish_document(
+    document: dict,
+    path: str | os.PathLike,
+    comparisons: list[dict] | None = None,
+    selection: ReportSelection | None = None,
+) -> Path:
+    """Write the document, then ``report.html`` beside it; return the HTML path.
+
+    Both are written to a temporary name and renamed.
+    """
+    # Deferred: only publishing needs the loader.
+    from lib.results_document import (  # pylint: disable=import-outside-toplevel
+        load_document,
+    )
+
+    write_document(document, path)
+    print(f"Results document saved as {path}", file=sys.stderr)
+    for item in document.get("diagnostics", []):
+        if item.get("code") == EXECUTION_UNMATCHED:
+            print(f"Warning: not reported: {item['detail']}", file=sys.stderr)
+    try:
+        return publish_report_html(
+            [load_document(path)], Path(path).parent, comparisons, selection
+        )
+    except ValueError:
+        # A comparison naming an unknown section shows only once the results
+        # are parsed; an earlier page must not outlive the new document.
+        (Path(path).parent / REPORT_HTML_FILENAME).unlink(missing_ok=True)
+        raise
+
+
+def publish_report_html(
+    documents: Sequence[Any],
+    directory: str | os.PathLike,
+    comparisons: list[dict] | None = None,
+    selection: ReportSelection | None = None,
+) -> Path:
+    """Write ``report.html`` for loaded documents into ``directory``,
+    showing what ``selection`` selects.
+
+    An invalid comparison (``ValueError``) is raised before anything is written.
+    """
+    # Deferred: only publishing needs the renderer.
+    from lib.report_html import (  # pylint: disable=import-outside-toplevel
+        render_report,
+        write_report,
+    )
+    from lib.results_document import (  # pylint: disable=import-outside-toplevel
+        effective_live_detail,
+    )
+
+    selection = selection or ReportSelection()
+    html = Path(directory) / REPORT_HTML_FILENAME
+    page = render_report(
+        list(documents),
+        comparisons,
+        keep_execution=selection.keep_execution(),
+        live_detail=selection.live_detail,
+        normalize_to=selection.normalize_to,
+    )
+    write_report(html, page)
+    for loaded in documents:
+        live_detail = effective_live_detail(loaded.data, selection.live_detail)
+        if live_detail != LIVE_DETAIL_LEVELS[-1]:
+            print(
+                f"Live detail is {live_detail}, not full: report.html omits "
+                "per-client charts.",
+                file=sys.stderr,
+            )
+    print(f"HTML report saved as {html}", file=sys.stderr)
+    return html
 
 
 def read_fragment(path: str | os.PathLike) -> dict:
@@ -280,9 +485,20 @@ class SidecarWriter:
     def _write_line(self, document: dict) -> None:
         self._writer.write(serialize(document).encode("utf-8"))
 
-    def write_interval(self, elapsed_ms: int, bytes_per_s: list[int | None]) -> None:
+    def write_interval(
+        self,
+        elapsed_ms: int,
+        bytes_per_s: list[int | None],
+        done_bytes_delta: list[int | None] | None = None,
+    ) -> None:
         """Append one interval line."""
-        self._write_line({"elapsed_ms": elapsed_ms, "bytes_per_s": list(bytes_per_s)})
+        line: dict[str, Any] = {
+            "elapsed_ms": elapsed_ms,
+            "bytes_per_s": list(bytes_per_s),
+        }
+        if done_bytes_delta is not None:
+            line["done_bytes_delta"] = list(done_bytes_delta)
+        self._write_line(line)
 
     def close(self) -> None:
         """Finish the zstd frame and atomically publish the file."""
@@ -293,6 +509,7 @@ class SidecarWriter:
             self._writer.close()
             self._file.flush()
             os.fsync(self._file.fileno())
+            set_published_mode(self._file.fileno())
             self._file.close()
             os.replace(self._temporary, self.path)
             self.size_bytes = self._hashing.size
@@ -348,8 +565,10 @@ class _GroupSpec:  # pylint: disable=too-few-public-methods,too-many-instance-at
         self.group_id: str = fields[K_GROUP_ID]
         self.kind: str = fields[K_KIND]
         self.output_relative: str = fields["output_relative"]
+        self.source: str | None = fields.get("source")
         self.prefix: str = fields.get("prefix", "")
         self.settings: dict = fields.get("settings") or {}
+        self.settings_text: str | None = fields.get("settings_text")
         self.settings_sha256: dict = fields["settings_sha256"]
         self.ledger: list[dict] = fields["ledger"]
         self.fragment: dict | None = fields.get("fragment")
@@ -367,17 +586,26 @@ def _target_block(settings: Mapping) -> dict:
     return {"name": target.name, "recorded": target.recorded}
 
 
-def _group_record(spec: _GroupSpec) -> dict:
+def _unpaired_live(spec: _GroupSpec, live_dir: Path | None) -> list[dict]:
+    """Live objects of the group's live CSVs that have no result pair."""
+    objects = copy.deepcopy((spec.fragment or {}).get(K_UNPAIRED_LIVE) or [])
+    return [_rewrite_live(live, spec.prefix, live_dir) for live in objects]
+
+
+def _group_record(spec: _GroupSpec, live_dir: Path | None = None) -> dict:
     return {
         K_GROUP_ID: spec.group_id,
         K_KIND: spec.kind,
         "label": None,
         "output_relative": spec.output_relative,
+        "source": spec.source,
         "target": _target_block(spec.settings),
         "settings_sha256": spec.settings_sha256,
         "env_override": spec.settings.get("env_override"),
         "settings": spec.settings,
+        "settings_text": spec.settings_text,
         "execution_ids": [item[K_EXECUTION_ID] for item in spec.ledger],
+        K_UNPAIRED_LIVE: _unpaired_live(spec, live_dir),
     }
 
 
@@ -388,14 +616,16 @@ def _posix_join(prefix: str, path: str) -> str:
 def _rewrite_live(live: Any, prefix: str, live_dir: Path | None) -> Any:
     if not isinstance(live, dict):
         return live
+    # Replace rather than edit nested dicts: a live CSV's domains may share
+    # one source dict, which must not be prefixed once per domain.
     source = live.get("source")
     if isinstance(source, dict) and isinstance(source.get(K_PATH), str):
-        source[K_PATH] = _posix_join(prefix, source[K_PATH])
+        live["source"] = {**source, K_PATH: _posix_join(prefix, source[K_PATH])}
     series = live.get("client_series")
     if isinstance(series, dict) and "sha256" in series and live_dir is not None:
-        name = series[K_PATH]
         # Sidecars sit beside the document; paths resolve from its directory.
-        series[K_PATH] = f"{live_dir.name}/{name}"
+        path = f"{live_dir.name}/{series[K_PATH]}"
+        live["client_series"] = {**series, K_PATH: path}
     return live
 
 
@@ -406,6 +636,8 @@ def _rewrite_results(results: Any, prefix: str, live_dir: Path | None) -> Any:
     for phase in results.get("phases") or []:
         if "live" in phase:
             phase["live"] = _rewrite_live(phase["live"], prefix, live_dir)
+    for live in results.get(K_LIVE_DOMAINS) or []:
+        _rewrite_live(live, prefix, live_dir)
     return results
 
 
@@ -428,6 +660,7 @@ def _execution_record(
         "coordinates": fragment.get("coordinates"),
         "coordinate_key": fragment.get("coordinate_key"),
         "dataset": fragment.get("dataset"),
+        "producer_version": fragment.get("producer_version"),
         K_RESULT_FILES: fragment.get(K_RESULT_FILES) or [],
         K_LOG: ledger[K_LOG],
         K_RESULTS: fragment.get(K_RESULTS),
@@ -552,7 +785,7 @@ def _execution_sort_key(execution: Mapping[str, Any]) -> tuple:
         execution[K_GROUP_ID],
         identifier is None,
         identifier or "",
-        execution["coordinate_key"] or "",
+        natural_key(execution["coordinate_key"] or ""),
     )
 
 
@@ -595,7 +828,7 @@ def _compose(
         "generator": generator,
         "batch": batch,
         "batch_outcome": _batch_outcome(executions, specs),
-        "groups": [_group_record(s) for s in specs],
+        "groups": [_group_record(s, live_dir) for s in specs],
         K_EXECUTIONS: executions,
         "diagnostics": diagnostics,
     }
@@ -613,6 +846,14 @@ def _load_settings(directory: Path) -> dict:
 
     settings = load_env_used_yaml(str(directory))
     return settings if isinstance(settings, dict) else {}
+
+
+def _settings_text(directory: Path) -> str | None:
+    """The verbatim env_used.yaml text, or None when it cannot be read."""
+    try:
+        return (directory / "env_used.yaml").read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
 
 
 def _optional_sha(path: Path) -> str | None:
@@ -661,7 +902,9 @@ def _batch_specs(
                 kind=group.kind,
                 output_relative=group.output_relative,
                 prefix=group.output_relative,
+                source=str(manifest.group_path(group)),
                 settings=_load_settings(manifest.group_path(group)),
+                settings_text=_settings_text(manifest.group_path(group)),
                 settings_sha256={
                     "env_used_sh": group.shell_digest,
                     "env_used_yaml": group.yaml_digest,
@@ -699,14 +942,25 @@ def assemble_batch_document(  # pylint: disable=too-many-arguments,too-many-posi
     return _compose(batch, specs, generator, live_dir)
 
 
-def _ordinary_ledger(result_dir: Path, fragment: Mapping[str, Any]) -> list[dict]:
-    # The ledger is every executions/NNNN.sh, not just those the engine could
-    # parse: an unreadable definition must still count against completeness.
-    defined = {
+def _ledger_definitions(result_dir: str | os.PathLike) -> set[str]:
+    return {
         path.stem
-        for path in (result_dir / _EXECUTIONS_DIR).glob("[0-9]*.sh")
+        for path in (Path(result_dir) / _EXECUTIONS_DIR).glob("[0-9]*.sh")
         if path.stem.isdigit()
     }
+
+
+def has_execution_ledger(result_dir: str | os.PathLike) -> bool:
+    """True when executions/ holds a definition; an empty one is no ledger."""
+    return bool(_ledger_definitions(result_dir))
+
+
+def _ordinary_ledger(
+    result_dir: Path, relative: str, fragment: Mapping[str, Any]
+) -> list[dict]:
+    # The ledger is every executions/NNNN.sh, not just those the engine could
+    # parse: an unreadable definition must still count against completeness.
+    defined = _ledger_definitions(result_dir)
     parsed = {
         e[K_EXECUTION_ID] for e in fragment[K_EXECUTIONS] if e.get(K_EXECUTION_ID)
     }
@@ -717,6 +971,7 @@ def _ordinary_ledger(result_dir: Path, fragment: Mapping[str, Any]) -> list[dict
         if status.is_file():
             value = status.read_text(encoding="utf-8").strip().lower()
             state = value if value in LEDGER_STATES[:-1] else _UNKNOWN
+        log = f"{_EXECUTIONS_DIR}/{identifier}.log"
         ledger.append(
             {
                 K_EXECUTION_ID: identifier,
@@ -724,41 +979,116 @@ def _ordinary_ledger(result_dir: Path, fragment: Mapping[str, Any]) -> list[dict
                     result_dir / _EXECUTIONS_DIR / f"{identifier}.sh"
                 ),
                 K_LEDGER_STATE: state,
-                K_LOG: _log_relative(result_dir, ".", identifier),
+                K_LOG: (
+                    _posix_join(relative, log) if (result_dir / log).is_file() else None
+                ),
                 K_DEFINITION_PATH: result_dir / _EXECUTIONS_DIR / f"{identifier}.sh",
             }
         )
     return ledger
 
 
-def assemble_ordinary_document(
-    result_dir: Path, fragment: dict, live_dir: Path | None, generator: dict
-) -> dict:
-    """Build the one-group document for an ordinary (non-batch) result directory."""
-    result_dir = Path(result_dir).resolve()
-    settings = _load_settings(result_dir)
-    has_ledger = (result_dir / _EXECUTIONS_DIR).is_dir()
-    spec = _GroupSpec(
-        group_id=_ORDINARY_GROUP_ID,
+def _ordinary_spec(
+    result_dir: Path, fragment: dict, group_id: str, relative: str
+) -> _GroupSpec:
+    """One ordinary result directory as a group whose paths start at ``relative``."""
+    has_ledger = has_execution_ledger(result_dir)
+    return _GroupSpec(
+        group_id=group_id,
         kind=fragment[K_KIND],
-        output_relative=".",
-        settings=settings,
+        output_relative=relative,
+        prefix=relative,
+        source=str(result_dir),
+        settings=_load_settings(result_dir),
+        settings_text=_settings_text(result_dir),
         settings_sha256={
             "env_used_sh": _optional_sha(result_dir / "env_used.sh"),
             "env_used_yaml": _optional_sha(result_dir / "env_used.yaml"),
         },
-        ledger=_ordinary_ledger(result_dir, fragment) if has_ledger else [],
+        ledger=_ordinary_ledger(result_dir, relative, fragment) if has_ledger else [],
         fragment=fragment,
         has_ledger=has_ledger,
     )
-    match = _DATESTAMP_SUFFIX.search(result_dir.name)
-    substrate = settings.get("EXECUTION_SUBSTRATE")
+
+
+def _shared(values: list[Any]) -> Any:
+    """The value every item has, or None when they differ."""
+    return values[0] if values and all(v == values[0] for v in values) else None
+
+
+def assemble_inputs_document(
+    inputs: Sequence[tuple[str | os.PathLike, dict]],
+    live_dir: Path | None,
+    generator: dict,
+) -> dict:
+    """Build one document with a group per ordinary result directory.
+
+    One input is group 0000 rooted at itself. Several are groups 0001, 0002,
+    ... in input order, rooted at their common parent directory.
+    """
+    dirs = [Path(directory).resolve() for directory, _ in inputs]
+    if len(dirs) == 1:
+        root, ids = dirs[0], [_ORDINARY_GROUP_ID]
+    else:
+        root = Path(os.path.commonpath(dirs))
+        ids = [f"{number:04d}" for number in range(1, len(dirs) + 1)]
+    specs = [
+        _ordinary_spec(
+            directory,
+            fragment,
+            group_id,
+            Path(os.path.relpath(directory, root)).as_posix(),
+        )
+        for directory, (_, fragment), group_id in zip(dirs, inputs, ids)
+    ]
+    datestamps = [_DATESTAMP_SUFFIX.search(directory.name) for directory in dirs]
+    substrate = _shared([spec.settings.get("EXECUTION_SUBSTRATE") for spec in specs])
     batch = {
-        "root": str(result_dir),
-        "datestamp": match.group(1) if match else None,
+        "root": str(root),
+        "datestamp": _shared([m.group(1) if m else None for m in datestamps]),
         "manifest_version": None,
         "manifest_sha256": None,
         "sealed": None,
         "substrate": None if substrate is None else str(substrate),
     }
-    return _compose(batch, [spec], generator, live_dir)
+    return _compose(batch, specs, generator, live_dir)
+
+
+def load_from_json_inputs(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> tuple[list[Any], list[dict] | None, frozenset[str] | None]:
+    """The ``--from-json`` documents, the parsed ``--comparisons`` file and
+    the ``--groups`` selection (each ID must exist in some document).
+
+    Any problem, including an option the documents fix
+    (``check_replay_options``), is a usage error, before anything is written.
+    """
+    # Deferred: only rendering from documents needs these.
+    from lib.filesystem_report_options import (  # pylint: disable=import-outside-toplevel
+        check_replay_options,
+        validate_from_json,
+    )
+    from lib.results_document import (  # pylint: disable=import-outside-toplevel
+        load_document,
+        recorded_options,
+    )
+
+    try:
+        validate_from_json(args.from_json, args.input_dirs, args.output_dir)
+        documents = [load_document(path) for path in args.from_json]
+        check_replay_options(
+            args, [recorded_options(loaded.data) for loaded in documents]
+        )
+        comparisons = load_comparisons(args.comparisons)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    if not args.groups:
+        return documents, comparisons, None
+    selected = frozenset(args.groups.split(","))
+    known = {group["group_id"] for doc in documents for group in doc.data["groups"]}
+    if selected - known:
+        parser.error(
+            f"unknown groups in {' '.join(args.from_json)}: "
+            f"{','.join(sorted(selected - known))}"
+        )
+    return documents, comparisons, selected

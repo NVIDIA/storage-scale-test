@@ -37,3 +37,8 @@ def test_raw_warp_histogram_accumulates_equivalent_buckets():
     assert _MODULE._decode_warp_histogram_buckets(  # pylint: disable=protected-access
         buckets
     ) == {2.4: 12}
+
+
+def test_window_sizes_list_shortest_first():
+    sizes = {"10s", "1s", "500ms", "2m"}
+    assert _MODULE.window_sizes_text(sizes) == "500ms, 1s, 10s, 2m"

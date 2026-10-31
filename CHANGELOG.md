@@ -21,6 +21,47 @@ Notable changes in each release. Versions follow [Semantic Versioning](https://s
 see [docs/VERSIONING.md](docs/VERSIONING.md). Each release's notes are its
 section below.
 
+## Unreleased
+
+### Added
+
+- Every filesystem report writes `report.html`: one file with charts, sortable
+  tables, per-run live detail, and comparisons of sections that differ in one
+  setting. Charts load Chart.js from a pinned CDN URL; tables work offline.
+  See [docs/HTML_REPORT.md](docs/HTML_REPORT.md).
+- `--from-json PATH...` renders reports again from one or more `results.json`
+  documents, without the raw results; `--comparisons FILE` chooses which
+  sections are compared.
+- `extract-filesystem.py` is the one filesystem reporting command. It accepts
+  several result directories (IO, metadata, or both) and reports them
+  together in `--output-dir`. `extract-elbencho.py` and
+  `extract-mdtest-elbencho.py` are now its internal engines.
+- `results.json` schema 1.1 adds what the text reports read: every live
+  domain, producer versions, mdtest commands, and settings text.
+
+### Changed (breaking)
+
+- Filesystem reports always write `results.json`, `report.html`,
+  `report.txt`, and PNGs, and `--live-detail` defaults to `full`. `--to-json`
+  and `--markdown` are removed from filesystem reports; netbench and Warp
+  keep `--markdown`.
+- Several input directories need an `--output-dir` that is not one of them.
+- A batch's `reports/report.html` replaces `reports/index.md`.
+
+### Fixed
+
+- Results saved before prepared batches report correctly (an empty
+  `executions/` directory, an older `env_used.yaml`).
+- Metadata reports reject a malformed `--only-nodes` or `--only-threads`
+  (exit 2) instead of warning and reporting unfiltered.
+- Python tools rebuild a repository `.venv` built on another OS (e.g. a
+  checkout shared by a container and its host) instead of hanging.
+- Names with numbers sort by value (`node9` before `node10`, `c_500` before
+  `c_1000`): Slurm idle-node CSVs, Warp client legends and window sizes, and
+  IO live-fairness lines.
+- IO reports leave out elbencho's directory phases (`MKDIRS`, `RMDIRS`,
+  `RMFILES`, `STAT`), which live CSVs record alongside write and read.
+
 ## [2.1.0] - 2026-10-29
 
 ### Added

@@ -81,10 +81,9 @@ def test_install_reuse_and_repair_missing_package(offline_repo, capfd):
     python = bootstrap.ensure_environment(repo)
     stamp = repo / ".venv" / bootstrap.STAMP_NAME
     assert _metadata_version(python) == "1.0"
-    assert (
-        stamp.read_text().strip()
-        == hashlib.sha256((repo / "requirements.txt").read_bytes()).hexdigest()
-    )
+    digest = hashlib.sha256((repo / "requirements.txt").read_bytes()).hexdigest()
+    # pylint: disable-next=protected-access
+    assert stamp.read_text().strip() == f"{digest} {bootstrap._PLATFORM}"
     capfd.readouterr()
     assert bootstrap.ensure_environment(repo) == python
     assert "Installing required packages" not in capfd.readouterr().err
@@ -97,6 +96,26 @@ def test_install_reuse_and_repair_missing_package(offline_repo, capfd):
     bootstrap.ensure_environment(repo)
     assert _metadata_version(python) == "1.0"
     assert "Installing required packages" in capfd.readouterr().err
+
+
+def test_environment_from_another_platform_is_rebuilt(offline_repo, capfd):
+    """A shared .venv last built by another OS is wiped and reinstalled."""
+    repo, _ = offline_repo
+    python = bootstrap.ensure_environment(repo)
+    venv = repo / ".venv"
+    stamp = venv / bootstrap.STAMP_NAME
+    digest = stamp.read_text().split()[0]
+    stamp.write_text(f"{digest} other-os-machine\n")
+    leftover = venv / "lib" / "other-os-binary.so"
+    leftover.write_text("")
+    capfd.readouterr()
+    assert bootstrap.ensure_environment(repo) == python
+    assert "built on another platform" in capfd.readouterr().err
+    assert not leftover.exists()
+    assert (venv / ".bootstrap.lock").exists()
+    assert _metadata_version(python) == "1.0"
+    # pylint: disable-next=protected-access
+    assert stamp.read_text().split() == [digest, bootstrap._PLATFORM]
 
 
 def test_failed_install_invalidates_stamp_and_retry_succeeds(offline_repo):
@@ -235,6 +254,31 @@ def test_old_interpreter_reexecs_after_same_prefix_upgrade(tmp_path, monkeypatch
     bootstrap.ensure_runtime(str(script))
     assert calls == [(str(python), [str(python), str(script), "--path", "has spaces"])]
     assert "PYTHONHOME" not in bootstrap.os.environ
+
+
+def test_reexec_that_misses_the_environment_stops_instead_of_looping(
+    tmp_path, monkeypatch
+):
+    """A .venv the re-executed Python cannot enter (another OS) fails clearly."""
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    (repo / "requirements.txt").write_text("", encoding="utf-8")
+    script = repo / "report.py"
+    python = repo / ".venv/bin/python"
+    monkeypatch.setattr(bootstrap, "ensure_environment", lambda _root: python)
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / "system"))
+    monkeypatch.setattr(sys, "argv", [str(script)])
+    monkeypatch.setenv("PATH", bootstrap.os.environ.get("PATH", ""))
+    monkeypatch.delenv("STORAGE_SCALE_TEST_REEXEC", raising=False)
+    calls = []
+    monkeypatch.setattr(
+        bootstrap.os, "execv", lambda executable, args: calls.append(executable)
+    )
+    bootstrap.ensure_runtime(str(script))
+    assert calls == [str(python)]
+    with pytest.raises(SystemExit, match="did not start inside"):
+        bootstrap.ensure_runtime(str(script))
+    assert calls == [str(python)]
 
 
 def test_unsupported_launcher_selects_supported_path_python(tmp_path, monkeypatch):

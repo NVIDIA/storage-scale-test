@@ -33,7 +33,7 @@ NVIDIA Storage Scale Test is a benchmark orchestration tool packaged by the user
    - S3-compatible object storage endpoints accessed over HTTPS.
    - Network paths between benchmark clients (TCP throughput/latency).
 
-4. **Analysis tools.** Executable Python tools bootstrap a shared virtual environment, then parse result files and produce terminal tables, PNG plots, and optional Markdown reports.
+4. **Analysis tools.** Executable Python tools bootstrap a shared virtual environment, then parse result files and produce terminal tables and PNG plots. Filesystem reports also write a results document and an HTML report; netbench and Warp reports can add Markdown.
 
 The tool has no always-running daemon or server-side control plane. A
 Kubernetes filesystem sweep creates a finite-lived coordinator Job per
@@ -63,7 +63,8 @@ model with network access policies and firewalls that deny outside-initiated
 connections while permitting the required internal benchmark traffic and
 explicitly configured outbound traffic.
 
-The diagrams below illustrate the three execution substrates.
+The diagrams below illustrate the three execution substrates and the
+filesystem reporting pipeline.
 
 ---
 
@@ -255,3 +256,45 @@ the publication manifest, copies results back to the executing host, removes
 attempt state and exact owned resources, and releases the UID-journaled Leases
 last, in reverse acquisition order. Details are normative in
 [KUBERNETES_ELBENCHO_LIFECYCLE.md](KUBERNETES_ELBENCHO_LIFECYCLE.md).
+
+---
+
+## Filesystem Reporting Pipeline
+
+The filesystem reporters parse raw results once into the results document
+([MACHINE_READABLE_RESULTS.md](MACHINE_READABLE_RESULTS.md)) and render every
+output from it. Boxes marked "pool" run in the report process pool; the rest
+runs in the parent.
+
+```text
+ result dir, batch dir,              --from-json results.json ...
+ or several dirs                     (one or more documents)
+        |                                        |
+        v                                        |
+ discover executions and live CSVs               |
+        |  one task per execution, one per live CSV
+        v                                        |
++- pool: parse -------------------------+        |
+| .csv/.out  --> phase entries          |        |
+| .live.csv  --> live objects, and      |        |
+|                results.live/ sidecars |        |
++------------------+--------------------+        |
+                   v                             |
+ assemble and write results.json                 |
+                   |<----------------------------+
+                   v
+ load documents, apply --only-* filters,
+ build report model (pairs sections across documents)
+                   |
+     +-------------+---------------------+
+     v             v                     v
+ text tables   report.html     +- pool: plots ------------+
+ (stdout,                      | PNGs per plot set and    |
+ report.txt)                   | live domain (reads       |
+                               | results.live/ sidecars)  |
+                               +--------------------------+
+```
+
+A batch submits every group's parse tasks before assembling any group, and
+writes one `results.json` and one `report.html`. Plot tasks start once the
+model exists, so PNGs render while the parent writes text and HTML.

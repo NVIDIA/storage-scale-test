@@ -49,6 +49,7 @@ from lib.parse_only_sizes import (  # pylint: disable=wrong-import-position
 from lib.reporting_common import (  # pylint: disable=wrong-import-position
     PNG_SAVE_OPTIONS,
     histogram_axis_ranges,
+    natural_key,
 )
 from lib.stdout_report_file import (  # pylint: disable=wrong-import-position
     REPORT_TXT_FILENAME,
@@ -303,6 +304,21 @@ def bytes_per_sec_to_mib_per_sec(bytes_per_sec: float) -> float:
     Note: Warp JSON uses 'bps' to mean BYTES per second, not bits.
     """
     return bytes_per_sec / (1024**2)
+
+
+_WINDOW_UNIT_MS = {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000}
+
+
+def window_sizes_text(sizes: set) -> str:
+    """Window sizes such as ``500ms``, ``1s``, ``10s``, shortest first."""
+
+    def millis(size: str) -> tuple:
+        match = re.fullmatch(r"(\d+)(ms|s|m|h)", size)
+        if not match:
+            return (1, natural_key(size))
+        return (0, int(match.group(1)) * _WINDOW_UNIT_MS[match.group(2)])
+
+    return ", ".join(sorted(sizes, key=millis))
 
 
 def format_window_size_from_millis(millis: int) -> str:
@@ -3002,7 +3018,9 @@ def plot_client_ttfb_percentile_lines(
     colors = get_plot_colors(num_clients)
 
     # Plot each underperformer client
-    for idx, (client, percs) in enumerate(sorted(client_avg_percentiles.items())):
+    for idx, (client, percs) in enumerate(
+        sorted(client_avg_percentiles.items(), key=lambda item: natural_key(item[0]))
+    ):
         y_values = [
             percs["p25"],
             percs["p50"],
@@ -3320,7 +3338,7 @@ def plot_metrics(
     if len(window_sizes) == 1:
         window_size = window_sizes.pop()
     else:
-        window_size = ", ".join(sorted(window_sizes))
+        window_size = window_sizes_text(window_sizes)
     prepared_data["window_size"] = window_size
 
     if is_multi_node:
@@ -3541,7 +3559,9 @@ def print_table(
         # Check if all metrics in this group have the same window size
         window_sizes = {m.window_size for m in config_metrics}
         window_size_str = (
-            window_sizes.pop() if len(window_sizes) == 1 else ", ".join(window_sizes)
+            window_sizes.pop()
+            if len(window_sizes) == 1
+            else window_sizes_text(window_sizes)
         )
 
         print(
@@ -3623,7 +3643,7 @@ def print_table(
     filtered_window_size_str = (
         filtered_window_sizes.pop()
         if len(filtered_window_sizes) == 1
-        else ", ".join(filtered_window_sizes)
+        else window_sizes_text(filtered_window_sizes)
     )
 
     # Print combined summary table

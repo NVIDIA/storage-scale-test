@@ -45,7 +45,7 @@ from dataclasses import dataclass
 import json
 import re
 import sys
-from typing import Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 STORAGE_TARGET_KEY = "STORAGE_TARGET_NAME"
 UNKNOWN_TARGET = "unknown"
@@ -279,3 +279,19 @@ def guarded_report_target(
     except MixedStorageTargetsError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         sys.exit(1)
+
+
+def guarded_document_target(
+    groups: Iterable[Mapping[str, Any]], allow_mixed: bool
+) -> str:
+    """The report label of results-document groups (see ``guarded_report_target``)."""
+    return guarded_report_target(
+        [
+            (
+                group.get("source") or group["group_id"],
+                StorageTarget(group["target"]["name"], group["target"]["recorded"]),
+            )
+            for group in groups
+        ],
+        allow_mixed,
+    )

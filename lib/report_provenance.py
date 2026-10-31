@@ -24,6 +24,7 @@ import re
 from typing import Callable, Iterable, List
 
 from lib.project_version import UNKNOWN, project_version
+from lib.reporting_common import natural_key
 
 VERSION_SUFFIX = ".project-version"
 # Warp results are JSON; their version file is named after the matching .out.
@@ -46,6 +47,12 @@ def result_version(result_file) -> str:
     except (OSError, UnicodeError):
         return UNKNOWN
     return value if _DISPLAYABLE.fullmatch(value) else UNKNOWN
+
+
+def recorded_result_version(result_file) -> str | None:
+    """The version recorded beside a native result file; None when it has none."""
+    version = result_version(result_file)
+    return None if version == UNKNOWN else version
 
 
 class ResultVersions:
@@ -76,12 +83,6 @@ def selected_versions(
     return [version for metric, version in recorded if key(metric) in keys]
 
 
-def _natural_key(version: str) -> list:
-    return [
-        int(part) if part.isdigit() else part for part in re.split(r"(\d+)", version)
-    ]
-
-
 def with_versions(
     printer: Callable,
     versions: Iterable[str],
@@ -92,7 +93,7 @@ def with_versions(
 
     A given storage target label follows them.
     """
-    produced = ", ".join(sorted(set(versions), key=_natural_key)) or UNKNOWN
+    produced = ", ".join(sorted(set(versions), key=natural_key)) or UNKNOWN
     prefix = "- " if markdown else ""
 
     def print_report(*args, **kwargs):

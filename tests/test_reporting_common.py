@@ -26,6 +26,7 @@ from lib.reporting_common import (
     format_decimal_aligned_latency_ms,
     histogram_axis_ranges,
     latency_column_widths,
+    natural_key,
     parse_int_values_with_ranges,
     parse_integer_histogram,
     strip_command_options,
@@ -190,3 +191,28 @@ def test_scale_filter_and_histogram_ranges():
         "min_count": 1.0,
         "max_count": 4488.0,
     }
+
+
+def test_natural_key_orders_embedded_numbers_by_value():
+    names = ["node10", "node9", "c_1000-s_064", "c_500-s_128", "c_500-s_16", "node"]
+    assert sorted(names, key=natural_key) == [
+        "c_500-s_16",
+        "c_500-s_128",
+        "c_1000-s_064",
+        "node",
+        "node9",
+        "node10",
+    ]
+
+
+def test_natural_key_ties_break_on_the_text():
+    assert sorted(["node9", "node09", "node009"], key=natural_key) == [
+        "node009",
+        "node09",
+        "node9",
+    ]
+    assert sorted(["node9", "node009", "node09"], key=natural_key) == [
+        "node009",
+        "node09",
+        "node9",
+    ]
