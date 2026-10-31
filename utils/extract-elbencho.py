@@ -165,7 +165,11 @@ from lib.elbencho_live_steady import (
 )
 from lib.join_datestamps import join_datestamps, join_datestamps_for_filename
 from lib.parse_only_sizes import parse_only_sizes_filter
-from lib.reporting_common import PNG_SAVE_OPTIONS, histogram_axis_ranges
+from lib.reporting_common import (
+    PNG_SAVE_OPTIONS,
+    histogram_axis_ranges,
+    natural_key,
+)
 from lib.results_document import (
     LoadedDocument,
     document_from_data,
@@ -2751,8 +2755,10 @@ def _terminal_table_subgroup_key(metric: ElbenchoMetrics) -> Tuple[Any, ...]:
 
 def _terminal_table_bucket_sort_key(key: Tuple[Any, ...]) -> Tuple[Any, ...]:
     """Sort order between subgroup buckets: dio before bio, then SN/MN, seq/rand, duration, workload."""
-    is_mn, dio, rand_io, dur, workload = key
-    return (-dio, is_mn, rand_io, dur, workload)
+    is_mn, dio, rand_io, dur, (kind, value) = key
+    if isinstance(value, str):
+        value = natural_key(value)
+    return (-dio, is_mn, rand_io, dur, (kind, value))
 
 
 def _terminal_table_row_sort_key(metric: ElbenchoMetrics) -> Tuple[int, int, int, str]:
@@ -5209,7 +5215,7 @@ def document_live_renders(
             group, reported.get(group["group_id"], []), filters, selection
         )
         prefix = f"{group['group_id']}." if several else ""
-        for source in sorted(selection.by_source):
+        for source in sorted(selection.by_source, key=natural_key):
             metadata = _live_file_metadata(
                 os.path.normpath(os.path.join(root, source)), prefix
             )

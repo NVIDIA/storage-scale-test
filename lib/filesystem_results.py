@@ -43,6 +43,7 @@ from typing import Any, Callable, Mapping, Sequence
 from lib.filesystem_coordinates import definition_coordinates
 from lib.filesystem_report_options import validate_integer_filter
 from lib.parse_only_sizes import parse_only_sizes_filter
+from lib.reporting_common import natural_key
 
 # Document and fragment keys used in several places.
 K_EXECUTION_ID = "execution_id"
@@ -784,7 +785,7 @@ def _execution_sort_key(execution: Mapping[str, Any]) -> tuple:
         execution[K_GROUP_ID],
         identifier is None,
         identifier or "",
-        execution["coordinate_key"] or "",
+        natural_key(execution["coordinate_key"] or ""),
     )
 
 

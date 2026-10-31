@@ -34,6 +34,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # pylint: disable-next=wrong-import-position
 from lib.project_version import add_version_argument
 
+# pylint: disable-next=wrong-import-position
+from lib.reporting_common import natural_key
+
 SCRIPT_NAME = os.path.basename(__file__)
 
 _DS_RE = re.compile(r"(\d{8}Z\d{6})")
@@ -149,7 +152,7 @@ def collect_log_paths(result_dir: str) -> List[str]:
     paths: List[str] = []
     for pat in ("*.out", "*.log"):
         paths.extend(glob.glob(os.path.join(result_dir, pat)))
-    return sorted(set(paths))
+    return sorted(set(paths), key=natural_key)
 
 
 def read_text(path: str) -> str:
@@ -683,7 +686,7 @@ def _build_yaml_test_dirs_lines(merged: Dict[str, Any]) -> List[str]:
     if not td:
         out.append("  {}")
         return out
-    for path in sorted(td.keys()):
+    for path in sorted(td.keys(), key=natural_key):
         out.append(f"  {_yaml_quote(path)}: {td[path]}")
     return out
 

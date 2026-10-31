@@ -56,6 +56,9 @@ section below.
   (exit 2) instead of warning and reporting unfiltered.
 - Python tools rebuild a repository `.venv` built on another OS (e.g. a
   checkout shared by a container and its host) instead of hanging.
+- Names with numbers sort by value (`node9` before `node10`, `c_500` before
+  `c_1000`): Slurm idle-node CSVs, Warp client legends and window sizes, and
+  IO live-fairness lines.
 - IO reports leave out elbencho's directory phases (`MKDIRS`, `RMDIRS`,
   `RMFILES`, `STAT`), which live CSVs record alongside write and read.
 

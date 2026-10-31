@@ -87,6 +87,7 @@ from lib.reporting_common import (  # pylint: disable=wrong-import-position
     filter_metrics_by_scale,
     format_decimal_aligned_latency_ms,
     latency_column_widths,
+    natural_key,
     strip_command_options,
 )
 from lib.results_document import (  # pylint: disable=wrong-import-position
@@ -1962,14 +1963,17 @@ def _result_file_records(
 ) -> List[Dict[str, Any]]:
     """file_record for every result file, relative to the input directory."""
     paths = sorted(
-        path
-        for files in files_list
-        for path in (
-            files.csv_path,
-            files.out_path,
-            files.out_path and files.out_path + VERSION_SUFFIX,
-        )
-        if path is not None and os.path.isfile(path)
+        (
+            path
+            for files in files_list
+            for path in (
+                files.csv_path,
+                files.out_path,
+                files.out_path and files.out_path + VERSION_SUFFIX,
+            )
+            if path is not None and os.path.isfile(path)
+        ),
+        key=natural_key,
     )
     return [
         results_json.file_record(path, os.path.relpath(path, input_dir))

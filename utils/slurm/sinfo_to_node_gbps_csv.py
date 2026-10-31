@@ -34,6 +34,9 @@ if str(_REPO_ROOT) not in sys.path:
 from lib.project_version import (  # pylint: disable=wrong-import-position
     add_version_argument,
 )
+from lib.reporting_common import (  # pylint: disable=wrong-import-position
+    natural_key,
+)
 
 PARTITION_ENV_VAR = "PARTITION"
 SINFO_BIN = "sinfo"
@@ -117,7 +120,7 @@ def _load_idle_nodes(partition: str, environment: dict[str, str]) -> List[str]:
     """Idle nodes with no jobs, excluding drain/draining/drained (still reported as idle)."""
     idle = {*_sinfo_node_lines(partition, SINFO_STATE_IDLE, environment)}
     drain = {*_sinfo_node_lines(partition, SINFO_STATE_DRAIN, environment)}
-    return sorted(idle - drain)
+    return sorted(idle - drain, key=natural_key)
 
 
 def _longest_matching_gbps(
@@ -216,7 +219,7 @@ def main() -> None:
             "or configure partition in env.sh"
         )
         sys.exit(1)
-    nodes = sorted({*_load_idle_nodes(partition, environment)})
+    nodes = _load_idle_nodes(partition, environment)
     pairs_sorted = sorted(args.prefix_gbps, key=lambda item: len(item[0]), reverse=True)
     _write_csv(nodes, pairs_sorted, sys.stdout)
 
