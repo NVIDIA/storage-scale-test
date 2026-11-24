@@ -557,6 +557,137 @@
         "elapsed_ms"
       ]
     },
+    "service_rate_spread": {
+      "type": "object",
+      "properties": {
+        "min": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "avg": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "min_host": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_host": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "min",
+        "avg",
+        "max",
+        "min_host",
+        "max_host"
+      ]
+    },
+    "service_instance": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "elapsed_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "latency_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/latency_us"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "host",
+        "elapsed_ms",
+        "latency_us"
+      ]
+    },
+    "services": {
+      "type": "object",
+      "properties": {
+        "instances": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/service_instance"
+          }
+        },
+        "ops_per_s": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/service_rate_spread"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bytes_per_s": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/service_rate_spread"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "instances",
+        "ops_per_s",
+        "bytes_per_s"
+      ]
+    },
     "work": {
       "type": "object",
       "properties": {
@@ -709,6 +840,16 @@
             "type": "string"
           }
         },
+        "services": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/services"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "live": {
           "anyOf": [
             {
@@ -851,6 +992,16 @@
             }
           ]
         },
+        "elbencho_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "state": {
           "type": "string"
         },
@@ -968,6 +1119,16 @@
           ]
         },
         "producer_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "elbencho_version": {
           "anyOf": [
             {
               "type": "string"

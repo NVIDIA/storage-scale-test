@@ -225,6 +225,7 @@ class LatencySummary:  # pylint: disable=too-many-instance-attributes
     # ratio to it (ClientSteady.io_latency_avg_us and io_latency_ratio).
     client_avg_p50_us: Optional[float] = None
     client_ratio_max: Optional[float] = None
+    max_per_io: bool = False  # max_us is a per-IO maximum, not an interval mean
 
 
 @dataclass
@@ -950,6 +951,7 @@ def _latency_summary(
         rho_latency_throughput=rho_throughput,
         client_avg_p50_us=clients[0],
         client_ratio_max=clients[1],
+        max_per_io=bool(maxima),
     )
 
 

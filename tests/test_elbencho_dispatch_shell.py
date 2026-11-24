@@ -492,19 +492,23 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         )
         self.assertNotIn("999999", result.stdout)
 
-    def test_result_artifact_cleanup_removes_csv_out_live_and_treefile(self) -> None:
+    def test_result_artifact_cleanup_removes_json_csv_out_live_and_treefile(
+        self,
+    ) -> None:
         script = f"""
         set -e
         source "{_ELBENCHO_FUNCTIONS}"
         tmp=$(mktemp -d)
         trap 'rm -rf "$tmp"' EXIT
-        _elbencho_io_set_resfile_csvfile "$tmp" r64K 4 8 2 20260731Z010203
+        _elbencho_io_set_result_files "$tmp" r64K 4 8 2 20260731Z010203
         _elbencho_io_set_livecsvfile "$tmp" r64K 4 8 2 20260731Z010203
         _elbencho_io_set_treefile "$tmp" r64K 4 8 2 20260731Z010203
-        touch "$resfile" "$csvfile" "$livecsvfile" "$treefile"
+        [[ "$jsonfile" == "$tmp/elbencho-r64K-c_004-s_008-d_002_20260731Z010203.json" ]]
+        [[ "$csvfile" == "${{jsonfile%.json}}.csv" && "$resfile" == "${{jsonfile%.json}}.out" ]]
+        touch "$resfile" "$jsonfile" "$csvfile" "$livecsvfile" "$treefile"
         _elbencho_io_cleanup_result_artifacts \
-            "$resfile" "$csvfile" "$livecsvfile" "$treefile"
-        for f in "$resfile" "$csvfile" "$livecsvfile" "$treefile"; do
+            "$resfile" "$jsonfile" "$csvfile" "$livecsvfile" "$treefile"
+        for f in "$resfile" "$jsonfile" "$csvfile" "$livecsvfile" "$treefile"; do
             [[ ! -e "$f" ]] || exit 1
         done
         """

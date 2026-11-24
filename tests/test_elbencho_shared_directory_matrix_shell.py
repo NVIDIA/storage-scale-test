@@ -111,7 +111,15 @@ class TestElbenchoSharedDirectoryMatrixShell(unittest.TestCase):
                 [[ $(wc -l <"$CAPTURE") -eq 4 ]]
                 [[ $(grep -c -- "--dirs=0 --files=$native_files" "$CAPTURE") -eq 4 ]]
                 [[ $(grep -c -- '--size=4K' "$CAPTURE") -eq 3 ]]
-                [[ $(grep -c -- '--nocsvlabels' "$CAPTURE") -eq 3 ]]
+                [[ $(grep -c -- '--svcstats=elapsed,lat,percent,minmax' "$CAPTURE") -eq 4 ]]
+                [[ $(grep -c -- '--jsonfile=' "$CAPTURE") -eq 4 ]]
+                ! grep -Eq -- '--jsonfile=.*--jsonfile=|--csvfile|--nocsvlabels' "$CAPTURE"
+                # Write and read phase JSON is appended to the run's .json.
+                stem_json=$(printf '%s/elbencho-4K-c_001-s_%03d-d_001_DS.json' \
+                    "$output_dir" "$threads")
+                [[ $(grep -c '"phase_type":"WRITE"' "$stem_json") -eq 1 ]]
+                [[ $(grep -c '"phase_type":"READ"' "$stem_json") -eq 1 ]]
+                ! grep -q RMFILES "$stem_json"
                 grep -q -- '--delfiles' "$CAPTURE"
                 ! grep -- '--delfiles' "$CAPTURE" | \
                     grep -Eq -- '--size|--block|--direct|--iodepth|--sync'

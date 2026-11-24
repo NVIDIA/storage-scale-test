@@ -2576,7 +2576,7 @@ def _assert_mdtest_result_artifacts(
     result: Path, execution_root: Path, execution_id: str, nodes: int, tasks: int
 ) -> None:
     """Require a completed MD cell to publish raw data and its commit marker."""
-    for suffix in ("csv", "out"):
+    for suffix in ("json", "out"):
         matches = sorted(
             result.glob(f"mdtest-elbencho-c_{nodes:03d}-t_{tasks:03d}_*_iter1.{suffix}")
         )
@@ -5949,9 +5949,9 @@ def _assert_batch_cell(
     elif assignments.get("ELBENCHO_FILE_LAYOUT") != "worker-directories":
         # Only the generated shared-directory layout writes per-phase JSON;
         # worker-directory cells (e.g. a weighted multi-root target) prove
-        # completion through their CSV/OUT results below.
+        # completion through their JSON/OUT results below.
         _assert_phase_artifacts(output / "executions", identity, step, status)
-    for suffix in ("csv", "out"):
+    for suffix in ("json", "out"):
         if not any(path.stat().st_size for path in output.glob(f"*.{suffix}")):
             raise IntegrationTestError(
                 f"mixed batch group {group[1]} lacks {suffix} evidence"

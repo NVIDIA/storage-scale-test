@@ -93,7 +93,7 @@ OUTPUT:
   Results are written to \$RESULTS_DIR/netbench-<mode>-<datestamp>/
   Each configuration produces:
     - netbench-<mode>-c_<nodes>-t_<threads>_<datestamp>_iter<N>.out
-    - netbench-<mode>-c_<nodes>-t_<threads>_<datestamp>_iter<N>.csv
+    - netbench-<mode>-c_<nodes>-t_<threads>_<datestamp>_iter<N>.json
 
 EOF
     exit "${1:-1}"

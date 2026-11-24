@@ -78,6 +78,10 @@ from lib.filesystem_report_options import (  # pylint: disable=wrong-import-posi
     validate_integer_filter,
     validate_report_inputs,
 )
+from lib.elbencho_json_results import (  # pylint: disable=wrong-import-position
+    LatencyStats,
+    read_phase_results,
+)
 from lib.join_datestamps import (  # pylint: disable=wrong-import-position
     join_datestamps as join_datestamps_lib,
     join_datestamps_for_filename,
@@ -240,7 +244,7 @@ class AggregatedMetrics:
 
 # Regex pattern for mdtest-elbencho result files
 FILENAME_PATTERN = re.compile(
-    r"mdtest-elbencho-c_(\d+)-t_(\d+)_(\d{8}Z\d{6})_iter(\d+)\.(csv|out)"
+    r"mdtest-elbencho-c_(\d+)-t_(\d+)_(\d{8}Z\d{6})_iter(\d+)\.(csv|json|out)"
 )
 EXIT_INCOMPLETE = 3
 REQUIRED_OPERATIONS = ("WRITE", "STAT", "RMFILES")
@@ -366,9 +370,46 @@ def parse_csv_file(csv_path: str) -> Dict[str, Dict[str, Any]]:
     return result
 
 
+def parse_json_file(
+    json_path: str,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[float, int]], Optional[str]]:
+    """Parse an elbencho --jsonfile (3.4+) in one pass.
+
+    Returns what parse_csv_file and parse_out_file return for the same run,
+    plus the elbencho version. Raises OSError or ValueError when unreadable.
+    """
+    rows: Dict[str, Dict[str, Any]] = {}
+    histograms: Dict[str, Dict[float, int]] = {op: {} for op in REQUIRED_OPERATIONS}
+    version = None
+    for phase in read_phase_results(json_path):
+        op = phase.phase_type.upper()
+        if op not in REQUIRED_OPERATIONS:
+            continue
+        version = phase.version or version
+        latency = phase.entries_latency or LatencyStats()
+        bounds = (latency.min_us, latency.avg_us, latency.max_us)
+        rate = phase.first.entries_per_s
+        elapsed_ms = phase.last.elapsed_ms
+        rows[op] = {
+            "rate": rate or 0.0,
+            "elapsed_sec": (elapsed_ms or 0) / 1000,
+            "lat_min": (bounds[0] or 0.0) / 1_000_000,
+            "lat_avg": (bounds[1] or 0.0) / 1_000_000,
+            "lat_max": (bounds[2] or 0.0) / 1_000_000,
+            "command": phase.command,
+            "rate_valid": rate is not None,
+            "elapsed_valid": elapsed_ms is not None,
+            "lat_valid": None not in bounds,
+            "complete": None not in (rate, elapsed_ms) and bool(phase.command),
+        }
+        histograms[op] = dict(latency.histogram_us)
+    return rows, histograms, version
+
+
 def incomplete_result_reason(
     csv_data: Dict[str, Dict[str, Any]],
     out_data: Dict[str, Dict[float, int]],
+    sources: Tuple[str, str] = ("CSV", "OUT"),
 ) -> str:
     """Explain why a result pair is not yet safe to aggregate."""
     missing_csv = [op for op in REQUIRED_OPERATIONS if op not in csv_data]
@@ -381,11 +422,13 @@ def incomplete_result_reason(
 
     reasons = []
     if missing_csv:
-        reasons.append(f"missing CSV operations: {', '.join(missing_csv)}")
+        reasons.append(f"missing {sources[0]} operations: {', '.join(missing_csv)}")
     if partial_csv:
-        reasons.append(f"partial CSV operations: {', '.join(partial_csv)}")
+        reasons.append(f"partial {sources[0]} operations: {', '.join(partial_csv)}")
     if missing_histograms:
-        reasons.append(f"missing OUT histograms: {', '.join(missing_histograms)}")
+        reasons.append(
+            f"missing {sources[1]} histograms: {', '.join(missing_histograms)}"
+        )
     return "; ".join(reasons)
 
 
@@ -1743,12 +1786,23 @@ class _Slot:
 
 @dataclass
 class _IterationFiles:
-    """The result files of one iteration; either file may be missing."""
+    """The result files of one iteration; any file may be missing."""
 
     datestamp: str
     iteration: int
     csv_path: Optional[str] = None
     out_path: Optional[str] = None
+    json_path: Optional[str] = None
+
+
+@dataclass
+class _LoadedIteration:
+    """One iteration's parsed results and why it is not whole, if it is not."""
+
+    csv_data: Dict[str, Dict[str, Any]]
+    out_data: Dict[str, Dict[float, int]]
+    reasons: List[str]
+    elbencho_version: Optional[str] = None
 
 
 def _read_mdtest_ledger(input_dir: str, env: Dict[str, Any]) -> List[_Slot]:
@@ -1791,20 +1845,29 @@ def _scan_result_files(
         key = (int(match.group(1)), int(match.group(2)), iteration, match.group(3))
         files = by_iteration.setdefault(key, _IterationFiles(match.group(3), iteration))
         path = os.path.join(input_dir, filename)
-        if match.group(5) == "csv":
-            files.csv_path = path
-        else:
-            files.out_path = path
+        setattr(files, f"{match.group(5)}_path", path)
     grouped: Dict[Tuple[int, int], List[_IterationFiles]] = {}
     for key in sorted(by_iteration):
         grouped.setdefault((key[0], key[1]), []).append(by_iteration[key])
     return grouped
 
 
-def _load_iteration(
-    files: _IterationFiles,
-) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[float, int]], List[str]]:
-    """Parse whatever result files exist; return (csv, out, reasons it is not whole)."""
+def _load_json_iteration(json_path: str) -> _LoadedIteration:
+    """An elbencho 3.4+ iteration: its .json holds every result."""
+    try:
+        csv_data, out_data, version = parse_json_file(json_path)
+    except (OSError, ValueError) as error:
+        return _LoadedIteration({}, {}, [f"unparseable JSON file: {error}"])
+    incomplete = incomplete_result_reason(csv_data, out_data, ("JSON", "JSON"))
+    return _LoadedIteration(
+        csv_data, out_data, [incomplete] if incomplete else [], version
+    )
+
+
+def _load_iteration(files: _IterationFiles) -> _LoadedIteration:
+    """Parse whatever result files exist; the .json wins over .csv/.out."""
+    if files.json_path is not None:
+        return _load_json_iteration(files.json_path)
     reasons: List[str] = []
     csv_data: Dict[str, Dict[str, Any]] = {}
     out_data: Dict[str, Dict[float, int]] = {}
@@ -1826,7 +1889,7 @@ def _load_iteration(
         incomplete = incomplete_result_reason(csv_data, out_data)
         if incomplete:
             reasons.append(incomplete)
-    return csv_data, out_data, reasons
+    return _LoadedIteration(csv_data, out_data, reasons)
 
 
 def _iteration_phase(
@@ -1860,12 +1923,10 @@ def _iteration_phase(
 
 
 def _iteration_entry(
-    files: _IterationFiles,
-    csv_data: Dict[str, Dict[str, Any]],
-    out_data: Dict[str, Dict[float, int]],
-    reasons: List[str],
+    files: _IterationFiles, loaded: _LoadedIteration
 ) -> Dict[str, Any]:
     """The per-iteration JSON object."""
+    csv_data, out_data, reasons = loaded.csv_data, loaded.out_data, loaded.reasons
     phases = [
         phase
         for name, operation in _JSON_PHASES
@@ -1886,6 +1947,7 @@ def _iteration_entry(
         "producer_version": (
             recorded_result_version(files.out_path) if files.out_path else None
         ),
+        "elbencho_version": loaded.elbencho_version,
         "state": "incomplete" if reasons else "complete",
         "problems": problems,
         "phases": phases,
@@ -1968,6 +2030,7 @@ def _result_file_records(
             for files in files_list
             for path in (
                 files.csv_path,
+                files.json_path,
                 files.out_path,
                 files.out_path and files.out_path + VERSION_SUFFIX,
             )
@@ -1988,13 +2051,13 @@ def _execution_entry(
     iterations: List[Dict[str, Any]] = []
     metrics: List[IterationMetrics] = []
     for files in files_list:
-        csv_data, out_data, reasons = _load_iteration(files)
-        iterations.append(_iteration_entry(files, csv_data, out_data, reasons))
-        if not reasons:
+        loaded = _load_iteration(files)
+        iterations.append(_iteration_entry(files, loaded))
+        if not loaded.reasons:
             metrics.append(
                 metrics_from_parsed(
-                    csv_data,
-                    out_data,
+                    loaded.csv_data,
+                    loaded.out_data,
                     slot.nodes,
                     slot.tasks,
                     files.datestamp,
@@ -2028,6 +2091,14 @@ def _execution_entry(
         "dataset": None,
         "result_state": _result_state(iterations, missing, bool(files_list)),
         "problems": problems,
+        "elbencho_version": next(
+            (
+                item["elbencho_version"]
+                for item in iterations
+                if item["elbencho_version"]
+            ),
+            None,
+        ),
         "result_files": _result_file_records(files_list, input_dir),
         "results": results,
     }
@@ -2375,14 +2446,19 @@ def render_text_report(
 
 
 def _test_parse(test_parse: str) -> None:
-    base_path = test_parse.replace(".csv", "").replace(".out", "")
+    base_path = re.sub(r"\.(csv|json|out)$", "", test_parse)
     csv_path = base_path + ".csv"
     out_path = base_path + ".out"
+    json_path = base_path + ".json"
 
-    eprint(f"Testing parse of {csv_path} and {out_path}")
-
-    csv_data = parse_csv_file(csv_path)
-    eprint("\nCSV Data:")
+    if os.path.exists(json_path):
+        eprint(f"Testing parse of {json_path}")
+        csv_data, out_data, _ = parse_json_file(json_path)
+    else:
+        eprint(f"Testing parse of {csv_path} and {out_path}")
+        csv_data = parse_csv_file(csv_path)
+        out_data = parse_out_file(out_path)
+    eprint("\nResult Data:")
     for op, data in csv_data.items():
         eprint(
             f"  {op}: rate={data['rate']:.0f}, "
@@ -2390,8 +2466,7 @@ def _test_parse(test_parse: str) -> None:
             f"lat_avg={data['lat_avg']*1000:.3f}ms"
         )
 
-    out_data = parse_out_file(out_path)
-    eprint("\nOUT Data (histograms):")
+    eprint("\nHistograms:")
     for op, hist in out_data.items():
         if hist:
             eprint(f"  {op}: {len(hist)} buckets, total count={sum(hist.values())}")

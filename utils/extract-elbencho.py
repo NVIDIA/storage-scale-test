@@ -118,7 +118,15 @@ from lib.filesystem_coordinates import (
     phase_plan,
     plan_runs_phase,
 )
+from lib.elbencho_json_results import (
+    LatencyStats,
+    PhaseResult,
+    RateSpread,
+    ServiceGroup,
+    read_phase_results,
+)
 from lib.elbencho_live_results import LiveCSVError, LiveObjects, build_live_objects
+from lib import elbencho_services as services_lib
 from lib.elbencho_live_results import load_workers_tsv, null_live
 from lib.elbencho_live_results import (
     analyze_document_live,
@@ -319,6 +327,11 @@ class ElbenchoMetrics:
     raw_command: str = ""
     # Which of "1", "50", "75", "99" the .out "IO lat % us" line provided.
     lat_pct_found: FrozenSet[str] = frozenset()
+    # From a --jsonfile only (elbencho 3.4+); None for .csv/.out results.
+    # elbencho_version is config.version; services is the results-document
+    # "services" object (per-service elapsed, latency and rate spread).
+    elbencho_version: Optional[str] = None
+    services: Optional[Dict[str, Any]] = None
 
     # Optional sweep log annotations (from nv-elbencho-sweep / _elbencho_functions.sh .out text)
     write_only_data_dir: str = ""  # path from ELBENCHO_WRITE_ONLY_DATA_DIR=
@@ -334,7 +347,7 @@ class ElbenchoMetrics:
     treescan_max_bytes: int = 0
     treescan_first_file_bytes: int = 0  # when only first-file fallback line exists
 
-    # Directory of the .csv/.out pair; tells same-named runs apart across inputs.
+    # Directory of the result files; tells same-named runs apart across inputs.
     result_dir: str = "."
 
     # Single-file mode annotations (from .out log lines)
@@ -2057,7 +2070,7 @@ def _create_legend_label(
         return f"{size}, {io_depth}d {metric_type}"
 
 
-CSV_OUT_EXT_RE = r"\.(csv|out)$"
+RESULT_EXT_RE = r"\.(csv|json|out)$"
 
 # Metric configuration for different plot types
 METRIC_CONFIGS = {
@@ -2867,6 +2880,7 @@ def print_terminal_table(
                 )
                 print_sweep_auxiliary_lines_for_metrics(sub_metrics)
                 print_workload_metadata_for_metrics(sub_metrics)
+                print_elbencho_version_line(sub_metrics)
 
                 show_dur = any(
                     _metric_should_show_csv_phase_dur(m) for m in sub_metrics
@@ -3040,6 +3054,7 @@ def print_terminal_table(
                 # Print data rows
                 for row in rows:
                     print(row_format.format(*row))
+                print_service_spread_table(sub_metrics)
                 if live:
                     print_live_fairness_table(sub_metrics, live)
 
@@ -3049,7 +3064,7 @@ def print_terminal_table(
 def test_parse(base_filename: str) -> None:
     """Test the parse_elbencho_file function on a specific file."""
     # Strip any extension
-    base_filename = re.sub(CSV_OUT_EXT_RE, "", base_filename)
+    base_filename = re.sub(RESULT_EXT_RE, "", base_filename)
 
     metrics = parse_elbencho_files(base_filename)
     for metric in metrics:
@@ -3155,6 +3170,8 @@ class LiveReportOptions:
 
 
 LIVE_FAIRNESS_HEADING = "Live fairness"
+SERVICES_KEY = "_services"
+MIB_BYTES = 1024 * 1024
 NO_VALUE = "-"
 
 
@@ -3307,7 +3324,7 @@ def _latency_ms(value_us: Optional[float]) -> str:
 def _live_table_cells(steady: LiveFairness) -> List[str]:
     """Steady, Jain 5 s, Jain 30 s, slowest/median, slow clients, latency."""
     if not steady.window.available:
-        return ["none"] + [NO_VALUE] * 8
+        return ["none"] + [NO_VALUE] * 10
     window, summary_5s = steady.window, steady.summary(WINDOW_5S)
     counts, latency = steady.class_counts(), steady.latency
     total = sum(counts.values())
@@ -3324,8 +3341,29 @@ def _live_table_cells(steady: LiveFairness) -> List[str]:
         ),
         _latency_ms(latency.p50_us if latency else None),
         _latency_ms(latency.p90_us if latency else None),
+        _latency_ms(latency.max_us if latency and latency.max_per_io else None),
         _fmt(latency.max_over_p50 if latency else None, ".2f"),
+        _fmt(latency.client_ratio_max if latency else None, ".2f"),
     ]
+
+
+def _short_host(service: str) -> str:
+    """A service's display name: no port, and no domain unless an address."""
+    host = service.split(":", 1)[0]
+    first = host.split(".", 1)[0]
+    return host if first.isdigit() else first
+
+
+def _straggler_text(metric: ElbenchoMetrics) -> str:
+    """'host 2.4x': the client with the highest final p99 and its ratio to the
+    phase's overall p99; '-' without per-service results."""
+    found = services_lib.straggler_ratio(
+        metric.services, metric.lat_pct_99 * 1e6 if metric.lat_pct_99 else None
+    )
+    if found is None:
+        return NO_VALUE
+    host, _, ratio = found
+    return _short_host(host) + ("" if ratio is None else f" {ratio:.2f}x")
 
 
 def _live_table_columns(
@@ -3345,8 +3383,9 @@ def _live_table_columns(
         )
         for start, end in zip(starts, ends)
     ]
-    for index in (6, 7):
+    for index in (6, 7, 8, 10):
         columns[index] = align_decimal_points(columns[index])
+    columns.append([_straggler_text(metric) for metric in metrics])
     return [
         [str(metric.nodes) for metric in metrics],
         [str(metric.threads) for metric in metrics],
@@ -3371,6 +3410,138 @@ def _render_header_groups(
     return " | ".join(parts)
 
 
+def _spread_cells(services: Optional[dict], key: str, scale: float):
+    """(slowest, fastest, fastest/slowest) text cells of a rate spread."""
+    spread = services_lib.rate_spread(services, key)
+    if spread is None:
+        return [NO_VALUE] * 3
+    ratio = services_lib.spread_ratio(spread)
+
+    def cell(rate: Optional[float], host: Optional[str]) -> str:
+        if rate is None:
+            return NO_VALUE
+        text = format_with_sig_figs(rate / scale)
+        return f"{text} ({_short_host(host)})" if host else text
+
+    return [
+        cell(spread.get("min"), spread.get("min_host")),
+        cell(spread.get("max"), spread.get("max_host")),
+        NO_VALUE if ratio is None else f"{ratio:.2f}",
+    ]
+
+
+SERVICE_SPREAD_HEADING = "Per-service spread"
+
+
+def print_service_spread_table(metrics: Sequence[ElbenchoMetrics]) -> None:
+    """Print the slowest and fastest service rates of each row (from final
+    --svcstats minmax results; needs no live CSV), when any row has them."""
+    rows = [metric for metric in metrics if metric.services]
+    if not any(
+        services_lib.rate_spread(metric.services, key) is not None
+        for metric in rows
+        for key in ("ops_per_s", "bytes_per_s")
+    ):
+        return
+    headers = [
+        "Nodes",
+        "Thrds",
+        "IODep",
+        "Slowest ops/s",
+        "Fastest ops/s",
+        "fast/slow",
+        "Slowest MiB/s",
+        "Fastest MiB/s",
+        "fast/slow",
+    ]
+    table = []
+    for metric in metrics:
+        table.append(
+            [str(metric.nodes), str(metric.threads), str(metric.io_depth)]
+            + _spread_cells(metric.services, "ops_per_s", 1.0)
+            + _spread_cells(metric.services, "bytes_per_s", MIB_BYTES)
+        )
+    widths = [max(len(h), *(len(r[i]) for r in table)) for i, h in enumerate(headers)]
+    print(f"\n{SERVICE_SPREAD_HEADING} (slowest and fastest service, from --svcstats)")
+    print(
+        " | ".join(
+            h.ljust(w) if i < 3 else h.rjust(w)
+            for i, (h, w) in enumerate(zip(headers, widths))
+        )
+    )
+    print("-" * (sum(widths) + 3 * (len(widths) - 1)))
+    for row in table:
+        print(
+            " | ".join(
+                v.ljust(w) if i < 3 else v.rjust(w)
+                for i, (v, w) in enumerate(zip(row, widths))
+            )
+        )
+
+
+def print_elbencho_version_line(metrics: Sequence[ElbenchoMetrics]) -> None:
+    """Echo the elbencho version(s) that produced a table's rows."""
+    versions = sorted({m.elbencho_version for m in metrics if m.elbencho_version})
+    if versions:
+        print(f"Elbencho version: {', '.join(versions)}")
+
+
+# Display-column indexes of the elbencho 3.4 live table columns, which are
+# omitted when every row is empty.
+_LIVE_MAX_MS = 10
+_NEW_LIVE_COLUMNS = (_LIVE_MAX_MS, 12, 13)
+
+
+def _live_table_spec(window_5s: str, window_30s: str) -> List[Tuple[str, str]]:
+    """(top group label, column label) of every live table column."""
+    return [
+        ("", "Nodes"),
+        ("", "Thrds"),
+        ("", "IODep"),
+        ("Steady", "window (s)"),
+        ("Jain p50/min", window_5s),
+        ("Jain p50/min", window_30s),
+        ("Slowest/med", f"p10, {window_5s}"),
+        ("Slow clients", "pers+trans"),
+        ("Interval mean latency", "p50 (ms)"),
+        ("Interval mean latency", "p90 (ms)"),
+        ("Max latency", "ms"),
+        ("Max latency", "max/p50"),
+        ("Client lat", "worst/med"),
+        ("Highest p99 client", "name, x fleet p99"),
+    ]
+
+
+def _group_spans(names: Sequence[str]) -> List[Tuple[str, int]]:
+    """Top labels with the span of each run of equal non-empty names."""
+    groups: List[Tuple[str, int]] = []
+    for name in names:
+        if name and groups and groups[-1][0] == name:
+            groups[-1] = (name, groups[-1][1] + 1)
+        else:
+            groups.append((name, 1))
+    return groups
+
+
+def _live_caption(interval: str, keep: Sequence[int]) -> str:
+    """The table caption, describing only the columns shown."""
+    if not any(index in keep for index in _NEW_LIVE_COLUMNS):
+        return (
+            f"latency is the mean of each {interval} interval, not a per-I/O percentile"
+        )
+    caption = (
+        f"p50 and p90 are means of each {interval} interval, not per-I/O percentiles"
+    )
+    if _LIVE_MAX_MS in keep:
+        caption += (
+            "; max is the largest single I/O, or for older elbencho the "
+            "largest interval mean"
+        )
+    if _NEW_LIVE_COLUMNS[2] in keep:
+        caption += "; the p99 client is from the final results"
+    return caption
+
+
 def print_live_fairness_table(
     metrics: Sequence[ElbenchoMetrics],
     live: Dict[LiveRowKey, LiveFairness],
@@ -3387,30 +3558,28 @@ def print_live_fairness_table(
     steadies = [steady for _, steady in rows]
     window_5s = _window_label(steadies, WINDOW_5S, "5s")
     interval = _seconds_label({steady.interval_ms for steady in steadies}, "live")
-    groups = [
-        ("", 1),
-        ("", 1),
-        ("", 1),
-        ("Steady", 1),
-        ("Jain p50/min", 2),
-        ("Slowest/med", 1),
-        ("Slow clients", 1),
-        ("Interval mean latency", 3),
-    ]
-    labels = [
-        "Nodes",
-        "Thrds",
-        "IODep",
-        "window (s)",
-        window_5s,
-        _window_label(steadies, WINDOW_30S, "30s"),
-        f"p10, {window_5s}",
-        "pers+trans",
-        "p50 (ms)",
-        "p90 (ms)",
-        "max/p50",
-    ]
     columns = _live_table_columns(row_metrics, steadies)
+    spec = _live_table_spec(window_5s, _window_label(steadies, WINDOW_30S, "30s"))
+    # elbencho 3.4 columns are shown only when some row has a value.
+    keep = [
+        index
+        for index in range(len(columns))
+        if index not in _NEW_LIVE_COLUMNS
+        or any(value.strip() != NO_VALUE for value in columns[index])
+    ]
+    columns = [columns[index] for index in keep]
+    spec = [spec[index] for index in keep]
+    if _LIVE_MAX_MS not in keep:
+        spec = [
+            (
+                ("Interval mean latency", label)
+                if group == "Max latency"
+                else (group, label)
+            )
+            for group, label in spec
+        ]
+    groups = _group_spans([group for group, _ in spec])
+    labels = [label for _, label in spec]
     widths = [
         max(len(label), *(len(value) for value in column))
         for label, column in zip(labels, columns)
@@ -3427,8 +3596,9 @@ def print_live_fairness_table(
         )
         span_start = span_end
     print(
-        f"\n{LIVE_FAIRNESS_HEADING} (steady window only; latency is the mean "
-        f"of each {interval} interval, not a per-I/O percentile)"
+        f"\n{LIVE_FAIRNESS_HEADING} (steady window only; "
+        + _live_caption(interval, keep)
+        + ")"
     )
     print(_render_header_groups(groups, widths))
     print(_render_header_groups([(label, 1) for label in labels], widths))
@@ -3452,6 +3622,7 @@ def _report_live_domain(  # pylint: disable=too-many-arguments,too-many-position
     steady: SteadyAnalysis,
     output_dir: str,
     options: LiveReportOptions,
+    services: Optional[dict] = None,
 ) -> None:
     """Generate aggregate, fairness and optional client reports for one domain."""
     aggregate_path = plot_aggregate_timeseries(metadata, domain, steady, output_dir)
@@ -3468,7 +3639,7 @@ def _report_live_domain(  # pylint: disable=too-many-arguments,too-many-position
         )
         eprint(f"Live CSV diagnostics for {domain_key.label}: {diagnostics}")
     _report_live_client_domain(
-        analysis, metadata, domain_key, domain, steady, output_dir, options
+        analysis, metadata, domain_key, domain, steady, output_dir, options, services
     )
 
 
@@ -3491,6 +3662,7 @@ def _report_live_client_domain(  # pylint: disable=too-many-arguments,too-many-p
     steady: SteadyAnalysis,
     output_dir: str,
     options: LiveReportOptions,
+    services: Optional[dict] = None,
 ) -> None:
     """Generate bounded-detail client reports for one extended live domain."""
     if not domain.has_extended_rows:
@@ -3499,7 +3671,9 @@ def _report_live_client_domain(  # pylint: disable=too-many-arguments,too-many-p
             f"{domain_key.label}; skipping per-client reports"
         )
         return
-    summary_paths = write_client_summaries(metadata, domain, steady, output_dir)
+    summary_paths = write_client_summaries(
+        metadata, domain, steady, output_dir, services
+    )
     eprint(f"Generated live client summaries: {', '.join(summary_paths)}")
     timeseries_clients = classified_clients(steady, options.max_timeseries_lines)
     heatmap_clients = select_heatmap_rows(steady, options.max_heatmap_rows)
@@ -3622,6 +3796,7 @@ def _elbencho_dedupe_latest_operation_metrics(
 def add_elbencho_out_file_metrics(
     out_file: str,
     metrics: List[ElbenchoMetrics],
+    latency_from_out: bool = True,
 ) -> None:
     """Parse an elbencho .out file, extract histogram and percentile data,
        and add them to the given metrics.
@@ -3629,6 +3804,8 @@ def add_elbencho_out_file_metrics(
     Args:
         out_file: Path to the .out file
         metrics: List of ElbenchoMetrics objects to which we add data
+        latency_from_out: False when a --jsonfile supplied the latency
+            percentiles and histogram; only the sweep log lines are read.
     """
 
     # Read the file
@@ -3643,6 +3820,8 @@ def add_elbencho_out_file_metrics(
                 metric.io_duration_sec = sweep_secs
 
     apply_sweep_auxiliary_log_lines(content, metrics)
+    if not latency_from_out:
+        return
 
     # Parse the output file for each operation (last section wins on resume append)
     for metric in metrics:
@@ -3941,9 +4120,16 @@ def parse_elbencho_csv_file(
         eprint(f"Error parsing CSV file {csv_file}: {e}")
         traceback.print_exc()
 
+    return _latest_attempt_with_file_sizes(metrics, "CSV")
+
+
+def _latest_attempt_with_file_sizes(
+    metrics: List[ElbenchoMetrics], source: str
+) -> List[ElbenchoMetrics]:
+    """Give a READ without a file size the WRITE's; keep the latest attempt."""
     non_zero_sizes = {m.file_size_bytes for m in metrics if m.file_size_bytes > 0}
     if len(non_zero_sizes) > 1:
-        raise ValueError("Multiple non-zero file sizes found in CSV file")
+        raise ValueError(f"Multiple non-zero file sizes found in {source} file")
     write_file_size = non_zero_sizes.pop() if non_zero_sizes else 0
 
     for metric in metrics:
@@ -3953,8 +4139,107 @@ def parse_elbencho_csv_file(
     return _elbencho_dedupe_latest_operation_metrics(metrics)
 
 
+def _us_to_sec(value_us: Optional[float]) -> float:
+    return (value_us or 0.0) / 1_000_000
+
+
+def _mib_s(bytes_per_s: Optional[float]) -> Optional[float]:
+    return None if bytes_per_s is None else bytes_per_s / 1048576
+
+
+def _apply_json_latency_detail(metric: ElbenchoMetrics, latency: LatencyStats) -> None:
+    """Percentiles and histogram, as the .out "IO lat % us"/"IO lat hist" give."""
+    found = set()
+    for name, _ in PERCENTILE_FIELDS:
+        value = latency.percentiles_us.get(name)
+        if value is not None:
+            setattr(metric, f"lat_pct_{name}", value / 1_000_000)
+            found.add(name)
+    metric.lat_pct_found = frozenset(found)
+    metric.histogram = {
+        bucket_us / 1_000_000: count
+        for bucket_us, count in latency.histogram_us.items()
+    }
+
+
+def _json_phase_metric(
+    phase: PhaseResult, filename_params: Dict[str, Any]
+) -> Optional[ElbenchoMetrics]:
+    """One READ/WRITE --jsonfile phase as metrics; the CSV row reader's twin."""
+    operation = phase.phase_type.upper()
+    if operation not in ("READ", "WRITE"):
+        return None
+    first, last = phase.first, phase.last
+    latency = phase.io_latency or LatencyStats()
+    throughput_mib_s = _mib_s(first.bytes_per_s) or 0.0
+    lat_sec = [_us_to_sec(v) for v in (latency.min_us, latency.avg_us, latency.max_us)]
+    if not _elbencho_csv_row_has_numeric_metrics(
+        first.iops or 0.0, throughput_mib_s, *lat_sec
+    ):
+        return None
+    command = strip_hosts_from_command(phase.command)
+    metric = ElbenchoMetrics(
+        io_size=filename_params["io_size"],
+        nodes=filename_params["nodes"],
+        threads=filename_params["threads"],
+        io_depth=filename_params["io_depth"],
+        operation=operation,
+        datestamp=filename_params["datestamp"],
+        is_multi_node=False,
+        iops=first.iops or 0.0,
+        throughput_mib_s=throughput_mib_s,
+        throughput_mb_s=normalize_throughput_to_mb(throughput_mib_s),
+        throughput_gbps=mib_to_gbps(throughput_mib_s),
+        min_lat_sec=lat_sec[0],
+        avg_lat_sec=lat_sec[1],
+        max_lat_sec=lat_sec[2],
+        lat_pct_1=0,
+        lat_pct_50=0,
+        lat_pct_75=0,
+        lat_pct_99=0,
+        direct_io=int(bool(phase.direct_io)),
+        random_io=int(bool(phase.random_offsets)),
+        command=command,
+        file_size_bytes=phase.file_size or 0,
+        io_duration_sec=parse_timelimit_seconds_from_command(command),
+        phase_wall_duration_ms=last.elapsed_ms or 0,
+        phase_first_duration_ms=first.elapsed_ms or 0,
+        time_ms_first=first.elapsed_ms,
+        time_ms_last=last.elapsed_ms,
+        iops_first=first.iops,
+        throughput_mib_s_first=_mib_s(first.bytes_per_s),
+        iops_last=last.iops,
+        throughput_mib_s_last=_mib_s(last.bytes_per_s),
+        raw_command=phase.command,
+        elbencho_version=phase.version or None,
+        services=services_object(phase.services),
+    )
+    _apply_json_latency_detail(metric, latency)
+    return metric
+
+
+def parse_elbencho_json_file(
+    json_file: str, filename_params: Dict[str, Any]
+) -> List[ElbenchoMetrics]:
+    """Parse an elbencho --jsonfile (3.4+): rates, latency, percentiles,
+    histogram and per-service results in one pass.
+
+    Raises OSError or ValueError when the file cannot be read or decoded.
+    """
+    metrics = [
+        metric
+        for phase in read_phase_results(json_file)
+        if (metric := _json_phase_metric(phase, filename_params)) is not None
+    ]
+    return _latest_attempt_with_file_sizes(metrics, "JSON")
+
+
 def parse_elbencho_files(base_filename: str) -> List[ElbenchoMetrics]:
-    """Parse a .csv and .out pair of elbencho output files and extract metrics.
+    """Parse one run's elbencho output files and extract metrics.
+
+    A .json (elbencho 3.4+ --jsonfile) supplies every result; the .out then
+    adds only the sweep log lines. Without a .json (older results), the .csv
+    supplies the rates and the .out the percentiles and histogram.
 
     Args:
         base_filename: Base path of the elbencho output files (without
@@ -3963,13 +4248,13 @@ def parse_elbencho_files(base_filename: str) -> List[ElbenchoMetrics]:
     Returns:
         List of ElbenchoMetrics objects
     """
-    # Both files must exists
     out_file = f"{base_filename}.out"
-    csv_file = f"{base_filename}.csv"
+    use_json = os.path.exists(f"{base_filename}.json")
+    data_file = f"{base_filename}.json" if use_json else f"{base_filename}.csv"
 
-    if not os.path.exists(out_file) or not os.path.exists(csv_file):
+    if not os.path.exists(out_file) or not os.path.exists(data_file):
         raise FileNotFoundError(
-            f"One or both required files missing: {out_file} or {csv_file}"
+            f"One or both required files missing: {out_file} or {data_file}"
         )
 
     # Get the directory and base name for extracting info from filename
@@ -3982,28 +4267,26 @@ def parse_elbencho_files(base_filename: str) -> List[ElbenchoMetrics]:
             "Cannot parse benchmark parameters from " f"filename: {basename}"
         )
 
-    # Extract metrics primarily from the .csv file if it exists
-    # This will include all metrics except histogram and percentile data
     metrics = []
-    if os.path.exists(csv_file):
-        try:
-            metrics = parse_elbencho_csv_file(csv_file, filename_params)
-            eprint(f"Extracted base metrics from {csv_file}")
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            eprint(f"Error parsing {csv_file}: {e}")
-            traceback.print_exc()
+    parse_data_file = parse_elbencho_json_file if use_json else parse_elbencho_csv_file
+    try:
+        metrics = parse_data_file(data_file, filename_params)
+        eprint(f"Extracted base metrics from {data_file}")
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        eprint(f"Error parsing {data_file}: {e}")
+        traceback.print_exc()
 
-    # If we found no CSV metrics, we can't proceed
+    # If we found no metrics, we can't proceed
     if not metrics:
         eprint(
-            f"Warning: No valid metrics found in {csv_file}. Check if file exists and has correct format."
+            f"Warning: No valid metrics found in {data_file}. Check if file exists and has correct format."
         )
         return []
 
-    # Extract histogram and percentile data and add them to our write/read metrics
+    # Add the sweep log lines and, without a .json, histogram and percentiles
     try:
-        add_elbencho_out_file_metrics(out_file, metrics)
-        eprint(f"Extracted histogram and percentile data from {out_file}")
+        add_elbencho_out_file_metrics(out_file, metrics, latency_from_out=not use_json)
+        eprint(f"Extracted sweep annotations and latency data from {out_file}")
     except Exception as e:  # pylint: disable=broad-exception-caught
         eprint(f"Error parsing {out_file}: {e}")
         traceback.print_exc()
@@ -4034,7 +4317,7 @@ LIVE_UNREADABLE = "unreadable"
 LIVE_SUFFIX = ".live.csv"
 LIVE_LEVEL_NONE = "none"
 LIVE_LEVEL_FULL = "full"
-RESULT_EXTENSIONS = (".csv", ".out", ".out" + VERSION_SUFFIX, LIVE_SUFFIX)
+RESULT_EXTENSIONS = (".csv", ".json", ".out", ".out" + VERSION_SUFFIX, LIVE_SUFFIX)
 RESULTS_LIVE_DIRNAME = "results.live"
 RESULTS_DEFAULT_FILENAME = "results.json"
 EXIT_INCOMPLETE = 3
@@ -4254,8 +4537,53 @@ def _latency_object(metric: ElbenchoMetrics) -> dict:
     return latency
 
 
+def _service_latency(stats: Optional[LatencyStats]) -> Optional[dict]:
+    if stats is None:
+        return None
+    latency = {
+        "min": results_json.round_latency_us(stats.min_us),
+        "avg": results_json.round_latency_us(stats.avg_us),
+        "max": results_json.round_latency_us(stats.max_us),
+    }
+    for name, label in PERCENTILE_FIELDS:
+        latency[label] = results_json.round_latency_us(stats.percentiles_us.get(name))
+    return latency
+
+
+def _rate_spread(spread: Optional[RateSpread], rounder) -> Optional[dict]:
+    if spread is None:
+        return None
+    return {
+        "min": rounder(spread.min),
+        "avg": rounder(spread.avg),
+        "max": rounder(spread.max),
+        "min_host": spread.min_host,
+        "max_host": spread.max_host,
+    }
+
+
+def services_object(group: Optional[ServiceGroup]) -> Optional[dict]:
+    """The results-document "services" object of one phase (None without
+    --svcstats data): per-service completion time and IO latency, and the
+    per-service ops/s and bytes/s spread."""
+    if group is None:
+        return None
+    return {
+        "instances": [
+            {
+                "host": service.host,
+                "elapsed_ms": service.elapsed_ms,
+                "latency_us": _service_latency(service.io_latency),
+            }
+            for service in group.instances
+        ],
+        "ops_per_s": _rate_spread(group.iops, results_json.round_ops),
+        "bytes_per_s": _rate_spread(group.bytes_per_s, results_json.round_bytes_per_s),
+    }
+
+
 def _metric_phase(metric: ElbenchoMetrics, metadata: Optional[Dict[str, str]]) -> dict:
-    """Encode one elbencho CSV/.out phase (the live value is filled later)."""
+    """Encode one elbencho result phase (the live value is filled later)."""
     phase = metric.operation.lower()
     return {
         "phase": phase,
@@ -4276,6 +4604,7 @@ def _metric_phase(metric: ElbenchoMetrics, metadata: Optional[Dict[str, str]]) -
         "file_size_bytes": metric.file_size_bytes or None,
         "configured_time_limit_s": metric.io_duration_sec or None,
         "command": results_json.command_argv(metric.raw_command or metric.command),
+        "services": metric.services,
         "live": None,
     }
 
@@ -4487,6 +4816,7 @@ def _execution_entry(
         "coordinate_key": key,
         "dataset": _dataset_object(ledger, data.env, metadata, metrics),
         "producer_version": None,
+        "elbencho_version": None,
         "result_state": STATE_MISSING,
         "problems": [],
         "result_files": [],
@@ -4511,6 +4841,10 @@ def _execution_entry(
         ]
         return entry
     entry["producer_version"] = recorded_result_version(base_filename + ".out")
+    entry["elbencho_version"] = next(
+        (metric.elbencho_version for metric in metrics if metric.elbencho_version),
+        None,
+    )
     entry["results"], entry["problems"] = _results_object(
         ledger, (base_filename, metrics), metadata, data
     )
@@ -4946,7 +5280,7 @@ def _execution_datestamp(execution: dict) -> str:
     if datestamp is not None:
         return datestamp
     for record in execution.get("result_files") or []:
-        name = re.sub(CSV_OUT_EXT_RE, "", os.path.basename(record["path"]))
+        name = re.sub(RESULT_EXT_RE, "", os.path.basename(record["path"]))
         params = parse_benchmark_filename(name)
         if params is not None:
             return params["datestamp"]
@@ -5017,6 +5351,8 @@ def _phase_metric(
             bucket / 1e6: count
             for bucket, count in zip(histogram["buckets_us"], histogram["counts"])
         },
+        elbencho_version=execution.get("elbencho_version"),
+        services=phase.get("services"),
     )
 
 
@@ -5114,8 +5450,10 @@ def _group_metric_rows(
 
 def _execution_lives(results: dict) -> List[dict]:
     """Every analyzed live domain of one execution."""
+    # The phase's final per-service results ride along under SERVICES_KEY so
+    # the client summaries can join them to each client.
     attached = [
-        phase["live"]
+        {**phase["live"], SERVICES_KEY: phase.get("services")}
         for phase in results["phases"]
         if isinstance(phase.get("live"), dict) and "domain" in phase["live"]
     ]
@@ -5332,7 +5670,14 @@ def _render_live_domain(
         options.min_slow_windows,
     )
     _report_live_domain(
-        analysis, metadata, domain.key, domain, steady, output_dir, options
+        analysis,
+        metadata,
+        domain.key,
+        domain,
+        steady,
+        output_dir,
+        options,
+        live.get(SERVICES_KEY),
     )
     return LiveFairness.of(steady)
 
@@ -5502,13 +5847,13 @@ def _render_request(
 
 
 def discover_result_bases(input_dir: str) -> List[str]:
-    """Base filenames (without .csv/.out) of the benchmark result pairs."""
+    """Base filenames (without extension) of the benchmark results."""
     bases = set()
-    for ext in ("csv", "out"):
+    for ext in ("csv", "json", "out"):
         for filepath in glob.glob(os.path.join(input_dir, f"*.{ext}")):
-            name = re.sub(CSV_OUT_EXT_RE, "", os.path.basename(filepath))
+            name = re.sub(RESULT_EXT_RE, "", os.path.basename(filepath))
             if parse_benchmark_filename(name):
-                bases.add(re.sub(CSV_OUT_EXT_RE, "", filepath))
+                bases.add(re.sub(RESULT_EXT_RE, "", filepath))
     eprint(f"Found {len(bases)} unique benchmark file pairs in {input_dir}")
     return sorted(bases)
 

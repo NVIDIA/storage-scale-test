@@ -50,7 +50,8 @@ def discover_result_pairs(
     extension_group: int,
     warn: Callable[[str], Any],
 ) -> dict[_ResultKey, tuple[str, str]]:
-    """Find pairs within each directory and reject ambiguous logical keys."""
+    """Find (.json or .csv, .out) pairs within each directory and reject
+    ambiguous logical keys."""
     file_pairs: dict[tuple[str, _ResultKey], dict[str, str]] = {}
     duplicate_artifacts: set[tuple[str, _ResultKey]] = set()
 
@@ -82,20 +83,22 @@ def discover_result_pairs(
         if source_key in duplicate_artifacts:
             continue
         _, key = source_key
-        if "csv" in paths and "out" in paths:
+        # elbencho 3.4+ results carry a .json; older ones a .csv.
+        data = paths.get("json") or paths.get("csv")
+        if data and "out" in paths:
             if key in result:
                 warn(
                     f"Warning: Duplicate result pair for {key!r} in "
                     f"{os.path.dirname(result[key][0])} and "
-                    f"{os.path.dirname(paths['csv'])}; skipping both"
+                    f"{os.path.dirname(data)}; skipping both"
                 )
                 ambiguous.add(key)
             else:
-                result[key] = (paths["csv"], paths["out"])
-        elif "csv" in paths:
-            warn(f"Warning: Missing .out file for {paths['csv']}")
+                result[key] = (data, paths["out"])
+        elif data:
+            warn(f"Warning: Missing .out file for {data}")
         elif "out" in paths:
-            warn(f"Warning: Missing .csv file for {paths['out']}")
+            warn(f"Warning: Missing .json or .csv file for {paths['out']}")
     for key in ambiguous:
         del result[key]
     return result

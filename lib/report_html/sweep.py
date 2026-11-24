@@ -23,8 +23,9 @@ phase. Throughput is elbencho's ``[first]`` aggregate, as in the text report.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Sequence
 
+from lib import elbencho_services as services_lib
 from lib.report_html import model
 from lib.report_html.common import (
     CATEGORY,
@@ -37,11 +38,15 @@ from lib.report_html.common import (
     IO_PHASES,
     K_COORDS,
     K_DEPTH,
+    K_MIX,
     K_NODES,
+    K_OCCURRENCE,
+    K_PHASE,
     K_THREADS,
     LATENCY_MS,
     LOG,
     MAX,
+    MB,
     MIN,
     MS_PER_S,
     NO_VALUE,
@@ -584,8 +589,50 @@ _RESULT_COLUMNS = (
     Column("p75 ms", extra=True, digits=3),
     Column("p99 ms", best=MIN, digits=3),
     Column("duration s", extra=True, digits=3),
+    # Per-service spread (elbencho 3.4 --svcstats minmax); n/a before 3.4.
+    Column("slowest host MB/s", extra=True),
+    Column("fastest host MB/s", extra=True),
+    Column("fastest ÷ slowest host", digits=3),
+    Column("slowest host ops/s", extra=True),
+    Column("fastest host ops/s", extra=True),
     Column(_RUN, numeric=False, extra=True),
 )
+_SPREAD_LABELS = (
+    "slowest host MB/s",
+    "fastest host MB/s",
+    "fastest ÷ slowest host",
+    "slowest host ops/s",
+    "fastest host ops/s",
+)
+
+
+def _spread_cells(data: dict) -> list:
+    """Slowest and fastest service rates, their ratio, and slowest and fastest
+    ops/s; n/a without per-service results (before elbencho 3.4)."""
+    services = data.get("services")
+    bytes_spread = services_lib.rate_spread(services, "bytes_per_s") or {}
+    ops_spread = services_lib.rate_spread(services, "ops_per_s") or {}
+    ratio = services_lib.spread_ratio(bytes_spread) or services_lib.spread_ratio(
+        ops_spread
+    )
+    return [
+        sig(scaled(bytes_spread.get("min"), MB)),
+        sig(scaled(bytes_spread.get("max"), MB)),
+        sig(ratio, 3),
+        sig(ops_spread.get("min")),
+        sig(ops_spread.get("max")),
+    ]
+
+
+def _drop_empty_columns(table: Table, labels: Sequence[str]) -> Table:
+    """Drop the named columns when no row has a value (pre-3.4 results)."""
+    for label in labels:
+        index = next((i for i, c in enumerate(table.columns) if c.label == label), None)
+        if index is not None and all(
+            row[index] in (None, NO_VALUE) for row in table.rows
+        ):
+            drop_column(table.columns, table.rows, label)
+    return table
 
 
 def _run_cell(sweep: _Sweep, execution: dict):
@@ -620,6 +667,7 @@ def _result_row(sweep: _Sweep, execution: dict, data: dict) -> list:
         ms("p75"),
         ms(P99_KEY),
         sig(scaled(first.get("elapsed_ms"), MS_PER_S), 3),
+        *_spread_cells(data),
         _run_cell(sweep, execution),
     ]
 
@@ -637,13 +685,17 @@ def results_tables(sweep: _Sweep) -> list[Table]:
             tables.append(
                 _without_fixed_nodes(
                     sweep,
-                    Table(
-                        model.RESULTS_TABLE,
-                        f"{sweep.anchor}-{model.RESULTS_TABLE}-{phase}",
-                        f"{phase.capitalize()} results per configuration — "
-                        f"{sweep.title}. {_BEST_NOTE}",
-                        list(_RESULT_COLUMNS),
-                        rows,
+                    _drop_empty_columns(
+                        Table(
+                            model.RESULTS_TABLE,
+                            f"{sweep.anchor}-{model.RESULTS_TABLE}-{phase}",
+                            f"{phase.capitalize()} results per configuration — "
+                            f"{sweep.title}. {_BEST_NOTE} Host columns: "
+                            "slowest and fastest service (--svcstats minmax).",
+                            list(_RESULT_COLUMNS),
+                            rows,
+                        ),
+                        _SPREAD_LABELS,
                     ),
                 )
             )
@@ -671,13 +723,24 @@ _FAIRNESS_COLUMNS = (
     Column("slow clients", numeric=False),
     Column("lat p50 ms", digits=3),
     Column("lat p90 ms", extra=True, digits=3),
+    Column("lat max ms", digits=3),
     Column("lat max ÷ p50", digits=3),
+    Column("worst client ÷ median lat", digits=3),
+    Column("highest-p99 client", numeric=False),
+    Column("its p99 ÷ fleet p99", digits=3),
     Column(_RUN, numeric=False, extra=True),
+)
+_FAIRNESS_NEW = (
+    "lat max ms",
+    "worst client ÷ median lat",
+    "highest-p99 client",
+    "its p99 ÷ fleet p99",
 )
 
 
-# Columns measured over the steady window: "Jain p50 5 s" to "lat max ÷ p50".
-_STEADY_METRICS = 9
+# Columns measured over the steady window: "Jain p50 5 s" to "lat max ÷ p50"
+# and "worst client ÷ median lat".
+_STEADY_METRICS = 11
 
 
 def _steady_text(live: dict) -> str:
@@ -696,6 +759,30 @@ def _slow_text(live: dict) -> str:
     return f"{persistent}+{transient} of {live.get('clients') or 0}"
 
 
+def _straggler_cells(execution: dict, domain: dict) -> list:
+    """Highest final-p99 client and its ratio to the phase's p99 (the phase's
+    per-service results; plain domains only), n/a without them."""
+    if domain.get(K_MIX) or domain.get(K_OCCURRENCE):
+        return [None, None]
+    phase = phase_of(execution, str(domain.get(K_PHASE))) or {}
+    fleet = (phase.get("latency_us") or {}).get(P99_KEY)
+    found = services_lib.straggler_ratio(phase.get("services"), fleet)
+    if found is None:
+        return [None, None]
+    return [found[0], sig(found[2], 3)]
+
+
+def _per_io_max_ms(live: dict):
+    """The largest single IO's latency (ms), only for elbencho 3.4 domains.
+
+    Older domains' ``latency.max_us`` is the largest interval mean, a
+    different quantity, so their cell stays empty."""
+    per_io = (live.get("aggregate_series") or {}).get("io_latency_max_us") or []
+    if all(value is None for value in per_io):
+        return None
+    return sig(scaled((live.get("latency") or {}).get("max_us"), US_PER_MS), 3)
+
+
 def _fairness_row(sweep: _Sweep, execution: dict, domain: dict) -> list:
     coords = execution[K_COORDS]
     live = domain["live"]
@@ -706,27 +793,33 @@ def _fairness_row(sweep: _Sweep, execution: dict, domain: dict) -> list:
         live.get("clients"),
         _steady_text(live),
     ]
+    tail = [*_straggler_cells(execution, domain), _run_cell(sweep, execution)]
     if steady_span(live) is None:
-        # Everything between is measured over the steady window.
-        return head + [NO_VALUE] * _STEADY_METRICS + [_run_cell(sweep, execution)]
+        # Everything measured over the steady window is n/a.
+        return head + [NO_VALUE] * _STEADY_METRICS + tail
     windows = live.get("fairness") or {}
     latency = live.get("latency") or {}
 
     def jain(window, key):
         return sig(((windows.get(window) or {}).get("jain") or {}).get(key), 4)
 
-    return head + [
-        jain("5s", P50_KEY),
-        jain("5s", MIN),
-        jain("30s", P50_KEY),
-        jain("30s", MIN),
-        sig((windows.get("5s") or {}).get("min_over_median_p10"), 3),
-        _slow_text(live),
-        sig(scaled(latency.get("p50_us"), US_PER_MS), 3),
-        sig(scaled(latency.get("p90_us"), US_PER_MS), 3),
-        sig(latency.get("max_over_p50"), 3),
-        _run_cell(sweep, execution),
-    ]
+    return (
+        head
+        + [
+            jain("5s", P50_KEY),
+            jain("5s", MIN),
+            jain("30s", P50_KEY),
+            jain("30s", MIN),
+            sig((windows.get("5s") or {}).get("min_over_median_p10"), 3),
+            _slow_text(live),
+            sig(scaled(latency.get("p50_us"), US_PER_MS), 3),
+            sig(scaled(latency.get("p90_us"), US_PER_MS), 3),
+            _per_io_max_ms(live),
+            sig(latency.get("max_over_p50"), 3),
+            sig(latency.get("client_ratio_max"), 3),
+        ]
+        + tail
+    )
 
 
 def fairness_tables(sweep: _Sweep) -> list[Table]:
@@ -742,14 +835,20 @@ def fairness_tables(sweep: _Sweep) -> list[Table]:
     return [
         _without_fixed_nodes(
             sweep,
-            Table(
-                model.FAIRNESS_TABLE,
-                f"{sweep.anchor}-{model.FAIRNESS_TABLE}-{slug(label)}",
-                f"{label.capitalize()} live fairness, steady window only — "
-                f"{sweep.title}. Latency is the fleet mean per interval, not a "
-                "per-IO percentile.",
-                list(_FAIRNESS_COLUMNS),
-                domain_rows,
+            _drop_empty_columns(
+                Table(
+                    model.FAIRNESS_TABLE,
+                    f"{sweep.anchor}-{model.FAIRNESS_TABLE}-{slug(label)}",
+                    f"{label.capitalize()} live fairness, steady window only — "
+                    f"{sweep.title}. Latency columns are the fleet mean per interval, "
+                    "not a per-IO percentile. lat max ms is the largest single IO and is shown "
+                    "only for elbencho 3.4 runs; lat max ÷ p50 is the largest single IO "
+                    "(3.4) or the largest interval mean (older) over p50; the client with "
+                    "the highest p99 is from the final per-service results.",
+                    list(_FAIRNESS_COLUMNS),
+                    domain_rows,
+                ),
+                _FAIRNESS_NEW,
             ),
         )
         for label, domain_rows in sorted(rows.items(), key=lambda item: order[item[0]])

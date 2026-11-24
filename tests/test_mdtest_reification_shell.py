@@ -101,7 +101,7 @@ class TestMdtestReification(unittest.TestCase):
                     for arg in "$@"; do
                         case "$arg" in
                             --resfile=*) printf 'result\\n' >> "${{arg#--resfile=}}" ;;
-                            --csvfile=*) printf 'result\\n' >> "${{arg#--csvfile=}}" ;;
+                            --jsonfile=*) printf 'result\\n' >> "${{arg#--jsonfile=}}" ;;
                         esac
                     done
                 }}
@@ -120,7 +120,8 @@ class TestMdtestReification(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             output = Path(temp_dir) / "mdtest-elbencho-20260929Z120000"
-            for suffix in ("csv", "out"):
+            self.assertEqual(sorted(output.glob("*.csv")), [])
+            for suffix in ("json", "out"):
                 artifacts = sorted(output.glob(f"*.{suffix}"))
                 self.assertEqual(len(artifacts), 2)
                 for artifact in artifacts:

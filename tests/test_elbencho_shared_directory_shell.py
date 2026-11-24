@@ -137,17 +137,17 @@ class TestElbenchoSharedDirectoryShell(unittest.TestCase):
             set -e
             source "{_FUNCTIONS}"
             io_size=4K node_count=2 thread_count=4 io_depth=1
-            resfile= csvfile= livecsvfile= treefile= workload=
+            resfile= jsonfile= livecsvfile= treefile= workload=
             _elbencho_staged_set_artifact_paths /results/out DS 0001 \
-                resfile csvfile livecsvfile treefile workload
+                resfile jsonfile livecsvfile treefile workload
             [[ "$resfile" == /results/out/elbencho-4K-c_002-s_004-d_001_DS.out ]]
-            [[ "$csvfile" == /results/out/elbencho-4K-c_002-s_004-d_001_DS.csv ]]
+            [[ "$jsonfile" == /results/out/elbencho-4K-c_002-s_004-d_001_DS.json ]]
             [[ "$livecsvfile" == /results/out/elbencho-4K-c_002-s_004-d_001_DS.live.csv ]]
             [[ "$treefile" == /results/out/elbencho-treescan-4K-c_002-s_004-d_001_DS.txt ]]
             [[ "$workload" == /results/out/executions/0001.workload.tsv ]]
             write_json= read_json= delete_json=
             _elbencho_shared_set_artifact_paths /results/out DS 0001 \
-                resfile csvfile livecsvfile treefile write_json read_json \
+                resfile jsonfile livecsvfile treefile write_json read_json \
                 delete_json workload
             [[ "$write_json" == /results/out/executions/0001.write.json ]]
             [[ "$read_json" == /results/out/executions/0001.read.json ]]

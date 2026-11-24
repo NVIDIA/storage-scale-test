@@ -3605,7 +3605,7 @@ def test_mdtest_execution_contract_requires_results_and_completion(tmp_path):
         )
         if expected.status is not _FILESYSTEM.ExecutionStatus.SUCCESS:
             continue
-        for extension in ("csv", "out"):
+        for extension in ("json", "out"):
             (
                 result
                 / f"mdtest-elbencho-c_{nodes:03d}-t_{tasks:03d}_20260929Z000000_iter1.{extension}"

@@ -215,6 +215,12 @@ def _producers(data: dict) -> str:
     return ", ".join(sorted(str(version) for version in versions if version))
 
 
+def _elbencho_versions(data: dict) -> str:
+    """The elbencho versions that produced the IO executions."""
+    versions = {e.get("elbencho_version") for e in data.get(_EXECUTIONS) or []}
+    return ", ".join(sorted(str(version) for version in versions if version))
+
+
 def _entries(loaded: LoadedDocument) -> list[tuple[str, str]]:
     data = loaded.data
     generator = data.get("generator") or {}
@@ -228,6 +234,7 @@ def _entries(loaded: LoadedDocument) -> list[tuple[str, str]]:
         ("Exported by", _exporter(generator)),
         ("Rendered by", _renderer()),
         ("Produced by", _producers(data)),
+        ("elbencho", _elbencho_versions(data)),
         ("Generated", str(generator.get("generated_at") or "")),
         ("Command", shlex.join(str(part) for part in command)),
         ("Options", _options(generator.get("options"))),

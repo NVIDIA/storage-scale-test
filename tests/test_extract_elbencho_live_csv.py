@@ -469,7 +469,21 @@ class TestLiveSecondPassAndSummaries(LiveCSVTestCase):
             "worst_30s_elapsed_sec short_5s_percent mean_mib_s median_mib_s "
             "valid_samples missing_samples invalid_samples"
         )
-        self.assertEqual(reader.fieldnames, pinned_columns.split())
+        # Columns are only ever appended (elbencho 3.4 and service results).
+        pinned = pinned_columns.split()
+        self.assertEqual(reader.fieldnames[: len(pinned)], pinned)
+        self.assertEqual(reader.fieldnames[len(pinned)], "mean_ops_per_s")
+        self.assertEqual(reader.fieldnames[-1], "finish_elapsed_sec")
+        self.assertIn("final_io_latency_p99_us", reader.fieldnames)
+        # No per-service results: final latency is empty, never 0, and the
+        # finish time is the live CSV's estimate.
+        self.assertEqual(rows[0]["final_io_latency_p99_us"], "")
+        self.assertEqual(rows[0]["finish_elapsed_sec"], "15.000")
+        # The text summary omits the elbencho 3.4 columns that are empty.
+        header = Path(text_path).read_text(encoding="utf-8").splitlines()[2]
+        is_v34 = self.COLUMNS is LIVE_CSV_COLUMNS_V34
+        self.assertEqual(header.split("\t")[-1], "finish s" if is_v34 else "invalid")
+        self.assertEqual("steady ops/s" in header, is_v34)
         self.assertEqual(
             [row["client"] for row in rows],
             ["worker-0", "worker-1", "worker-2", "worker-3", "worker-4"],
@@ -492,6 +506,52 @@ class TestLiveSecondPassAndSummaries(LiveCSVTestCase):
         )
         self.assertTrue(text[2].startswith("host/worker\tclass\tsteady MiB/s"))
         self.assertTrue(text[3].startswith("worker-0\tpersistent\t10.000\t0.100"))
+
+    def test_summary_files_join_service_results(self):
+        rows = [
+            (
+                {**row, "Service": f"h{row['Rank']}:1611"}
+                if row["Rank"] != "Total"
+                else row
+            )
+            for row in _outlier_rows(intervals=15)
+        ]
+        analysis = self._analyze(rows)
+        domain = analysis.domains[LiveDomainKey("READ", "")]
+        steady = analyze_steady(
+            analysis, domain, PhaseContext(15000, 15000, None, None), 1000
+        )
+        latency = {"min": 1, "avg": 50, "max": 900, "p1": 2, "p50": 40, "p75": 60}
+        services = {
+            "instances": [
+                {
+                    "host": "h0:1611",
+                    "elapsed_ms": 15500,
+                    "latency_us": {**latency, "p99": 5200},
+                },
+                {"host": "h1:1611", "elapsed_ms": 14000, "latency_us": None},
+            ]
+        }
+        csv_path, text_path = write_client_summaries(
+            analysis.metadata, domain, steady, self.temp_dir.name, services
+        )
+        with Path(csv_path).open(encoding="utf-8") as handle:
+            by_service = {row["service"]: row for row in csv.DictReader(handle)}
+        joined = by_service["h0:1611"]
+        self.assertEqual(joined["final_io_latency_p99_us"], "5200.0")
+        self.assertEqual(joined["final_io_latency_min_us"], "1.0")
+        self.assertEqual(joined["finish_elapsed_sec"], "15.500")
+        # A service without latency keeps its elapsed time; no match: estimate.
+        self.assertEqual(by_service["h1:1611"]["final_io_latency_p99_us"], "")
+        self.assertEqual(by_service["h1:1611"]["finish_elapsed_sec"], "14.000")
+        self.assertEqual(by_service["h2:1611"]["final_io_latency_p99_us"], "")
+        self.assertNotEqual(by_service["h2:1611"]["finish_elapsed_sec"], "")
+        text = Path(text_path).read_text(encoding="utf-8").splitlines()
+        self.assertTrue(
+            text[2].endswith("final lat p99 ms\tfinal lat max ms\tfinish s")
+        )
+        row = next(line for line in text[3:] if line.startswith("h0:1611"))
+        self.assertTrue(row.endswith("\t0.040\t5.200\t0.900\t15.5"))
 
     def test_summary_files_without_steady_window(self):
         analysis = self._analyze(_outlier_rows())

@@ -924,3 +924,167 @@ def test_metadata_rates_follow_normalization(tmp_path):
 def test_exact_text_keeps_fractions():
     assert exact_text(109_235_641.23) == "109,235,641.23"
     assert exact_text(109_249_000.0) == "109,249,000"
+
+
+def _svc_latency(p99):
+    return {
+        "min": 40,
+        "avg": 600,
+        "max": 9000,
+        "p1": 80,
+        "p50": 500,
+        "p75": 700,
+        "p99": p99,
+    }
+
+
+def _spread(low, high):
+    return {
+        "min": low,
+        "avg": (low + high) / 2,
+        "max": high,
+        "min_host": "svc0:1611",
+        "max_host": "svc1:1611",
+    }
+
+
+def _with_services(document):
+    """Elbencho 3.4 results: per-service finals on every phase, and the live
+    execution's client summary and latency with the 3.4 fields."""
+    for execution in document["executions"]:
+        results = execution.get("results") or {}
+        if not results.get("phases"):
+            continue
+        execution["elbencho_version"] = "3.4-1"
+        for phase in results["phases"]:
+            phase["services"] = {
+                "instances": [
+                    {
+                        "host": f"svc{i}:1611",
+                        "elapsed_ms": 59000 + 500 * i,
+                        "latency_us": _svc_latency(3000 + 3000 * i),
+                    }
+                    for i in range(2)
+                ],
+                "ops_per_s": _spread(800.0, 1200.0),
+                "bytes_per_s": _spread(2.0e8, 3.0e8),
+            }
+    execution = [
+        e for e in document["executions"] if e["execution_id"] == LIVE_EXECUTION
+    ][0]
+    live = execution["results"]["phases"][0]["live"]
+    live["latency"] = {
+        "p50_us": 500.0,
+        "p90_us": 900.0,
+        "max_us": 12500.0,
+        "max_over_p50": 3.0,
+        "client_ratio_max": 1.75,
+    }
+    live["aggregate_series"]["io_latency_max_us"] = [12500.0] * INTERVALS
+    columns = live["clients_summary"]["columns"]
+    for row in live["clients_summary"]["rows"][:2]:
+        index = int(row[columns.index("rank")])
+        row[columns.index("service")] = f"svc{index}:1611"
+    for row in live["clients_summary"]["rows"]:
+        row[columns.index("steady_ops_per_s")] = 321.0
+        row[columns.index("steady_io_latency_avg_us")] = 2500.0
+        row[columns.index("steady_io_latency_ratio")] = 1.25
+    return document
+
+
+def _table(page, name):
+    return page.split(f'id="{SECTION}-{name}"')[1].split("</table>")[0]
+
+
+def test_service_results_appear_in_the_html_report(tmp_path):
+    page = _render(tmp_path, _with_services(_full_document(tmp_path)))
+    results = _table(page, "results-table-write")
+    assert "slowest host MB/s" in results and "fastest ÷ slowest host" in results
+    row = [r for r in results.split("<tr>") if LIVE_EXECUTION in r][0]
+    assert "1.5" in row  # 3.0e8 / 2.0e8
+    fairness = _table(page, "fairness-table-write")
+    assert "lat max ms" in fairness and "worst client ÷ median lat" in fairness
+    row = [r for r in fairness.split("<tr>") if LIVE_EXECUTION in r][0]
+    cells = re.findall(r"<td[^>]*>(.*?)</td>", row)
+    assert "12.5" in cells  # lat max ms
+    assert "svc1:1611" in cells and "2" in cells  # 6000 / 3000
+    run = f"{SECTION}-run-client-table-r{LIVE_EXECUTION}-write"
+    clients = page.split(f'id="{run}"')[1].split("</table>")[0]
+    assert "final p99 ms" in clients and "IO lat avg ms" in clients
+    assert "elbencho" in page and "3.4-1" in page
+
+
+def _live_execution(document):
+    return [e for e in document["executions"] if e["execution_id"] == LIVE_EXECUTION][0]
+
+
+def _max_cell(page):
+    fairness = _table(page, "fairness-table-write")
+    labels = re.findall(r"<th[^>]*>(.*?)</th>", fairness)
+    if "lat max ms" not in labels:
+        return None
+    row = [r for r in fairness.split("<tr>") if LIVE_EXECUTION in r][0]
+    return re.findall(r"<td[^>]*>(.*?)</td>", row)[labels.index("lat max ms")]
+
+
+def test_latency_max_column_needs_per_io_maxima(tmp_path):
+    document = _with_services(_full_document(tmp_path))
+    assert _max_cell(_render(tmp_path, document)) == "12.5"
+    live = _live_execution(document)["results"]["phases"][0]["live"]
+    del live["aggregate_series"]["io_latency_max_us"]  # pre-3.4: interval means
+    page = _render(tmp_path, document)
+    assert _max_cell(page) is None
+    assert "lat max ÷ p50" in _table(page, "fairness-table-write")
+
+
+def test_latency_max_cell_is_empty_for_a_pre_per_io_row(tmp_path):
+    document = _with_services(_full_document(tmp_path))
+    old = copy.deepcopy(_live_execution(document))
+    old["execution_id"] = "0099"
+    old["coordinate_key"] = "zzz"
+    old["coordinates"] = {**old["coordinates"], "nodes": 8}
+    live = old["results"]["phases"][0]["live"]
+    del live["aggregate_series"]["io_latency_max_us"]
+    live["latency"]["max_us"] = 99000.0
+    document["executions"].append(old)
+    fairness = _table(_render(tmp_path, document), "fairness-table-write")
+    cells = [re.findall(r"<td[^>]*>(.*?)</td>", r) for r in fairness.split("<tr>")]
+    assert sum("–" in c or "12.5" in c for c in cells) == 2  # both rows present
+    assert any("12.5" in c for c in cells)
+    assert not any("99" in c for c in cells)
+    assert "lat max ms" in fairness
+
+
+def test_old_results_show_no_service_columns(tmp_path):
+    page = _render(tmp_path, _full_document(tmp_path))
+    for text in (
+        "slowest host",
+        "worst client ÷ median",
+        "highest-p99 client",
+        "final p99",
+    ):
+        assert text not in page
+
+
+def test_service_spread_renders_without_live_data(tmp_path):
+    document = _with_services(_full_document(tmp_path))
+    page = render_report(
+        [load_document(_write(tmp_path, document))], live_detail="none"
+    )
+    assert "fastest ÷ slowest host" in _table(page, "results-table-write")
+    assert "fairness-table" not in page
+
+
+def test_unmatched_services_show_na_in_the_client_table(tmp_path):
+    document = _with_services(_full_document(tmp_path))
+    for execution in document["executions"]:
+        for phase in (execution.get("results") or {}).get("phases") or []:
+            phase["services"]["instances"][0]["host"] = "elsewhere:1611"
+            phase["services"]["instances"][1]["host"] = "other:1611"
+    page = _render(tmp_path, document)
+    run = f"{SECTION}-run-client-table-r{LIVE_EXECUTION}-write"
+    clients = page.split(f'id="{run}"')[1].split("</table>")[0]
+    assert "final p99 ms" in clients
+    body = clients.split("</thead>")[1]
+    cells = re.findall(r"<td[^>]*>(.*?)</td>", body.split("</tr>")[0])
+    assert cells.count("–") >= 3

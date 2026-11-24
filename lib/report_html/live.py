@@ -26,6 +26,7 @@ import math
 import statistics
 from typing import Sequence
 
+from lib import elbencho_services as services_lib
 from lib.report_html import model
 from lib.report_html.common import (
     ELAPSED_S,
@@ -160,8 +161,16 @@ def _color(phase: str) -> str:
 class _DomainBuilder:
     """Builds the figures and table of one live domain."""
 
-    def __init__(self, ctx: GroupContext, anchors: tuple[str, str], domain: dict):
+    def __init__(
+        self,
+        ctx: GroupContext,
+        anchors: tuple[str, str],
+        domain: dict,
+        services: dict | None = None,
+    ):
         self.ctx = ctx
+        # The phase's final per-service results (None before elbencho 3.4).
+        self.services = services
         self.section_anchor, self.suffix = anchors
         self.domain = domain
         self.live = domain[K_LIVE]
@@ -440,7 +449,25 @@ class _ClientFigures:
         )
 
 
-def _client_columns(records: list[dict]) -> list[Column]:
+_LATENCY_STATS = (
+    ("p50", "final p50 ms"),
+    ("p99", "final p99 ms"),
+    ("max", "final max ms"),
+)
+_LIVE_IO_COLUMNS = (
+    ("steady_ops_per_s", "steady ops/s", False),
+    ("steady_io_latency_avg_us", "IO lat avg ms", False),
+    ("steady_io_latency_p90_us", "IO lat p90 ms", True),
+    ("steady_io_latency_max_us", "IO lat max ms", True),
+    ("steady_io_latency_ratio", "IO lat ÷ fleet median", False),
+)
+
+
+def _has(records: list[dict], key: str) -> bool:
+    return any(r.get(key) is not None for r in records)
+
+
+def _client_columns(records: list[dict], services: dict | None) -> list[Column]:
     columns = [Column(K_CLIENT, numeric=False)]
     if any(r.get("kubernetes_node") for r in records):
         columns.append(Column("node", numeric=False))
@@ -453,11 +480,41 @@ def _client_columns(records: list[dict]) -> list[Column]:
     ]
     if any("short_5s_windows" in r for r in records):
         columns.append(Column("short 5 s windows", numeric=False))
+    for key, label, extra in _LIVE_IO_COLUMNS:
+        if _has(records, key):
+            columns.append(Column(label, extra=extra, digits=3))
+    if services_lib.instances(services):
+        columns += [
+            Column(label, extra=key == "max", digits=3) for key, label in _LATENCY_STATS
+        ]
     columns += [Column("finish s", extra=True), Column("bad samples")]
     return columns
 
 
-def _client_row(record: dict, columns: list[Column]) -> list:
+def _final_latency_ms(record: dict, services: dict | None, key: str):
+    entry = services_lib.find_instance(services, record.get("service"))
+    return sig(scaled(services_lib.latency_of(entry, key), US_PER_MS), 3)
+
+
+def _finish_s(record: dict, services: dict | None):
+    """The service's own completion time, else the live CSV's estimate."""
+    entry = services_lib.find_instance(services, record.get("service"))
+    elapsed = (entry or {}).get("elapsed_ms")
+    if elapsed is None:
+        elapsed = record.get("finish_elapsed_ms")
+    return sig(scaled(elapsed, MS_PER_S))
+
+
+_US_KEYS = frozenset(
+    {
+        "steady_io_latency_avg_us",
+        "steady_io_latency_p90_us",
+        "steady_io_latency_max_us",
+    }
+)
+
+
+def _client_row(record: dict, columns: list[Column], services: dict | None) -> list:
     labels = {c.label for c in columns}
     row = [record.get(K_CLIENT)]
     if "node" in labels:
@@ -472,8 +529,15 @@ def _client_row(record: dict, columns: list[Column]) -> list:
     if "short 5 s windows" in labels:
         short, steady = record.get("short_5s_windows"), record.get("steady_5s_windows")
         row.append(NO_VALUE if short is None else f"{short} of {steady}")
+    for key, label, _ in _LIVE_IO_COLUMNS:
+        if label in labels:
+            value = record.get(key)
+            value = scaled(value, US_PER_MS) if key in _US_KEYS else value
+            row.append(sig(value, 3 if key in _US_KEYS else 4))
+    if "final p50 ms" in labels:
+        row += [_final_latency_ms(record, services, k) for k, _ in _LATENCY_STATS]
     bad = (record.get("missing_samples") or 0) + (record.get("invalid_samples") or 0)
-    row += [sig(scaled(record.get("finish_elapsed_ms"), MS_PER_S)), bad]
+    row += [_finish_s(record, services), bad]
     return row
 
 
@@ -483,7 +547,7 @@ def client_table(builder: _DomainBuilder) -> Table | None:
     if not records:
         return None
     shown = records[:CLIENT_TABLE_MAX_ROWS]
-    columns = _client_columns(records)
+    columns = _client_columns(records, builder.services)
     total = len(records)
     count = f"{len(shown)} slowest of {total}" if len(shown) < total else str(total)
     caption = f"{builder.label} per-client summary, slowest first ({count} clients)"
@@ -492,7 +556,7 @@ def client_table(builder: _DomainBuilder) -> Table | None:
         builder.anchor(model.RUN_CLIENT_TABLE),
         caption,
         columns,
-        [_client_row(r, columns) for r in shown],
+        [_client_row(r, columns, builder.services) for r in shown],
     )
 
 
@@ -516,6 +580,13 @@ def _chip(execution: dict, domain: dict) -> tuple[str, str]:
     return str(domain.get(K_PHASE) or ""), " · ".join(parts)
 
 
+def _domain_services(execution: dict, domain: dict) -> dict | None:
+    """The per-service results of a plain domain's phase, else None."""
+    if domain.get(K_MIX) or domain.get(K_OCCURRENCE):
+        return None
+    return (phase_of(execution, str(domain.get(K_PHASE))) or {}).get("services")
+
+
 def build_run(
     ctx: GroupContext, section_anchor: str, run: tuple[str, str], execution: dict
 ) -> RunDetail | None:
@@ -531,7 +602,8 @@ def build_run(
         live = domain[K_LIVE]
         mode = live.get("client_mode") or K_CLIENT
         heading = f"{domain_label(domain)}: {live.get('clients') or 0} {mode}s"
-        builder = _DomainBuilder(ctx, (section_anchor, suffix), domain)
+        services = _domain_services(execution, domain)
+        builder = _DomainBuilder(ctx, (section_anchor, suffix), domain, services)
         built.append(builder.build(f"{section_anchor}{suffix}", heading))
     chips = [_chip(execution, d) for d in domains]
     return RunDetail(run_anchor, execution_id, label, chips, built)

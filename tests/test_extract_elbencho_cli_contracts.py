@@ -566,11 +566,18 @@ def test_fairness_lines_skip_phases_without_data(monkeypatch, tmp_path):
     assert [key.label for _, key, _ in collected] == ["WRITE"]
 
 
-def _table_steady(reason=None, transient=2):
-    """A duck-typed LiveFairness for the live table."""
+def _table_steady(reason=None, transient=2, **latency):
+    """A duck-typed LiveFairness for the live table; ``latency`` adds elbencho
+    3.4 fields (client_ratio_max, max_per_io), None/False before 3.4."""
+    fields = {
+        "max_us": 3500.0,
+        "client_ratio_max": None,
+        "max_per_io": False,
+        **latency,
+    }
     stub = _steady_stub(
         reason,
-        SimpleNamespace(p50_us=2180.0, p90_us=12860.0, max_over_p50=1.9923),
+        SimpleNamespace(p50_us=2180.0, p90_us=12860.0, max_over_p50=1.9923, **fields),
     )
     stub.interval_ms = 800
     stub.window_ms = {"5s": 4800, "30s": 30400}
@@ -586,21 +593,127 @@ def test_live_fairness_table_follows_the_table_rows(capsys):
         _EXTRACT.live_row_key(metrics[2], "write"): _table_steady("too_short"),
     }
     _EXTRACT.print_live_fairness_table(metrics, live)
-    assert capsys.readouterr().out.splitlines() == [
-        "",
+    lines = capsys.readouterr().out.splitlines()
+    # Before elbencho 3.4 the new columns are omitted, caption included.
+    assert lines[1] == (
         "Live fairness (steady window only; latency is the mean of each 0.8s "
-        "interval, not a per-I/O percentile)",
-        "      |       |       |     Steady | --- Jain p50/min -- "
-        "| Slowest/med | Slow clients | --- Interval mean latency ---",
-        "Nodes | Thrds | IODep | window (s) |        4.8s | 30.4s "
-        "|   p10, 4.8s |   pers+trans | p50 (ms) | p90 (ms) | max/p50",
-        "-" * 117,
-        "1     | 1     | 1     |   2.0-31.5 | 0.977/0.900 |   -/- "
-        "|       0.950 |     1+2 of 4 |     2.18 |     12.9 |    1.99",
-        "1     | 1     | 16    |       none |           - |     - "
-        "|           - |            - |     -    |      -   |       -",
-        "No steady window for Nodes 1, Thrds 1, IODep 16: phase too short",
+        "interval, not a per-I/O percentile)"
+    )
+    assert "Max latency" not in lines[2] and "Highest p99" not in lines[2]
+    assert _cells(lines[3])[8:] == ["p50 (ms)", "p90 (ms)", "max/p50"]
+    assert "-- Interval mean latency ---" in lines[2]
+    assert _cells(lines[5])[8:] == ["2.18", "12.9", "1.99"]
+    assert _cells(lines[6])[3:] == ["none"] + ["-"] * 7
+    assert (
+        lines[-1] == "No steady window for Nodes 1, Thrds 1, IODep 16: phase too short"
+    )
+
+
+def test_live_fairness_table_shows_3_4_columns(capsys):
+    """Per-I/O max and client latency columns appear when any row has them."""
+    metrics = [_io_metric(io_depth=depth) for depth in (1, 4)]
+    live = {
+        _EXTRACT.live_row_key(metrics[0], "write"): _table_steady(
+            max_per_io=True, client_ratio_max=1.31
+        ),
+        _EXTRACT.live_row_key(metrics[1], "write"): _table_steady(),
+    }
+    _EXTRACT.print_live_fairness_table(metrics, live)
+    lines = capsys.readouterr().out.splitlines()
+    assert "max is the largest single I/O" in lines[1]
+    assert "the p99 client" not in lines[1]
+    assert "Max latency" in lines[2] and "Client lat" in lines[2]
+    assert "Highest p99 client" not in lines[2]
+    assert _cells(lines[3])[8:] == [
+        "p50 (ms)",
+        "p90 (ms)",
+        "ms",
+        "max/p50",
+        "worst/med",
     ]
+    # An old row in a mixed table keeps "-" for the per-I/O max.
+    assert _cells(lines[5])[10:] == ["3.50", "1.99", "1.31"]
+    assert _cells(lines[6])[10:] == ["-", "1.99", "-"]
+
+
+def _cells(line):
+    return [cell.strip() for cell in line.split("|")]
+
+
+_SERVICES = {
+    "instances": [
+        {
+            "host": "dgx-node-017.cluster.example.com:1611",
+            "elapsed_ms": 900,
+            "latency_us": {"min": 1, "avg": 50, "max": 900, "p99": 5200},
+        },
+        {
+            "host": "dgx-node-002.cluster.example.com:1611",
+            "elapsed_ms": 800,
+            "latency_us": {"min": 1, "avg": 40, "max": 500, "p99": 2000},
+        },
+    ],
+    "ops_per_s": {
+        "min": 1200.0,
+        "avg": 1500.0,
+        "max": 1800.0,
+        "min_host": "dgx-node-017.cluster.example.com:1611",
+        "max_host": "dgx-node-002.cluster.example.com:1611",
+    },
+    "bytes_per_s": {
+        "min": 5e8,
+        "avg": 6e8,
+        "max": 9e8,
+        "min_host": "dgx-node-017.cluster.example.com:1611",
+        "max_host": "dgx-node-002.cluster.example.com:1611",
+    },
+}
+
+
+def test_live_fairness_table_names_the_highest_p99_client(capsys):
+    """With per-service results the table names the p99 straggler and its
+    ratio to the phase p99; rows without services show '-'."""
+    with_services = _io_metric(services=_SERVICES, lat_pct_99=0.0026)
+    without = _io_metric(io_depth=4)
+    live = {
+        _EXTRACT.live_row_key(with_services, "write"): _table_steady(
+            max_us=12000.0, client_ratio_max=1.31, max_per_io=True
+        ),
+        _EXTRACT.live_row_key(without, "write"): _table_steady(),
+    }
+    _EXTRACT.print_live_fairness_table([with_services, without], live)
+    rows = capsys.readouterr().out.splitlines()[5:7]
+    assert _cells(rows[0])[10:] == ["12.0", "1.99", "1.31", "dgx-node-017 2.00x"]
+    assert _cells(rows[1])[10:] == ["-", "1.99", "-", "-"]
+
+
+def test_service_spread_table_renders_without_live_data(capsys):
+    """The slowest/fastest service rates need no live CSV; old rows show '-'."""
+    with_services = _io_metric(services=_SERVICES)
+    old = _io_metric(io_depth=4)
+    _EXTRACT.print_service_spread_table([with_services, old])
+    lines = capsys.readouterr().out.splitlines()
+    assert "Per-service spread" in lines[1]
+    assert _cells(lines[4])[3:] == [
+        "1200 (dgx-node-017)",
+        "1800 (dgx-node-002)",
+        "1.50",
+        "477 (dgx-node-017)",
+        "858 (dgx-node-002)",
+        "1.80",
+    ]
+    assert _cells(lines[5])[3:] == ["-"] * 6
+
+
+def test_service_spread_and_version_lines_skip_single_node_runs(capsys):
+    """No services: no spread table; the version line needs a version."""
+    _EXTRACT.print_service_spread_table([_io_metric()])
+    _EXTRACT.print_elbencho_version_line([_io_metric()])
+    assert capsys.readouterr().out == ""
+    _EXTRACT.print_elbencho_version_line(
+        [_io_metric(elbencho_version="3.4-1"), _io_metric(elbencho_version="3.4-1")]
+    )
+    assert capsys.readouterr().out == "Elbencho version: 3.4-1\n"
 
 
 def test_live_fairness_rows_fall_back_to_lines():

@@ -664,6 +664,7 @@ def _execution_record(
         "coordinate_key": fragment.get("coordinate_key"),
         "dataset": fragment.get("dataset"),
         "producer_version": fragment.get("producer_version"),
+        "elbencho_version": fragment.get("elbencho_version"),
         K_RESULT_FILES: fragment.get(K_RESULT_FILES) or [],
         K_LOG: ledger[K_LOG],
         K_RESULTS: fragment.get(K_RESULTS),

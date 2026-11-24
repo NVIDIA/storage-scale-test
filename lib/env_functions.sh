@@ -2876,25 +2876,26 @@ _elbencho_result_artifacts_for_execution() {
             base=$(printf '%s/mdtest-elbencho-c_%03d-t_%03d_%s' \
                 "$output_dir" "$nodes" "$tasks_per_node" "$ds")
             for ((iter = 1; iter <= MDTEST_ITERATIONS; iter++)); do
-                printf '%s_iter%d.out\n%s_iter%d.csv\n%s_iter%d.out.project-version\n' \
-                    "$base" "$iter" "$base" "$iter" "$base" "$iter"
+                printf '%s_iter%d.%s\n' "$base" "$iter" out "$base" "$iter" json \
+                    "$base" "$iter" csv "$base" "$iter" out.project-version
             done
             _mdtest_completion_path "$output_dir" "$execution_id"
             exit 0
         fi
         local ds="${output_dir##*-}"
         local resfile
+        local jsonfile
         local csvfile
         local livecsvfile
         local treefile
-        _elbencho_io_set_resfile_csvfile "$output_dir" "$io_size" "$nodes" \
+        _elbencho_io_set_result_files "$output_dir" "$io_size" "$nodes" \
             "$thread_count" "$io_depth" "$ds"
         _elbencho_io_set_livecsvfile "$output_dir" "$io_size" "$nodes" \
             "$thread_count" "$io_depth" "$ds"
         _elbencho_io_set_treefile "$output_dir" "$io_size" "$nodes" \
             "$thread_count" "$io_depth" "$ds"
-        printf '%s\n' "$resfile" "$resfile.project-version" "$csvfile" \
-            "$livecsvfile" "$treefile" \
+        printf '%s\n' "$resfile" "$resfile.project-version" "$jsonfile" \
+            "$csvfile" "$livecsvfile" "$treefile" \
             "${output_dir}/executions/${execution_id}.write.json" \
             "${output_dir}/executions/${execution_id}.read.json" \
             "${output_dir}/executions/${execution_id}.delete.json" \
@@ -2913,9 +2914,10 @@ _elbencho_required_result_artifacts_for_execution() {
         output_dir=$(_elbencho_execution_output_dir_for_definition "$output_dir" "$nnnn_sh") || exit 1
         local prefix="${output_dir}/executions/${execution_id}"
         if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == mdtest ]]; then
-            # Project version records are informational, never required.
+            # Project version records are informational, never required, and
+            # a .csv is only a stale result of elbencho before 3.4.
             _elbencho_result_artifacts_for_execution "$output_dir" "$nnnn_sh" \
-                | grep -v '\.project-version$'
+                | grep -v -e '\.project-version$' -e '\.csv$'
             exit "${PIPESTATUS[0]}"
         fi
         if [[ -n "${ELBENCHO_SWEEP_READ_FROM:-}" \

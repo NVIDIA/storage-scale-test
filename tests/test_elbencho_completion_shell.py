@@ -414,11 +414,13 @@ def _native_harness(root, **options):
     return _harness(root, **options) + f"""
 run_an_elbencho() {{
     local phase=mkdir arg
+    local -a args=()
     for arg in "$@"; do
         [[ "$arg" != --write ]] || phase=write
         [[ "$arg" != --read ]] || phase=read
+        [[ "$arg" == --jsonfile=* ]] || args+=("$arg")
     done
-    {shlex.quote(str(_BINARY))} "$@" --jsonfile="$root/$phase.json"
+    {shlex.quote(str(_BINARY))} "${{args[@]}}" --jsonfile="$root/$phase.json"
 }}
 """
 

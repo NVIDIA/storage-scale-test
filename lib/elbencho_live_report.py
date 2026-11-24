@@ -28,16 +28,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     Dict,
     Iterable,
     Iterator,
     List,
+    Mapping,
     NamedTuple,
     Optional,
     Sequence,
     Tuple,
 )
+
+from lib.elbencho_services import find_instance, latency_of
 
 if TYPE_CHECKING:  # pragma: no cover
     from lib.elbencho_live_steady import ClientSteady, SteadyAnalysis
@@ -720,7 +724,27 @@ SUMMARY_COLUMNS = [
     "valid_samples",
     "missing_samples",
     "invalid_samples",
+    # elbencho 3.4 live columns and final per-service results (--svcstats);
+    # empty for older results.
+    "mean_ops_per_s",
+    "steady_ops_per_s",
+    "steady_io_latency_avg_us",
+    "steady_io_latency_p90_us",
+    "steady_io_latency_max_us",
+    "steady_io_latency_ratio",
+    "final_io_latency_min_us",
+    "final_io_latency_avg_us",
+    "final_io_latency_max_us",
+    "final_io_latency_p1_us",
+    "final_io_latency_p50_us",
+    "final_io_latency_p75_us",
+    "final_io_latency_p99_us",
+    "finish_elapsed_sec",
 ]
+_FINAL_LATENCY_KEYS = ("min", "avg", "max", "p1", "p50", "p75", "p99")
+# Text columns up to "invalid" always appear; the rest (elbencho 3.4) are
+# omitted when empty in every row.
+_TEXT_BASE_COLUMNS = 10
 SUMMARY_TEXT_HEADER = (
     "host/worker",
     "class",
@@ -732,6 +756,15 @@ SUMMARY_TEXT_HEADER = (
     "mean MiB/s",
     "missing",
     "invalid",
+    "steady ops/s",
+    "IO lat avg ms",
+    "IO lat p90 ms",
+    "IO lat max ms",
+    "lat/median",
+    "final lat p50 ms",
+    "final lat p99 ms",
+    "final lat max ms",
+    "finish s",
 )
 
 
@@ -740,8 +773,12 @@ def write_client_summaries(
     domain: DomainAnalysis,
     steady: Optional["SteadyAnalysis"],
     output_dir: str,
+    services: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[str, str]:
-    """Write sorted CSV and text client summaries; return both paths."""
+    """Write sorted CSV and text client summaries; return both paths.
+
+    ``services`` is the phase's final per-service results (elbencho 3.4
+    ``--svcstats``), joined to each client by its "host:port"."""
     base = f"{metadata.stem}-{domain.key.slug}-client-summary"
     csv_path = os.path.join(output_dir, f"{base}.csv")
     text_path = os.path.join(output_dir, f"{base}.txt")
@@ -750,14 +787,34 @@ def write_client_summaries(
         writer = csv.writer(handle)
         writer.writerow(SUMMARY_COLUMNS)
         for summary, client_steady in rows:
-            writer.writerow(_summary_csv_row(summary, client_steady))
+            writer.writerow(_summary_csv_row(summary, client_steady, services))
     with open(text_path, "w", encoding="utf-8") as handle:
         handle.write(f"Elbencho live client summary: {domain.key.label}\n")
         handle.write(_steady_heading(steady) + "\n")
-        handle.write("\t".join(SUMMARY_TEXT_HEADER) + "\n")
-        for summary, client_steady in rows:
-            handle.write("\t".join(_summary_text_row(summary, client_steady)) + "\n")
+        text_rows = [
+            _summary_text_row(summary, client_steady, services)
+            for summary, client_steady in rows
+        ]
+        keep = _text_columns_kept(text_rows)
+        handle.write("\t".join(SUMMARY_TEXT_HEADER[i] for i in keep) + "\n")
+        for row in text_rows:
+            handle.write("\t".join(row[i] for i in keep) + "\n")
     return csv_path, text_path
+
+
+def _text_columns_kept(text_rows: Sequence[Sequence[str]]) -> List[int]:
+    """Text column indexes to show: the base ones, and each 3.4 column that
+    has a value in some row. "finish s" always has a live-derived value, so it
+    appears only beside other 3.4 columns."""
+    last = len(SUMMARY_TEXT_HEADER) - 1
+    keep = list(range(_TEXT_BASE_COLUMNS)) + [
+        index
+        for index in range(_TEXT_BASE_COLUMNS, last)
+        if any(row[index] != "-" for row in text_rows)
+    ]
+    if len(keep) > _TEXT_BASE_COLUMNS:
+        keep.append(last)
+    return keep
 
 
 def _summary_rows(
@@ -797,7 +854,9 @@ def _fmt(value: Optional[float], digits: int, scale: float = 1.0) -> str:
 
 
 def _summary_csv_row(
-    summary: ClientSummary, client_steady: Optional["ClientSteady"]
+    summary: ClientSummary,
+    client_steady: Optional["ClientSteady"],
+    services: Optional[Mapping[str, Any]] = None,
 ) -> List[object]:
     """One client-summary CSV row; missing values are empty cells."""
     has_samples = summary.sample_count > 0
@@ -831,11 +890,43 @@ def _summary_csv_row(
             summary.invalid_count,
         ]
     )
+    row.extend(_ops_latency_cells(summary, client_steady))
+    entry = find_instance(services, summary.client.service)
+    row.extend(_fmt(latency_of(entry, key), 1) for key in _FINAL_LATENCY_KEYS)
+    row.append(_fmt(_finish_ms(summary, entry), 3, 0.001))
     return row
 
 
-def _summary_text_row(
+def _finish_ms(summary: ClientSummary, entry: Optional[Mapping]) -> Optional[float]:
+    """Completion time: the service's own, else the live CSV's estimate."""
+    elapsed = (entry or {}).get("elapsed_ms")
+    return elapsed if elapsed is not None else summary.finish_elapsed_ms
+
+
+def _ops_latency_cells(
     summary: ClientSummary, client_steady: Optional["ClientSteady"]
+) -> List[str]:
+    """Mean and steady ops/s, steady IO latency avg/p90/max and its ratio."""
+    steady = (
+        [None] * 5
+        if client_steady is None
+        else [
+            client_steady.steady_ops_per_s,
+            client_steady.io_latency_avg_us,
+            client_steady.io_latency_p90_us,
+            client_steady.io_latency_max_us,
+            client_steady.io_latency_ratio,
+        ]
+    )
+    cells = [_fmt(summary.mean_ops_s, 1)]
+    cells += [_fmt(value, 4 if i == 4 else 1) for i, value in enumerate(steady)]
+    return cells
+
+
+def _summary_text_row(
+    summary: ClientSummary,
+    client_steady: Optional["ClientSteady"],
+    services: Optional[Mapping[str, Any]] = None,
 ) -> List[str]:
     """One tab-separated text row; missing values are '-'."""
 
@@ -868,7 +959,33 @@ def _summary_text_row(
             str(summary.invalid_count),
         ]
     )
+    cells.extend(_text_io_cells(summary, client_steady, services))
     return cells
+
+
+def _text_io_cells(
+    summary: ClientSummary,
+    client_steady: Optional["ClientSteady"],
+    services: Optional[Mapping[str, Any]],
+) -> List[str]:
+    """Steady ops/s, steady IO latency (ms), final latency (ms), finish (s)."""
+
+    def text(value: Optional[float], digits: int, scale: float = 1.0) -> str:
+        return _fmt(value, digits, scale) or "-"
+
+    entry = find_instance(services, summary.client.service)
+    steady = client_steady
+    return [
+        text(steady.steady_ops_per_s if steady else None, 0),
+        text(steady.io_latency_avg_us if steady else None, 3, 0.001),
+        text(steady.io_latency_p90_us if steady else None, 3, 0.001),
+        text(steady.io_latency_max_us if steady else None, 3, 0.001),
+        text(steady.io_latency_ratio if steady else None, 2),
+        text(latency_of(entry, "p50"), 3, 0.001),
+        text(latency_of(entry, "p99"), 3, 0.001),
+        text(latency_of(entry, "max"), 3, 0.001),
+        text(_finish_ms(summary, entry), 1, 0.001),
+    ]
 
 
 def _steady_heading(steady: Optional["SteadyAnalysis"]) -> str:

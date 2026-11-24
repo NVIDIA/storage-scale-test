@@ -19,6 +19,7 @@
 
 import json
 import platform
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -26,7 +27,21 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ELBENCHO = _REPO_ROOT / "tmp" / "elbencho.aarch64"
+_FUNCTIONS = _REPO_ROOT / "lib" / "_elbencho_functions.sh"
 _CAN_RUN_BINARY = platform.machine() == "aarch64" and _ELBENCHO.is_file()
+_SVCSTATS = "--svcstats=elapsed,lat,percent,minmax"
+
+
+def _parse_phase_json(path: Path, phase: str) -> str:
+    """The shell completion parser's canonical output for one phase JSON."""
+    script = (
+        f"source {shlex.quote(str(_FUNCTIONS))}; "
+        f"_elbencho_parse_phase_json {shlex.quote(str(path))} {phase}"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script], check=True, capture_output=True, text=True
+    )
+    return result.stdout.strip()
 
 
 @unittest.skipUnless(_CAN_RUN_BINARY, "requires the local aarch64 probe binary")
@@ -43,12 +58,12 @@ class TestElbenchoSharedDirectoryBinary(unittest.TestCase):
             timeout=30,
         )
 
-    def test_zero_directory_mkdir_retains_single_csv_header(self) -> None:
+    def test_zero_directory_mkdir_writes_one_phase_object(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             target = root / "target"
             target.mkdir()
-            csv_path = root / "mkdir.csv"
+            json_path = root / "mkdir.json"
             result = self._run(
                 "--mkdirs",
                 "--dirs=0",
@@ -56,17 +71,18 @@ class TestElbenchoSharedDirectoryBinary(unittest.TestCase):
                 "--threads=1",
                 "--size=4K",
                 "--block=4K",
-                f"--csvfile={csv_path}",
+                f"--jsonfile={json_path}",
+                _SVCSTATS,
                 "--nolive",
                 str(target),
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(list(target.iterdir()), [])
-            rows = csv_path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(rows), 2)
-            self.assertIn("operation", rows[0])
-            self.assertIn("MKDIRS", rows[1])
+            rows = json_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(
+                [json.loads(row)["phase_type"] for row in rows], ["MKDIRS"]
+            )
 
     def test_one_worker_writes_four_flat_files_with_exact_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -83,11 +99,15 @@ class TestElbenchoSharedDirectoryBinary(unittest.TestCase):
                 "--size=4K",
                 "--block=4K",
                 f"--jsonfile={json_path}",
+                _SVCSTATS,
                 "--nolive",
                 str(target),
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertRegex(
+                _parse_phase_json(json_path, "WRITE"), r"^4\t16384\t[0-9]+$"
+            )
             self.assertEqual(
                 sorted(path.name for path in target.iterdir()),
                 ["r0-f0", "r0-f1", "r0-f2", "r0-f3"],
@@ -119,10 +139,14 @@ class TestElbenchoSharedDirectoryBinary(unittest.TestCase):
                 "--files=4",
                 "--threads=1",
                 f"--jsonfile={delete_json}",
+                _SVCSTATS,
                 "--nolive",
                 str(target),
             )
             self.assertEqual(delete_result.returncode, 0, delete_result.stderr)
+            self.assertRegex(
+                _parse_phase_json(delete_json, "RMFILES"), r"^4\tnull\t[0-9]+$"
+            )
             self.assertEqual(list(target.iterdir()), [])
             delete_records = [
                 json.loads(line)

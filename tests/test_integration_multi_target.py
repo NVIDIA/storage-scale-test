@@ -751,11 +751,11 @@ def _write_group_cell(result, group, identity, execution, status, csv):
     )
     if status != "SUCCESS":
         return
-    (output / "result.csv").write_text("x\n", encoding="utf-8")
+    (output / "result.json").write_text("x\n", encoding="utf-8")
     (output / "result.out").write_text("x\n", encoding="utf-8")
     if group.kind == "mdtest":
         stem = f"mdtest-elbencho-c_{coordinate.nodes:03d}-t_001_x_iter1"
-        for suffix in ("csv", "out"):
+        for suffix in ("json", "out"):
             (output / f"{stem}.{suffix}").write_text("x\n", encoding="utf-8")
         marker = output / "executions" / f"{identity}.mdtest.complete"
         marker.write_text("COMPLETE\n", encoding="utf-8")

@@ -910,10 +910,11 @@ together):
 
 | Output | Content |
 | --- | --- |
-| "Live fairness" table | Under each results table: steady span, Jain p50/min per window, slowest/median p10, slow clients, and per-interval mean latency p50, p90 and max/p50. In `report.txt` and stdout |
+| "Live fairness" table | Under each results table: steady span, Jain p50/min per window, slowest/median p10, slow clients, per-interval mean latency p50 and p90, max latency (largest single I/O for elbencho 3.4, else largest interval mean) and max/p50, and (elbencho 3.4) the worst client's mean latency over the median and the client with the highest final p99 and its ratio to the phase p99. In `report.txt` and stdout |
+| "Per-service spread" table | Under each results table with `--svcstats` minmax results (elbencho 3.4; no live CSV needed): slowest and fastest service ops/s and MiB/s, and their ratio. Also in `report.html` |
 | `aggregate-timeseries.png` | Total MiB/s and IOPS, plus a fleet IO latency panel; warmup and tail shaded, `[first]`/`[last]` marked |
 | `fairness-timeseries.png` | Jain per window with the 5 s floor; below, the 5 s slowest/median ratio against `1 - S` and `1 - 2S` |
-| `client-summary.csv` / `.txt` | Per client: class, steady MiB/s and ratio, worst 5 s and 30 s ratios and times, percent of 5 s windows short, whole-run mean and median, sample counts |
+| `client-summary.csv` / `.txt` | Per client: class, steady MiB/s and ratio, worst 5 s and 30 s ratios and times, percent of 5 s windows short, whole-run mean and median, sample counts; with elbencho 3.4, ops/s, steady IO latency, and the service's final latency min/avg/max/percentiles and completion time (`--svcstats`; empty without a match) |
 | `client-timeseries.png` | 5 s client rates against the fleet p10-p90 band; slow clients first |
 | `client-ratio-heatmap.png` | Clients by 5 s windows, percent of the fleet median on a 50-150% scale; slow clients, then representatives |
 

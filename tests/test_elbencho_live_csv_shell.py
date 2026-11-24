@@ -45,7 +45,7 @@ dio_or_bio=dio
 ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=0
 {extra_env}
 _elbencho_io_build_common_args \
-    /tmp/result.out /tmp/result.csv /tmp/result.live.csv 1G
+    /tmp/result.out /tmp/result.json /tmp/result.live.csv 1G
 printf '%s\\n' "${{common_args[@]}}"
 """
 
@@ -67,7 +67,8 @@ class TestElbenchoLiveCsvShell(unittest.TestCase):
                 "--latpercent",
                 "--nolive",
                 "--resfile=/tmp/result.out",
-                "--csvfile=/tmp/result.csv",
+                "--jsonfile=/tmp/result.json",
+                "--svcstats=elapsed,lat,percent,minmax",
                 "--iodepth=4",
                 "--direct",
             ],

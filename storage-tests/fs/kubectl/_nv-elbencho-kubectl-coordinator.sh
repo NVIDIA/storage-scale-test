@@ -749,7 +749,7 @@ _coordinator_require_success_artifacts() {
                 "$scratch" "$nodes" "$tasks_per_node" \
                 "${COORDINATOR_OUTPUT_BASENAME##*-}" "$iteration")
             if [[ ! -s "$stem.out" || -L "$stem.out" \
-                    || ! -s "$stem.csv" || -L "$stem.csv" ]]; then
+                    || ! -s "$stem.json" || -L "$stem.json" ]]; then
                 _coordinator_error "successful MD execution $id lacks iteration $iteration results"
                 return 1
             fi
@@ -764,7 +764,7 @@ _coordinator_require_success_artifacts() {
     fi
     # The pre-existing workload contract identifies completion files only for
     # shared-directory and staged-read modes. Legacy worker-directory output is
-    # parsed from Elbencho's regular .out/.csv artifacts and has no synthetic
+    # parsed from Elbencho's regular .out/.json artifacts and has no synthetic
     # completion sidecar to require here.
     local required=()
     if [[ -n "${ELBENCHO_SWEEP_READ_FROM:-}" \

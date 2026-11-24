@@ -54,7 +54,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_platform_functions.sh"
 #   _elbencho_resolve_run_context      - node_count, remote_output_dir, hosts_csv, mkdir
 #   _elbencho_io_build_common_args     - shared IO sweep elbencho argv preamble (see ELBENCHO_IO_EXTENT_INFERRED)
 #   _elbencho_io_append_rotated_hosts_for_read - append rotated --hosts to read args
-#   _elbencho_io_set_resfile_csvfile   - IO sweep resfile/csvfile paths
+#   _elbencho_io_set_result_files      - IO sweep resfile/jsonfile paths
 #   _elbencho_io_set_livecsvfile       - IO sweep live CSV path
 #   _elbencho_io_set_treefile          - IO sweep treescan path
 #   _elbencho_io_cleanup_result_artifacts - remove stale per-execution result files
@@ -1349,14 +1349,18 @@ run_elbencho_cell() {
 # inferred_extent — omit --size; elbencho uses tree sizes (treescan) or file metadata (single-file path).
 ELBENCHO_IO_EXTENT_INFERRED=inferred_extent
 
+# Per-service final results in the .json (elbencho 3.4+); see
+# docs/plans/elbencho-3.4-adoption.md decision 3. Harmless without --hosts.
+ELBENCHO_SVCSTATS=elapsed,lat,percent,minmax
+
 # Build common_args for IO sweep (run_elbencho_io_sweep_iteration*).
 # Caller must: local common_args
-# Args: resfile csvfile livecsvfile this_file_size [enable_nosvcshare] [extent_mode]
+# Args: resfile jsonfile livecsvfile this_file_size [enable_nosvcshare] [extent_mode]
 # When enable_nosvcshare is non-empty, adds --nosvcshare if ELBENCHO_ALL_NODES_ACCESS_ALL_DATA=1.
 # extent_mode: empty — pass --size=this_file_size. ELBENCHO_IO_EXTENT_INFERRED — omit --size (inferred from target).
 _elbencho_io_build_common_args() {
     local resfile="$1"
-    local csvfile="$2"
+    local jsonfile="$2"
     local livecsvfile="$3"
     local this_file_size="$4"
     local enable_nosvcshare="${5:-}"
@@ -1379,7 +1383,8 @@ _elbencho_io_build_common_args() {
         --latpercent
         --nolive
         --resfile="$resfile"
-        --csvfile="$csvfile"
+        --jsonfile="$jsonfile"
+        --svcstats="$ELBENCHO_SVCSTATS"
         --iodepth="$io_depth"
     )
     if [[ "${ELBENCHO_LIVE_CSV_EXTENDED:-1}" == "1" ]]; then
@@ -1441,18 +1446,22 @@ _elbencho_io_append_read_policy() {
     return 0
 }
 
-# Set resfile and csvfile for standard IO sweep naming. Caller must: local resfile csvfile
-_elbencho_io_set_resfile_csvfile() {
+# Set resfile and jsonfile for standard IO sweep naming, and csvfile: the
+# result CSV of runs before elbencho 3.4, kept only for stale-artifact cleanup.
+# Caller must: local resfile jsonfile csvfile
+_elbencho_io_set_result_files() {
     local remote_out="$1"
     local io_sz="$2"
     local nc="$3"
     local tc="$4"
     local id="$5"
     local ds="$6"
-    resfile=$(printf "%s/elbencho-%s-c_%03d-s_%03d-d_%03d_%s.out" \
+    local stem
+    stem=$(printf "%s/elbencho-%s-c_%03d-s_%03d-d_%03d_%s" \
         "$remote_out" "$io_sz" "$nc" "$tc" "$id" "$ds")
-    csvfile=$(printf "%s/elbencho-%s-c_%03d-s_%03d-d_%03d_%s.csv" \
-        "$remote_out" "$io_sz" "$nc" "$tc" "$id" "$ds")
+    resfile="${stem}.out"
+    jsonfile="${stem}.json"
+    csvfile="${stem}.csv"
 }
 
 # Set livecsvfile for standard IO sweep naming. Caller must: local livecsvfile
@@ -2452,16 +2461,17 @@ run_elbencho_io_sweep_iteration_single_big_file() {
     fi
 
     local resfile
+    local jsonfile
     local csvfile
     local livecsvfile
-    _elbencho_io_set_resfile_csvfile "$remote_output_dir" "$io_size" "$node_count" \
+    _elbencho_io_set_result_files "$remote_output_dir" "$io_size" "$node_count" \
         "$thread_count" "$io_depth" "$ds"
     _elbencho_io_set_livecsvfile "$remote_output_dir" "$io_size" "$node_count" \
         "$thread_count" "$io_depth" "$ds"
     _elbencho_io_set_treefile "$remote_output_dir" "$io_size" "$node_count" \
         "$thread_count" "$io_depth" "$ds"
     _elbencho_io_cleanup_result_artifacts \
-        "$resfile" "$csvfile" "$livecsvfile" "$treefile" || return 1
+        "$resfile" "$jsonfile" "$csvfile" "$livecsvfile" "$treefile" || return 1
 
     if [[ -z "$sweep_read_from" ]]; then
         _elbencho_cleanup_stale_single_big_file_sweep "${test_dirs[0]}" || return 1
@@ -2505,7 +2515,7 @@ run_elbencho_io_sweep_iteration_single_big_file() {
     echo "ELBENCHO_ALL_NODES_ACCESS_ALL_DATA: ${ELBENCHO_ALL_NODES_ACCESS_ALL_DATA:-0}"
 
     echo "(remote) Human readable output file: $resfile"
-    echo "(remote) CSV file: $csvfile"
+    echo "(remote) JSON file: $jsonfile"
     if [[ "${ELBENCHO_LIVE_CSV_EXTENDED:-1}" == "1" ]]; then
         echo "(remote) Live CSV file: $livecsvfile"
     fi
@@ -2513,7 +2523,7 @@ run_elbencho_io_sweep_iteration_single_big_file() {
     if [[ -n "$sweep_read_from" ]]; then
         # Read-only: file path (same as --read-from); no --treescan/--treefile. Omit --size (ELBENCHO_IO_EXTENT_INFERRED).
         local common_args
-        if ! _elbencho_io_build_common_args "$resfile" "$csvfile" "$livecsvfile" \
+        if ! _elbencho_io_build_common_args "$resfile" "$jsonfile" "$livecsvfile" \
             "unused" "1" "$ELBENCHO_IO_EXTENT_INFERRED"; then
             return 1
         fi
@@ -2535,18 +2545,16 @@ run_elbencho_io_sweep_iteration_single_big_file() {
     fi
 
     local common_args
-    _elbencho_io_build_common_args "$resfile" "$csvfile" "$livecsvfile" \
+    _elbencho_io_build_common_args "$resfile" "$jsonfile" "$livecsvfile" \
         "$this_file_size" "1"
 
-    # Same --csvfile for write and read: first phase writes CSV column labels; later phases use
-    # --nocsvlabels so appends do not repeat the header (no mkdir phase here, so write is first).
+    # Same --jsonfile for write and read: elbencho appends one object per phase.
     local elbencho_write_args=(
         --write
         --block="$this_write_size"
         "${common_args[@]}"
     )
     local elbencho_read_args=(--read --block="$this_read_size" "${common_args[@]}")
-    elbencho_read_args=(--nocsvlabels "${elbencho_read_args[@]}")
     _elbencho_io_append_rotated_hosts_for_read elbencho_read_args
 
     local write_rc=0
@@ -2732,24 +2740,24 @@ _elbencho_staged_set_artifact_paths() {
     local remote_output_dir="$1"
     local ds="$2"
     local id="$3"
-    local -n resfile_ref="$4" csvfile_ref="$5" livecsvfile_ref="$6"
+    local -n resfile_ref="$4" jsonfile_ref="$5" livecsvfile_ref="$6"
     local -n treefile_ref="$7" workload_ref="$8"
     local -a paths
     mapfile -t paths < <(
-        local resfile csvfile livecsvfile treefile
-        _elbencho_io_set_resfile_csvfile "$remote_output_dir" "$io_size" \
+        local resfile jsonfile csvfile livecsvfile treefile
+        _elbencho_io_set_result_files "$remote_output_dir" "$io_size" \
             "$node_count" "$thread_count" "$io_depth" "$ds"
         _elbencho_io_set_livecsvfile "$remote_output_dir" "$io_size" \
             "$node_count" "$thread_count" "$io_depth" "$ds"
         _elbencho_io_set_treefile "$remote_output_dir" "$io_size" \
             "$node_count" "$thread_count" "$io_depth" "$ds"
-        printf '%s\n' "$resfile" "$csvfile" "$livecsvfile" "$treefile"
+        printf '%s\n' "$resfile" "$jsonfile" "$livecsvfile" "$treefile"
     ) || return 1
     [[ ${#paths[@]} -eq 4 ]] || return 1
     # shellcheck disable=SC2034  # Nameref assignments update runner locals.
     resfile_ref="${paths[0]}"
     # shellcheck disable=SC2034  # Nameref assignments update runner locals.
-    csvfile_ref="${paths[1]}"
+    jsonfile_ref="${paths[1]}"
     # shellcheck disable=SC2034  # Nameref assignments update runner locals.
     livecsvfile_ref="${paths[2]}"
     # shellcheck disable=SC2034  # Nameref assignments update runner locals.
@@ -2868,11 +2876,12 @@ run_elbencho_io_sweep_iteration_staged() {
     [[ "$read_component" == r* ]] && use_random_read=1
     local this_read_size="${read_component#r}"
     local id="${ELBENCHO_RUN_EXECUTION_ID:-unknown}"
-    local resfile csvfile livecsvfile treefile workload
+    local resfile jsonfile livecsvfile treefile workload
     _elbencho_staged_set_artifact_paths "$remote_output_dir" \
-        "${output_dir##*-}" "$id" resfile csvfile livecsvfile treefile \
+        "${output_dir##*-}" "$id" resfile jsonfile livecsvfile treefile \
         workload || return 1
-    _elbencho_io_cleanup_result_artifacts "$resfile" "$csvfile" "$livecsvfile" "$treefile" \
+    _elbencho_io_cleanup_result_artifacts "$resfile" "$jsonfile" \
+        "${jsonfile%.json}.csv" "$livecsvfile" "$treefile" \
         "${remote_output_dir}/executions/${id}.write.json" \
         "${remote_output_dir}/executions/${id}.read.json" \
         "${remote_output_dir}/executions/${id}.delete.json" "$workload" || return 1
@@ -2887,7 +2896,7 @@ run_elbencho_io_sweep_iteration_staged() {
     _elbencho_staged_record_cache_hit_totals \
         "$tree_source" "$tree_path" files bytes || return 1
     local common_args
-    _elbencho_io_build_common_args "$resfile" "$csvfile" "$livecsvfile" unused "" "$ELBENCHO_IO_EXTENT_INFERRED" || return 1
+    _elbencho_io_build_common_args "$resfile" "$jsonfile" "$livecsvfile" unused "" "$ELBENCHO_IO_EXTENT_INFERRED" || return 1
     # shellcheck disable=SC2034  # Consumed through nameref by the execution helper.
     local -a args
     _elbencho_staged_build_read_args args "$this_read_size" "$tree_path" \
@@ -2932,25 +2941,25 @@ _elbencho_shared_set_artifact_paths() {
     local remote_output_dir="$1"
     local ds="$2"
     local id="$3"
-    local -n resfile_ref="$4" csvfile_ref="$5" livecsvfile_ref="$6"
+    local -n resfile_ref="$4" jsonfile_ref="$5" livecsvfile_ref="$6"
     local -n treefile_ref="$7" write_json_ref="$8" read_json_ref="$9"
     local -n delete_json_ref="${10}" workload_ref="${11}"
     local -a paths
     mapfile -t paths < <(
-        local resfile csvfile livecsvfile treefile
-        _elbencho_io_set_resfile_csvfile "$remote_output_dir" "$io_size" \
+        local resfile jsonfile csvfile livecsvfile treefile
+        _elbencho_io_set_result_files "$remote_output_dir" "$io_size" \
             "$node_count" "$thread_count" "$io_depth" "$ds"
         _elbencho_io_set_livecsvfile "$remote_output_dir" "$io_size" \
             "$node_count" "$thread_count" "$io_depth" "$ds"
         _elbencho_io_set_treefile "$remote_output_dir" "$io_size" \
             "$node_count" "$thread_count" "$io_depth" "$ds"
-        printf '%s\n' "$resfile" "$csvfile" "$livecsvfile" "$treefile"
+        printf '%s\n' "$resfile" "$jsonfile" "$livecsvfile" "$treefile"
     ) || return 1
     [[ ${#paths[@]} -eq 4 ]] || return 1
     # shellcheck disable=SC2034  # Nameref assignments update runner locals.
     resfile_ref="${paths[0]}"
     # shellcheck disable=SC2034  # Nameref assignments update runner locals.
-    csvfile_ref="${paths[1]}"
+    jsonfile_ref="${paths[1]}"
     # shellcheck disable=SC2034  # Nameref assignments update runner locals.
     livecsvfile_ref="${paths[2]}"
     # shellcheck disable=SC2034  # Nameref assignments update runner locals.
@@ -2971,8 +2980,8 @@ _elbencho_shared_prepare_attempt() {
     local total_files="$4" total_bytes="$5"
     local has_read="$6" has_delete="$7"
     shift 7
-    if ! _elbencho_io_cleanup_result_artifacts "$resfile" "$csvfile" \
-            "$livecsvfile" "$treefile" "$@"; then
+    if ! _elbencho_io_cleanup_result_artifacts "$resfile" "$jsonfile" \
+            "${jsonfile%.json}.csv" "$livecsvfile" "$treefile" "$@"; then
         _elbencho_finalize_generated_shared_failure || true
         return 1
     fi
@@ -2995,6 +3004,9 @@ _elbencho_shared_prepare_attempt() {
     return 0
 }
 
+# The mkdir phase writes the common --jsonfile. Write and read each write
+# their own phase JSON instead (the completion check needs one phase per
+# file); _elbencho_shared_keep_phase_json then appends it to the common one.
 _elbencho_shared_build_phase_args() {
     local -n mkdir_ref="$1" write_ref="$2" read_ref="$3"
     local write_size="$4" read_size="$5" files_per_worker="$6"
@@ -3003,13 +3015,17 @@ _elbencho_shared_build_phase_args() {
     shift 10
     # shellcheck disable=SC2034  # Nameref assignments update runner arrays.
     mkdir_ref=(--mkdirs "$@" --dirs=0 --files="$files_per_worker")
-    local -a write_common_args
-    _elbencho_io_aligned_write_args write_common_args "$@"
+    local -a phase_common_args=() write_common_args
+    local arg
+    for arg in "$@"; do
+        [[ "$arg" == --jsonfile=* ]] || phase_common_args+=("$arg")
+    done
+    _elbencho_io_aligned_write_args write_common_args "${phase_common_args[@]}"
     # shellcheck disable=SC2034  # Nameref assignments update runner arrays.
-    write_ref=(--write --block="$write_size" --nocsvlabels "${write_common_args[@]}"
+    write_ref=(--write --block="$write_size" "${write_common_args[@]}"
         --dirs=0 --files="$files_per_worker" --jsonfile="$write_json")
     # shellcheck disable=SC2034  # Nameref assignments update runner arrays.
-    read_ref=(--nocsvlabels --read --block="$read_size" "$@"
+    read_ref=(--read --block="$read_size" "${phase_common_args[@]}"
         --dirs=0 --files="$files_per_worker" --jsonfile="$read_json")
     [[ "$random_write" == 1 ]] && write_ref+=(--rand)
     [[ "$random_read" == 1 ]] && read_ref+=(--rand)
@@ -3022,8 +3038,16 @@ _elbencho_shared_build_delete_args() {
     local files_per_worker="$2" delete_json="$3"
     # Deletion is a metadata phase. I/O size, direct-I/O, iodepth, and --sync
     # do not apply and would distort the unlink timing.
-    args_ref=(--delfiles --nocsvlabels --threads="$thread_count"
+    args_ref=(--delfiles --threads="$thread_count" --svcstats="$ELBENCHO_SVCSTATS"
         --dirs=0 --files="$files_per_worker" --nolive --jsonfile="$delete_json")
+}
+
+# Append one shared write/read phase JSON to the run's --jsonfile, which the
+# report reads. A phase that wrote no JSON adds nothing.
+_elbencho_shared_keep_phase_json() {
+    local phase_json="$1"
+    [[ -f "$phase_json" ]] || return 0
+    cat -- "$phase_json" >>"$jsonfile"
 }
 
 _elbencho_shared_run_mkdir() {
@@ -3044,6 +3068,7 @@ _elbencho_shared_run_write() {
     ELBENCHO_SHARED_WRITE_STARTED_MS=$(_elbencho_monotonic_milliseconds) \
         || { _elbencho_shared_fail 1; return $?; }
     run_an_elbencho "$@" "$target" || phase_rc=$?
+    _elbencho_shared_keep_phase_json "$write_json" || check_rc=1
     _elbencho_record_bounded_phase_completion write "$write_json" \
         "$total_files" "$total_bytes" || check_rc=$?
     if [[ "$phase_rc" -ne 0 ]]; then
@@ -3082,6 +3107,7 @@ _elbencho_shared_run_read() {
     rm -f -- "$read_json" || { _elbencho_shared_fail 1; return $?; }
     local phase_rc=0 check_rc=0 service_rc=0
     run_an_elbencho "$@" "$target" || phase_rc=$?
+    _elbencho_shared_keep_phase_json "$read_json" || check_rc=1
     _elbencho_record_bounded_phase_completion read "$read_json" \
         "$total_files" "$total_bytes" || check_rc=$?
     _elbencho_workload_write || check_rc=1
@@ -3166,9 +3192,9 @@ run_elbencho_io_sweep_iteration_shared_generated() {
         write_only no_read has_read has_delete file_bytes <<<"$derived"
     : "$file_bytes"
     local id="${ELBENCHO_RUN_EXECUTION_ID:-unknown}"
-    local resfile csvfile livecsvfile treefile write_json read_json delete_json workload
+    local resfile jsonfile livecsvfile treefile write_json read_json delete_json workload
     _elbencho_shared_set_artifact_paths "$remote_output_dir" \
-        "${output_dir##*-}" "$id" resfile csvfile livecsvfile treefile \
+        "${output_dir##*-}" "$id" resfile jsonfile livecsvfile treefile \
         write_json read_json delete_json workload || return 1
     _elbencho_shared_prepare_attempt "$target" "$workload" "$files_per_node" \
         "$total_files" "$total_bytes" "$has_read" "$has_delete" \
@@ -3176,7 +3202,7 @@ run_elbencho_io_sweep_iteration_shared_generated() {
     echo "Generated shared-directory: --nodes=${node_count}; requested ELBENCHO_FILES_PER_NODE=${files_per_node}; effective files per node=${files_per_node}; ELBENCHO_SCALE_THREAD_LIST value=${thread_count}; files per worker=${files_per_worker}; ELBENCHO_IODEPTH_LIST value=${io_depth}"
     echo "File size=${file_size} total_files=${total_files} total_bytes=${total_bytes}; duration=not applicable (completion-based)"
     local common_args
-    _elbencho_io_build_common_args "$resfile" "$csvfile" "$livecsvfile" "$file_size" || { _elbencho_shared_fail 1; return $?; }
+    _elbencho_io_build_common_args "$resfile" "$jsonfile" "$livecsvfile" "$file_size" || { _elbencho_shared_fail 1; return $?; }
     local -a mkdir_args write_args read_args
     _elbencho_shared_build_phase_args mkdir_args write_args read_args \
         "$write_size" "$read_size" "$files_per_worker" "$write_json" \
@@ -3323,16 +3349,17 @@ run_elbencho_io_sweep_iteration() {
     echo "Run to Completion: $([ "$run_to_completion" = "1" ] && echo "Yes" || echo "No")"
 
     local resfile
+    local jsonfile
     local csvfile
     local livecsvfile
-    _elbencho_io_set_resfile_csvfile "$remote_output_dir" "$io_size" "$node_count" \
+    _elbencho_io_set_result_files "$remote_output_dir" "$io_size" "$node_count" \
         "$thread_count" "$io_depth" "$ds"
     _elbencho_io_set_livecsvfile "$remote_output_dir" "$io_size" "$node_count" \
         "$thread_count" "$io_depth" "$ds"
     _elbencho_io_set_treefile "$remote_output_dir" "$io_size" "$node_count" \
         "$thread_count" "$io_depth" "$ds"
     _elbencho_io_cleanup_result_artifacts \
-        "$resfile" "$csvfile" "$livecsvfile" "$treefile" || return 1
+        "$resfile" "$jsonfile" "$csvfile" "$livecsvfile" "$treefile" || return 1
 
     # Create test directories (skip when reading pre-existing tree only)
     if [[ -z "$sweep_read_from" ]]; then
@@ -3344,13 +3371,13 @@ run_elbencho_io_sweep_iteration() {
     fi
 
     echo "(remote) Human readable output file: $resfile"
-    echo "(remote) CSV file: $csvfile"
+    echo "(remote) JSON file: $jsonfile"
     if [[ "${ELBENCHO_LIVE_CSV_EXTENDED:-1}" == "1" ]]; then
         echo "(remote) Live CSV file: $livecsvfile"
     fi
 
     local common_args
-    _elbencho_io_build_common_args "$resfile" "$csvfile" "$livecsvfile" \
+    _elbencho_io_build_common_args "$resfile" "$jsonfile" "$livecsvfile" \
         "$this_file_size"
 
     local use_treefile_cache=0
@@ -3373,8 +3400,7 @@ run_elbencho_io_sweep_iteration() {
     # Not sure why or how, but some aspect of the mkdirs runtime is proportional
     # to the file count.  To keep that from starving our write timeout, if applicable,
     # we run the mkdirs by itself first.
-    # Same --csvfile for mkdir, write, read: mkdir runs first without --nocsvlabels (one header row);
-    # write and read use --nocsvlabels so they only append data (never a second header).
+    # Same --jsonfile for mkdir, write, read: elbencho appends one object per phase.
     local elbencho_mkdir_args=(
         --mkdirs
         "${common_args[@]}"
@@ -3384,19 +3410,13 @@ run_elbencho_io_sweep_iteration() {
     local elbencho_write_args=(
         --write
         --block="$this_write_size"
-        --nocsvlabels
         "${write_common_args[@]}"
     )
-    # --read-from runs only this read phase; include CSV column labels so extract-elbencho.py
-    # can parse (nocsvlabels would emit headerless CSV and break DictReader).
     local elbencho_read_args=(
         --read
         --block="$this_read_size"
         "${common_args[@]}"
     )
-    if [[ -z "$sweep_read_from" ]]; then
-        elbencho_read_args=(--nocsvlabels "${elbencho_read_args[@]}")
-    fi
     # Completion reads finish once; timed direct reads repeat until the limit.
     # Only saved historical buffered requests retain a time ceiling.
     _elbencho_io_append_read_policy elbencho_read_args
@@ -4148,6 +4168,7 @@ run_elbencho_metadata_benchmark() {
     for ((iter = 1; iter <= MDTEST_ITERATIONS; iter++)); do
         _elbencho_io_cleanup_result_artifacts \
             "${base_resfile}_iter${iter}.out" \
+            "${base_resfile}_iter${iter}.json" \
             "${base_resfile}_iter${iter}.csv" || return 1
     done
     if [[ "${ELBENCHO_EXECUTION_KIND:-}" == mdtest ]]; then
@@ -4201,7 +4222,7 @@ run_elbencho_metadata_benchmark() {
     _mdtest_print_run_summary "$ds"
 
     # Base output file names (iteration number will be inserted)
-    echo "Output files: ${base_resfile}_iter*.out / .csv"
+    echo "Output files: ${base_resfile}_iter*.out / .json"
     echo
 
     # Common elbencho arguments for metadata operations (without output files)
@@ -4217,6 +4238,7 @@ run_elbencho_metadata_benchmark() {
         --lathisto
         --latpercent
         --nolive
+        --svcstats="$ELBENCHO_SVCSTATS"
     )
 
     # External iteration loop - gives fresh state each iteration and per-iteration output
@@ -4226,10 +4248,10 @@ run_elbencho_metadata_benchmark() {
 
         # Per-iteration output files
         local resfile="${base_resfile}_iter${iter}.out"
-        local csvfile="${base_resfile}_iter${iter}.csv"
+        local jsonfile="${base_resfile}_iter${iter}.json"
         local iter_output_args=(
             --resfile="$resfile"
-            --csvfile="$csvfile"
+            --jsonfile="$jsonfile"
         )
 
         # Phase 1: Create directories and files
@@ -4279,7 +4301,6 @@ run_elbencho_metadata_benchmark() {
         stat_args+=(
             --stat                      # Stat files
             "${common_args[@]}"
-            --nocsvlabels               # Don't repeat CSV header
             "${iter_output_args[@]}"
             "${elbencho_paths[@]}"
         )
@@ -4307,7 +4328,6 @@ run_elbencho_metadata_benchmark() {
             -F                          # Delete files
             ${delete_extra_args[@]+"${delete_extra_args[@]}"}  # -D unless dense
             "${common_args[@]}"
-            --nocsvlabels               # Don't repeat CSV header
             "${iter_output_args[@]}"
             "${elbencho_paths[@]}"
         )
