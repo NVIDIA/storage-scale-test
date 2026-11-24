@@ -33,7 +33,7 @@ Kubernetes users should also read the
 
 SSH and Slurm require an elbencho binary for each client architecture under
 `utils/` and filesystems mounted at the same paths on every client. Kubernetes
-uses an elbencho image (default `docker.io/breuner/elbencho:v3.2-1`) and
+uses an elbencho image (default `docker.io/breuner/elbencho:v3.4-1`) and
 claim-qualified test roots instead; see [Kubernetes setup](#kubernetes-setup).
 For SSH or Slurm, configure one test root:
 
@@ -1028,7 +1028,7 @@ TEST_DIRS=(["vendor-b/data:scale-test"]=1)       # claim data in vendor-b
   The coordinator itself has no Kubernetes API credentials.
 - The elbencho image supports your nodes and is usable under the pull policy
   with any required registry credentials. `KUBECTL_ELBENCHO_IMAGE` defaults to
-  `docker.io/breuner/elbencho:v3.2-1`; set it only for another image or a
+  `docker.io/breuner/elbencho:v3.4-1`; set it only for another image or a
   mirror. `Never` requires preloading; `Always` requires a digest-pinned
   image, so not the default tag.
 

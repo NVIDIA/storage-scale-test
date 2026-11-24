@@ -5615,8 +5615,8 @@ def test_markerless_sbx_elbencho_bundle_is_rebuilt(tmp_path, monkeypatch):
     cache = tmp_path / "test-cache" / "container"
     cache.mkdir(parents=True)
     binary_name = "elbencho.aarch64"
-    binary = cache / f"v3.2-1-{binary_name}"
-    runtime = cache / f"v3.2-1-{binary_name}.runtime"
+    binary = cache / f"v3.4-1-{binary_name}"
+    runtime = cache / f"v3.4-1-{binary_name}.runtime"
     binary.write_text("stale wrapper\n", encoding="utf-8")
     runtime.mkdir()
     calls = []
@@ -5633,7 +5633,7 @@ def test_markerless_sbx_elbencho_bundle_is_rebuilt(tmp_path, monkeypatch):
     _ensure_elbencho(object(), config, "aarch64", "sbx-shared")
 
     assert calls == ["aarch64"]
-    marker = cache / f"v3.2-1-{binary_name}.bundle.json"
+    marker = cache / f"v3.4-1-{binary_name}.bundle.json"
     document = json.loads(marker.read_text(encoding="utf-8"))
     assert document["container"] == _FILESYSTEM.ELBENCHO_CONTAINER
     assert document["recipe"] == _FILESYSTEM.SBX_ELBENCHO_BUNDLE_RECIPE

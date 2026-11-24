@@ -69,6 +69,7 @@ def _kubectl_deployment(tmp_path):
     shutil.copy2(_ROOT / "validate_env.sh", deployment / "validate_env.sh")
     (deployment / "lib").mkdir()
     shutil.copy2(_ROOT / "lib/project_version.sh", deployment / "lib")
+    shutil.copy2(_ROOT / "lib/_platform_functions.sh", deployment / "lib")
     shutil.copy2(_ROOT / "lib/_kubectl_claims.sh", deployment / "lib")
     shutil.copy2(
         _ROOT
@@ -96,7 +97,7 @@ def _kubectl_deployment(tmp_path):
             KUBECTL_PV=pawan-lustre-pv
             KUBECTL_PVC=lustre-pvc-example
             KUBECTL_NODE_SELECTOR=lustre-host=true
-            KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
+            KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.4-1
             KUBECTL_IMAGE_PULL_POLICY=IfNotPresent
             KUBECTL_RUN_AS_USER=0
             KUBECTL_RUN_AS_GROUP=0

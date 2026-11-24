@@ -1529,6 +1529,15 @@ _coordinator_main() {
     # shellcheck disable=SC1091,SC1090  # Digest-verified, colocated control library.
     source "$CONTROL_DIR/_elbencho_functions.sh" || return 1
     _coordinator_initialize_state || return 1
+    # The floor applies to the image the workers run too, so check before any
+    # benchmark. An integration fake stands in for the binary and has no version.
+    if [[ -z "${KUBECTL_INTEGRATION_FAKE_ELBENCHO:-}" ]]; then
+        local version_error
+        version_error=$(elbencho_check_binary_version "$ELBENCHO" 2>&1) || {
+            _coordinator_finish_startup_failure "$version_error"
+            return 1
+        }
+    fi
     _coordinator_validate_endpoint_rows || {
         _coordinator_finish_startup_failure "invalid worker endpoint evidence"
         return 1

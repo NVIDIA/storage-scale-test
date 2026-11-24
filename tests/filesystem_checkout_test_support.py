@@ -19,6 +19,13 @@ from pathlib import Path
 import shlex
 import shutil
 
+# What a launcher's version check needs from a stand-in elbencho.
+FAKE_ELBENCHO_SCRIPT = (
+    "#!/usr/bin/env bash\n"
+    '[[ "${1-}" != --version ]] || printf "elbencho\\n * Version: 3.4-1\\n"\n'
+    "exit 0\n"
+)
+
 
 def make_filesystem_checkout(parent: Path, repo_root: Path) -> Path:
     """Copy real launchers and seed a bounded SSH workload with a fake binary."""
@@ -27,7 +34,7 @@ def make_filesystem_checkout(parent: Path, repo_root: Path) -> Path:
     shutil.copytree(repo_root / "lib", base / "lib")
     shutil.copytree(repo_root / "storage-tests/fs", base / "storage-tests/fs")
     (base / "utils").mkdir()
-    (base / "utils/elbencho").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (base / "utils/elbencho").write_text(FAKE_ELBENCHO_SCRIPT)
     (base / "utils/elbencho").chmod(0o755)
     (base / "hosts").write_text("first,second\n")
     text = (repo_root / "env.sh.template").read_text()

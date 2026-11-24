@@ -1283,7 +1283,7 @@ def test_sweep_job_renders_segment_label_suspend_flag_and_every_claim():
     job = _render(_CLAIM_VOLUMES.format(shape="workload") + f"""
         kubectl_render_attempt_template {_TEMPLATES}/sweep-job.yaml.tmpl \\
             {_common_args(1)} RESOURCE_NAME=sst-elb-1234abcd-s1-sweep \\
-            IMAGE=breuner/elbencho:v3.2-1 IMAGE_PULL_POLICY=Never \\
+            IMAGE=breuner/elbencho:v3.4-1 IMAGE_PULL_POLICY=Never \\
             RUN_AS_USER=2000 RUN_AS_GROUP=2000 "${{volumes[@]}}" \\
             COORDINATOR_NODE=node-a JOB_SUSPEND=true \\
             REMOTE_RUN_DIRECTORY=$KUBECTL_CONTROL_ROOT/runs/1234abcd
@@ -1309,15 +1309,15 @@ def test_sweep_job_renders_segment_label_suspend_flag_and_every_claim():
 def test_workload_templates_mount_every_claim(template):
     arguments = {
         "worker-daemonset": (
-            "IMAGE=breuner/elbencho:v3.2-1 IMAGE_PULL_POLICY=Never "
+            "IMAGE=breuner/elbencho:v3.4-1 IMAGE_PULL_POLICY=Never "
             "RUN_AS_USER=2000 RUN_AS_GROUP=2000 SEGMENT_INDEX=1 "
             '"NODE_SELECTOR_BLOCK=$(kubectl_render_node_selector a=b)" '
             '"NODE_AFFINITY_VALUES=$(kubectl_render_node_affinity_values node-a)"'
         ),
         "validation-job": (
-            "IMAGE=breuner/elbencho:v3.2-1 IMAGE_PULL_POLICY=Never "
+            "IMAGE=breuner/elbencho:v3.4-1 IMAGE_PULL_POLICY=Never "
             "RUN_AS_USER=2000 RUN_AS_GROUP=2000 NODE_NAME=node-a "
-            "MOUNT_ROOT=/mnt/storage-scale-test "
+            "MOUNT_ROOT=/mnt/storage-scale-test ELBENCHO_MIN_VERSION=3.4-1 "
             '"TEST_ROOT_ARGUMENTS=$(kubectl_render_test_root_arguments '
             '/mnt/storage-scale-test/lustre-a/x /mnt/storage-scale-test/lustre-b/y)"'
         ),
@@ -1345,7 +1345,7 @@ def test_helper_pods_carry_their_segment_and_mount_its_claims(helper):
     pod = _render(_CLAIM_VOLUMES.format(shape="pod") + f"""
         kubectl_render_attempt_template {_TEMPLATES}/{helper}-pod.yaml.tmpl \\
             {_common_args(3)} RESOURCE_NAME=sst-elb-1234abcd-s3-{helper}-0badcafe \\
-            OPERATION_TOKEN=0badcafe IMAGE=breuner/elbencho:v3.2-1 \\
+            OPERATION_TOKEN=0badcafe IMAGE=breuner/elbencho:v3.4-1 \\
             IMAGE_PULL_POLICY=Never RUN_AS_USER=2000 RUN_AS_GROUP=2000 \\
             "${{volumes[@]}}" NODE_NAME=node-a \\
             REMOTE_RUN_DIRECTORY=$KUBECTL_CONTROL_ROOT/runs/1234abcd
@@ -1397,7 +1397,7 @@ def test_status_and_collector_helpers_mount_only_the_control_claim(tmp_path):
         KUBECTL_CONTROL_LOGICAL_ROOT=ns-a/pvc-z:bench
         KUBECTL_CONTROL_TEST_ROOT="$KUBECTL_SWEEP_MOUNT_ROOT/pvc-z/bench"
         KUBECTL_CONTROL_ROOT="$KUBECTL_CONTROL_TEST_ROOT/.storage-scale-test"
-        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.4-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000
         export KUBECTL_RUN_AS_GROUP=2000
         kubectl_create_owned_object() {{
@@ -1476,7 +1476,7 @@ def test_ambiguous_names_render_as_yaml_strings_in_helper_pods(helper):
         kubectl_render_attempt_template {_TEMPLATES}/{helper}-pod.yaml.tmpl \\
             ATTEMPT_ID=1234abcd OWNERSHIP_NONCE={_NONCE} NAMESPACE=null \\
             SEGMENT_INDEX=0 RESOURCE_NAME=sst-elb-1234abcd-{helper}-0badcafe \\
-            OPERATION_TOKEN=0badcafe IMAGE=breuner/elbencho:v3.2-1 \\
+            OPERATION_TOKEN=0badcafe IMAGE=breuner/elbencho:v3.4-1 \\
             IMAGE_PULL_POLICY=Never RUN_AS_USER=2000 RUN_AS_GROUP=2000 \\
             "${{volumes[@]}}" NODE_NAME=on \\
             REMOTE_RUN_DIRECTORY=$KUBECTL_CONTROL_ROOT/runs/1234abcd
@@ -1496,23 +1496,23 @@ def test_ambiguous_names_render_as_yaml_strings_in_workloads():
         common="ATTEMPT_ID=1234abcd OWNERSHIP_NONCE={_NONCE} NAMESPACE=yes"
         kubectl_render_attempt_template {_TEMPLATES}/sweep-job.yaml.tmpl $common \\
             SEGMENT_INDEX=0 RESOURCE_NAME=sst-elb-1234abcd-sweep \\
-            IMAGE=breuner/elbencho:v3.2-1 IMAGE_PULL_POLICY=Never \\
+            IMAGE=breuner/elbencho:v3.4-1 IMAGE_PULL_POLICY=Never \\
             RUN_AS_USER=2000 RUN_AS_GROUP=2000 "${{volumes[@]}}" \\
             COORDINATOR_NODE=1.5 JOB_SUSPEND=false \\
             REMOTE_RUN_DIRECTORY=$KUBECTL_CONTROL_ROOT/runs/1234abcd
         printf '\\n---\\n'
         kubectl_render_attempt_template {_TEMPLATES}/worker-daemonset.yaml.tmpl \\
             $common SEGMENT_INDEX=0 RESOURCE_NAME=sst-elb-1234abcd-workers \\
-            IMAGE=breuner/elbencho:v3.2-1 IMAGE_PULL_POLICY=Never \\
+            IMAGE=breuner/elbencho:v3.4-1 IMAGE_PULL_POLICY=Never \\
             RUN_AS_USER=2000 RUN_AS_GROUP=2000 "${{volumes[@]}}" \\
             "NODE_SELECTOR_BLOCK=$(kubectl_render_node_selector on=yes,null=123)" \\
             "NODE_AFFINITY_VALUES=$(kubectl_render_node_affinity_values 123 on)"
         printf '\\n---\\n'
         kubectl_render_attempt_template {_TEMPLATES}/validation-job.yaml.tmpl \\
             $common RESOURCE_NAME=sst-elb-1234abcd-validate \\
-            IMAGE=breuner/elbencho:v3.2-1 IMAGE_PULL_POLICY=Never \\
+            IMAGE=breuner/elbencho:v3.4-1 IMAGE_PULL_POLICY=Never \\
             RUN_AS_USER=2000 RUN_AS_GROUP=2000 "${{volumes[@]}}" NODE_NAME=null \\
-            MOUNT_ROOT=/mnt/storage-scale-test \\
+            MOUNT_ROOT=/mnt/storage-scale-test ELBENCHO_MIN_VERSION=3.4-1 \\
             "TEST_ROOT_ARGUMENTS=$(kubectl_render_test_root_arguments \\
                 /mnt/storage-scale-test/123/x)"
         printf '\\n---\\n'

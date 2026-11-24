@@ -291,7 +291,7 @@ the LoginSet, extract it in shared storage, and launch both there. The NFS
 profile gets Elbencho from a size-limited, checksum-verified upstream archive;
 Docker SBX, and NFS outside GitHub Actions when that download is blocked,
 extract the binary and runtime libraries from the digest-pinned
-`docker.io/breuner/elbencho:v3.2-1` image into the generated test deployment
+`docker.io/breuner/elbencho:v3.4-1` image into the generated test deployment
 only.
 
 The SSH `baseline` instead runs from a release source archive built from the

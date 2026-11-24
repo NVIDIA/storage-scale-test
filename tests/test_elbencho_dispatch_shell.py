@@ -2143,6 +2143,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 [[ "$1" == bio && "$4" == 0 ]]
             }
             resolve_elbencho_completion_mode() { return 99; }
+            elbencho_check_binary_version() { return 0; }
             dispatch_slurm_executions() { printf 'RESTORED_DISPATCH:%s\n' "$1"; }
             """.replace("__FAKE_ROOT__", str(fake_root))
             (fake_root / "env.sh").write_text(
@@ -2217,6 +2218,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 [[ "$ELBENCHO_FILES_PER_NODE" == 8 ]]
                 [[ "$ELBENCHO_FILE_SIZE" == 64G ]]
             }
+            elbencho_check_binary_version() { return 0; }
             dispatch_slurm_executions() { printf 'SHARED_DISPATCH:%s\n' "$1"; }
             """.replace("__FAKE_ROOT__", str(fake_root))
             (fake_root / "env.sh").write_text(
@@ -2298,6 +2300,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             print_slurm_node_warnings() { printf 'WARNING_NODES=%s\\n' "$1"; }
             reify_all_elbencho_executions() { printf 'REIFIED=%s\\n' "$5"; }
             dispatch_slurm_executions() { return 0; }
+            elbencho_check_binary_version() { return 0; }
             """.replace("__FAKE_ROOT__", str(fake_root))
                 .replace("__RESULTS_DIR__", str(Path(tmp) / "results"))
                 .replace("__FUNCTIONS__", str(_ELBENCHO_FUNCTIONS))

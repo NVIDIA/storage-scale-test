@@ -1405,7 +1405,7 @@ filesystem_enabled_from_test_dirs() {
 
 # The elbencho image Kubernetes sweeps run when KUBECTL_ELBENCHO_IMAGE is unset
 # or empty: the release utils/build/fetch_elbencho.sh downloads (ELBENCHO_VERSION_TAG).
-KUBECTL_DEFAULT_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.2-1
+KUBECTL_DEFAULT_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.4-1
 
 # apply_kubectl_defaults: on EXECUTION_SUBSTRATE=kubectl, default the settings
 # env.sh may leave out. env_base.sh calls it, and so does every entry point

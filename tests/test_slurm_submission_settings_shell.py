@@ -23,6 +23,8 @@ import textwrap
 
 import pytest
 
+from tests.filesystem_checkout_test_support import FAKE_ELBENCHO_SCRIPT
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ENV_FUNCTIONS = _REPO_ROOT / "lib" / "env_functions.sh"
 _INVALID_INTERVALS = ("0", "-1", "1.5", "abc")
@@ -106,6 +108,9 @@ def test_launchers_submit_nothing_with_an_invalid_poll_interval(
         encoding="utf-8",
     )
     (deployment / ".obj_auth").touch()
+    (deployment / "utils").mkdir(exist_ok=True)
+    (deployment / "utils/elbencho").write_text(FAKE_ELBENCHO_SCRIPT)
+    (deployment / "utils/elbencho").chmod(0o755)
     bin_dir, calls = _scheduler_stubs(tmp_path)
 
     result = subprocess.run(

@@ -102,7 +102,7 @@ LOG = logging.getLogger("storage-scale-integration")
 # One batch group's expectation: (group ID, workload kind, storage target name).
 GroupRow = tuple[str, str, str]
 
-ELBENCHO_VERSION = "v3.2-1"
+ELBENCHO_VERSION = "v3.4-1"
 ELBENCHO_RELEASE_API = (
     "https://api.github.com/repos/breuner/elbencho/releases/tags/" + ELBENCHO_VERSION
 )
@@ -115,12 +115,12 @@ SLURM_CLEANUP_MARGIN_SECONDS = 120
 ELBENCHO_ARCHIVES = {
     "x86_64": (
         "elbencho-static-x86_64.tar.gz",
-        "c32f9f905e879b7efed8c2f83ea9be7a362dceae43155bb46ddab3d5d6c23210",
+        "0ff66bd031fe5cb0004bf74e40e13a6e99ee8961dc9393afd6d48d196db1e328",
         "elbencho",
     ),
     "aarch64": (
         "elbencho-static-aarch64.tar.gz",
-        "3af09f8110586863b35da019e748c8062fcf57cc0f32e446b1c054df4500eba3",
+        "a5a18384c432a30e871cc94e0b87b0e7434dc0d1a251cbe12abd1afe2c1dd30e",
         "elbencho.aarch64",
     ),
 }

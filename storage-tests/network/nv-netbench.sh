@@ -219,6 +219,8 @@ if [[ -z "${NETBENCH_ITERATIONS:-}" ]] || [[ "$NETBENCH_ITERATIONS" -lt 1 ]]; th
     exit 1
 fi
 
+elbencho_check_binary_version "$ELBENCHO" || exit 1
+
 # Mode abbreviation for directory naming
 if [[ "$bidirectional" == "true" ]]; then
     mode_abbrev="bidir"

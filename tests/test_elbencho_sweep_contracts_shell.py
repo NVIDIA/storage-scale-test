@@ -26,6 +26,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.filesystem_checkout_test_support import FAKE_ELBENCHO_SCRIPT
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ENV_BASE = _REPO_ROOT / "lib" / "env_base.sh"
 _ENV_FUNCTIONS = _REPO_ROOT / "lib" / "env_functions.sh"
@@ -408,6 +410,8 @@ def _make_sweep_fixture(tmp_path: Path) -> Path:
     )
     root = tmp_path / "data"
     root.mkdir()
+    (tmp_path / "elbencho").write_text(FAKE_ELBENCHO_SCRIPT)
+    (tmp_path / "elbencho").chmod(0o755)
     env = tmp_path / "env.sh"
     env.write_text(
         textwrap.dedent(f"""
@@ -433,6 +437,7 @@ def _make_sweep_fixture(tmp_path: Path) -> Path:
             export SSH_ENABLED=
             export SLURM_ENABLED=
             source "$SCALE_TEST_BASE/lib/env_functions.sh"
+            export ELBENCHO={shlex.quote(str(tmp_path / 'elbencho'))}
             """),
         encoding="utf-8",
     )

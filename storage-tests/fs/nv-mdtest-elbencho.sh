@@ -295,6 +295,11 @@ if [[ -z "${FS_ENABLED:-}" ]]; then
     exit 1
 fi
 
+# Kubernetes runs the pinned image's elbencho, not this host's binary.
+if [[ -z "${KUBECTL_ENABLED:-}" ]]; then
+    elbencho_check_binary_version "$ELBENCHO" || exit 1
+fi
+
 if [[ "$operation" == resume ]]; then
     resume_log="$OUTPUT_DIR/mdtest-elbencho-sweep-$DS-resume-$(date -u +%Y%m%dZ%H%M%S).log"
     exec 1> >(tee -a "$resume_log")

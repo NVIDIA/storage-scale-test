@@ -63,7 +63,8 @@ def _deployment_source(tmp_path):
     shutil.copy2(
         ROOT / "utils/build/fetch_elbencho.sh", root / "utils/build/fetch_elbencho.sh"
     )
-    shutil.copy2(ROOT / "lib/project_version.sh", root / "lib/project_version.sh")
+    for library in ("project_version.sh", "_platform_functions.sh"):
+        shutil.copy2(ROOT / "lib" / library, root / "lib" / library)
     (root / "NOTICE").write_text("notice\n")
     (root / "source.txt").write_text("source\n")
     (root / ".gitignore").write_text("utils/elbencho*\nutils/warp*\nutils/s3test*\n")
@@ -77,6 +78,10 @@ def _deployment_source(tmp_path):
         (root / "utils" / name).write_bytes(b"custom binary")
     for binary in (root / "utils").glob("[ews]*"):
         binary.chmod(0o755)
+    # Stamped as current, so the fetch keeps them rather than downloading.
+    for name in ("elbencho", "elbencho.aarch64"):
+        sha = hashlib.sha256((root / "utils" / name).read_bytes()).hexdigest()
+        (root / "utils" / f"{name}.version").write_text(f"v3.4-1 {sha}\n")
     return root
 
 
