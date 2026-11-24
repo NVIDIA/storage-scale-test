@@ -234,6 +234,9 @@ collect before resume.
 - Network testing is beta; Elbencho netbench has no native timeout, so
   external execution limits are the operator's concern.
 - Raw and live histograms sum repeated buckets so no observation is lost.
+- Netbench writes `--jsonfile` (no `.csv`); 3.4 renamed `--respsize` to
+  `--recvsize` (env var still `NETBENCH_RESPSIZE`). Older directories read
+  from `.csv`/`.out`.
 
 ## Results and analysis
 
@@ -289,8 +292,13 @@ python3 utils/compress_json_for_context.py < result.json
 ## Deployment and supply chain
 
 `utils/build/fetch_elbencho.sh` downloads pinned upstream elbencho `v3.4-1` and
-verifies per-architecture SHA-256 values; existing custom binaries stay unless
-`--force-download`. Warp is never downloaded: existing binaries are included,
+verifies per-architecture SHA-256 values. An existing binary is kept only if
+it is at least `ELBENCHO_MIN_VERSION` (3.4-1, `lib/_platform_functions.sh`)
+and `--force-download` is not given; a failed download only warns. Each
+download gets a `.version` stamp, which the version check uses for binaries
+that cannot run on the launcher. Checks run in `validate_env.sh`, the sweep,
+mdtest and netbench launchers, the kubectl coordinator, and the validation
+Job. Warp is never downloaded: existing binaries are included,
 or users build them with `utils/build/build_warp_from_source.sh`. Archives
 exclude credential files. Users own source and toolchain selection,
 provenance, licenses, and validation of the tarball they build.

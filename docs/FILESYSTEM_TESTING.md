@@ -31,7 +31,8 @@ Kubernetes users should also read the
 [reporting](#filesystem-reporting); tuned settings live in the
 [benchmark recipes](../BENCHMARK_RECIPES_FILESYSTEM.md).
 
-SSH and Slurm require an elbencho binary for each client architecture under
+SSH and Slurm require an elbencho binary (3.4-1 or newer, enforced by
+`validate_env.sh` and each run) for each client architecture under
 `utils/` and filesystems mounted at the same paths on every client. Kubernetes
 uses an elbencho image (default `docker.io/breuner/elbencho:v3.4-1`) and
 claim-qualified test roots instead; see [Kubernetes setup](#kubernetes-setup).

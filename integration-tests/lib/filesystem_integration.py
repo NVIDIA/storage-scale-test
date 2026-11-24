@@ -3012,8 +3012,38 @@ def _live_object_problems(document: dict[str, Any]) -> list[str]:
             latency = live.get("aggregate_series", {}).get("io_latency_avg_us", ())
             if not any(isinstance(value, (int, float)) for value in latency):
                 problems.append(f"{label}: no Lat IO us samples")
+            problems.extend(_v34_live_problems(label, live))
+            if live.get("client_mode") == "service":
+                phase_services = _phase_services(execution, name)
+                if not (phase_services or {}).get("instances"):
+                    problems.append(f"{label}: no services.instances")
     if not document.get("executions"):
         problems.append("no executions")
+    return problems
+
+
+def _phase_services(execution: dict[str, Any], name: str) -> dict[str, Any] | None:
+    """The ``services`` object of one IO phase of an execution, if any."""
+    for phase in (execution.get("results") or {}).get("phases", ()):
+        if phase.get("phase") == name:
+            return phase.get("services")
+    return None
+
+
+def _v34_live_problems(label: str, live: dict[str, Any]) -> list[str]:
+    """Problems with the elbencho 3.4 live fields (counts and client latency)."""
+    problems = []
+    series = live.get("aggregate_series", {})
+    for key in ("done_ios", "io_latency_max_us"):
+        if not any(isinstance(value, (int, float)) for value in series.get(key, ())):
+            problems.append(f"{label}: no {key} samples")
+    summary = live.get("clients_summary") or {}
+    columns = summary.get("columns", ())
+    if "mean_ops_per_s" not in columns:
+        return problems + [f"{label}: clients_summary lacks 3.4 columns"]
+    position = columns.index("mean_ops_per_s")
+    if not any(isinstance(row[position], (int, float)) for row in summary["rows"]):
+        problems.append(f"{label}: no client ops/s")
     return problems
 
 
@@ -3184,6 +3214,8 @@ def _assert_read_cache(step: ScenarioStep, result: Path) -> None:
 
 LIVE_FAIRNESS_HEADING = "Live fairness"
 LIVE_PHASES = ("write", "read")
+# DoneBytes plus the columns elbencho 3.4 added (the floor for these runs).
+LIVE_CSV_COLUMNS_V34 = ("DoneBytes", "DoneIOs", "Lat IO max us")
 
 
 def _assert_live_capture(result: Path) -> None:
@@ -3197,8 +3229,9 @@ def _assert_live_capture(result: Path) -> None:
         if len(lines) < 3:
             continue
         header = lines[0]
-        if "DoneBytes" not in header:
-            raise IntegrationTestError(f"live CSV lacks DoneBytes column: {path}")
+        for column in LIVE_CSV_COLUMNS_V34:
+            if column not in header:
+                raise IntegrationTestError(f"live CSV lacks {column} column: {path}")
         stable_series = True
     if not stable_series:
         raise IntegrationTestError(

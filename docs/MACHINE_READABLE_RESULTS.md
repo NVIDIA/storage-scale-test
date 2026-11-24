@@ -34,7 +34,7 @@ metadata (mdtest) executions. Warp and netbench have no such document.
 The document is `<output-dir>/results.json` (IO and metadata directories
 together give two; see below), beside the text reports,
 plots, and [`report.html`](HTML_REPORT.md), which are all rendered from it.
-`--from-json PATH...` renders them again from documents (any schema 1.x) into
+`--from-json PATH...` renders them again from documents (schema 1.x or 2.x) into
 a separate `--output-dir`, without rewriting them. `<output-dir>` defaults to
 `<batch>/reports` for a batch and to the input directory otherwise. The
 document and `report.html` are replaced atomically.
@@ -148,8 +148,8 @@ otherwise.
 | --- | --- | --- |
 | `phase_missing` | IO | A phase expected by `phase_plan` has no result. |
 | `phase_unparseable` | IO | Result files exist but no phase parsed. |
-| `percentiles_missing` | IO | Latency percentiles absent from the `.out` file. |
-| `rates_missing` | IO | An `elbencho_first` rate is absent or malformed in the CSV; it is `null`. |
+| `percentiles_missing` | IO | Latency percentiles absent from the result. |
+| `rates_missing` | IO | An `elbencho_first` rate is absent or malformed in the result; it is `null`. |
 | `completion_incomplete` | IO | A phase did not complete all its work. |
 | `live_csv_unreadable` | IO | The live CSV could not be analyzed. Does not change `result_state`. |
 | `iteration_incomplete` | metadata | An iteration has partial or invalid data; listed on the iteration and, prefixed with its number, on the execution. |
@@ -211,12 +211,16 @@ and `lifecycle_elapsed_ms`.
 | `elbencho_first` | `ops_per_s`, `bytes_per_s`, `elapsed_ms`: elbencho's `[first]` column, the aggregate from phase start until the fastest worker thread finished. |
 | `elbencho_last` | The same fields from the `[last]` column: until the slowest worker thread finished. |
 | `latency_us` | `min`, `avg`, `max`, `p1`, `p50`, `p75`, `p99`. A missing percentile is `null`. |
+| `services` | Optional, elbencho 3.4+ runs with `--svcstats`: `instances[]` (`host`, `elapsed_ms`, `latency_us` of `min`/`avg`/`max`/`p1`/`p50`/`p75`/`p99`, one per service) and `ops_per_s`, `bytes_per_s`, each `{min, avg, max, min_host, max_host}`. |
 | `histogram_us`, `work`, `file_size_bytes`, `configured_time_limit_s`, `command`, `live` | Latency histogram; expected and completed files and bytes; the CSV file size (`null` if none); the configured limit; the recorded argv; the [live object](#live-object). |
 
 The `delete` phase has only `phase`, `completion_state`, `work`, and
 `elapsed_ms`.
 
-Reports and tables use `elbencho_first`. Use `elbencho_last` for the rate the
+Rates, latency and histograms come from elbencho's `--jsonfile` (`.json`)
+for runs on elbencho 3.4+, else from the `.csv` and `.out`. Each execution
+records `elbencho_version` (`null` if unknown). Reports and tables use
+`elbencho_first`. Use `elbencho_last` for the rate the
 whole fleet sustained.
 
 ### Metadata coordinates and results
@@ -265,12 +269,12 @@ Without an analysis, `live` is `{"reason": R}` with `R` one of `not_captured`,
 | `phase_context` | From the phase's result pair, else `null`: `first_ms`, `last_ms` (elbencho `[first]`/`[last]` times), `block_size_bytes`, `final_avg_latency_us`. |
 | `intervals`, `clients` | Counts. |
 | `steady` | `start_ms`, `end_ms`, `end_source` (`elbencho_first`), `reason` (`null`, `no_first_time`, `too_short`, or `no_steady_state`), and `interval_ms`, the live interval used. See [live reports](FILESYSTEM_TESTING.md#live-client-and-latency-reports). |
-| `aggregate_series` | Columnar: `elapsed_ms`, `bytes_per_s`, `ops_per_s`, `io_latency_avg_us` (fleet mean IO latency), `entries_latency_avg_us`, `clock_skew_ms`; `null` is a missing or invalid sample. `start_time` is the first sample's `ISO Date`, verbatim. |
+| `aggregate_series` | Columnar: `elapsed_ms`, `bytes_per_s`, `ops_per_s`, `io_latency_avg_us` (fleet mean IO latency), `entries_latency_avg_us`, `clock_skew_ms`; 2.0 adds `io_latency_max_us`, `entries_latency_max_us`, `done_bytes`, `done_ios` (elbencho 3.4+ CSVs, else absent); `null` is a missing or invalid sample. `start_time` is the first sample's `ISO Date`, verbatim. |
 | `fleet_series` | Columnar per-interval client statistics: `elapsed_ms`, `client_count`, `bytes_per_s_p10`, `_p50`, `_p90`, `_mean`, `_stddev`. |
 | `fairness` | `null` without a steady window; else `interval`, `5s`, and `30s`, each `null` or `{window_ms, windows, jain {min, p10, p50}, jain_min_at_ms, share_below_0_95, min_over_median_p10, floor_p50, series {end_ms, clients, jain}}` over the windows inside the steady window. `min_over_median_p10` is the p10 of each window's slowest-client ratio; `floor_p50` is the expected Jain floor. |
-| `latency` | `null` without steady latency; else `p50_us`, `p90_us`, `max_us`, `max_over_p50`, `cv`, `steady_mean_us` (op-weighted), `final_avg_us` (from `.out`), and Spearman `rho_jain_latency` and `rho_latency_throughput` over 5 s windows (`null` under 6). |
+| `latency` | `null` without steady latency; else `p50_us`, `p90_us`, `max_us` (largest elbencho 3.4 `Lat IO max us`; before 3.4, the largest interval mean), `max_over_p50`, `cv`, `steady_mean_us` (op-weighted), `client_avg_p50_us` and `client_ratio_max` (client mean latency median and worst ratio to it; 2.0, `null` before 3.4), `final_avg_us` (from `.out`), and Spearman `rho_jain_latency` and `rho_latency_throughput` over 5 s windows (`null` under 6). |
 | `distribution` | Imbalance without per-client data: `client_mean_bytes_per_s` (`min`, `p10`, `p50`, `p90`, `max`, `cv`), `min_over_median`, `max_over_median`, `final_done_bytes` (`min`, `p50`, `max`, `cv`), `finish_elapsed_ms` (`min`, `p50`, `max`), `persistent_clients`, `transient_clients` (`null` when the steady window is unavailable). |
-| `clients_summary` | `{"columns": [...], "rows": [[...]]}`, one row per client: `client`, `rank`, `service`, `kubernetes_node`, `kubernetes_pod`, `class`, `mean_bytes_per_s`, `median_bytes_per_s`, `mean_ratio_to_fleet_median`, `steady_bytes_per_s`, `steady_ratio`, `worst_5s_ratio`, `worst_5s_elapsed_ms`, `worst_30s_ratio`, `worst_30s_elapsed_ms`, `short_5s_share`, `final_done_bytes`, `finish_elapsed_ms`, `valid_samples`, `missing_samples`, `invalid_samples`, `short_5s_windows`, `steady_5s_windows`, `first_progress_elapsed_ms`. |
+| `clients_summary` | `{"columns": [...], "rows": [[...]]}`, one row per client: `client`, `rank`, `service`, `kubernetes_node`, `kubernetes_pod`, `class`, `mean_bytes_per_s`, `median_bytes_per_s`, `mean_ratio_to_fleet_median`, `steady_bytes_per_s`, `steady_ratio`, `worst_5s_ratio`, `worst_5s_elapsed_ms`, `worst_30s_ratio`, `worst_30s_elapsed_ms`, `short_5s_share`, `final_done_bytes`, `finish_elapsed_ms`, `valid_samples`, `missing_samples`, `invalid_samples`, `short_5s_windows`, `steady_5s_windows`, `first_progress_elapsed_ms`; 2.0 appends `mean_ops_per_s`, `steady_ops_per_s`, `steady_io_latency_avg_us`, `steady_io_latency_p90_us`, `steady_io_latency_max_us`, `steady_io_latency_ratio` (latency ratio to the fleet median; `null` before elbencho 3.4). |
 | `client_series` | `null` at `summary`; at `selected`, inline `clients`, `elapsed_ms`, and `bytes_per_s` (one list per client); at `full`, a sidecar reference `{"path", "sha256", "size_bytes", "clients", "intervals"}`. |
 | `diagnostics` | `missing_samples`, `counter_resets`, `non_adjacent_samples`, and possibly `additional_domains`. |
 
@@ -319,6 +323,9 @@ zstd-compressed JSON Lines in source order:
 (1.1) is `DoneBytes` minus the client's previous sample (the first is
 absolute; negative after a counter reset), `null` without a sample. Summing it
 rebuilds the counters every live report and statistic is computed from.
+
+1.2 adds `done_ios_delta` (same, for `DoneIOs`), `io_latency_avg_us` and
+`io_latency_max_us` per client; each is absent or `null` for elbencho before 3.4.
 
 ### Size
 
@@ -502,8 +509,10 @@ workload fields, `command` on metadata phases, the rendering options,
 `clock_skew_ms`, and three `clients_summary` columns; treat them as absent in
 1.0 documents. Version 2.0 makes live `latency.max_us` the largest
 elbencho 3.4 `Lat IO max us` (in 1.x and for older elbencho, the largest
-interval mean). Sidecar 1.1 added `mix_type`, `occurrence`, and
-`done_bytes_delta`.
+interval mean), and adds `executions[].elbencho_version` (and mdtest
+`iterations[].elbencho_version`), `phases[].services`, and the 3.4 live fields
+above. Sidecar 1.1 added `mix_type`, `occurrence`, and `done_bytes_delta`;
+sidecar 1.2 added the per-client count and latency arrays.
 
 ## Example
 

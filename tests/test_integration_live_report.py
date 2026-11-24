@@ -29,21 +29,36 @@ import filesystem_scenario_specs as _SPECS  # pylint: disable=wrong-import-posit
 _problems = _INTEGRATION._live_object_problems  # pylint: disable=protected-access
 
 
+def _series(**changes):
+    series = {
+        "io_latency_avg_us": [None, 41.5],
+        "io_latency_max_us": [None, 90.0],
+        "done_ios": [0, 10],
+    }
+    series.update(changes)
+    return series
+
+
 def _live(**changes):
     live = {
         "client_mode": "service",
         "clients": 2,
         "configured_interval_ms": 10,
         "steady": {"end_source": "elbencho_first", "reason": "too_short"},
-        "aggregate_series": {"io_latency_avg_us": [None, 41.5]},
+        "aggregate_series": _series(),
+        "clients_summary": {
+            "columns": ["client", "mean_ops_per_s"],
+            "rows": [["a", 1200.0], ["b", 1100.0]],
+        },
     }
     live.update(changes)
     return live
 
 
 def _document(write_live, read_live=None):
-    phases = [{"phase": "write", "live": write_live}]
-    phases.append({"phase": "read", "live": read_live or _live()})
+    services = {"instances": [{"host": "a"}, {"host": "b"}]}
+    phases = [{"phase": "write", "live": write_live, "services": services}]
+    phases.append({"phase": "read", "live": read_live or _live(), "services": services})
     return {"executions": [{"execution_id": "0001", "results": {"phases": phases}}]}
 
 
@@ -58,11 +73,20 @@ def test_each_broken_contract_is_named():
         "clients": _live(clients=1),
         "configured_interval_ms": _live(configured_interval_ms=None),
         "steady": _live(steady={"end_source": None, "reason": "no_first_time"}),
-        "Lat IO us": _live(aggregate_series={"io_latency_avg_us": [None]}),
+        "Lat IO us": _live(aggregate_series=_series(io_latency_avg_us=[None])),
+        "done_ios": _live(aggregate_series=_series(done_ios=[None])),
+        "3.4 columns": _live(clients_summary={"columns": [], "rows": []}),
     }
     for expected, write_live in cases.items():
         problems = _problems(_document(write_live))
         assert len(problems) == 1 and expected in problems[0], (expected, problems)
+
+
+def test_missing_services_is_named():
+    document = _document(_live())
+    document["executions"][0]["results"]["phases"][0].pop("services")
+    problems = _problems(document)
+    assert len(problems) == 1 and "services.instances" in problems[0]
 
 
 def test_empty_document_is_a_problem():

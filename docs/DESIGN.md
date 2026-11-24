@@ -879,9 +879,9 @@ $RESULTS_DIR/
 │   │   ├── 0001.status
 │   │   ├── 0001.log
 │   │   └── ...
-│   ├── elbencho-1M-c_001-s_032-d_001_20250815Z143022.csv
+│   ├── elbencho-1M-c_001-s_032-d_001_20250815Z143022.json
 │   ├── elbencho-1M-c_001-s_032-d_001_20250815Z143022.out
-│   ├── elbencho-1M-c_004-s_032-d_001_20250815Z143022.csv
+│   ├── elbencho-1M-c_004-s_032-d_001_20250815Z143022.json
 │   └── ...
 ├── warp-20250816Z091500/
 │   ├── warp-GET-16MiB-c_001-s_064_20250816Z091500.json.zst
@@ -933,9 +933,9 @@ Result files encode the configuration in the filename:
 ```
 
 Examples:
-- `elbencho-1M-c_004-s_064-d_008_20250815Z143022.csv` — 1MiB IO, 4 nodes, 64 threads, 8 IO depth
+- `elbencho-1M-c_004-s_064-d_008_20250815Z143022.json` — 1MiB IO, 4 nodes, 64 threads, 8 IO depth
 - `warp-GET-16MiB-c_001-s_064_20250816Z091500.json.zst` — GET, 16MiB objects, 1 node, 64 threads
-- `netbench-half-c_008-t_016_20250818Z080000_iter2_AtoB.csv` — 8 nodes, 16 threads, iteration 2, A→B
+- `netbench-half-c_008-t_016_20250818Z080000_iter2_AtoB.json` — 8 nodes, 16 threads, iteration 2, A→B
 
 This makes it possible to identify results without opening files, and allows
 glob-based filtering for partial re-analysis.
@@ -978,7 +978,7 @@ Results directory → extract-*.py → Terminal tables + PNG plots [+ Markdown r
 
 Each analysis script:
 
-1. **Parses** result files from the input directory (CSV, JSON, or text output).
+1. **Parses** result files from the input directory (elbencho `.json`; `.csv` and `.out` for results before 3.4; Warp JSON).
 2. **Aggregates** metrics across iterations/directions where applicable.
 3. **Prints** summary tables to stdout, formatted for fixed-width terminal.
 4. **Generates** PNG plots saved alongside the results.
