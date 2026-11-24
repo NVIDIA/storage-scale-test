@@ -24,20 +24,29 @@ the file again to evaluate sliding windows of one interval, 5 s and 30 s:
 Jain's index and each client's ratio to the fleet median, which classify
 clients as persistent, transient or ok. Memory stays O(intervals) plus a
 30 s ring of ``DoneBytes`` per client.
+
+With elbencho 3.4's ``DoneIOs`` and client latency, the same pass also
+summarizes each client's steady-window IO latency, and IO counts replace
+block-size estimates.
 """
 
 from __future__ import annotations
 
+import math
 import statistics
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from lib.elbencho_live_report import (
     MIB,
+    AggregatePoint,
     DomainAnalysis,
     LiveAnalysis,
     LiveClientId,
+    ParsedRow,
     client_sort_key,
+    counter_delta,
+    interval_latency,
     iter_live_rows,
     percentile_from_sorted,
 )
@@ -81,6 +90,12 @@ END_SOURCE_FIRST = "elbencho_first"
 DEFAULT_INTERVAL_MS = 1000
 # Spearman rho needs at least this many window pairs.
 MIN_RHO_PAIRS = 6
+# Client latency percentiles count interval means in logarithmic buckets
+# this many per doubling (a value is within about 2% of its bucket's centre).
+LATENCY_BUCKETS_PER_DOUBLING = 16
+CLIENT_LATENCY_PERCENTILE = 90
+
+RowObserver = Callable[[int, ParsedRow], None]
 
 
 @dataclass(frozen=True)
@@ -180,6 +195,12 @@ class ClientSteady:  # pylint: disable=too-many-instance-attributes
     windows_30s: int = 0
     short_30s: int = 0  # 30 s windows with ratio < 1 - S
     classification: Optional[str] = None
+    # elbencho 3.4 only (DoneIOs and client latency); None otherwise.
+    steady_ops_per_s: Optional[float] = None
+    io_latency_avg_us: Optional[float] = None  # weighted by DoneIOs
+    io_latency_p90_us: Optional[float] = None  # of interval means
+    io_latency_max_us: Optional[float] = None  # largest interval max
+    io_latency_ratio: Optional[float] = None  # avg / fleet median avg
 
     @property
     def short_5s_share(self) -> Optional[float]:
@@ -200,6 +221,10 @@ class LatencySummary:  # pylint: disable=too-many-instance-attributes
     final_avg_us: Optional[float]  # from PhaseContext, for comparison
     rho_jain_latency: Optional[float]  # Spearman over steady 5 s windows
     rho_latency_throughput: Optional[float]  # Spearman over steady 5 s windows
+    # elbencho 3.4: the median client steady mean and the largest client
+    # ratio to it (ClientSteady.io_latency_avg_us and io_latency_ratio).
+    client_avg_p50_us: Optional[float] = None
+    client_ratio_max: Optional[float] = None
 
 
 @dataclass
@@ -362,11 +387,13 @@ def _domain_client_rows(
     analysis: LiveAnalysis,
     domain: DomainAnalysis,
     wanted: Optional[frozenset],
+    observe: Optional[RowObserver] = None,
 ) -> Iterator[Tuple[int, LiveClientId, int]]:
-    """Stream (interval, client, DoneBytes) of the domain's client rows."""
+    """Stream (interval, client, DoneBytes) of the domain's client rows;
+    ``observe`` also sees each of those rows."""
     key = domain.key
     to_interval = domain.runtime_to_interval
-    for row in iter_live_rows(analysis):
+    for row in iter_live_rows(analysis, key.phase):
         client = row.client
         if client is None or row.done_bytes is None or row.key != key:
             continue
@@ -374,6 +401,8 @@ def _domain_client_rows(
             continue
         interval = to_interval.get(row.runtime_ms)
         if interval is not None:
+            if observe is not None:
+                observe(interval, row)
             yield interval, client, row.done_bytes
 
 
@@ -381,6 +410,7 @@ def _iter_interval_snapshots(
     analysis: LiveAnalysis,
     domain: DomainAnalysis,
     wanted: Optional[frozenset] = None,
+    observe: Optional[RowObserver] = None,
 ) -> Iterator[Tuple[int, Dict[LiveClientId, int]]]:
     """Stream the file; yield (interval, {client: DoneBytes}) for every
     interval of the domain in order, including intervals without client rows.
@@ -391,7 +421,7 @@ def _iter_interval_snapshots(
     snapshot: Dict[LiveClientId, int] = {}
     rows: Iterator[Tuple[int, LiveClientId, int]] = iter(())
     if domain.clients and (wanted is None or wanted):
-        rows = _domain_client_rows(analysis, domain, wanted)
+        rows = _domain_client_rows(analysis, domain, wanted, observe)
     for interval, client, done_bytes in rows:
         if interval < current:
             continue
@@ -426,6 +456,155 @@ def _window_deltas(
             continue
         deltas[client] = done_bytes - prior
     return deltas
+
+
+class LogHistogram:
+    """Counts of positive values in logarithmic buckets, for a percentile in
+    bounded memory; zero has its own bucket."""
+
+    __slots__ = ("counts", "total", "low", "high")
+
+    def __init__(self) -> None:
+        self.counts: Dict[int, int] = {}
+        self.total = 0
+        self.low = math.inf
+        self.high = -math.inf
+
+    def add(self, value: float) -> None:
+        """Count one value (negative values count as zero)."""
+        bucket = (
+            math.floor(math.log2(value) * LATENCY_BUCKETS_PER_DOUBLING)
+            if value > 0
+            else None
+        )
+        self.counts[bucket] = self.counts.get(bucket, 0) + 1
+        self.total += 1
+        if value < self.low:
+            self.low = value
+        if value > self.high:
+            self.high = value
+
+    def percentile(self, pct: float) -> Optional[float]:
+        """The nearest-rank percentile's bucket centre, kept within the
+        observed range; None when empty."""
+        if not self.total:
+            return None
+        rank = max(1, math.ceil(pct / 100.0 * self.total))
+        seen = 0
+        bucket = None
+        for bucket in sorted(
+            self.counts, key=lambda key: -math.inf if key is None else key
+        ):
+            seen += self.counts[bucket]
+            if seen >= rank:
+                break
+        if bucket is None:
+            return max(0.0, self.low)
+        centre = 2.0 ** ((bucket + 0.5) / LATENCY_BUCKETS_PER_DOUBLING)
+        return min(max(centre, self.low), self.high)
+
+
+class _ClientIO:  # pylint: disable=too-few-public-methods
+    """One client's DoneIOs and latency over the steady window."""
+
+    __slots__ = (
+        "last_ios",
+        "start",
+        "end",
+        "reset",
+        "weighted_us",
+        "ios",
+        "means",
+        "max_us",
+    )
+
+    def __init__(self) -> None:
+        self.last_ios: Optional[int] = None
+        # (DoneIOs, RuntimeMS) of the last sample at or before each bound.
+        self.start: Optional[Tuple[int, int]] = None
+        self.end: Optional[Tuple[int, int]] = None
+        self.reset = False  # DoneIOs went back inside the steady window
+        self.weighted_us = 0.0
+        self.ios = 0
+        self.means = LogHistogram()
+        self.max_us: Optional[float] = None
+
+
+class _ClientLatencyPass:
+    """Per-client steady-window ops/s and IO latency (elbencho 3.4 rows).
+
+    Latency covers the intervals the fleet latency covers (start through
+    end); idle intervals (0 with no new IOs) are skipped.
+    """
+
+    def __init__(self, window: SteadyWindow) -> None:
+        self.start = window.start_interval
+        self.end = window.end_interval
+        self.clients: Dict[LiveClientId, _ClientIO] = {}
+
+    def observe(self, interval: int, row: ParsedRow) -> None:
+        """Account one client row of the domain."""
+        done_ios = row.done_ios
+        if done_ios is None or interval > self.end:
+            return
+        stats = self.clients.get(row.client)
+        if stats is None:
+            stats = self.clients[row.client] = _ClientIO()
+        new_ios = counter_delta(done_ios, stats.last_ios)
+        stats.last_ios = done_ios
+        stats.end = (done_ios, row.runtime_ms)
+        if interval <= self.start:
+            stats.start = stats.end
+            stats.reset = False
+        elif new_ios is None:
+            stats.reset = True
+        if interval < self.start:
+            return
+        latency = interval_latency(row.io_latency_us, new_ios)
+        if latency is not None:
+            stats.means.add(latency)
+            if new_ios:
+                stats.weighted_us += latency * new_ios
+                stats.ios += new_ios
+        peak = interval_latency(row.io_latency_max_us, new_ios)
+        if peak is not None and (stats.max_us is None or peak > stats.max_us):
+            stats.max_us = peak
+
+    def finish(
+        self, clients: Dict[LiveClientId, "ClientSteady"]
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Store each client's statistics; return the fleet median client mean
+        and the largest client ratio to it."""
+        for client, stats in self.clients.items():
+            steady = clients.setdefault(client, ClientSteady(client=client))
+            steady.steady_ops_per_s = _ops_per_s(stats)
+            steady.io_latency_avg_us = (
+                stats.weighted_us / stats.ios if stats.ios else None
+            )
+            steady.io_latency_p90_us = stats.means.percentile(CLIENT_LATENCY_PERCENTILE)
+            steady.io_latency_max_us = stats.max_us
+        means = sorted(
+            steady.io_latency_avg_us
+            for steady in clients.values()
+            if steady.io_latency_avg_us is not None
+        )
+        median = percentile_from_sorted(means, 50) if means else None
+        if not median:
+            return median, None
+        for steady in clients.values():
+            if steady.io_latency_avg_us is not None:
+                steady.io_latency_ratio = steady.io_latency_avg_us / median
+        return median, means[-1] / median
+
+
+def _ops_per_s(stats: _ClientIO) -> Optional[float]:
+    """Ops/s between the client's samples at the steady bounds."""
+    if stats.start is None or stats.end is None or stats.reset:
+        return None
+    (start_ios, start_ms), (end_ios, end_ms) = stats.start, stats.end
+    if end_ms <= start_ms or end_ios < start_ios:
+        return None
+    return (end_ios - start_ios) * 1000.0 / (end_ms - start_ms)
 
 
 class _SnapshotRing:
@@ -468,9 +647,20 @@ class _SnapshotRing:
 class _SteadyPass:  # pylint: disable=too-many-instance-attributes
     """Accumulate window series, the band and client ratios interval by interval."""
 
-    def __init__(self, steady: SteadyAnalysis, runtimes: List[int]) -> None:
+    def __init__(
+        self,
+        steady: SteadyAnalysis,
+        runtimes: List[int],
+        points: Sequence[AggregatePoint] = (),
+    ) -> None:
         self.steady = steady
         self.runtimes = runtimes
+        # Total (DoneBytes, DoneIOs) per interval (elbencho 3.4), for the floor.
+        self.totals: Dict[int, Tuple[int, int]] = {
+            point.interval: (point.done_bytes, point.done_ios)
+            for point in points
+            if point.done_bytes is not None and point.done_ios is not None
+        }
         self.ring = _SnapshotRing(
             max(series.length_intervals for series in steady.series.values())
         )
@@ -517,10 +707,8 @@ class _SteadyPass:  # pylint: disable=too-many-instance-attributes
             jain = total * total / (count * squares)
             if median > 0:
                 min_over_median = values[0] / median
-        block_size = self.steady.context.block_size_bytes
-        if block_size and count and total > 0:
-            per_window = total / count / block_size
-            floor = per_window / (per_window + 1.0)
+        if count and total > 0:
+            floor = self._floor(interval, series.length_intervals, total / count)
         window = self.steady.window
         in_steady = (
             window.available
@@ -543,6 +731,25 @@ class _SteadyPass:  # pylint: disable=too-many-instance-attributes
                 self.steady_5s.append((interval, jain, total))
         if in_steady and median and series.label in WINDOW_SECONDS:
             self._record_ratios(series.label, deltas, median, end_ms)
+
+    def _floor(self, interval: int, length: int, mean_bytes: float) -> Optional[float]:
+        """Jain's floor for clients doing a mean of ``mean_bytes`` in the
+        window: IO counts from Total DoneIOs, else the phase's block size."""
+        bytes_per_io = self._bytes_per_io(interval - length, interval)
+        if bytes_per_io is None:
+            bytes_per_io = self.steady.context.block_size_bytes
+        if not bytes_per_io:
+            return None
+        per_window = mean_bytes / bytes_per_io
+        return per_window / (per_window + 1.0)
+
+    def _bytes_per_io(self, begin: int, end: int) -> Optional[float]:
+        """Bytes per IO of the fleet over (begin, end], from Total rows."""
+        first, last = self.totals.get(begin), self.totals.get(end)
+        if first is None or last is None:
+            return None
+        moved, ios = last[0] - first[0], last[1] - first[1]
+        return moved / ios if moved > 0 and ios > 0 else None
 
     def _record_band(self, end_ms: int, elapsed_ms: int, values: List[int]) -> None:
         band = self.steady.band_5s
@@ -685,11 +892,17 @@ def analyze_steady(  # pylint: disable=too-many-arguments,too-many-positional-ar
         # of the file; Total-row latency needs no client data.
         steady.latency = _latency_summary(domain, steady, [])
         return steady
-    accumulator = _SteadyPass(steady, _runtimes_ms(domain))
-    for interval, snapshot in _iter_interval_snapshots(analysis, domain):
+    accumulator = _SteadyPass(steady, _runtimes_ms(domain), domain.aggregate_points)
+    latency_pass = None
+    if domain.has_done_ios and steady.window.available:
+        latency_pass = _ClientLatencyPass(steady.window)
+    for interval, snapshot in _iter_interval_snapshots(
+        analysis, domain, observe=latency_pass.observe if latency_pass else None
+    ):
         accumulator.complete(interval, snapshot)
     accumulator.finish()
-    steady.latency = _latency_summary(domain, steady, accumulator.steady_5s)
+    clients = latency_pass.finish(steady.clients) if latency_pass else (None, None)
+    steady.latency = _latency_summary(domain, steady, accumulator.steady_5s, clients)
     return steady
 
 
@@ -697,8 +910,12 @@ def _latency_summary(
     domain: DomainAnalysis,
     steady: SteadyAnalysis,
     steady_5s: Sequence[Tuple[int, Optional[float], int]],
+    clients: Tuple[Optional[float], Optional[float]] = (None, None),
 ) -> Optional[LatencySummary]:
-    """Fleet IO latency over the steady window, or None without one."""
+    """Fleet IO latency over the steady window, or None without one.
+
+    ``clients`` is the median client mean and largest client ratio to it.
+    """
     window = steady.window
     if not window.available:
         return None
@@ -713,24 +930,43 @@ def _latency_summary(
     values = sorted(point.io_latency_us for point in points)
     p50 = percentile_from_sorted(values, 50)
     mean = sum(values) / len(values)
-    weighted = [(point.io_latency_us, point.iops) for point in points if point.iops]
-    weight = sum(iops for _, iops in weighted if iops > 0)
+    # elbencho 3.4's per-IO max; older files only have interval means.
+    maxima = [
+        point.io_latency_max_us
+        for point in points
+        if point.io_latency_max_us is not None
+    ]
+    peak = max(maxima, default=values[-1])
     rho_jain, rho_throughput = _latency_rhos(domain, steady, steady_5s)
     return LatencySummary(
         p50_us=p50,
         p90_us=percentile_from_sorted(values, 90),
-        max_us=values[-1],
-        max_over_p50=values[-1] / p50 if p50 > 0 else None,
+        max_us=peak,
+        max_over_p50=peak / p50 if p50 > 0 else None,
         cv=statistics.pstdev(values) / mean if mean > 0 else None,
-        steady_mean_us=(
-            sum(latency * iops for latency, iops in weighted if iops > 0) / weight
-            if weight > 0
-            else None
-        ),
+        steady_mean_us=_weighted_latency(points),
         final_avg_us=steady.context.final_avg_latency_us,
         rho_jain_latency=rho_jain,
         rho_latency_throughput=rho_throughput,
+        client_avg_p50_us=clients[0],
+        client_ratio_max=clients[1],
     )
+
+
+def _weighted_latency(points: Sequence[AggregatePoint]) -> Optional[float]:
+    """Mean interval latency weighted by the interval's IOs: DoneIOs deltas
+    (elbencho 3.4), else the IOPS cell."""
+    weighted = [
+        (
+            point.io_latency_us,
+            point.new_ios if point.done_ios is not None else point.iops,
+        )
+        for point in points
+    ]
+    weight = sum(ios for _, ios in weighted if ios and ios > 0)
+    if weight <= 0:
+        return None
+    return sum(latency * ios for latency, ios in weighted if ios and ios > 0) / weight
 
 
 def _latency_rhos(

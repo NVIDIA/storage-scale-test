@@ -112,12 +112,24 @@ CLIENT_COLUMNS = [
     "short_5s_windows",
     "steady_5s_windows",
     "first_progress_elapsed_ms",
+    # Schema 1.2 (elbencho 3.4 DoneIOs and client latency; null before).
+    "mean_ops_per_s",
+    "steady_ops_per_s",
+    "steady_io_latency_avg_us",
+    "steady_io_latency_p90_us",
+    "steady_io_latency_max_us",
+    "steady_io_latency_ratio",
 ]
 DEFAULT_DIAGNOSTICS = ("missing_samples", "counter_resets", "non_adjacent_samples")
 ADDITIONAL_DOMAINS = "additional_domains"
 NO_CONTEXT = PhaseContext(None, None, None, None)
 LIVE_SUFFIX = ".live.csv"
 DONE_BYTES_DELTA = "done_bytes_delta"
+# Schema 1.2 sidecar interval arrays, written only for elbencho 3.4 files.
+DONE_IOS_DELTA = "done_ios_delta"
+IO_LATENCY_AVG = "io_latency_avg_us"
+IO_LATENCY_MAX = "io_latency_max_us"
+CLIENT_IO_ARRAYS = (DONE_IOS_DELTA, IO_LATENCY_AVG, IO_LATENCY_MAX)
 # An elbencho ISO Date: date and time, an optional fraction, then the zone.
 _ISO_DATE = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,6}))?(.*)")
 
@@ -335,6 +347,15 @@ def _aggregate_series(domain: DomainAnalysis) -> dict:
         ],
         "start_time": start_time,
         "clock_skew_ms": skews,
+        # Schema 1.2: elbencho 3.4 Total-row columns (null before 3.4).
+        "io_latency_max_us": [
+            round_latency_us(point.io_latency_max_us) for point in points
+        ],
+        "entries_latency_max_us": [
+            round_latency_us(point.entries_latency_max_us) for point in points
+        ],
+        "done_bytes": [point.done_bytes for point in points],
+        "done_ios": [point.done_ios for point in points],
     }
 
 
@@ -461,6 +482,8 @@ def _latency(steady: SteadyAnalysis) -> Optional[dict]:
         "final_avg_us": round_latency_us(value.final_avg_us),
         "rho_jain_latency": _rounded(value.rho_jain_latency, 4),
         "rho_latency_throughput": _rounded(value.rho_latency_throughput, 4),
+        "client_avg_p50_us": round_latency_us(value.client_avg_p50_us),
+        "client_ratio_max": _rounded(value.client_ratio_max, 4),
     }
 
 
@@ -590,6 +613,12 @@ def _client_row(
         detail.short_5s,
         detail.windows_5s,
         None if first is None else _ms(domain.interval_times[first]),
+        round_ops(summary.mean_ops_s),
+        round_ops(detail.steady_ops_per_s),
+        round_latency_us(detail.io_latency_avg_us),
+        round_latency_us(detail.io_latency_p90_us),
+        round_latency_us(detail.io_latency_max_us),
+        _rounded(detail.io_latency_ratio, 6),
     ]
 
 
@@ -668,11 +697,11 @@ def _write_sidecar(
     }
     try:
         with SidecarWriter(os.path.join(sidecar_dir, name), header) as writer:
-            for interval, rates, deltas in _iter_interval_samples(
+            for interval, rates, deltas, extra in _iter_interval_samples(
                 analysis, domain, ordered
             ):
                 writer.write_interval(
-                    _ms(domain.interval_times[interval]), rates, deltas
+                    _ms(domain.interval_times[interval]), rates, deltas, extra
                 )
     except (OSError, ValueError, csv.Error, UnicodeError) as exc:
         raise LiveCSVError(f"cannot write live sidecar {name}: {exc}") from exc
@@ -686,26 +715,63 @@ def _write_sidecar(
 
 
 class _IntervalSamples:
-    """One interval's per-client rates and DoneBytes, and each client's last
-    emitted DoneBytes (the base of the next delta)."""
+    """One interval's per-client rates, DoneBytes and (elbencho 3.4) DoneIOs
+    and latency, and each client's last emitted counters (the base of the
+    next delta)."""
 
-    def __init__(self, count: int) -> None:
+    def __init__(self, count: int, with_ios: bool) -> None:
         self.count = count
+        self.with_ios = with_ios
         self.last_done: List[Optional[int]] = [None] * count
+        self.last_ios: List[Optional[int]] = [None] * count
+        self._clear()
+
+    def _clear(self) -> None:
+        count = self.count
         self.rates: List[Optional[int]] = [None] * count
         self.done: List[Optional[int]] = [None] * count
+        self.ios: List[Optional[int]] = [None] * count
+        self.latency: List[Optional[float]] = [None] * count
+        self.latency_max: List[Optional[float]] = [None] * count
 
-    def emit(self) -> Tuple[List[Optional[int]], List[Optional[int]]]:
-        """Return (bytes/s, DoneBytes deltas) and start the next interval."""
-        deltas: List[Optional[int]] = [None] * self.count
-        for position, done_bytes in enumerate(self.done):
-            if done_bytes is not None:
-                deltas[position] = done_bytes - (self.last_done[position] or 0)
-                self.last_done[position] = done_bytes
+    def add(self, position: int, parsed: ParsedRow, rate: Optional[int]) -> None:
+        """Hold one client row of the interval."""
+        self.rates[position] = rate
+        self.done[position] = parsed.done_bytes
+        if self.with_ios:
+            self.ios[position] = parsed.done_ios
+            self.latency[position] = round_latency_us(parsed.io_latency_us)
+            self.latency_max[position] = round_latency_us(parsed.io_latency_max_us)
+
+    def emit(
+        self,
+    ) -> Tuple[List[Optional[int]], List[Optional[int]], Optional[dict]]:
+        """Return (bytes/s, DoneBytes deltas, 3.4 arrays or None) and start
+        the next interval."""
+        deltas = _deltas(self.done, self.last_done)
+        extra = None
+        if self.with_ios:
+            extra = {
+                DONE_IOS_DELTA: _deltas(self.ios, self.last_ios),
+                IO_LATENCY_AVG: self.latency,
+                IO_LATENCY_MAX: self.latency_max,
+            }
         rates = self.rates
-        self.rates = [None] * self.count
-        self.done = [None] * self.count
-        return rates, deltas
+        self._clear()
+        return rates, deltas, extra
+
+
+def _deltas(
+    current: Sequence[Optional[int]], last: List[Optional[int]]
+) -> List[Optional[int]]:
+    """Each counter minus its last emitted value (the first is absolute);
+    None where there is no sample. Updates ``last``."""
+    deltas: List[Optional[int]] = [None] * len(current)
+    for position, value in enumerate(current):
+        if value is not None:
+            deltas[position] = value - (last[position] or 0)
+            last[position] = value
+    return deltas
 
 
 def _iter_interval_samples(
@@ -713,14 +779,15 @@ def _iter_interval_samples(
     domain: DomainAnalysis,
     ordered: Sequence[LiveClientId],
 ):
-    """Yield (interval, per-client bytes/s, per-client DoneBytes delta) for
-    every interval in O(clients) memory. A delta is relative to the client's
-    previous sample (its first is absolute); None means no sample."""
+    """Yield (interval, per-client bytes/s, per-client DoneBytes delta, 3.4
+    arrays or None) for every interval in O(clients) memory. A delta is
+    relative to the client's previous sample (its first is absolute); None
+    means no sample."""
     index = {client: position for position, client in enumerate(ordered)}
     previous: Dict[LiveClientId, PreviousSample] = {}
-    samples = _IntervalSamples(len(ordered))
+    samples = _IntervalSamples(len(ordered), domain.has_done_ios)
     pending = 0
-    for parsed in iter_live_rows(analysis):
+    for parsed in iter_live_rows(analysis, domain.key.phase):
         client, done_bytes = parsed.client, parsed.done_bytes
         if parsed.key != domain.key or parsed.rank == TOTAL_RANK:
             continue
@@ -735,8 +802,7 @@ def _iter_interval_samples(
         rate = derive_rate(
             previous.get(client), done_bytes, parsed.runtime_ms, interval
         )
-        samples.rates[index[client]] = _bytes(rate)
-        samples.done[index[client]] = done_bytes
+        samples.add(index[client], parsed, _bytes(rate))
         previous[client] = PreviousSample(done_bytes, parsed.runtime_ms, interval)
     while pending < len(domain.interval_times):
         yield (pending, *samples.emit())
@@ -793,34 +859,49 @@ def _total_row(key: LiveDomainKey, series: dict, index: int) -> ParsedRow:
     if start is not None and skew is not None:
         iso = live_timestamp(start, elapsed - series["elapsed_ms"][0] + skew) or ""
     rate = series["bytes_per_s"][index]
-    entries = series.get("entries_latency_avg_us")
     return ParsedRow(
         key,
         elapsed,
         iso,
         TOTAL_RANK,
         None,
-        None,
+        _item(series, "done_bytes", index),
         None if rate is None else rate / MIB,
         series["ops_per_s"][index],
         series["io_latency_avg_us"][index],
-        entries[index] if entries else None,
+        _item(series, "entries_latency_avg_us", index),
+        _item(series, "done_ios", index),
+        _item(series, "io_latency_max_us", index),
+        _item(series, "entries_latency_max_us", index),
     )
+
+
+def _item(series: dict, name: str, index: int):
+    """One entry of an optional series (absent in older schemas), or None."""
+    values = series.get(name)
+    return values[index] if values else None
 
 
 def _client_rows(
     key: LiveDomainKey,
     elapsed: int,
     clients: Sequence[LiveClientId],
-    done: List[int],
-    deltas: Sequence[Optional[int]],
+    counters: Tuple[List[int], List[int]],
+    arrays: Sequence[Optional[list]],
 ) -> Iterator[ParsedRow]:
-    """Client rows of one interval; ``done`` accumulates each DoneBytes."""
+    """Client rows of one interval; ``counters`` accumulate each client's
+    DoneBytes and DoneIOs from the sidecar ``arrays`` (DoneBytes deltas, then
+    CLIENT_IO_ARRAYS, None when absent)."""
+    done, done_ios = counters
+    deltas, ios, latency, latency_max = arrays
     for position, delta in enumerate(deltas):
         if delta is None:
             continue
         done[position] += delta
         client = clients[position]
+        ios_delta = ios[position] if ios else None
+        if ios_delta is not None:
+            done_ios[position] += ios_delta
         yield ParsedRow(
             key,
             elapsed,
@@ -830,8 +911,10 @@ def _client_rows(
             done[position],
             None,
             None,
+            latency[position] if latency else None,
             None,
-            None,
+            None if ios_delta is None else done_ios[position],
+            latency_max[position] if latency_max else None,
         )
 
 
@@ -845,13 +928,13 @@ def _document_rows(live: dict, series) -> Iterator[ParsedRow]:
     clients = _document_clients(live, series.clients)
     aggregate = live["aggregate_series"]
     totals = {elapsed: index for index, elapsed in enumerate(aggregate["elapsed_ms"])}
-    done = [0] * len(clients)
-    for elapsed, deltas in series.rows:
+    counters = ([0] * len(clients), [0] * len(clients))
+    for elapsed, arrays in series.rows:
         index = totals.get(elapsed)
         if index is not None:
             yield _total_row(key, aggregate, index)
         emitted = index is not None
-        for row in _client_rows(key, elapsed, clients, done, deltas):
+        for row in _client_rows(key, elapsed, clients, counters, arrays):
             emitted = True
             yield row
         if not emitted:
@@ -869,14 +952,13 @@ def analyze_document_live(
     """
     # Deferred: only rendering from a document reads sidecars.
     from lib.results_document import (  # pylint: disable=import-outside-toplevel
-        open_client_series,
+        open_client_arrays,
     )
 
+    names = (DONE_BYTES_DELTA, *CLIENT_IO_ARRAYS)
     analysis = analyze_live_csv(
         metadata,
-        lambda: _document_rows(
-            live, open_client_series(Path(sidecar), DONE_BYTES_DELTA)
-        ),
+        lambda: _document_rows(live, open_client_arrays(Path(sidecar), names)),
     )
     return analysis, analysis.domains.get(live_domain_key(live))
 
@@ -920,6 +1002,10 @@ def document_aggregate_domain(live: dict) -> DomainAnalysis:
                 iops=row.iops,
                 io_latency_us=row.io_latency_us,
                 entries_latency_us=row.entries_latency_us,
+                io_latency_max_us=row.io_latency_max_us,
+                entries_latency_max_us=row.entries_latency_max_us,
+                done_bytes=row.done_bytes,
+                done_ios=row.done_ios,
             )
         )
     return domain

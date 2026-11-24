@@ -108,6 +108,8 @@ ELBENCHO_RELEASE_API = (
 )
 ELBENCHO_CONTAINER = ELBENCHO_UPSTREAM_IMAGE
 SBX_ELBENCHO_BUNDLE_RECIPE = 1
+# results.json major version; must match lib/filesystem_results.py.
+RESULTS_SCHEMA_MAJOR = "2"
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
 MAX_DEPLOYMENT_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_DEPLOYMENT_FILES = 10_000
@@ -6217,7 +6219,7 @@ def _assert_batch_results_json(path: Path, rows: tuple[GroupRow, ...]) -> None:
     problems = []
     if document.get("schema") != "storage-scale-test/filesystem-batch-results":
         problems.append(f"schema {document.get('schema')!r}")
-    if not str(document.get("schema_version")).startswith("1."):
+    if not str(document.get("schema_version")).startswith(f"{RESULTS_SCHEMA_MAJOR}."):
         problems.append(f"schema_version {document.get('schema_version')!r}")
     if document.get("batch_outcome", {}).get("complete") is not True:
         problems.append("batch_outcome.complete is not true")

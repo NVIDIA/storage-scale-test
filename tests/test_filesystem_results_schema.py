@@ -41,7 +41,7 @@ def _validator(name):
 
 def validate_results_document(doc):
     """Raise jsonschema.ValidationError unless ``doc`` conforms to the results schema."""
-    _validator("filesystem-batch-results-1.schema.json").validate(doc)
+    _validator("filesystem-batch-results-2.schema.json").validate(doc)
 
 
 def validate_sidecar_lines(path):
@@ -92,6 +92,9 @@ def minimal_document():
 def test_schemas_are_valid_2020_12_and_accept_minimal_document():
     document, _ = minimal_document()
     validate_results_document(document)
+    # 1.x documents validate against the 1.x schema file.
+    document["schema_version"] = "1.1"
+    _validator("filesystem-batch-results-1.schema.json").validate(document)
 
 
 @pytest.mark.parametrize(
@@ -99,7 +102,7 @@ def test_schemas_are_valid_2020_12_and_accept_minimal_document():
     [
         lambda d: d.pop("batch_outcome"),
         lambda d: d.update(schema="other"),
-        lambda d: d.update(schema_version="2.0"),
+        lambda d: d.update(schema_version="1.1"),
         lambda d: d["batch_outcome"]["executions"].pop("total"),
         lambda d: d.update(diagnostics=[{"code": "x"}]),
     ],
@@ -125,8 +128,19 @@ def test_sidecar_lines_validate_and_bad_lines_fail(tmp_path):
     with results.SidecarWriter(path, header) as writer:
         writer.write_interval(1000, [1, None])
         writer.write_interval(2000, [2, 3], [2048, None])
+        writer.write_interval(
+            3000,
+            [2, 3],
+            [2048, 0],
+            {
+                "done_ios_delta": [2, 0],
+                "io_latency_avg_us": [10.5, 0.0],
+                "io_latency_max_us": [20.0, None],
+            },
+        )
     lines = validate_sidecar_lines(path)
-    assert len(lines) == 3
+    assert len(lines) == 4
+    assert lines[3]["done_ios_delta"] == [2, 0]
     assert "done_bytes_delta" not in lines[1]
     assert lines[2]["done_bytes_delta"] == [2048, None]
     bad = _load("live-client-series-1.schema.json")
@@ -135,4 +149,8 @@ def test_sidecar_lines_validate_and_bad_lines_fail(tmp_path):
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.Draft202012Validator(bad).validate(
             {"elapsed_ms": 1, "bytes_per_s": [], "done_bytes_delta": [1.5]}
+        )
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.Draft202012Validator(bad).validate(
+            {"elapsed_ms": 1, "bytes_per_s": [], "done_ios_delta": [0.5]}
         )

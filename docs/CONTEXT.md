@@ -251,7 +251,7 @@ collect before resume.
   `coordinates` and `coordinate_key`; `dataset`/`results` only when parsed.
 - Live outputs replay from sidecar `done_bytes_delta` (exact `DoneBytes`);
   rates alone drift (rounding, gaps, resets). Below `full`, text uses the
-  stored fairness summary. Renderers read 1.1 fields with `.get`.
+  stored fairness summary. Renderers read post-1.0 fields with `.get`.
 - Pass the same `ReportSelection` to every `report.html` write so HTML shows
   what text shows. Template names and anchors are user-facing references.
 - `report_html/pairing.py`'s docstring defines which settings block, imply

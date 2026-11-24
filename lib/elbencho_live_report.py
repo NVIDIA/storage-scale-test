@@ -36,7 +36,6 @@ from typing import (
     NamedTuple,
     Optional,
     Sequence,
-    Set,
     Tuple,
 )
 
@@ -54,6 +53,10 @@ OCCURRENCE_RATE_JUMP_MAX_MS = 100
 OCCURRENCE_RATE_JUMP_FACTOR = 4.0
 IO_LATENCY_COLUMN = "Lat IO us"
 ENTRIES_LATENCY_COLUMN = "Lat Ent us"
+# elbencho 3.4 inserts these columns; files are told apart by which exist.
+DONE_IOS_COLUMN = "DoneIOs"
+IO_LATENCY_MAX_COLUMN = "Lat IO max us"
+ENTRIES_LATENCY_MAX_COLUMN = "Lat Ent max us"
 MALFORMED_CLIENT_ROWS = "malformed_client_rows"
 # Malformed client rows named by line number (the rest are only counted).
 MALFORMED_LINES_REPORTED = 5
@@ -77,6 +80,17 @@ LIVE_CSV_COLUMNS = [
     "CPU",
     "Service",
 ]
+# The elbencho 3.0-3.3 layout above; 3.4 adds DoneIOs and two max columns.
+LIVE_CSV_COLUMNS_V34 = [
+    *LIVE_CSV_COLUMNS[:8],
+    DONE_IOS_COLUMN,
+    *LIVE_CSV_COLUMNS[8:12],
+    ENTRIES_LATENCY_COLUMN,
+    ENTRIES_LATENCY_MAX_COLUMN,
+    IO_LATENCY_COLUMN,
+    IO_LATENCY_MAX_COLUMN,
+    *LIVE_CSV_COLUMNS[14:],
+]
 REQUIRED_COLUMNS = frozenset(
     {
         "ISO Date",
@@ -92,9 +106,12 @@ REQUIRED_COLUMNS = frozenset(
 )
 
 
-@dataclass(frozen=True, order=True)
-class LiveDomainKey:
-    """Independent live-counter domain within one CSV file."""
+class LiveDomainKey(NamedTuple):
+    """Independent live-counter domain within one CSV file.
+
+    Keys and client ids are NamedTuples: every parsed row hashes and compares
+    them, which tuples do in C (dataclasses did it in Python).
+    """
 
     phase: str
     mix_type: str
@@ -118,8 +135,7 @@ class LiveDomainKey:
         return re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-") or "unknown"
 
 
-@dataclass(frozen=True, order=True)
-class LiveClientId:
+class LiveClientId(NamedTuple):
     """Stable identity for a standalone worker or distributed service."""
 
     rank: str
@@ -268,6 +284,8 @@ class ClientSummary:  # pylint: disable=too-many-instance-attributes
     final_done_bytes: Optional[int] = None
     finish_elapsed_ms: Optional[int] = None
     first_progress_interval: Optional[int] = None
+    ops_sample_count: int = 0
+    _ops_sum: float = 0.0
 
     def observe_done_bytes(
         self, done_bytes: int, runtime_ms: int, interval: Optional[int] = None
@@ -290,6 +308,18 @@ class ClientSummary:  # pylint: disable=too-many-instance-attributes
         if fleet_median > 0:
             self.relative_median_sum += rate_mib_s / fleet_median
             self.relative_median_count += 1
+
+    def add_ops_rate(self, ops_s: float) -> None:
+        """Add one interval's ops/s (from DoneIOs deltas)."""
+        self.ops_sample_count += 1
+        self._ops_sum += ops_s
+
+    @property
+    def mean_ops_s(self) -> Optional[float]:
+        """Mean interval ops/s, or None without DoneIOs (before elbencho 3.4)."""
+        if not self.ops_sample_count:
+            return None
+        return self._ops_sum / self.ops_sample_count
 
     def mark_missing(self) -> None:
         """Record a missing interval."""
@@ -323,6 +353,13 @@ class AggregatePoint:  # pylint: disable=too-many-instance-attributes
     iops: Optional[float]
     io_latency_us: Optional[float] = None
     entries_latency_us: Optional[float] = None
+    # elbencho 3.4: interval max latency, cumulative counters, and the IOs
+    # completed since the previous Total row (the interval's latency weight).
+    io_latency_max_us: Optional[float] = None
+    entries_latency_max_us: Optional[float] = None
+    done_bytes: Optional[int] = None
+    done_ios: Optional[int] = None
+    new_ios: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -352,6 +389,8 @@ class DomainAnalysis:
     interval_iso_timestamps: List[str] = field(default_factory=list)
     runtime_to_interval: Dict[int, int] = field(default_factory=dict)
     diagnostics: Counter = field(default_factory=Counter)
+    # Whether any row had DoneIOs (elbencho 3.4); selects the new statistics.
+    has_done_ios: bool = False
 
     @property
     def has_extended_rows(self) -> bool:
@@ -399,6 +438,7 @@ class PreviousSample:
     done_bytes: int
     runtime_ms: int
     interval: int
+    done_ios: Optional[int] = None
 
 
 @dataclass
@@ -406,10 +446,8 @@ class _IntervalBuffer:
     runtime_ms: int
     iso_timestamp: str
     client_rows: Dict[LiveClientId, int] = field(default_factory=dict)
-    aggregate_mib_s: Optional[float] = None
-    aggregate_iops: Optional[float] = None
-    io_latency_us: Optional[float] = None
-    entries_latency_us: Optional[float] = None
+    client_ios: Dict[LiveClientId, int] = field(default_factory=dict)
+    total: Optional["ParsedRow"] = None
 
 
 @dataclass
@@ -417,13 +455,14 @@ class _DomainState:
     analysis: DomainAnalysis
     previous: Dict[LiveClientId, PreviousSample] = field(default_factory=dict)
     buffer: Optional[_IntervalBuffer] = None
+    last_total_ios: Optional[int] = None
 
 
 @dataclass
 class _OccurrenceState:
-    occurrence: int = 0
+    key: LiveDomainKey
     runtime_ms: Optional[int] = None
-    identities: Set[object] = field(default_factory=set)
+    total_seen: bool = False  # a Total row at ``runtime_ms``
     total_done_bytes: Optional[int] = None
 
 
@@ -440,10 +479,22 @@ class _LiveCSVColumns:
     service: int
     io_latency: Optional[int] = None
     entries_latency: Optional[int] = None
+    done_ios: Optional[int] = None
+    io_latency_max: Optional[int] = None
+    entries_latency_max: Optional[int] = None
+
+    @property
+    def has_done_ios(self) -> bool:
+        """Whether the file has elbencho 3.4's DoneIOs column."""
+        return self.done_ios is not None
 
 
 class ParsedRow(NamedTuple):
-    """One parsed live CSV row; only Total rows carry rates and latency."""
+    """One parsed live CSV row; only Total rows carry rates and entry latency.
+
+    Latency is the interval mean and max, where the file has it (client rows
+    only since elbencho 3.4). The last three fields are elbencho 3.4 columns.
+    """
 
     key: LiveDomainKey
     runtime_ms: int
@@ -455,55 +506,71 @@ class ParsedRow(NamedTuple):
     iops: Optional[float]
     io_latency_us: Optional[float]
     entries_latency_us: Optional[float]
+    done_ios: Optional[int] = None
+    io_latency_max_us: Optional[float] = None
+    entries_latency_max_us: Optional[float] = None
 
 
 class _OccurrenceTracker:
-    """Assign phase occurrence numbers while streaming native interval rows."""
+    """Assign phase occurrence numbers while streaming native interval rows.
+
+    Only Total rows can start an occurrence; client rows take the current one.
+    """
 
     def __init__(self) -> None:
         self._states: Dict[Tuple[str, str], _OccurrenceState] = {}
+        self._last: Tuple[str, str, Optional[_OccurrenceState]] = ("", "", None)
 
-    def domain_key(
+    def _state(self, phase: str, mix_type: str) -> _OccurrenceState:
+        last_phase, last_mix_type, state = self._last
+        # Consecutive rows share a phase; parsed phases are cached objects.
+        if state is not None and phase is last_phase and mix_type == last_mix_type:
+            return state
+        state = self._states.get((phase, mix_type))
+        if state is None:
+            state = _OccurrenceState(LiveDomainKey(phase, mix_type))
+            self._states[(phase, mix_type)] = state
+        self._last = (phase, mix_type, state)
+        return state
+
+    def client_key(self, phase: str, mix_type: str, runtime_ms: int) -> LiveDomainKey:
+        """The occurrence-qualified key of a client (or rank-less) row."""
+        state = self._state(phase, mix_type)
+        if state.runtime_ms != runtime_ms:
+            state.runtime_ms = runtime_ms
+            state.total_seen = False
+        return state.key
+
+    def total_key(
         self,
-        key: LiveDomainKey,
+        phase: str,
+        mix_type: str,
         runtime_ms: int,
-        identity: object,
         done_bytes: Optional[int],
         aggregate_mib_s: Optional[float],
     ) -> LiveDomainKey:
-        """Return the occurrence-qualified key for one parsed row."""
-        base = (key.phase, key.mix_type)
-        state = self._states.setdefault(base, _OccurrenceState())
-        if self._starts_new_occurrence(
-            state,
-            runtime_ms,
-            identity,
-            done_bytes,
-            aggregate_mib_s,
-        ):
-            state.occurrence += 1
-            state.identities.clear()
+        """The occurrence-qualified key of a Total row."""
+        state = self._state(phase, mix_type)
+        if self._starts_new_occurrence(state, runtime_ms, done_bytes, aggregate_mib_s):
+            state.key = LiveDomainKey(phase, mix_type, state.key.occurrence + 1)
             state.total_done_bytes = None
-        elif state.runtime_ms != runtime_ms:
-            state.identities.clear()
         state.runtime_ms = runtime_ms
-        state.identities.add(identity)
-        if identity == TOTAL_RANK and done_bytes is not None:
+        state.total_seen = True
+        if done_bytes is not None:
             state.total_done_bytes = done_bytes
-        return LiveDomainKey(key.phase, key.mix_type, state.occurrence)
+        return state.key
 
     @staticmethod
     def _starts_new_occurrence(
         state: _OccurrenceState,
         runtime_ms: int,
-        identity: object,
         done_bytes: Optional[int],
         aggregate_mib_s: Optional[float],
     ) -> bool:
-        if identity != TOTAL_RANK or state.runtime_ms is None:
+        if state.runtime_ms is None:
             return False
         runtime_restarted = runtime_ms < state.runtime_ms or (
-            runtime_ms == state.runtime_ms and identity in state.identities
+            runtime_ms == state.runtime_ms and state.total_seen
         )
         counter_restarted = (
             done_bytes is not None
@@ -548,15 +615,20 @@ def _total_rate_jump_restarted(
     return implied_mib_s > restart_threshold
 
 
-def iter_live_rows(analysis: LiveAnalysis) -> Iterator[ParsedRow]:
-    """Stream the analysis's parsed rows from its source, once per call."""
+def iter_live_rows(
+    analysis: LiveAnalysis, phase: Optional[str] = None
+) -> Iterator[ParsedRow]:
+    """Stream the analysis's parsed rows from its source, once per call.
+
+    With ``phase``, rows of other phases may be skipped unparsed.
+    """
     if analysis.rows is not None:
         yield from analysis.rows()
         return
     path = analysis.metadata.path
     with open(path, "r", encoding="utf-8-sig", newline="") as handle:
         reader, columns = live_csv_reader(handle, path)
-        yield from iter_parsed_rows(reader, columns)
+        yield from iter_parsed_rows(reader, columns, phase)
 
 
 def analyze_live_csv(
@@ -571,18 +643,18 @@ def analyze_live_csv(
         state = states.get(key)
         if state is None:
             state = states[key] = _DomainState(analysis=DomainAnalysis(key=key))
-        _advance_buffer(state, parsed.runtime_ms, parsed.iso_timestamp)
+        buffer = state.buffer
+        if buffer is None or buffer.runtime_ms != parsed.runtime_ms:
+            _advance_buffer(state, parsed.runtime_ms, parsed.iso_timestamp)
         if parsed.rank == TOTAL_RANK:
-            buffer = state.buffer
-            buffer.aggregate_mib_s = parsed.mib_s
-            buffer.aggregate_iops = parsed.iops
-            buffer.io_latency_us = parsed.io_latency_us
-            buffer.entries_latency_us = parsed.entries_latency_us
+            state.buffer.total = parsed
             continue
         if parsed.client is None or parsed.done_bytes is None:
             _record_malformed(state.analysis.diagnostics, line_number)
             continue
         state.buffer.client_rows[parsed.client] = parsed.done_bytes
+        if parsed.done_ios is not None:
+            state.buffer.client_ios[parsed.client] = parsed.done_ios
     for state in states.values():
         _flush_interval(state)
     analysis.domains = {key: state.analysis for key, state in states.items()}
@@ -614,7 +686,7 @@ def collect_selected_client_detail(
     interval_count = len(domain.interval_times)
     rates = {client: [INVALID_RATE] * interval_count for client in selected}
     previous: Dict[LiveClientId, PreviousSample] = {}
-    for parsed in iter_live_rows(analysis):
+    for parsed in iter_live_rows(analysis, domain.key.phase):
         client = parsed.client
         if client not in selected_set or parsed.key != domain.key:
             continue
@@ -842,6 +914,9 @@ def _columns_from_header(
         service=positions["Service"],
         io_latency=positions.get(IO_LATENCY_COLUMN),
         entries_latency=positions.get(ENTRIES_LATENCY_COLUMN),
+        done_ios=positions.get(DONE_IOS_COLUMN),
+        io_latency_max=positions.get(IO_LATENCY_MAX_COLUMN),
+        entries_latency_max=positions.get(ENTRIES_LATENCY_MAX_COLUMN),
     )
 
 
@@ -852,72 +927,187 @@ def _optional_cell(row: Sequence[str], index: Optional[int]) -> Optional[float]:
     return _optional_float(row[index])
 
 
-def _parse_row(row: Sequence[str], columns: _LiveCSVColumns) -> Optional[tuple]:
-    """Parse one row into ParsedRow fields (before occurrence numbering)."""
-    try:
-        phase = row[columns.phase].strip()
-        runtime_value = row[columns.runtime_ms]
-        rank = row[columns.rank].strip()
-        iso_timestamp = row[columns.iso_date].strip()
-        mix_type = row[columns.mix_type].strip()
-        done_bytes_value = row[columns.done_bytes]
-        mib_per_sec_value = row[columns.mib_per_sec]
-        iops_value = row[columns.iops]
-        service = row[columns.service].strip()
-    except IndexError:
-        return None
-    if not phase or phase.upper() in SKIPPED_METADATA_PHASES:
-        return None
-    try:
-        runtime_ms = int(runtime_value)
-    except ValueError:
-        return None
-    key = LiveDomainKey(phase=phase, mix_type=mix_type)
-    if rank == TOTAL_RANK:
-        return (
+def _row_parser(
+    columns: _LiveCSVColumns, only_phase: Optional[str] = None
+) -> Callable[[Sequence[str]], Optional[ParsedRow]]:
+    """A function parsing one row (None to skip it), with occurrence numbers;
+    with ``only_phase``, other phases are skipped (occurrences are per phase).
+
+    The hot path of every pass: column positions are locals, and phases and
+    client ids are cached by their raw cells.
+    """
+    tracker = _OccurrenceTracker()
+    phase_at, runtime_at, rank_at = columns.phase, columns.runtime_ms, columns.rank
+    iso_at, mix_at, service_at = columns.iso_date, columns.mix_type, columns.service
+    numbers = _client_numbers(columns)
+    width = 1 + max(
+        phase_at, runtime_at, rank_at, iso_at, mix_at, service_at,
+        columns.done_bytes, columns.mib_per_sec, columns.iops,
+    )  # fmt: skip
+    phases: Dict[str, str] = {}
+    clients: Dict[Tuple[str, str], LiveClientId] = {}
+
+    def parse(row: Sequence[str]) -> Optional[ParsedRow]:
+        if len(row) < width:
+            return None
+        phase = phases.get(row[phase_at])
+        if phase is None:
+            phase = phases[row[phase_at]] = _kept_phase(row[phase_at])
+        if not phase or (only_phase is not None and phase != only_phase):
+            return None
+        try:
+            runtime_ms = int(row[runtime_at])
+        except ValueError:
+            return None
+        rank = row[rank_at].strip()
+        mix_type = row[mix_at].strip()
+        if rank == TOTAL_RANK:
+            return _total_parsed(row, columns, tracker, (phase, mix_type, runtime_ms))
+        key = tracker.client_key(phase, mix_type, runtime_ms)
+        iso_timestamp = row[iso_at].strip()
+        if not rank:
+            return ParsedRow(key, runtime_ms, iso_timestamp, rank, *_NO_CLIENT)
+        raw = (rank, row[service_at])
+        client = clients.get(raw)
+        if client is None:
+            client = clients[raw] = LiveClientId(rank, raw[1].strip())
+        done_bytes, latency, done_ios, latency_max = numbers(row)
+        # Client rates come from counter deltas: the cells are rounded
+        # (elbencho 3.4) or empty (3.0-3.3). Entry latency is read from Total
+        # rows only.
+        return ParsedRow(
             key,
             runtime_ms,
             iso_timestamp,
             rank,
+            client,
+            done_bytes,
             None,
-            _optional_int(done_bytes_value),
-            _optional_float(mib_per_sec_value),
-            _optional_float(iops_value),
-            _optional_cell(row, columns.io_latency),
-            _optional_cell(row, columns.entries_latency),
+            None,
+            latency,
+            None,
+            done_ios,
+            latency_max,
+            None,
         )
-    if not rank:
-        return key, runtime_ms, iso_timestamp, rank, None, None, None, None, None, None
-    return (
-        key,
+
+    return parse
+
+
+ClientNumbers = Tuple[Optional[int], Optional[float], Optional[int], Optional[float]]
+
+
+def _client_numbers(
+    columns: _LiveCSVColumns,
+) -> Callable[[Sequence[str]], ClientNumbers]:
+    """A function reading a client row's (DoneBytes, Lat IO us, DoneIOs, Lat IO
+    max us); well-formed cells take a fast path, the rest the helpers."""
+    done_at, ios_at = columns.done_bytes, columns.done_ios
+    latency_at, max_at = columns.io_latency, columns.io_latency_max
+    isfinite = math.isfinite
+
+    def checked(row: Sequence[str]) -> ClientNumbers:
+        return (
+            _optional_int(row[done_at]),
+            _optional_cell(row, latency_at),
+            _optional_int_cell(row, ios_at),
+            _optional_cell(row, max_at),
+        )
+
+    if latency_at is None:
+        return checked
+
+    def legacy(row: Sequence[str]) -> ClientNumbers:
+        # Before elbencho 3.4, client latency cells are empty.
+        try:
+            done = row[done_at]
+            if not row[latency_at]:
+                return int(done) if done else None, None, None, None
+        except (IndexError, ValueError):
+            pass
+        return checked(row)
+
+    if ios_at is None or max_at is None:
+        return legacy
+
+    def fast(row: Sequence[str]) -> ClientNumbers:
+        try:
+            done, ios = row[done_at], row[ios_at]
+            latency, peak = row[latency_at], row[max_at]
+            latency_us = float(latency) if latency else None
+            max_us = float(peak) if peak else None
+            if (latency_us is None or isfinite(latency_us)) and (
+                max_us is None or isfinite(max_us)
+            ):
+                return (
+                    int(done) if done else None,
+                    latency_us,
+                    int(ios) if ios else None,
+                    max_us,
+                )
+        except (IndexError, ValueError):
+            pass
+        return checked(row)
+
+    return fast
+
+
+# ParsedRow fields after the rank of a row without one.
+_NO_CLIENT = (None,) * 9
+
+
+def _kept_phase(raw: str) -> str:
+    """The stripped phase, or "" for a skipped (metadata or empty) phase."""
+    phase = raw.strip()
+    return "" if phase.upper() in SKIPPED_METADATA_PHASES else phase
+
+
+def _total_parsed(
+    row: Sequence[str],
+    columns: _LiveCSVColumns,
+    tracker: _OccurrenceTracker,
+    position: Tuple[str, str, int],
+) -> ParsedRow:
+    """A Total row; ``position`` is its (phase, mix type, RuntimeMS)."""
+    phase, mix_type, runtime_ms = position
+    done_bytes = _optional_int(row[columns.done_bytes])
+    mib_s = _optional_float(row[columns.mib_per_sec])
+    return ParsedRow(
+        tracker.total_key(phase, mix_type, runtime_ms, done_bytes, mib_s),
         runtime_ms,
-        iso_timestamp,
-        rank,
-        LiveClientId(rank=rank, service=service),
-        _optional_int(done_bytes_value),
+        row[columns.iso_date].strip(),
+        TOTAL_RANK,
         None,
-        None,
+        done_bytes,
+        mib_s,
+        _optional_float(row[columns.iops]),
         _optional_cell(row, columns.io_latency),
         _optional_cell(row, columns.entries_latency),
+        _optional_int_cell(row, columns.done_ios),
+        _optional_cell(row, columns.io_latency_max),
+        _optional_cell(row, columns.entries_latency_max),
     )
+
+
+def _optional_int_cell(row: Sequence[str], index: Optional[int]) -> Optional[int]:
+    """Parse an optional integer column's cell; absent columns and cells are None."""
+    if index is None or index >= len(row):
+        return None
+    return _optional_int(row[index])
 
 
 def iter_parsed_rows(
     reader: Iterable[Sequence[str]],
     columns: _LiveCSVColumns,
+    phase: Optional[str] = None,
 ) -> Iterator[ParsedRow]:
-    """Yield parsed rows while separating repeated phase/runtime occurrences."""
-    tracker = _OccurrenceTracker()
+    """Yield parsed rows while separating repeated phase/runtime occurrences;
+    with ``phase``, only that phase's rows."""
+    parse = _row_parser(columns, phase)
     for row in reader:
-        parsed = _parse_row(row, columns)
-        if parsed is None:
-            continue
-        key, runtime_ms, _, rank, client, done_bytes, mib_s = parsed[:7]
-        identity = TOTAL_RANK if rank == TOTAL_RANK else client
-        yield ParsedRow(
-            tracker.domain_key(key, runtime_ms, identity, done_bytes, mib_s),
-            *parsed[1:],
-        )
+        parsed = parse(row)
+        if parsed is not None:
+            yield parsed
 
 
 def _optional_int(value: Optional[str]) -> Optional[int]:
@@ -959,7 +1149,7 @@ def _flush_interval(state: _DomainState) -> None:
     domain.interval_times.append(elapsed_sec)
     domain.interval_iso_timestamps.append(buffer.iso_timestamp)
     domain.runtime_to_interval[buffer.runtime_ms] = interval
-    _record_aggregate(domain, buffer, interval, elapsed_sec)
+    _record_aggregate(state, buffer, interval, elapsed_sec)
     _mark_missing_clients(domain, buffer.client_rows)
     rates = _derive_interval_rates(state, buffer, interval)
     _record_fleet_statistics(
@@ -972,20 +1162,48 @@ def _flush_interval(state: _DomainState) -> None:
     state.buffer = None
 
 
+def interval_latency(
+    latency_us: Optional[float], new_ios: Optional[float]
+) -> Optional[float]:
+    """An interval's latency, or None: elbencho writes 0 for an interval
+    without IOs. ``new_ios`` is the interval's IO count (or IOPS cell)."""
+    if latency_us == 0 and not new_ios:
+        return None
+    return latency_us
+
+
+def counter_delta(current: Optional[int], prior: Optional[int]) -> Optional[int]:
+    """A cumulative counter's increase since ``prior`` (None: since the phase
+    start); None when unknown or the counter went back."""
+    if current is None:
+        return None
+    delta = current - (prior or 0)
+    return delta if delta >= 0 else None
+
+
 def _record_aggregate(
-    domain: DomainAnalysis,
+    state: _DomainState,
     buffer: _IntervalBuffer,
     interval: int,
     elapsed_sec: float,
 ) -> None:
-    io_latency = buffer.io_latency_us
-    if io_latency == 0 and not buffer.aggregate_iops:
-        io_latency = None  # elbencho prints 0 for an interval without IOs
-    entries_latency = buffer.entries_latency_us or None
+    total = buffer.total
+    if total is None:
+        return
+    domain = state.analysis
+    new_ios = None
+    if total.done_ios is not None:
+        domain.has_done_ios = True
+        new_ios = counter_delta(total.done_ios, state.last_total_ios)
+        state.last_total_ios = total.done_ios
+    # 3.4 counts the interval's IOs; older files only have the IOPS cell.
+    ios = new_ios if total.done_ios is not None else total.iops
+    io_latency = interval_latency(total.io_latency_us, ios)
     if (
-        buffer.aggregate_mib_s is None
-        and buffer.aggregate_iops is None
+        total.mib_s is None
+        and total.iops is None
         and io_latency is None
+        and total.done_ios is None
     ):
         return
     domain.aggregate_points.append(
@@ -993,10 +1211,15 @@ def _record_aggregate(
             interval=interval,
             elapsed_sec=elapsed_sec,
             iso_timestamp=buffer.iso_timestamp,
-            throughput_mib_s=buffer.aggregate_mib_s,
-            iops=buffer.aggregate_iops,
+            throughput_mib_s=total.mib_s,
+            iops=total.iops,
             io_latency_us=io_latency,
-            entries_latency_us=entries_latency,
+            entries_latency_us=total.entries_latency_us or None,
+            io_latency_max_us=interval_latency(total.io_latency_max_us, ios),
+            entries_latency_max_us=total.entries_latency_max_us or None,
+            done_bytes=total.done_bytes,
+            done_ios=total.done_ios,
+            new_ios=new_ios,
         )
     )
 
@@ -1026,6 +1249,11 @@ def _derive_interval_rates(
         summary.observe_done_bytes(done_bytes, buffer.runtime_ms, interval)
         prior = state.previous.get(client)
         rate = derive_rate(prior, done_bytes, buffer.runtime_ms, interval)
+        done_ios = buffer.client_ios.get(client)
+        if done_ios is not None:
+            ops = derive_ops_rate(prior, done_ios, buffer.runtime_ms, interval)
+            if ops is not None:
+                summary.add_ops_rate(ops)
         if prior is not None and prior.interval != interval - 1:
             state.analysis.diagnostics["non_adjacent_samples"] += 1
         elif prior is not None and rate is None:
@@ -1036,7 +1264,11 @@ def _derive_interval_rates(
             state.analysis.diagnostics[reason] += 1
         if rate is not None:
             rates[client] = rate
-        state.previous[client] = PreviousSample(done_bytes, buffer.runtime_ms, interval)
+        state.previous[client] = PreviousSample(
+            done_bytes, buffer.runtime_ms, interval, done_ios
+        )
+    if buffer.client_ios:
+        state.analysis.has_done_ios = True
     return rates
 
 
@@ -1054,6 +1286,22 @@ def derive_rate(
     if elapsed_ms <= 0 or byte_delta < 0:
         return None
     return byte_delta * 1000.0 / elapsed_ms / MIB
+
+
+def derive_ops_rate(
+    prior: Optional[PreviousSample],
+    done_ios: int,
+    runtime_ms: int,
+    interval: int,
+) -> Optional[float]:
+    """Ops/s from DoneIOs since the immediately preceding interval, or None."""
+    if prior is None or prior.done_ios is None or prior.interval != interval - 1:
+        return None
+    elapsed_ms = runtime_ms - prior.runtime_ms
+    delta = done_ios - prior.done_ios
+    if elapsed_ms <= 0 or delta < 0:
+        return None
+    return delta * 1000.0 / elapsed_ms
 
 
 def _invalid_rate_reason(

@@ -391,7 +391,7 @@ def test_several_documents_prefix_anchors(tmp_path):
 @pytest.mark.parametrize(
     "change, message",
     [
-        ({"schema_version": "2.0"}, "schema_version '2.0' is not supported"),
+        ({"schema_version": "3.0"}, "schema_version '3.0' is not supported"),
         ({"schema": "other"}, "not a storage-scale-test/filesystem-batch-results"),
     ],
 )

@@ -83,7 +83,7 @@ def _chart_data(output):
 
 # -- schema 1.0 ----------------------------------------------------------------
 
-# Keys that schema 1.1 added, by the object that holds them.
+# Keys that schemas 1.1 and 2.0 added, by the object that holds them.
 _V11_KEYS = {
     "execution": ("producer_version",),
     "results": ("datestamp", "additional_live_domains"),
@@ -92,7 +92,16 @@ _V11_KEYS = {
     "workload": ("write_elapsed_ms", "read_elapsed_ms", "write_delete_elapsed_ms"),
     "live": ("phase_context",),
     "steady": ("interval_ms",),
-    "aggregate_series": ("start_time", "clock_skew_ms", "entries_latency_avg_us"),
+    "aggregate_series": (
+        "start_time",
+        "clock_skew_ms",
+        "entries_latency_avg_us",
+        "io_latency_max_us",
+        "entries_latency_max_us",
+        "done_bytes",
+        "done_ios",
+    ),
+    "latency": ("client_avg_p50_us", "client_ratio_max"),
     "group": ("settings_text", "source", "unpaired_live"),
     "iteration": ("producer_version",),
     "options": (
@@ -110,11 +119,21 @@ def _drop(item, kind):
             item.pop(key, None)
 
 
+# Schema 2.0 appended this many clients_summary columns.
+_V12_CLIENT_COLUMNS = 6
+
+
 def _strip_live(live):
     if isinstance(live, dict):
         _drop(live, "live")
         _drop(live.get("steady"), "steady")
         _drop(live.get("aggregate_series"), "aggregate_series")
+        _drop(live.get("latency"), "latency")
+        summary = live.get("clients_summary")
+        if summary:
+            del summary["columns"][-_V12_CLIENT_COLUMNS:]
+            for row in summary["rows"]:
+                del row[-_V12_CLIENT_COLUMNS:]
 
 
 def _strip_results(results):

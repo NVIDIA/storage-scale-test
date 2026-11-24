@@ -62,9 +62,9 @@ K_LIVE_DOMAINS = "additional_live_domains"
 K_UNPAIRED_LIVE = "unpaired_live"
 
 SCHEMA = "storage-scale-test/filesystem-batch-results"
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "2.0"
 LIVE_SCHEMA = "storage-scale-test/live-client-series"
-LIVE_SCHEMA_VERSION = "1.1"
+LIVE_SCHEMA_VERSION = "1.2"
 FRAGMENT_VERSION = 1
 LIVE_DETAIL_LEVELS = ("none", "summary", "selected", "full")
 REPORT_HTML_FILENAME = "report.html"
@@ -490,14 +490,17 @@ class SidecarWriter:
         elapsed_ms: int,
         bytes_per_s: list[int | None],
         done_bytes_delta: list[int | None] | None = None,
+        extra: dict[str, list] | None = None,
     ) -> None:
-        """Append one interval line."""
+        """Append one interval line; ``extra`` adds more per-client arrays."""
         line: dict[str, Any] = {
             "elapsed_ms": elapsed_ms,
             "bytes_per_s": list(bytes_per_s),
         }
         if done_bytes_delta is not None:
             line["done_bytes_delta"] = list(done_bytes_delta)
+        for name, values in (extra or {}).items():
+            line[name] = list(values)
         self._write_line(line)
 
     def close(self) -> None:

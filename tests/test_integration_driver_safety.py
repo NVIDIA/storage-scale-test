@@ -59,6 +59,12 @@ def test_deployment_and_fixture_elbencho_release_pins_agree(architecture):
     assert f"KUBECTL_ELBENCHO_IMAGE=docker.io/breuner/elbencho:{version}" in environment
 
 
+def test_results_schema_major_matches_the_writer():
+    """The fixture's results.json check must expect the version the tools write."""
+    writer = (_REPO_ROOT / "lib/filesystem_results.py").read_text(encoding="utf-8")
+    assert f'SCHEMA_VERSION = "{_FILESYSTEM.RESULTS_SCHEMA_MAJOR}.' in writer
+
+
 @pytest.mark.parametrize("failed", [False, True])
 @pytest.mark.parametrize("collected", [False, True])
 @pytest.mark.parametrize(

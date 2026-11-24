@@ -26,7 +26,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List
+from typing import Dict, Optional, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -35,6 +35,7 @@ if str(_REPO_ROOT) not in sys.path:
 from lib.elbencho_live_report import (  # pylint: disable=wrong-import-position
     MIB,
     LIVE_CSV_COLUMNS,
+    LIVE_CSV_COLUMNS_V34,
     LiveClientId,
     LiveDomainKey,
     LiveFileMetadata,
@@ -63,15 +64,30 @@ TRANSIENT_RATE_MIB_S = 40
 ANOMALY_GROUP_SIZE = 10
 MIN_BENCHMARK_CLIENTS = 5 * ANOMALY_GROUP_SIZE + 1
 BASE_TIMESTAMP = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
+BLOCK_SIZE = 64 * 1024
+IOS_PER_MIB = MIB // BLOCK_SIZE
+# One thread at queue depth 1: latency in us of an IO at a MiB/s rate.
+LATENCY_US_PER_MIB_S = 1_000_000 // IOS_PER_MIB
 
 
-def generate_live_csv(path: Path, client_count: int, interval_count: int) -> None:
-    """Stream the deterministic benchmark CSV to disk."""
+def generate_live_csv(
+    path: Path,
+    client_count: int,
+    interval_count: int,
+    columns: Optional[Sequence[str]] = None,
+) -> None:
+    """Stream the deterministic benchmark CSV to disk.
+
+    ``columns`` is LIVE_CSV_COLUMNS_V34 (the default; filled client rows) or
+    the elbencho 3.0-3.3 LIVE_CSV_COLUMNS (client rates and latency empty).
+    """
+    columns = LIVE_CSV_COLUMNS_V34 if columns is None else list(columns)
     counters = [0] * client_count
     aggregate_done = 0
+    filled = columns == LIVE_CSV_COLUMNS_V34
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(LIVE_CSV_COLUMNS)
+        writer.writerow(columns)
         for interval in range(interval_count):
             runtime_ms = (interval + 1) * 1000
             iso_timestamp = (
@@ -81,40 +97,32 @@ def generate_live_csv(path: Path, client_count: int, interval_count: int) -> Non
                 _rate_for_client(client, interval, interval_count)
                 for client in range(client_count)
             ]
-            aggregate_rate = sum(
+            present = [
                 rate
                 for client, rate in enumerate(rates)
                 if not _sample_is_missing(client, interval)
-            )
+            ]
+            aggregate_rate = sum(present)
             aggregate_done += aggregate_rate * MIB
-            writer.writerow(
-                _live_row(
-                    runtime_ms,
-                    iso_timestamp,
-                    "Total",
-                    aggregate_done,
-                    "",
-                    aggregate_rate,
-                    aggregate_rate * 16,
-                )
-            )
+            row = _live_row(runtime_ms, iso_timestamp, "Total", aggregate_done, "")
+            row.update(_filled_cells(aggregate_rate, aggregate_done, len(present)))
+            writer.writerow([row.get(name, "") for name in columns])
             for client, rate in enumerate(rates):
                 if _sample_is_missing(client, interval):
                     continue
                 if _sample_resets(client, interval, interval_count):
                     counters[client] = 0
                 counters[client] += rate * MIB
-                writer.writerow(
-                    _live_row(
-                        runtime_ms,
-                        iso_timestamp,
-                        client,
-                        counters[client],
-                        f"client-{client:05d}",
-                        "",
-                        "",
-                    )
+                row = _live_row(
+                    runtime_ms,
+                    iso_timestamp,
+                    client,
+                    counters[client],
+                    f"client-{client:05d}",
                 )
+                if filled:
+                    row.update(_filled_cells(rate, counters[client]))
+                writer.writerow([row.get(name, "") for name in columns])
 
 
 def run_analysis(
@@ -214,28 +222,34 @@ def _live_row(
     rank: object,
     done_bytes: int,
     service: str,
-    mib_s: object,
-    iops: object,
-) -> List[object]:
-    return [
-        iso_timestamp,
-        "",
-        "READ",
-        runtime_ms,
-        rank,
-        "",
-        0,
-        done_bytes,
-        mib_s,
-        iops,
-        0,
-        "",
-        "",
-        "",
-        "",
-        "",
-        service,
-    ]
+) -> Dict[str, object]:
+    return {
+        "ISO Date": iso_timestamp,
+        "Phase": "READ",
+        "RuntimeMS": runtime_ms,
+        "Rank": rank,
+        "Done%": 0,
+        "DoneBytes": done_bytes,
+        "Entries": 0,
+        "Service": service,
+    }
+
+
+def _filled_cells(
+    rate_mib_s: int, done_bytes: int, threads: int = 1
+) -> Dict[str, object]:
+    """Rate, DoneIOs and latency cells (all of a Total row; 3.4 client rows).
+
+    ``threads`` clients at ``rate_mib_s`` in all have this IO-weighted mean.
+    """
+    latency_us = LATENCY_US_PER_MIB_S * threads // rate_mib_s if rate_mib_s else 0
+    return {
+        "DoneIOs": done_bytes // BLOCK_SIZE,
+        "MiB/s": rate_mib_s,
+        "IOPS": rate_mib_s * IOS_PER_MIB,
+        "Lat IO us": latency_us,
+        "Lat IO max us": 4 * latency_us,
+    }
 
 
 def _validate_results(domain, steady, selected, client_count: int) -> None:
@@ -254,6 +268,18 @@ def _validate_results(domain, steady, selected, client_count: int) -> None:
         raise RuntimeError("Persistent synthetic throughput was derived incorrectly")
     if abs(domain.clients[normal].mean_mib_s - BASE_RATE_MIB_S) >= 0.01:
         raise RuntimeError("Normal synthetic throughput was derived incorrectly")
+    if domain.has_done_ios:
+        _validate_done_ios(domain, steady, persistent)
+
+
+def _validate_done_ios(domain, steady, persistent: LiveClientId) -> None:
+    """Ops/s and client latency of the elbencho 3.4 layout."""
+    expected_ops = PERSISTENT_RATE_MIB_S * IOS_PER_MIB
+    if abs(domain.clients[persistent].mean_ops_s - expected_ops) >= 0.01:
+        raise RuntimeError("Persistent synthetic ops/s was derived incorrectly")
+    latency = steady.clients[persistent].io_latency_avg_us
+    if latency != LATENCY_US_PER_MIB_S // PERSISTENT_RATE_MIB_S:
+        raise RuntimeError("Persistent synthetic latency was derived incorrectly")
 
 
 def _peak_rss_mib() -> float:
@@ -282,6 +308,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--analyze-only", action="store_true")
     parser.add_argument("--no-plots", action="store_true")
+    parser.add_argument(
+        "--legacy-columns",
+        action="store_true",
+        help="write the elbencho 3.0-3.3 layout (client rates and latency empty)",
+    )
     args = parser.parse_args()
     if args.clients < MIN_BENCHMARK_CLIENTS:
         parser.error(f"--clients must be at least {MIN_BENCHMARK_CLIENTS}")
@@ -297,7 +328,8 @@ def main() -> None:
     live_path = args.work_dir / _benchmark_filename(args.clients)
     if not args.analyze_only:
         generate_started = time.perf_counter()
-        generate_live_csv(live_path, args.clients, args.intervals)
+        columns = LIVE_CSV_COLUMNS if args.legacy_columns else LIVE_CSV_COLUMNS_V34
+        generate_live_csv(live_path, args.clients, args.intervals, columns)
         print(f"generation_seconds={time.perf_counter() - generate_started:.3f}")
     if not live_path.is_file():
         raise FileNotFoundError(f"Benchmark input does not exist: {live_path}")

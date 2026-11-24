@@ -5272,7 +5272,7 @@ def _document_fairness(live: dict, options: LiveReportOptions) -> LiveFairness:
             None
             if latency is None
             else LatencySummary(
-                **{item.name: latency[item.name] for item in fields(LatencySummary)}
+                **{item.name: latency.get(item.name) for item in fields(LatencySummary)}
             )
         ),
         {

@@ -86,7 +86,7 @@ recorded `sha256` and `size_bytes` describes the stored bytes.
 
 | Field | Content |
 | --- | --- |
-| `schema`, `schema_version` | `storage-scale-test/filesystem-batch-results`, `"MAJOR.MINOR"` (currently `"1.1"`). |
+| `schema`, `schema_version` | `storage-scale-test/filesystem-batch-results`, `"MAJOR.MINOR"` (currently `"2.0"`). |
 | `generator` | `tool`, `version`, `generated_at` (UTC), `command`, `options` (`live_detail`, `shortfall_percent`, `min_slow_windows`, `client_max_timeseries_lines`, `client_max_heatmap_rows`, `no_dual_y_axis`, `normalize_to`, `only_nodes`, `only_threads`, `only_sizes`, `only_iodepths`, `groups`, `kind`; `null` when unused). |
 | `batch` | `root`, `datestamp`, `manifest_version`, `manifest_sha256`, `sealed`, `substrate`. |
 | `batch_outcome` | `complete`; `executions` counts (`total` plus one per `ledger_state`); `results` counts (one per `result_state`); `groups_reported`; `groups_not_reported`. |
@@ -310,7 +310,7 @@ Earlier sidecars in that directory are removed before each export. Each is
 zstd-compressed JSON Lines in source order:
 
 ```json
-{"schema": "storage-scale-test/live-client-series", "schema_version": "1.1", "execution_id": "0014", "phase": "write", "mix_type": "", "occurrence": 0, "clients": ["host001 [rank 0]", "..."]}
+{"schema": "storage-scale-test/live-client-series", "schema_version": "1.2", "execution_id": "0014", "phase": "write", "mix_type": "", "occurrence": 0, "clients": ["host001 [rank 0]", "..."]}
 {"elapsed_ms": 1000, "bytes_per_s": [null, 1320000000, 1290000000], "done_bytes_delta": [1048576, 1320000000, 1290000000]}
 ```
 
@@ -487,7 +487,8 @@ jq -r '.executions[] | [.execution_id, (tojson | length)] | @tsv' "$R" | sort -k
 
 ## Schemas and versioning
 
-- `docs/schemas/filesystem-batch-results-1.schema.json`: the document.
+- `docs/schemas/filesystem-batch-results-2.schema.json`: the document
+  (`-1.schema.json` for 1.x documents).
 - `docs/schemas/live-client-series-1.schema.json`: each sidecar line.
 
 Both are JSON Schema 2020-12. `schema_version` is `MAJOR.MINOR`. A minor
@@ -499,7 +500,9 @@ workload fields, `command` on metadata phases, the rendering options,
 `additional_live_domains`, `unpaired_live`, and the live fields `phase_context`,
 `steady.interval_ms`, `entries_latency_avg_us`, `start_time`,
 `clock_skew_ms`, and three `clients_summary` columns; treat them as absent in
-1.0 documents. Sidecar 1.1 added `mix_type`, `occurrence`, and
+1.0 documents. Version 2.0 makes live `latency.max_us` the largest
+elbencho 3.4 `Lat IO max us` (in 1.x and for older elbencho, the largest
+interval mean). Sidecar 1.1 added `mix_type`, `occurrence`, and
 `done_bytes_delta`.
 
 ## Example
@@ -512,7 +515,7 @@ TARGET = {"io/c004/s032/d016/w1M-seq/r4K-rand/dio": 3.0e9}  # bytes/s
 
 with open("results.json", encoding="utf-8") as stream:
     doc = json.load(stream)
-if not doc["schema_version"].startswith("1."):
+if not doc["schema_version"].startswith(("1.", "2.")):
     sys.exit("unsupported schema")
 if not doc["batch_outcome"]["complete"]:
     sys.exit("batch incomplete")
