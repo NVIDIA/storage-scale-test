@@ -34,6 +34,9 @@ SCALE_TEST_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCALE_TEST_BASE/lib/project_version.sh" || exit 1
 project_version_option "$SCALE_TEST_BASE" "$@"
+# shellcheck source=lib/_platform_functions.sh
+# shellcheck disable=SC1091
+source "$SCALE_TEST_BASE/lib/_platform_functions.sh" || exit 1
 
 validate_env_usage() {
     cat <<'USAGE'
@@ -1875,6 +1878,15 @@ if [ -n "$FS_ENABLED" ]; then
         fi
     }
     check_elbencho_config
+
+    # Kubernetes checks the image's elbencho in its runtime validation Job.
+    if [[ -z "${KUBECTL_ENABLED:-}" && -x "${ELBENCHO-}" ]]; then
+        if ! validation_output=$(elbencho_check_binary_version "$ELBENCHO" 2>&1); then
+            while IFS= read -r line; do
+                register_error "$line"
+            done <<< "$validation_output"
+        fi
+    fi
 
     if [[ -z "${KUBECTL_ENABLED:-}" ]]; then
         # Loop over all filesystems in TEST_DIRS

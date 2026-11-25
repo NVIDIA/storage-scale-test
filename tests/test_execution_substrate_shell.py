@@ -266,8 +266,8 @@ def test_legacy_resume_cannot_be_reinterpreted_as_kubectl(tmp_path):
 @pytest.mark.parametrize(
     ("configured", "expected"),
     (
-        ("unset KUBECTL_ELBENCHO_IMAGE", "docker.io/breuner/elbencho:v3.2-1"),
-        ("KUBECTL_ELBENCHO_IMAGE=", "docker.io/breuner/elbencho:v3.2-1"),
+        ("unset KUBECTL_ELBENCHO_IMAGE", "docker.io/breuner/elbencho:v3.4-1"),
+        ("KUBECTL_ELBENCHO_IMAGE=", "docker.io/breuner/elbencho:v3.4-1"),
         (
             "KUBECTL_ELBENCHO_IMAGE=registry.example/elbencho:x",
             "registry.example/elbencho:x",

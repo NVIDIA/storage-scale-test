@@ -31,6 +31,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.filesystem_checkout_test_support import FAKE_ELBENCHO_SCRIPT
+
 _ROOT = Path(__file__).resolve().parent.parent
 _BASH = shutil.which("bash") or "/bin/bash"
 _SUCCESS = "All validation checks passed successfully"
@@ -155,6 +157,7 @@ def _deployment(tmp_path: Path, env_text: str) -> Path:
     (deployment / "lib").mkdir(parents=True)
     shutil.copy2(_ROOT / "validate_env.sh", deployment / "validate_env.sh")
     shutil.copy2(_ROOT / "lib/project_version.sh", deployment / "lib")
+    shutil.copy2(_ROOT / "lib/_platform_functions.sh", deployment / "lib")
     (tmp_path / "results").mkdir()
     (tmp_path / "logs").mkdir()
     (deployment / "env.sh").write_text(
@@ -188,7 +191,7 @@ def _roots(tmp_path: Path) -> list[str]:
 
 
 def _ssh_env(tmp_path: Path) -> str:
-    binary = _write_executable(tmp_path / "elbencho", "#!/bin/sh\n")
+    binary = _write_executable(tmp_path / "elbencho", FAKE_ELBENCHO_SCRIPT)
     roots = " ".join(f"[{root!r}]=1" for root in _roots(tmp_path))
     return (
         f"{_SSH_FAKES}FS_ENABLED=1\nELBENCHO={str(binary)!r}\n"
@@ -238,7 +241,10 @@ def test_ssh_failure_lists_errors_and_omits_the_failed_summary(tmp_path):
 def test_slurm_success_prints_only_a_short_summary(tmp_path):
     """Slurm, architecture, every binary, the roots and the bucket: one line each."""
     binaries = {
-        name: _write_executable(tmp_path / name, "#!/bin/sh\n")
+        name: _write_executable(
+            tmp_path / name,
+            FAKE_ELBENCHO_SCRIPT if name == "elbencho" else "#!/bin/sh\n",
+        )
         for name in ("elbencho", "warp")
     }
     s3test = _write_executable(tmp_path / "s3test", "#!/bin/sh\necho 0\n")
@@ -265,7 +271,7 @@ def test_slurm_success_prints_only_a_short_summary(tmp_path):
 
 
 def _slurm_roots_env(tmp_path: Path, count: int) -> str:
-    binary = _write_executable(tmp_path / "elbencho", "#!/bin/sh\n")
+    binary = _write_executable(tmp_path / "elbencho", FAKE_ELBENCHO_SCRIPT)
     roots = []
     for index in range(count):
         root = tmp_path / "mnt" / f"root {index}"

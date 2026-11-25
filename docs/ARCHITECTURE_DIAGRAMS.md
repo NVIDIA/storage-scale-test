@@ -275,7 +275,7 @@ runs in the parent.
         |  one task per execution, one per live CSV
         v                                        |
 +- pool: parse -------------------------+        |
-| .csv/.out  --> phase entries          |        |
+| .json (or .csv/.out) --> phase entries|        |
 | .live.csv  --> live objects, and      |        |
 |                results.live/ sidecars |        |
 +------------------+--------------------+        |

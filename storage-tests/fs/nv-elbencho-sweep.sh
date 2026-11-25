@@ -650,6 +650,11 @@ _validate_elbencho_sweep_environment() {
         validation_failed=1
     fi
 
+    # Kubernetes runs the pinned image's elbencho, not this host's binary.
+    if [[ -z "${KUBECTL_ENABLED:-}" ]] && ! elbencho_check_binary_version "$ELBENCHO"; then
+        validation_failed=1
+    fi
+
     if [[ "$validation_failed" -ne 0 ]]; then
         echo "Error: Elbencho configuration validation failed. Fix the errors above and try again." >&2
         return 1

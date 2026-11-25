@@ -99,6 +99,32 @@ spec:
                   echo "Error: /usr/bin/elbencho is not executable in the benchmark image" >&2
                   exit 1
               }
+              printf 'STORAGE_SCALE_TEST_VALIDATION_PHASE=elbencho-version\n'
+              # Same rule as elbencho_check_binary_version in lib/_platform_functions.sh;
+              # tests/test_elbencho_version.py runs both against the same cases.
+              check_elbencho_version() {
+                  local binary=$1 floor=$2 found="" line found_key floor_key
+                  while IFS= read -r line; do
+                      if [[ "$line" =~ ^[[:space:]]*\*[[:space:]]*Version:[[:space:]]*([^[:space:]]+)[[:space:]]*$ ]]; then
+                          found=${BASH_REMATCH[1]}
+                          break
+                      fi
+                  done < <("$binary" --version 2>/dev/null)
+                  if [[ "$found" =~ ^v?([0-9]+)[.]([0-9]+)[.-]([0-9]+)$ ]]; then
+                      printf -v found_key '%08d%08d%08d' "$((10#${BASH_REMATCH[1]}))" \
+                          "$((10#${BASH_REMATCH[2]}))" "$((10#${BASH_REMATCH[3]}))"
+                      [[ "$floor" =~ ^v?([0-9]+)[.]([0-9]+)[.-]([0-9]+)$ ]] || return 1
+                      printf -v floor_key '%08d%08d%08d' "$((10#${BASH_REMATCH[1]}))" \
+                          "$((10#${BASH_REMATCH[2]}))" "$((10#${BASH_REMATCH[3]}))"
+                      [[ ! "$found_key" < "$floor_key" ]] && return 0
+                      echo "Error: the benchmark image's elbencho is $found; $floor or newer is required." >&2
+                  else
+                      echo "Error: cannot determine the benchmark image's elbencho version (got '${found:-nothing}'); $floor or newer is required." >&2
+                  fi
+                  echo "Fix: set KUBECTL_ELBENCHO_IMAGE to an image with elbencho $floor or newer." >&2
+                  return 1
+              }
+              check_elbencho_version /usr/bin/elbencho "@@ELBENCHO_MIN_VERSION@@" || exit 1
               test_roots=(
 @@TEST_ROOT_ARGUMENTS@@
               )

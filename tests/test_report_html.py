@@ -64,6 +64,8 @@ INTERVALS = 400
 SECTION = "g0001-1m-seq-dio"
 OPS = ("create", "stat", "delete")
 LIVE_EXECUTION = "0003"
+# Templates only elbencho 3.4 data produces.
+NEW_TEMPLATES = ("run-client-scatter", "service-latency", "service-completion")
 _BLOB = re.compile(
     r'<script type="application/json" id="report-charts">(.*?)</script>', re.S
 )
@@ -177,7 +179,7 @@ def test_render_is_deterministic_and_order_independent(tmp_path):
 def test_anchors_templates_and_numbering(full_page):
     assert not _duplicate_ids(full_page)
     used = set(re.findall(r'data-template="([^"]+)"', full_page))
-    assert used == set(TEMPLATES) - {"comparison-chart"}
+    assert used == set(TEMPLATES) - {"comparison-chart", *NEW_TEMPLATES}
     for template in ("sweep-throughput", "sweep-efficiency"):
         assert f'id="{SECTION}-{template}"' in full_page
     for phase in ("write", "read"):
@@ -391,7 +393,7 @@ def test_several_documents_prefix_anchors(tmp_path):
 @pytest.mark.parametrize(
     "change, message",
     [
-        ({"schema_version": "2.0"}, "schema_version '2.0' is not supported"),
+        ({"schema_version": "3.0"}, "schema_version '3.0' is not supported"),
         ({"schema": "other"}, "not a storage-scale-test/filesystem-batch-results"),
     ],
 )
@@ -924,3 +926,296 @@ def test_metadata_rates_follow_normalization(tmp_path):
 def test_exact_text_keeps_fractions():
     assert exact_text(109_235_641.23) == "109,235,641.23"
     assert exact_text(109_249_000.0) == "109,249,000"
+
+
+def _svc_latency(p99):
+    return {
+        "min": 40,
+        "avg": 600,
+        "max": 9000,
+        "p1": 80,
+        "p50": 500,
+        "p75": 700,
+        "p99": p99,
+    }
+
+
+def _spread(low, high):
+    return {
+        "min": low,
+        "avg": (low + high) / 2,
+        "max": high,
+        "min_host": "svc0:1611",
+        "max_host": "svc1:1611",
+    }
+
+
+def _with_services(document):
+    """Elbencho 3.4 results: per-service finals on every phase, and the live
+    execution's client summary and latency with the 3.4 fields."""
+    for execution in document["executions"]:
+        results = execution.get("results") or {}
+        if not results.get("phases"):
+            continue
+        execution["elbencho_version"] = "3.4-1"
+        for phase in results["phases"]:
+            phase["services"] = {
+                "instances": [
+                    {
+                        "host": f"svc{i}:1611",
+                        "elapsed_ms": 59000 + 500 * i,
+                        "latency_us": _svc_latency(3000 + 3000 * i),
+                    }
+                    for i in range(2)
+                ],
+                "ops_per_s": _spread(800.0, 1200.0),
+                "bytes_per_s": _spread(2.0e8, 3.0e8),
+            }
+    execution = [
+        e for e in document["executions"] if e["execution_id"] == LIVE_EXECUTION
+    ][0]
+    live = execution["results"]["phases"][0]["live"]
+    live["latency"] = {
+        "p50_us": 500.0,
+        "p90_us": 900.0,
+        "max_us": 12500.0,
+        "max_over_p50": 3.0,
+        "client_ratio_max": 1.75,
+    }
+    live["aggregate_series"]["io_latency_max_us"] = [12500.0] * INTERVALS
+    columns = live["clients_summary"]["columns"]
+    for row in live["clients_summary"]["rows"][:2]:
+        index = int(row[columns.index("rank")])
+        row[columns.index("service")] = f"svc{index}:1611"
+    for row in live["clients_summary"]["rows"]:
+        row[columns.index("steady_ops_per_s")] = 321.0
+        row[columns.index("steady_io_latency_avg_us")] = 2500.0
+        row[columns.index("steady_io_latency_ratio")] = 1.25
+    return document
+
+
+def _table(page, name):
+    return page.split(f'id="{SECTION}-{name}"')[1].split("</table>")[0]
+
+
+def test_service_results_appear_in_the_html_report(tmp_path):
+    page = _render(tmp_path, _with_services(_full_document(tmp_path)))
+    results = _table(page, "results-table-write")
+    assert "slowest host MB/s" in results and "fastest ÷ slowest host" in results
+    row = [r for r in results.split("<tr>") if LIVE_EXECUTION in r][0]
+    assert "1.5" in row  # 3.0e8 / 2.0e8
+    fairness = _table(page, "fairness-table-write")
+    assert "lat max ms" in fairness and "worst client ÷ median lat" in fairness
+    row = [r for r in fairness.split("<tr>") if LIVE_EXECUTION in r][0]
+    cells = re.findall(r"<td[^>]*>(.*?)</td>", row)
+    assert "12.5" in cells  # lat max ms
+    assert "svc1:1611" in cells and "2" in cells  # 6000 / 3000
+    run = f"{SECTION}-run-client-table-r{LIVE_EXECUTION}-write"
+    clients = page.split(f'id="{run}"')[1].split("</table>")[0]
+    assert "final p99 ms" in clients and "IO lat avg ms" in clients
+    assert "elbencho" in page and "3.4-1" in page
+
+
+def _live_execution(document):
+    return [e for e in document["executions"] if e["execution_id"] == LIVE_EXECUTION][0]
+
+
+def _max_cell(page):
+    fairness = _table(page, "fairness-table-write")
+    labels = re.findall(r"<th[^>]*>(.*?)</th>", fairness)
+    if "lat max ms" not in labels:
+        return None
+    row = [r for r in fairness.split("<tr>") if LIVE_EXECUTION in r][0]
+    return re.findall(r"<td[^>]*>(.*?)</td>", row)[labels.index("lat max ms")]
+
+
+def test_latency_max_column_needs_per_io_maxima(tmp_path):
+    document = _with_services(_full_document(tmp_path))
+    assert _max_cell(_render(tmp_path, document)) == "12.5"
+    live = _live_execution(document)["results"]["phases"][0]["live"]
+    del live["aggregate_series"]["io_latency_max_us"]  # pre-3.4: interval means
+    page = _render(tmp_path, document)
+    assert _max_cell(page) is None
+    assert "lat max ÷ p50" in _table(page, "fairness-table-write")
+
+
+def test_latency_max_cell_is_empty_for_a_pre_per_io_row(tmp_path):
+    document = _with_services(_full_document(tmp_path))
+    old = copy.deepcopy(_live_execution(document))
+    old["execution_id"] = "0099"
+    old["coordinate_key"] = "zzz"
+    old["coordinates"] = {**old["coordinates"], "nodes": 8}
+    live = old["results"]["phases"][0]["live"]
+    del live["aggregate_series"]["io_latency_max_us"]
+    live["latency"]["max_us"] = 99000.0
+    document["executions"].append(old)
+    fairness = _table(_render(tmp_path, document), "fairness-table-write")
+    cells = [re.findall(r"<td[^>]*>(.*?)</td>", r) for r in fairness.split("<tr>")]
+    assert sum("–" in c or "12.5" in c for c in cells) == 2  # both rows present
+    assert any("12.5" in c for c in cells)
+    assert not any("99" in c for c in cells)
+    assert "lat max ms" in fairness
+
+
+def test_old_results_show_no_service_columns(tmp_path):
+    page = _render(tmp_path, _full_document(tmp_path))
+    for text in (
+        "slowest host",
+        "worst client ÷ median",
+        "highest-p99 client",
+        "final p99",
+    ):
+        assert text not in page
+
+
+def test_service_spread_renders_without_live_data(tmp_path):
+    document = _with_services(_full_document(tmp_path))
+    page = render_report(
+        [load_document(_write(tmp_path, document))], live_detail="none"
+    )
+    assert "fastest ÷ slowest host" in _table(page, "results-table-write")
+    assert "fairness-table" not in page
+
+
+def test_unmatched_services_show_na_in_the_client_table(tmp_path):
+    document = _with_services(_full_document(tmp_path))
+    for execution in document["executions"]:
+        for phase in (execution.get("results") or {}).get("phases") or []:
+            phase["services"]["instances"][0]["host"] = "elsewhere:1611"
+            phase["services"]["instances"][1]["host"] = "other:1611"
+    page = _render(tmp_path, document)
+    run = f"{SECTION}-run-client-table-r{LIVE_EXECUTION}-write"
+    clients = page.split(f'id="{run}"')[1].split("</table>")[0]
+    assert "final p99 ms" in clients
+    body = clients.split("</thead>")[1]
+    cells = re.findall(r"<td[^>]*>(.*?)</td>", body.split("</tr>")[0])
+    assert cells.count("–") >= 3
+
+
+def _spec(page, template, phase="write"):
+    name = f"{SECTION}-{template}-r{LIVE_EXECUTION}-{phase}"
+    return _blob(page).get(name)
+
+
+def _templates(page):
+    return set(re.findall(r'data-template="([^"]+)"', page))
+
+
+def test_client_scatter_plots_steady_throughput_against_latency(tmp_path):
+    document = _with_services(_full_document(tmp_path))
+    live = _live_execution(document)["results"]["phases"][0]["live"]
+    columns = live["clients_summary"]["columns"]
+    for number, row in enumerate(live["clients_summary"]["rows"]):
+        row[columns.index("steady_io_latency_avg_us")] = 1000.0 + number
+    page = _render(tmp_path, document)
+    spec = _spec(page, "run-client-scatter")
+    assert spec["kind"] == "scatter" and spec["y"]["fmt"] == "ms"
+    assert {s["name"] for s in spec["series"]} <= {"persistent", "transient", "ok"}
+    assert sum(len(s["points"]) for s in spec["series"]) == CLIENTS
+    hosts = _blob(page)["$hosts"]
+    for group in spec["series"]:
+        assert len(group["names"]) == len(group["points"])
+        assert all(hosts[i].startswith("host") for i in group["names"])
+    assert "run-client-scatter" in _templates(page)
+    assert "low throughput at normal latency" in page.lower()
+
+
+def test_client_scatter_needs_two_clients_with_both_values(tmp_path):
+    document = _with_services(_full_document(tmp_path))
+    live = _live_execution(document)["results"]["phases"][0]["live"]
+    columns = live["clients_summary"]["columns"]
+    for row in live["clients_summary"]["rows"][1:]:
+        row[columns.index("steady_io_latency_avg_us")] = None
+    assert _spec(_render(tmp_path, document), "run-client-scatter") is None
+
+
+def test_aggregate_chart_adds_the_per_io_latency_max(tmp_path):
+    page = _render(tmp_path, _with_services(_full_document(tmp_path)))
+    lines = {s["name"]: s for s in _spec(page, "run-aggregate")["series"]}
+    worst = lines["max latency (any IO)"]
+    assert worst["axis"] == "y2" and worst["dash"] is True
+    assert max(p[1] for p in worst["points"]) == 12.5
+    old = _render(tmp_path, _full_document(tmp_path))
+    assert "max latency" not in json.dumps(_spec(old, "run-aggregate"))
+
+
+def _service_specs(page, phase="write"):
+    return (
+        _spec(page, "service-latency", phase),
+        _spec(page, "service-completion", phase),
+    )
+
+
+def test_service_charts_show_sorted_final_results(tmp_path):
+    page = _render(tmp_path, _with_services(_full_document(tmp_path)))
+    latency, completion = _service_specs(page)
+    lines = {s["name"]: s for s in latency["series"]}
+    assert lines["service p99"]["points"] == [[1, 3], [2, 6]]  # ms
+    assert lines["service p50"]["points"] == [[1, 0.5], [2, 0.5]]
+    hosts = _blob(page)["$hosts"]
+    assert [hosts[i] for i in lines["service p99"]["names"]] == [
+        "svc0:1611",
+        "svc1:1611",
+    ]
+    assert lines["phase p99"]["dash"] is True
+    assert completion["series"][0]["points"] == [[1, 59], [2, 59.5]]
+    assert completion["y"]["label"] == "completion (s)"
+    assert {"service-latency", "service-completion"} <= _templates(page)
+    assert _spec(page, "service-latency", "read") is not None
+
+
+def test_service_charts_need_no_live_data(tmp_path):
+    document = _with_services(_full_document(tmp_path))
+    page = render_report(
+        [load_document(_write(tmp_path, document))], live_detail="none"
+    )
+    assert "fairness-table" not in page and "run-aggregate" not in page
+    latency, completion = _service_specs(page)
+    assert latency and completion
+    assert "Per-run detail" in page and "Per-run live detail" not in page
+
+
+def test_service_charts_join_the_live_domain_when_there_is_one(tmp_path):
+    page = _render(tmp_path, _with_services(_full_document(tmp_path)))
+    run = page.split(f'id="{SECTION}-r{LIVE_EXECUTION}"')[1].split("</details>")[0]
+    assert run.count("<h4 ") == 2  # live write domain, services-only read
+    assert f"service-latency-r{LIVE_EXECUTION}-write" in run
+    assert "Per-run detail" in page  # some runs have no live data
+
+
+def test_service_charts_skip_a_single_service(tmp_path):
+    document = _with_services(_full_document(tmp_path))
+    for execution in document["executions"]:
+        for phase in (execution.get("results") or {}).get("phases") or []:
+            phase["services"]["instances"] = phase["services"]["instances"][:1]
+    page = _render(tmp_path, document)
+    assert not {"service-latency", "service-completion"} & _templates(page)
+
+
+def test_old_results_have_no_new_figures(tmp_path):
+    page = _render(tmp_path, _full_document(tmp_path))
+    assert not set(NEW_TEMPLATES) & _templates(page)
+
+
+def test_many_services_are_thinned_and_stay_small(tmp_path):
+    document = _with_services(_full_document(tmp_path))
+    before = len(_render(tmp_path, document))
+    phase = _live_execution(document)["results"]["phases"][0]
+    phase["services"]["instances"] = [
+        {
+            "host": f"node-{i:04d}.cluster.example:1611",
+            "elapsed_ms": 59000 + (i * 7919) % 3000,
+            "latency_us": _svc_latency(3000 + (i * 104729) % 9000),
+        }
+        for i in range(700)
+    ]
+    page = _render(tmp_path, document)
+    for spec in _service_specs(page):
+        for line in spec["series"]:
+            assert len(line["points"]) <= 300
+    latency = _service_specs(page)[0]
+    p99 = [s for s in latency["series"] if s["name"] == "service p99"][0]
+    values = [p[1] for p in p99["points"]]
+    assert values == sorted(values)
+    assert "evenly spaced" in page
+    assert len(page) - before < 120_000

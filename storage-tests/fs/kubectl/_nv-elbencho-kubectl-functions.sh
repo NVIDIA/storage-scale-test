@@ -1610,6 +1610,7 @@ _kubectl_validate_placeholder() {
             [[ "$value" =~ ^/mnt/storage-scale-test/([A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+$ ]]
             ;;
         MOUNT_ROOT) [[ "$value" =~ ^(/[A-Za-z0-9._-]+)+$ ]] ;;
+        ELBENCHO_MIN_VERSION) [[ "$value" =~ ^[0-9]+[.][0-9]+[.-][0-9]+$ ]] ;;
         *) return 1 ;;
     esac
 }
@@ -4189,6 +4190,11 @@ kubectl_validate_runtime_pod() {
     # workload identity, command contract, and actual PVC write/read/remove on
     # every root. It runs in the roots' namespace and mounts all their claims.
     kubectl_validate_cluster_identity >/dev/null || return 1
+    if [[ -z "${ELBENCHO_MIN_VERSION:-}" ]]; then
+        # shellcheck source=lib/_platform_functions.sh
+        # shellcheck disable=SC1091
+        source "$(dirname "${BASH_SOURCE[0]}")/../../../lib/_platform_functions.sh" || return 1
+    fi
     local control_logical_root control_test_root namespace
     local -a claims=() claim_volumes=()
     kubectl_select_control_root control_logical_root control_test_root || return 1
@@ -4225,6 +4231,7 @@ kubectl_validate_runtime_pod() {
         "RUN_AS_USER=$KUBECTL_RUN_AS_USER" "RUN_AS_GROUP=$KUBECTL_RUN_AS_GROUP" \
         "NODE_NAME=$node" "${claim_volumes[@]}" \
         "MOUNT_ROOT=$KUBECTL_SWEEP_MOUNT_ROOT" \
+        "ELBENCHO_MIN_VERSION=${ELBENCHO_MIN_VERSION:?}" \
         "TEST_ROOT_ARGUMENTS=$test_root_arguments") || return 1
     # From the create until the delete, an INT or TERM only ends the wait: the
     # Job is still deleted, then the interrupt's status is returned.

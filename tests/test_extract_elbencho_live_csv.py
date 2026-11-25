@@ -28,6 +28,7 @@ from pathlib import Path
 from lib.elbencho_live_report import (
     MIB,
     LIVE_CSV_COLUMNS,
+    LIVE_CSV_COLUMNS_V34,
     LiveClientId,
     LiveDomainKey,
     LiveFileMetadata,
@@ -36,6 +37,7 @@ from lib.elbencho_live_report import (
     analyze_live_csv,
     client_sort_key,
     collect_selected_client_detail,
+    iter_live_rows,
     iter_parsed_rows,
     live_csv_reader,
     write_client_summaries,
@@ -48,6 +50,8 @@ from lib.elbencho_live_steady import (
     analyze_steady,
 )
 from utils.benchmark_elbencho_live_csv import generate_live_csv
+
+BLOCK_SIZE = 64 * 1024
 
 
 def _row(
@@ -63,7 +67,13 @@ def _row(
     entries_s="",
     lat_io="",
     lat_ent="",
+    done_ios=None,
+    lat_io_max="",
+    lat_ent_max="",
 ):
+    """One live CSV row as a dict; DoneIOs defaults to 64 KiB IOs."""
+    if done_ios is None:
+        done_ios = done_bytes // BLOCK_SIZE if isinstance(done_bytes, int) else ""
     iso_timestamp = (
         datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
         + timedelta(milliseconds=runtime_ms)
@@ -77,20 +87,50 @@ def _row(
         "MixType": mix_type,
         "Done%": "0",
         "DoneBytes": str(done_bytes),
+        "DoneIOs": str(done_ios),
         "MiB/s": str(mib_s),
         "IOPS": str(iops),
         "Entries": "0",
         "Entries/s": str(entries_s),
         "Lat Ent us": str(lat_ent),
+        "Lat Ent max us": str(lat_ent_max),
         "Lat IO us": str(lat_io),
+        "Lat IO max us": str(lat_io_max),
         "Active": "",
         "CPU": "",
         "Service": service,
     }
 
 
+# An elbencho v3.4-1 --livecsvex WRITE phase from two services (--liveint 500),
+# verbatim, trailing commas included.
+REAL_V34_SERVICES_CSV = """\
+ISO Date,Label,Phase,RuntimeMS,Rank,MixType,Done%,DoneBytes,DoneIOs,MiB/s,IOPS,Entries,Entries/s,Lat Ent us,Lat Ent max us,Lat IO us,Lat IO max us,Active,CPU,Service,
+2026-11-21T00:07:38.748+0000,,WRITE,500,Total,,25,83886080,1280,160,2560,8,16,2753,2903,21,103,4,0,,
+2026-11-21T00:07:38.748+0000,,WRITE,500,0,,25,41943040,640,80,1280,4,8,2741,2876,21,103,2,0,ebsvc1:1611,
+2026-11-21T00:07:38.748+0000,,WRITE,500,1,,25,41943040,640,80,1280,4,8,2765,2903,21,51,2,0,ebsvc2:1611,
+2026-11-21T00:07:39.250+0000,,WRITE,1002,Total,,25,84738048,1293,1,25,8,0,0,0,105,162,4,4,,
+2026-11-21T00:07:39.250+0000,,WRITE,1002,0,,25,42795008,653,1,25,4,0,0,0,105,162,2,3,ebsvc1:1611,
+2026-11-21T00:07:39.250+0000,,WRITE,1002,1,,25,41943040,640,0,0,4,0,0,0,0,0,2,6,ebsvc2:1611,
+2026-11-21T00:07:39.752+0000,,WRITE,1504,Total,,50,167772160,2560,158,2528,20,23,336942,999652,46,292,4,2,,
+2026-11-21T00:07:39.752+0000,,WRITE,1504,0,,50,83886080,1280,78,1251,10,11,336959,999652,45,206,2,5,ebsvc1:1611,
+2026-11-21T00:07:39.752+0000,,WRITE,1504,1,,50,83886080,1280,79,1277,10,11,336925,999485,46,292,2,0,ebsvc2:1611,
+2026-11-21T00:07:40.251+0000,,WRITE,2004,Total,,50,168558592,2572,1,24,20,0,0,0,140,258,4,1,,
+2026-11-21T00:07:40.251+0000,,WRITE,2004,0,,50,83886080,1280,0,0,10,0,0,0,0,0,2,3,ebsvc1:1611,
+2026-11-21T00:07:40.251+0000,,WRITE,2004,1,,50,84672512,1292,1,24,10,0,0,0,140,258,2,0,ebsvc2:1611,
+2026-11-21T00:07:40.752+0000,,WRITE,2505,Total,,75,251658240,3840,158,2530,28,15,500187,993685,55,325,4,0,,
+2026-11-21T00:07:40.752+0000,,WRITE,2505,0,,75,125829120,1920,79,1277,14,7,500216,993685,55,325,2,0,ebsvc1:1611,
+2026-11-21T00:07:40.752+0000,,WRITE,2505,1,,75,125829120,1920,78,1253,14,7,500159,993501,56,323,2,0,ebsvc2:1611,
+2026-11-21T00:07:41.248+0000,,WRITE,3001,Total,,75,251658240,3840,0,0,28,0,0,0,0,0,4,0,,
+2026-11-21T00:07:41.248+0000,,WRITE,3001,0,,75,125829120,1920,0,0,14,0,0,0,0,0,2,0,ebsvc1:1611,
+2026-11-21T00:07:41.248+0000,,WRITE,3001,1,,75,125829120,1920,0,0,14,0,0,0,0,0,2,0,ebsvc2:1611,
+"""
+
+
 class LiveCSVTestCase(unittest.TestCase):
-    """Fixture helpers for live CSV tests."""
+    """Fixture helpers for live CSV tests (elbencho 3.0-3.3 columns)."""
+
+    COLUMNS = LIVE_CSV_COLUMNS
 
     def setUp(self):
         # pylint: disable=consider-using-with
@@ -102,7 +142,7 @@ class LiveCSVTestCase(unittest.TestCase):
         )
 
     def _analyze(self, rows, columns=None):
-        fieldnames = columns or LIVE_CSV_COLUMNS
+        fieldnames = columns or self.COLUMNS
         with self.path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames, extrasaction="ignore")
             writer.writeheader()
@@ -148,7 +188,7 @@ class TestLiveAggregateAnalysis(LiveCSVTestCase):
                 _row(1000, "Total", MIB, mib_s=100, iops=1600),
                 _row(2000, "Total", 2 * MIB, mib_s=110, iops=1760),
             ],
-            columns=list(reversed(LIVE_CSV_COLUMNS)),
+            columns=list(reversed(self.COLUMNS)),
         )
         domain = analysis.domains[LiveDomainKey("READ", "")]
         self.assertEqual(
@@ -429,7 +469,21 @@ class TestLiveSecondPassAndSummaries(LiveCSVTestCase):
             "worst_30s_elapsed_sec short_5s_percent mean_mib_s median_mib_s "
             "valid_samples missing_samples invalid_samples"
         )
-        self.assertEqual(reader.fieldnames, pinned_columns.split())
+        # Columns are only ever appended (elbencho 3.4 and service results).
+        pinned = pinned_columns.split()
+        self.assertEqual(reader.fieldnames[: len(pinned)], pinned)
+        self.assertEqual(reader.fieldnames[len(pinned)], "mean_ops_per_s")
+        self.assertEqual(reader.fieldnames[-1], "finish_elapsed_sec")
+        self.assertIn("final_io_latency_p99_us", reader.fieldnames)
+        # No per-service results: final latency is empty, never 0, and the
+        # finish time is the live CSV's estimate.
+        self.assertEqual(rows[0]["final_io_latency_p99_us"], "")
+        self.assertEqual(rows[0]["finish_elapsed_sec"], "15.000")
+        # The text summary omits the elbencho 3.4 columns that are empty.
+        header = Path(text_path).read_text(encoding="utf-8").splitlines()[2]
+        is_v34 = self.COLUMNS is LIVE_CSV_COLUMNS_V34
+        self.assertEqual(header.split("\t")[-1], "finish s" if is_v34 else "invalid")
+        self.assertEqual("steady ops/s" in header, is_v34)
         self.assertEqual(
             [row["client"] for row in rows],
             ["worker-0", "worker-1", "worker-2", "worker-3", "worker-4"],
@@ -452,6 +506,52 @@ class TestLiveSecondPassAndSummaries(LiveCSVTestCase):
         )
         self.assertTrue(text[2].startswith("host/worker\tclass\tsteady MiB/s"))
         self.assertTrue(text[3].startswith("worker-0\tpersistent\t10.000\t0.100"))
+
+    def test_summary_files_join_service_results(self):
+        rows = [
+            (
+                {**row, "Service": f"h{row['Rank']}:1611"}
+                if row["Rank"] != "Total"
+                else row
+            )
+            for row in _outlier_rows(intervals=15)
+        ]
+        analysis = self._analyze(rows)
+        domain = analysis.domains[LiveDomainKey("READ", "")]
+        steady = analyze_steady(
+            analysis, domain, PhaseContext(15000, 15000, None, None), 1000
+        )
+        latency = {"min": 1, "avg": 50, "max": 900, "p1": 2, "p50": 40, "p75": 60}
+        services = {
+            "instances": [
+                {
+                    "host": "h0:1611",
+                    "elapsed_ms": 15500,
+                    "latency_us": {**latency, "p99": 5200},
+                },
+                {"host": "h1:1611", "elapsed_ms": 14000, "latency_us": None},
+            ]
+        }
+        csv_path, text_path = write_client_summaries(
+            analysis.metadata, domain, steady, self.temp_dir.name, services
+        )
+        with Path(csv_path).open(encoding="utf-8") as handle:
+            by_service = {row["service"]: row for row in csv.DictReader(handle)}
+        joined = by_service["h0:1611"]
+        self.assertEqual(joined["final_io_latency_p99_us"], "5200.0")
+        self.assertEqual(joined["final_io_latency_min_us"], "1.0")
+        self.assertEqual(joined["finish_elapsed_sec"], "15.500")
+        # A service without latency keeps its elapsed time; no match: estimate.
+        self.assertEqual(by_service["h1:1611"]["final_io_latency_p99_us"], "")
+        self.assertEqual(by_service["h1:1611"]["finish_elapsed_sec"], "14.000")
+        self.assertEqual(by_service["h2:1611"]["final_io_latency_p99_us"], "")
+        self.assertNotEqual(by_service["h2:1611"]["finish_elapsed_sec"], "")
+        text = Path(text_path).read_text(encoding="utf-8").splitlines()
+        self.assertTrue(
+            text[2].endswith("final lat p99 ms\tfinal lat max ms\tfinish s")
+        )
+        row = next(line for line in text[3:] if line.startswith("h0:1611"))
+        self.assertTrue(row.endswith("\t0.040\t5.200\t0.900\t15.5"))
 
     def test_summary_files_without_steady_window(self):
         analysis = self._analyze(_outlier_rows())
@@ -496,9 +596,7 @@ class TestLiveLatencyAndDiagnostics(LiveCSVTestCase):
         self.assertEqual([point.interval for point in points], [0, 1, 2, 3, 4])
 
     def test_latency_columns_are_optional(self):
-        columns = [
-            name for name in LIVE_CSV_COLUMNS if name not in ("Lat IO us", "Lat Ent us")
-        ]
+        columns = [name for name in self.COLUMNS if not name.startswith("Lat ")]
         analysis = self._analyze(
             [
                 _row(1000, "Total", MIB, mib_s=1, iops=16),
@@ -528,6 +626,24 @@ class TestLiveLatencyAndDiagnostics(LiveCSVTestCase):
         self.assertEqual(rows[1].done_bytes, MIB)
         self.assertIsNone(rows[1].io_latency_us)
         self.assertIsNone(rows[1].mib_s)
+
+    def test_phase_filter_keeps_occurrences(self):
+        rows = [
+            _row(1000, "Total", MIB, phase="WRITE", mib_s=1),
+            _row(1000, 0, MIB, phase="WRITE"),
+            _row(1000, "Total", MIB, mib_s=1),
+            _row(1000, 0, MIB),
+            _row(1000, "Total", MIB, mib_s=1),
+            _row(1000, 0, MIB),
+        ]
+        analysis = self._analyze(rows)
+        every = list(iter_live_rows(analysis))
+        reads = list(iter_live_rows(analysis, "READ"))
+        self.assertEqual(reads, [row for row in every if row.key.phase == "READ"])
+        self.assertEqual(
+            [row.key for row in reads],
+            [LiveDomainKey("READ", "", 0)] * 2 + [LiveDomainKey("READ", "", 1)] * 2,
+        )
 
     def test_malformed_line_diagnostics_are_capped(self):
         rows = [_row(1000, 0, MIB)]
@@ -584,6 +700,172 @@ class TestLiveLatencyAndDiagnostics(LiveCSVTestCase):
                 LiveClientId("b", ""),
             ],
         )
+
+
+class TestLiveAggregateAnalysisV34(TestLiveAggregateAnalysis):
+    """The aggregate tests on elbencho 3.4 columns."""
+
+    COLUMNS = LIVE_CSV_COLUMNS_V34
+
+
+class TestLiveClientRatesV34(TestLiveClientRates):
+    """The client-rate tests on elbencho 3.4 columns."""
+
+    COLUMNS = LIVE_CSV_COLUMNS_V34
+
+
+class TestLiveSecondPassAndSummariesV34(TestLiveSecondPassAndSummaries):
+    """The second-pass tests on elbencho 3.4 columns."""
+
+    COLUMNS = LIVE_CSV_COLUMNS_V34
+
+
+class TestLiveLatencyAndDiagnosticsV34(TestLiveLatencyAndDiagnostics):
+    """The latency and diagnostics tests on elbencho 3.4 columns."""
+
+    COLUMNS = LIVE_CSV_COLUMNS_V34
+
+    def test_total_row_latency_parsing(self):
+        # A 0 is idle only when DoneIOs did not move, whatever the IOPS cell.
+        analysis = self._analyze(
+            [
+                _row(1000, "Total", MIB, iops=16, lat_io=250, lat_io_max=900),
+                _row(2000, "Total", MIB, iops=5, lat_io=0, lat_io_max=0),
+                _row(3000, "Total", 2 * MIB, iops=0, lat_io=0, lat_io_max=3),
+                _row(4000, "Total", 3 * MIB, mib_s=1, done_ios="", lat_io=0),
+            ]
+        )
+        points = analysis.domains[LiveDomainKey("READ", "")].aggregate_points
+        self.assertEqual(
+            [point.io_latency_us for point in points], [250.0, None, 0.0, None]
+        )
+        self.assertEqual(
+            [point.io_latency_max_us for point in points], [900.0, None, 3.0, None]
+        )
+        self.assertEqual([point.new_ios for point in points], [16, 0, 16, None])
+        self.assertEqual([point.done_ios for point in points], [16, 16, 32, None])
+
+
+class TestLiveCSVV34Columns(LiveCSVTestCase):
+    """Columns elbencho 3.4 added, detected by name."""
+
+    COLUMNS = LIVE_CSV_COLUMNS_V34
+
+    def _parsed(self):
+        with self.path.open(encoding="utf-8", newline="") as handle:
+            reader, columns = live_csv_reader(handle, str(self.path))
+            return columns, list(iter_parsed_rows(reader, columns))
+
+    def test_v34_cells_are_parsed_and_client_rates_are_not(self):
+        self._analyze(
+            [
+                _row(1000, "Total", MIB, mib_s=1, iops=16, lat_io=12, lat_io_max=40),
+                _row(
+                    1000,
+                    0,
+                    MIB,
+                    service="node-a",
+                    mib_s=1,
+                    iops=16,
+                    lat_io=11,
+                    lat_io_max=30,
+                    lat_ent=5,
+                    lat_ent_max=9,
+                ),
+            ]
+        )
+        columns, (total, client) = self._parsed()
+        self.assertTrue(columns.has_done_ios)
+        self.assertEqual((total.done_ios, total.io_latency_max_us), (16, 40.0))
+        self.assertEqual(total.mib_s, 1.0)
+        self.assertEqual(client.done_ios, 16)
+        self.assertEqual((client.io_latency_us, client.io_latency_max_us), (11, 30))
+        # Entry latency is read from Total rows only.
+        self.assertEqual(
+            (client.entries_latency_us, client.entries_latency_max_us), (None, None)
+        )
+        self.assertIsNone(client.mib_s)
+        self.assertIsNone(client.iops)
+
+    def test_older_columns_leave_v34_fields_empty(self):
+        self._analyze(
+            [_row(1000, "Total", MIB, mib_s=1, iops=16), _row(1000, 0, MIB)],
+            columns=LIVE_CSV_COLUMNS,
+        )
+        columns, rows = self._parsed()
+        self.assertFalse(columns.has_done_ios)
+        for row in rows:
+            self.assertEqual(
+                (row.done_ios, row.io_latency_max_us, row.entries_latency_max_us),
+                (None, None, None),
+            )
+
+    def test_real_v34_service_rows(self):
+        self.path.write_text(REAL_V34_SERVICES_CSV, encoding="utf-8")
+        columns, rows = self._parsed()
+        self.assertTrue(columns.has_done_ios)
+        first_client = rows[1]
+        self.assertEqual(first_client.client, LiveClientId("0", "ebsvc1:1611"))
+        self.assertEqual(first_client.done_ios, 640)
+        self.assertEqual(first_client.io_latency_us, 21.0)
+        self.assertEqual(first_client.io_latency_max_us, 103.0)
+        analysis = analyze_live_csv(
+            LiveFileMetadata(str(self.path), "r64K", 2, 2, 1, "")
+        )
+        domain = analysis.domains[LiveDomainKey("WRITE", "")]
+        self.assertEqual(len(domain.interval_times), 6)
+        self.assertEqual(
+            set(domain.clients),
+            {LiveClientId("0", "ebsvc1:1611"), LiveClientId("1", "ebsvc2:1611")},
+        )
+        summary = domain.clients[LiveClientId("0", "ebsvc1:1611")]
+        self.assertEqual(summary.final_done_bytes, 125829120)
+        # MiB/s comes from DoneBytes deltas, not the rounded MiB/s cell.
+        self.assertAlmostEqual(
+            summary.mean_mib_s,
+            sum(
+                (done - prior) * 1000 / (now - then) / MIB
+                for (then, prior), (now, done) in zip(
+                    _REAL_CLIENT0_DONE, _REAL_CLIENT0_DONE[1:]
+                )
+            )
+            / 5,
+        )
+        # Ops/s comes from DoneIOs deltas: 640, 653, 1280, 1280, 1920, 1920.
+        ios = [640, 653, 1280, 1280, 1920, 1920]
+        times = [then for then, _ in _REAL_CLIENT0_DONE]
+        self.assertAlmostEqual(
+            summary.mean_ops_s,
+            sum(
+                (ios[i + 1] - ios[i]) * 1000 / (times[i + 1] - times[i])
+                for i in range(5)
+            )
+            / 5,
+        )
+        self.assertEqual(
+            [point.io_latency_max_us for point in domain.aggregate_points],
+            [103.0, 162.0, 292.0, 258.0, 325.0, None],
+        )
+        self.assertEqual(domain.aggregate_points[-1].new_ios, 0)
+
+    def test_client_ops_need_done_ios(self):
+        rows = [_row(1000, 0, MIB), _row(2000, 0, 3 * MIB)]
+        summary = self._analyze(rows).domains[LiveDomainKey("READ", "")].clients
+        self.assertEqual(summary[LiveClientId("0", "")].mean_ops_s, 32.0)
+        legacy = self._analyze(rows, columns=LIVE_CSV_COLUMNS)
+        legacy_summary = legacy.domains[LiveDomainKey("READ", "")].clients
+        self.assertIsNone(legacy_summary[LiveClientId("0", "")].mean_ops_s)
+
+
+# (RuntimeMS, DoneBytes) of rank 0 in REAL_V34_SERVICES_CSV.
+_REAL_CLIENT0_DONE = [
+    (500, 41943040),
+    (1002, 42795008),
+    (1504, 83886080),
+    (2004, 83886080),
+    (2505, 125829120),
+    (3001, 125829120),
+]
 
 
 class TestP2Median(unittest.TestCase):

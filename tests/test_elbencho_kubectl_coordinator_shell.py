@@ -366,7 +366,7 @@ def test_coordinator_dispatches_mixed_io_and_mdtest_cells(
             if [[ "${FAKE_MD_RESULTS:-none}" != none ]]; then
                 stem="$scratch/mdtest-elbencho-c_002-t_003_20260923Z010203_iter1"
                 printf 'result\\n' > "$stem.out"
-                printf 'csv\\n' > "$stem.csv"
+                printf 'json\\n' > "$stem.json"
             fi
             if [[ "${FAKE_MD_RESULTS:-none}" == complete ]]; then
                 mkdir -p "$scratch/executions"
@@ -415,8 +415,8 @@ def test_coordinator_dispatches_mixed_io_and_mdtest_cells(
             state_dir
             / "results"
             / "0002"
-            / "mdtest-elbencho-c_002-t_003_20260923Z010203_iter1.csv"
-        ).read_text() == "csv\n"
+            / "mdtest-elbencho-c_002-t_003_20260923Z010203_iter1.json"
+        ).read_text() == "json\n"
 
 
 @pytest.mark.parametrize("failures", [1, 3])
@@ -1755,7 +1755,7 @@ id=$1 scratch=$2
 printf '%s|%s\\n' "$id" "$ELBENCHO_RUN_TEST_DIRS_CSV" >> "$FAKE_ELBENCHO_RECORD"
 stem="$scratch/mdtest-elbencho-c_002-t_003_20260923Z010203_iter1"
 printf 'result\\n' > "$stem.out"
-printf 'csv\\n' > "$stem.csv"
+printf 'json\\n' > "$stem.json"
 mkdir -p "$scratch/executions"
 printf 'COMPLETE\\n' > "$scratch/executions/$id.mdtest.complete"
 """

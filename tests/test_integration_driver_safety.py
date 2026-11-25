@@ -59,6 +59,12 @@ def test_deployment_and_fixture_elbencho_release_pins_agree(architecture):
     assert f"KUBECTL_ELBENCHO_IMAGE=docker.io/breuner/elbencho:{version}" in environment
 
 
+def test_results_schema_major_matches_the_writer():
+    """The fixture's results.json check must expect the version the tools write."""
+    writer = (_REPO_ROOT / "lib/filesystem_results.py").read_text(encoding="utf-8")
+    assert f'SCHEMA_VERSION = "{_FILESYSTEM.RESULTS_SCHEMA_MAJOR}.' in writer
+
+
 @pytest.mark.parametrize("failed", [False, True])
 @pytest.mark.parametrize("collected", [False, True])
 @pytest.mark.parametrize(
@@ -3599,7 +3605,7 @@ def test_mdtest_execution_contract_requires_results_and_completion(tmp_path):
         )
         if expected.status is not _FILESYSTEM.ExecutionStatus.SUCCESS:
             continue
-        for extension in ("csv", "out"):
+        for extension in ("json", "out"):
             (
                 result
                 / f"mdtest-elbencho-c_{nodes:03d}-t_{tasks:03d}_20260929Z000000_iter1.{extension}"
@@ -5615,8 +5621,8 @@ def test_markerless_sbx_elbencho_bundle_is_rebuilt(tmp_path, monkeypatch):
     cache = tmp_path / "test-cache" / "container"
     cache.mkdir(parents=True)
     binary_name = "elbencho.aarch64"
-    binary = cache / f"v3.2-1-{binary_name}"
-    runtime = cache / f"v3.2-1-{binary_name}.runtime"
+    binary = cache / f"v3.4-1-{binary_name}"
+    runtime = cache / f"v3.4-1-{binary_name}.runtime"
     binary.write_text("stale wrapper\n", encoding="utf-8")
     runtime.mkdir()
     calls = []
@@ -5633,7 +5639,7 @@ def test_markerless_sbx_elbencho_bundle_is_rebuilt(tmp_path, monkeypatch):
     _ensure_elbencho(object(), config, "aarch64", "sbx-shared")
 
     assert calls == ["aarch64"]
-    marker = cache / f"v3.2-1-{binary_name}.bundle.json"
+    marker = cache / f"v3.4-1-{binary_name}.bundle.json"
     document = json.loads(marker.read_text(encoding="utf-8"))
     assert document["container"] == _FILESYSTEM.ELBENCHO_CONTAINER
     assert document["recipe"] == _FILESYSTEM.SBX_ELBENCHO_BUNDLE_RECIPE

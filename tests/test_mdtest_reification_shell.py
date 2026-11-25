@@ -23,6 +23,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.filesystem_checkout_test_support import FAKE_ELBENCHO_SCRIPT
+
 _ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -99,7 +101,7 @@ class TestMdtestReification(unittest.TestCase):
                     for arg in "$@"; do
                         case "$arg" in
                             --resfile=*) printf 'result\\n' >> "${{arg#--resfile=}}" ;;
-                            --csvfile=*) printf 'result\\n' >> "${{arg#--csvfile=}}" ;;
+                            --jsonfile=*) printf 'result\\n' >> "${{arg#--jsonfile=}}" ;;
                         esac
                     done
                 }}
@@ -118,7 +120,8 @@ class TestMdtestReification(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             output = Path(temp_dir) / "mdtest-elbencho-20260929Z120000"
-            for suffix in ("csv", "out"):
+            self.assertEqual(sorted(output.glob("*.csv")), [])
+            for suffix in ("json", "out"):
                 artifacts = sorted(output.glob(f"*.{suffix}"))
                 self.assertEqual(len(artifacts), 2)
                 for artifact in artifacts:
@@ -213,6 +216,9 @@ class TestMdtestReification(unittest.TestCase):
             shutil.copy2(_ROOT / "lib/project_version.sh", deployment / "lib")
             results = Path(temp_dir) / "results"
             test_root = Path(temp_dir) / "data"
+            fake_elbencho = Path(temp_dir) / "elbencho"
+            fake_elbencho.write_text(FAKE_ELBENCHO_SCRIPT)
+            fake_elbencho.chmod(0o755)
             env_file = deployment / "env.sh"
             env_file.write_text(
                 f"""
@@ -225,6 +231,7 @@ class TestMdtestReification(unittest.TestCase):
                 MDTEST_BRANCH_FACTOR=1 MDTEST_ITEMS_PER_DIR=2 MDTEST_ITERATIONS=1
                 declare -A TEST_DIRS=(['{test_root}']=1)
                 source '{_ROOT}/lib/env_functions.sh'
+                ELBENCHO='{fake_elbencho}'
                 dispatch_ssh_executions() {{ printf 'DISPATCH:%s\\n' "$1"; }}
                 """,
                 encoding="utf-8",

@@ -31,9 +31,10 @@ Kubernetes users should also read the
 [reporting](#filesystem-reporting); tuned settings live in the
 [benchmark recipes](../BENCHMARK_RECIPES_FILESYSTEM.md).
 
-SSH and Slurm require an elbencho binary for each client architecture under
+SSH and Slurm require an elbencho binary (3.4-1 or newer, enforced by
+`validate_env.sh` and each run) for each client architecture under
 `utils/` and filesystems mounted at the same paths on every client. Kubernetes
-uses an elbencho image (default `docker.io/breuner/elbencho:v3.2-1`) and
+uses an elbencho image (default `docker.io/breuner/elbencho:v3.4-1`) and
 claim-qualified test roots instead; see [Kubernetes setup](#kubernetes-setup).
 For SSH or Slurm, configure one test root:
 
@@ -910,10 +911,11 @@ together):
 
 | Output | Content |
 | --- | --- |
-| "Live fairness" table | Under each results table: steady span, Jain p50/min per window, slowest/median p10, slow clients, and per-interval mean latency p50, p90 and max/p50. In `report.txt` and stdout |
+| "Live fairness" table | Under each results table: steady span, Jain p50/min per window, slowest/median p10, slow clients, per-interval mean latency p50 and p90, max latency (largest single I/O for elbencho 3.4, else largest interval mean) and max/p50, and (elbencho 3.4) the worst client's mean latency over the median and the client with the highest final p99 and its ratio to the phase p99. In `report.txt` and stdout |
+| "Per-service spread" table | Under each results table with `--svcstats` minmax results (elbencho 3.4; no live CSV needed): slowest and fastest service ops/s and MiB/s, and their ratio. Also in `report.html` |
 | `aggregate-timeseries.png` | Total MiB/s and IOPS, plus a fleet IO latency panel; warmup and tail shaded, `[first]`/`[last]` marked |
 | `fairness-timeseries.png` | Jain per window with the 5 s floor; below, the 5 s slowest/median ratio against `1 - S` and `1 - 2S` |
-| `client-summary.csv` / `.txt` | Per client: class, steady MiB/s and ratio, worst 5 s and 30 s ratios and times, percent of 5 s windows short, whole-run mean and median, sample counts |
+| `client-summary.csv` / `.txt` | Per client: class, steady MiB/s and ratio, worst 5 s and 30 s ratios and times, percent of 5 s windows short, whole-run mean and median, sample counts; with elbencho 3.4, ops/s, steady IO latency, and the service's final latency min/avg/max/percentiles and completion time (`--svcstats`; empty without a match) |
 | `client-timeseries.png` | 5 s client rates against the fleet p10-p90 band; slow clients first |
 | `client-ratio-heatmap.png` | Clients by 5 s windows, percent of the fleet median on a 50-150% scale; slow clients, then representatives |
 
@@ -1028,7 +1030,7 @@ TEST_DIRS=(["vendor-b/data:scale-test"]=1)       # claim data in vendor-b
   The coordinator itself has no Kubernetes API credentials.
 - The elbencho image supports your nodes and is usable under the pull policy
   with any required registry credentials. `KUBECTL_ELBENCHO_IMAGE` defaults to
-  `docker.io/breuner/elbencho:v3.2-1`; set it only for another image or a
+  `docker.io/breuner/elbencho:v3.4-1`; set it only for another image or a
   mirror. `Never` requires preloading; `Always` requires a digest-pinned
   image, so not the default tag.
 

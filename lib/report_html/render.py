@@ -50,6 +50,8 @@ CHART_JS_URL = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"
 CHART_JS_INTEGRITY = (
     "sha384-dug+JxfBvklEQdJ4AYuBBAIScUz0bVN73xpy273gcAwHjb3qI0fXmuYNaNfdyYJG"
 )
+# Chart-blob key of the shared hover-name table (not an anchor).
+HOST_TABLE = "$hosts"
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
 CHART_DATA_ID = "report-charts"
 _LEADING_COMMENT = re.compile(r"\A\s*/\*.*?\*/\s*", re.DOTALL)
@@ -190,6 +192,7 @@ class _Page:
     def __init__(self) -> None:
         self.out: list[str] = []
         self.specs: dict[str, dict] = {}
+        self.hosts: dict[str, int] = {}
         self.numbers = _Numbering()
 
     def add(self, *parts: str) -> None:
@@ -224,10 +227,30 @@ class _Page:
             self.add("<tr>", *cells, "</tr>")
         self.add("</tbody></table></div></div>")
 
+    def _interned(self, spec: dict) -> dict:
+        """``spec`` with each series' hover ``names`` replaced by indexes into
+        one shared table, which many charts of the same hosts reuse."""
+        if not any("names" in item for item in spec.get("series") or []):
+            return spec
+        shared = [
+            (
+                {
+                    **item,
+                    "names": [
+                        self.hosts.setdefault(n, len(self.hosts)) for n in item["names"]
+                    ],
+                }
+                if "names" in item
+                else item
+            )
+            for item in spec["series"]
+        ]
+        return {**spec, "series": shared}
+
     def figure(self, figure: Figure) -> None:
         """A numbered chart box; its spec joins the data blob."""
         label = self.numbers.figure()
-        self.specs[figure.anchor] = figure.spec
+        self.specs[figure.anchor] = self._interned(figure.spec)
         anchor, title = esc(figure.anchor), esc(figure.title)
         canvas = (
             f'<canvas data-chart="{anchor}" role="img" aria-label="{title}"></canvas>'
@@ -368,6 +391,11 @@ def _run(page: _Page, run: RunDetail) -> None:
     page.add("</div></details>")
 
 
+def _runs_title(runs: list[RunDetail]) -> str:
+    """Live detail, or only per-service results for runs without live data."""
+    return "Per-run live detail" if all(run.chips for run in runs) else "Per-run detail"
+
+
 def _section(page: _Page, section: Section) -> None:
     number = page.numbers.next_chapter()
     anchor = esc(section.anchor)
@@ -390,7 +418,7 @@ def _section(page: _Page, section: Section) -> None:
     if section.runs:
         page.add(
             f'<div class="runs" id="{anchor}-runs"><div class="runbar">'
-            f'<h3>Per-run live detail <span class="meta">{len(section.runs)} '
+            f'<h3>{_runs_title(section.runs)} <span class="meta">{len(section.runs)} '
             "runs</span></h3>"
             '<span><button type="button" data-runs="open">Expand all</button> '
             '<button type="button" data-runs="close">Collapse all</button></span>'
@@ -455,10 +483,14 @@ def _toc(report: Report) -> str:
     links.append(
         f'<a href="#{model.PROVENANCE}" data-filter="provenance">Provenance</a>'
     )
-    # Only runs with live CSV data have per-run detail to open.
+    # Only runs with live CSV data or per-service results have detail to open.
     runs = ""
-    if any(section.runs for section in report.sections):
-        hint = 'title="Per-run live detail, from live CSV data"'
+    all_runs = [run for section in report.sections for run in section.runs]
+    if all_runs:
+        text = "Per-run live detail, from live CSV data"
+        if _runs_title(all_runs) != "Per-run live detail":
+            text = "Per-run detail, from live CSV data and per-service results"
+        hint = f'title="{text}"'
         runs = (
             f'<button type="button" data-runs="open" {hint}>Expand all runs</button>'
             f'<button type="button" data-runs="close" {hint}>Collapse all runs'
@@ -470,6 +502,11 @@ def _toc(report: Report) -> str:
         'aria-label="Filter sections">' + "".join(links) + f'<div class="tools">{runs}'
         '<button type="button" class="theme">Light/dark</button></div></nav>'
     )
+
+
+def _host_table(hosts: dict[str, int]) -> dict:
+    """The shared hover-name table (blob key ``$hosts``), if any chart has names."""
+    return {HOST_TABLE: list(hosts)} if hosts else {}
 
 
 def chart_data(specs: dict) -> str:
@@ -500,7 +537,7 @@ def render_html(report: Report) -> str:
             *page.out,
             "</main></div>",
             f'<script type="application/json" id="{CHART_DATA_ID}">',
-            chart_data(page.specs),
+            chart_data(page.specs | _host_table(page.hosts)),
             "</script>",
             f'<script src="{CHART_JS_URL}" integrity="{CHART_JS_INTEGRITY}" '
             'crossorigin="anonymous"></script>',

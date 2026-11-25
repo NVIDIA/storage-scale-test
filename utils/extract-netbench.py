@@ -45,6 +45,10 @@ if __name__ == "__main__":
 import matplotlib.pyplot as plt  # pylint: disable=wrong-import-position
 
 
+from lib.elbencho_json_results import (  # pylint: disable=wrong-import-position
+    LatencyStats,
+    read_phase_results,
+)
 from lib.join_datestamps import (  # pylint: disable=wrong-import-position
     join_datestamps as join_datestamps_lib,
     join_datestamps_for_filename,
@@ -82,6 +86,7 @@ def eprint(*args, **kwargs):
 
 # Conversion factor: 1 MiB = 8.388608 Mbit, so MiB/s * 8.388608 / 1000 = Gbps
 MIB_S_TO_GBPS = 8.388608 / 1000
+MIB = 1048576
 
 
 # =============================================================================
@@ -176,9 +181,9 @@ def format_throughput(gbps: float) -> Tuple[str, str]:
 # =============================================================================
 
 # Regex pattern for netbench result files
-# netbench-{mode}-c_{nodes}-t_{threads}_{datestamp}_iter{N}_{direction}.{csv|out}
+# netbench-{mode}-c_{nodes}-t_{threads}_{datestamp}_iter{N}_{direction}.{json|csv|out}
 FILENAME_PATTERN = re.compile(
-    r"netbench-(bidir|half)-c_(\d+)-t_(\d+)_(\d{8}Z\d{6})_iter(\d+)_(AtoB|BtoA)\.(csv|out)"
+    r"netbench-(bidir|half)-c_(\d+)-t_(\d+)_(\d{8}Z\d{6})_iter(\d+)_(AtoB|BtoA)\.(csv|json|out)"
 )
 
 
@@ -193,7 +198,7 @@ def discover_files(
 
     Returns:
         Dict mapping (mode, node_count, thread_count, datestamp, iteration, direction)
-        to (csv_path, out_path)
+        to (data_path, out_path); data_path is the .json, else the .csv
     """
 
     def key_from_match(match: re.Match[str]) -> Tuple[str, int, int, str, int, str]:
@@ -274,6 +279,37 @@ def parse_csv_file(csv_path: str) -> Dict[str, Any]:
     return result
 
 
+def parse_json_file(json_path: str) -> Tuple[Dict[str, Any], Dict[int, int]]:
+    """
+    Parse an elbencho 3.4+ --jsonfile: what parse_csv_file and
+    parse_out_file return for older results, from the NET phase.
+
+    Raises OSError or ValueError when the file cannot be read or decoded.
+    """
+    result = {
+        "mib_s_write": 0.0,
+        "mib_s_read": 0.0,
+        "lat_min_us": 0.0,
+        "lat_max_us": 0.0,
+        "command": "",
+    }
+    histogram: Dict[int, int] = {}
+    for phase in read_phase_results(json_path):
+        # elbencho 3.4 names the phase after the transport ("NET/tcp").
+        if phase.phase_type.upper().split("/")[0] != "NET":
+            continue
+        latency = phase.io_latency or LatencyStats()
+        result["mib_s_write"] = (phase.first.bytes_per_s or 0.0) / MIB
+        result["mib_s_read"] = (phase.first.rwmix_read_bytes_per_s or 0.0) / MIB
+        result["lat_min_us"] = latency.min_us or 0.0
+        result["lat_max_us"] = latency.max_us or 0.0
+        result["command"] = phase.command
+        histogram = {
+            int(bucket): count for bucket, count in latency.histogram_us.items()
+        }
+    return result, histogram
+
+
 def parse_out_file(out_path: str) -> Dict[int, int]:
     """
     Parse OUT file for histogram.
@@ -297,7 +333,7 @@ def parse_out_file(out_path: str) -> Dict[int, int]:
 
 
 def parse_file_pair(
-    csv_path: str,
+    data_path: str,
     out_path: str,
     mode: str,
     node_count: int,
@@ -307,11 +343,11 @@ def parse_file_pair(
     direction: str,
 ) -> Optional[IterationMetrics]:
     """
-    Parse a CSV/OUT file pair and return IterationMetrics.
+    Parse a run's results and return IterationMetrics.
 
     Args:
-        csv_path: Path to CSV file
-        out_path: Path to OUT file
+        data_path: Path to the .json (which holds every result), else the .csv
+        out_path: Path to OUT file (histogram source without a .json)
         mode: "bidir" or "half"
         node_count: Node count from filename
         thread_count: Thread count from filename
@@ -323,10 +359,13 @@ def parse_file_pair(
         IterationMetrics or None if parsing failed
     """
     try:
-        csv_data = parse_csv_file(csv_path)
-        histogram = parse_out_file(out_path)
+        if data_path.endswith(".json"):
+            csv_data, histogram = parse_json_file(data_path)
+        else:
+            csv_data = parse_csv_file(data_path)
+            histogram = parse_out_file(out_path)
     except Exception as e:  # pylint: disable=broad-exception-caught
-        eprint(f"Error parsing {csv_path} / {out_path}: {e}")
+        eprint(f"Error parsing {data_path} / {out_path}: {e}")
         return None
 
     # Throughput values
@@ -1286,21 +1325,25 @@ def main() -> None:
 
     # Handle test-parse mode
     if args.test_parse:
-        base_path = args.test_parse.replace(".csv", "").replace(".out", "")
+        base_path = re.sub(r"\.(csv|json|out)$", "", args.test_parse)
         csv_path = base_path + ".csv"
         out_path = base_path + ".out"
+        json_path = base_path + ".json"
 
-        eprint(f"Testing parse of {csv_path} and {out_path}")
-
-        csv_data = parse_csv_file(csv_path)
-        eprint("\nCSV Data:")
+        if os.path.exists(json_path):
+            eprint(f"Testing parse of {json_path}")
+            csv_data, histogram = parse_json_file(json_path)
+        else:
+            eprint(f"Testing parse of {csv_path} and {out_path}")
+            csv_data = parse_csv_file(csv_path)
+            histogram = parse_out_file(out_path)
+        eprint("\nResult Data:")
         eprint(f"  mib_s_write: {csv_data['mib_s_write']:.0f}")
         eprint(f"  mib_s_read: {csv_data['mib_s_read']:.0f}")
         eprint(f"  lat_min_us: {csv_data['lat_min_us']:.0f}")
         eprint(f"  lat_max_us: {csv_data['lat_max_us']:.0f}")
 
-        histogram = parse_out_file(out_path)
-        eprint("\nOUT Data (histogram):")
+        eprint("\nHistogram:")
         if histogram:
             eprint(f"  {len(histogram)} buckets, total count={sum(histogram.values())}")
         else:
@@ -1322,10 +1365,10 @@ def main() -> None:
 
     # Parse all file pairs
     iterations: List[IterationMetrics] = []
-    for key, (csv_path, out_path) in file_pairs.items():
+    for key, (data_path, out_path) in file_pairs.items():
         mode, node_count, thread_count, datestamp, iteration, direction = key
         m = parse_file_pair(
-            csv_path,
+            data_path,
             out_path,
             mode,
             node_count,

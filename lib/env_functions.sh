@@ -1405,7 +1405,7 @@ filesystem_enabled_from_test_dirs() {
 
 # The elbencho image Kubernetes sweeps run when KUBECTL_ELBENCHO_IMAGE is unset
 # or empty: the release utils/build/fetch_elbencho.sh downloads (ELBENCHO_VERSION_TAG).
-KUBECTL_DEFAULT_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.2-1
+KUBECTL_DEFAULT_ELBENCHO_IMAGE=docker.io/breuner/elbencho:v3.4-1
 
 # apply_kubectl_defaults: on EXECUTION_SUBSTRATE=kubectl, default the settings
 # env.sh may leave out. env_base.sh calls it, and so does every entry point
@@ -2876,25 +2876,26 @@ _elbencho_result_artifacts_for_execution() {
             base=$(printf '%s/mdtest-elbencho-c_%03d-t_%03d_%s' \
                 "$output_dir" "$nodes" "$tasks_per_node" "$ds")
             for ((iter = 1; iter <= MDTEST_ITERATIONS; iter++)); do
-                printf '%s_iter%d.out\n%s_iter%d.csv\n%s_iter%d.out.project-version\n' \
-                    "$base" "$iter" "$base" "$iter" "$base" "$iter"
+                printf '%s_iter%d.%s\n' "$base" "$iter" out "$base" "$iter" json \
+                    "$base" "$iter" csv "$base" "$iter" out.project-version
             done
             _mdtest_completion_path "$output_dir" "$execution_id"
             exit 0
         fi
         local ds="${output_dir##*-}"
         local resfile
+        local jsonfile
         local csvfile
         local livecsvfile
         local treefile
-        _elbencho_io_set_resfile_csvfile "$output_dir" "$io_size" "$nodes" \
+        _elbencho_io_set_result_files "$output_dir" "$io_size" "$nodes" \
             "$thread_count" "$io_depth" "$ds"
         _elbencho_io_set_livecsvfile "$output_dir" "$io_size" "$nodes" \
             "$thread_count" "$io_depth" "$ds"
         _elbencho_io_set_treefile "$output_dir" "$io_size" "$nodes" \
             "$thread_count" "$io_depth" "$ds"
-        printf '%s\n' "$resfile" "$resfile.project-version" "$csvfile" \
-            "$livecsvfile" "$treefile" \
+        printf '%s\n' "$resfile" "$resfile.project-version" "$jsonfile" \
+            "$csvfile" "$livecsvfile" "$treefile" \
             "${output_dir}/executions/${execution_id}.write.json" \
             "${output_dir}/executions/${execution_id}.read.json" \
             "${output_dir}/executions/${execution_id}.delete.json" \
@@ -2913,9 +2914,10 @@ _elbencho_required_result_artifacts_for_execution() {
         output_dir=$(_elbencho_execution_output_dir_for_definition "$output_dir" "$nnnn_sh") || exit 1
         local prefix="${output_dir}/executions/${execution_id}"
         if [[ "${ELBENCHO_EXECUTION_KIND:-io}" == mdtest ]]; then
-            # Project version records are informational, never required.
+            # Project version records are informational, never required, and
+            # a .csv is only a stale result of elbencho before 3.4.
             _elbencho_result_artifacts_for_execution "$output_dir" "$nnnn_sh" \
-                | grep -v '\.project-version$'
+                | grep -v -e '\.project-version$' -e '\.csv$'
             exit "${PIPESTATUS[0]}"
         fi
         if [[ -n "${ELBENCHO_SWEEP_READ_FROM:-}" \
@@ -5212,6 +5214,19 @@ print_slurm_node_warnings() {
     return 0
 }
 
+# Print the numeric job ID from `sbatch --parsable` output: the last nonempty
+# line, `jobid` or `jobid;cluster`. Returns 1 when there is none.
+_sbatch_parsable_job_id() {
+    local line last=""
+    while IFS= read -r line; do
+        [[ -z "${line//[[:space:]]/}" ]] || last="$line"
+    done <<< "$1"
+    last="${last%%;*}"
+    last="${last//[[:space:]]/}"
+    [[ "$last" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$last"
+}
+
 # Submit one sbatch job with dependency chaining, error checking, and log tracking.
 #
 # Relies on the following caller-scoped variables:
@@ -5256,14 +5271,20 @@ run_sbatch_job() {
         loop_sbatch_opts+=("--nodelist=${ordered_nodelist}")
     fi
 
-    JOBID="$( "${sbatch_cmd[@]}" --parsable --nodes="$nodes" \
+    # Only stdout carries the job ID; site plugins may write notes to stderr,
+    # which pass through to the terminal.
+    local sbatch_output rc=0
+    sbatch_output="$( "${sbatch_cmd[@]}" --parsable --nodes="$nodes" \
         "${g_sbatch_opts[@]}" \
         "${loop_sbatch_opts[@]}" \
-        "$@" 2>&1 )"
-    local rc=$?
+        "$@" )" || rc=$?
     if [[ $rc -ne 0 ]]; then
-        echo "$JOBID" >&2
+        [[ -z "$sbatch_output" ]] || echo "$sbatch_output" >&2
         return $rc
+    fi
+    if ! JOBID=$(_sbatch_parsable_job_id "$sbatch_output"); then
+        echo "Error: sbatch printed no job ID (output: '$sbatch_output'); check squeue for job '$job_name'" >&2
+        return 1
     fi
 
     local this_log_file="${output_fmt/\%j/$JOBID}"

@@ -240,8 +240,11 @@ wait_for_services_reachable() {
 #   2 services per node (ports NETBENCH_PORT and NETBENCH_PORT+1)
 #
 # Required env vars: See header comments
-# Sets: resfile, csvfile (output file paths for primary direction)
+# Sets: resfile, jsonfile (output file paths for primary direction)
 #
+# Per-client and per-server final results in the .json (elbencho 3.4+).
+NETBENCH_SVCSTATS=elapsed,lat,percent,minmax
+
 run_netbench_half_half() {
     local node_count
     local hosts_arg
@@ -314,14 +317,14 @@ run_netbench_half_half() {
         # 2 services per node; no localhost connections since groups are disjoint
 
         # Generate separate output files for each direction
-        local resfile_ab csvfile_ab resfile_ba csvfile_ba
+        local resfile_ab jsonfile_ab resfile_ba jsonfile_ba
         resfile_ab=$(printf "%s/netbench-%s-c_%03d-t_%03d_%s_iter%d_AtoB.out" \
             "$remote_output_dir" "$mode_abbrev" "$node_count" "$thread_count" "$ds" "$iteration")
-        csvfile_ab=$(printf "%s/netbench-%s-c_%03d-t_%03d_%s_iter%d_AtoB.csv" \
+        jsonfile_ab=$(printf "%s/netbench-%s-c_%03d-t_%03d_%s_iter%d_AtoB.json" \
             "$remote_output_dir" "$mode_abbrev" "$node_count" "$thread_count" "$ds" "$iteration")
         resfile_ba=$(printf "%s/netbench-%s-c_%03d-t_%03d_%s_iter%d_BtoA.out" \
             "$remote_output_dir" "$mode_abbrev" "$node_count" "$thread_count" "$ds" "$iteration")
-        csvfile_ba=$(printf "%s/netbench-%s-c_%03d-t_%03d_%s_iter%d_BtoA.csv" \
+        jsonfile_ba=$(printf "%s/netbench-%s-c_%03d-t_%03d_%s_iter%d_BtoA.json" \
             "$remote_output_dir" "$mode_abbrev" "$node_count" "$thread_count" "$ds" "$iteration")
 
         # Each coordinator uses a DIFFERENT service port to avoid conflicts
@@ -353,8 +356,8 @@ run_netbench_half_half() {
         echo "  Coordinator 2 (B→A): port $port_ba - clients $group_b_port_ba → servers $group_a_port_ba"
         echo
         echo "Output files:"
-        echo "  A→B: $resfile_ab, $csvfile_ab"
-        echo "  B→A: $resfile_ba, $csvfile_ba"
+        echo "  A→B: $resfile_ab, $jsonfile_ab"
+        echo "  B→A: $resfile_ba, $jsonfile_ba"
         echo
 
         # Build args for both directions (each uses its own port)
@@ -364,15 +367,16 @@ run_netbench_half_half() {
             --servers "$group_b_port_ab"
             --port "$port_ab"
             --block "$NETBENCH_BLOCKSIZE"
-            --respsize "$NETBENCH_RESPSIZE"
+            --recvsize "$NETBENCH_RESPSIZE"
             --size "$per_thread_size"
             --threads "$thread_count"
             --lat
             --lathisto
             --latpercent
             --nolive
+            --svcstats "$NETBENCH_SVCSTATS"
             --resfile "$resfile_ab"
-            --csvfile "$csvfile_ab"
+            --jsonfile "$jsonfile_ab"
         )
 
         local netbench_args_ba=(
@@ -381,15 +385,16 @@ run_netbench_half_half() {
             --servers "$group_a_port_ba"
             --port "$port_ba"
             --block "$NETBENCH_BLOCKSIZE"
-            --respsize "$NETBENCH_RESPSIZE"
+            --recvsize "$NETBENCH_RESPSIZE"
             --size "$per_thread_size"
             --threads "$thread_count"
             --lat
             --lathisto
             --latpercent
             --nolive
+            --svcstats "$NETBENCH_SVCSTATS"
             --resfile "$resfile_ba"
-            --csvfile "$csvfile_ba"
+            --jsonfile "$jsonfile_ba"
         )
 
         # Verify services are TCP-reachable from this node before launching coordinators
@@ -456,14 +461,14 @@ run_netbench_half_half() {
         # 1 service per node on NETBENCH_PORT
 
         # Generate separate output files for each direction
-        local resfile_ab csvfile_ab resfile_ba csvfile_ba
+        local resfile_ab jsonfile_ab resfile_ba jsonfile_ba
         resfile_ab=$(printf "%s/netbench-%s-c_%03d-t_%03d_%s_iter%d_AtoB.out" \
             "$remote_output_dir" "$mode_abbrev" "$node_count" "$thread_count" "$ds" "$iteration")
-        csvfile_ab=$(printf "%s/netbench-%s-c_%03d-t_%03d_%s_iter%d_AtoB.csv" \
+        jsonfile_ab=$(printf "%s/netbench-%s-c_%03d-t_%03d_%s_iter%d_AtoB.json" \
             "$remote_output_dir" "$mode_abbrev" "$node_count" "$thread_count" "$ds" "$iteration")
         resfile_ba=$(printf "%s/netbench-%s-c_%03d-t_%03d_%s_iter%d_BtoA.out" \
             "$remote_output_dir" "$mode_abbrev" "$node_count" "$thread_count" "$ds" "$iteration")
-        csvfile_ba=$(printf "%s/netbench-%s-c_%03d-t_%03d_%s_iter%d_BtoA.csv" \
+        jsonfile_ba=$(printf "%s/netbench-%s-c_%03d-t_%03d_%s_iter%d_BtoA.json" \
             "$remote_output_dir" "$mode_abbrev" "$node_count" "$thread_count" "$ds" "$iteration")
 
         echo "Netbench Unidirectional Parameters:"
@@ -484,8 +489,8 @@ run_netbench_half_half() {
         echo "  Direction 2: Group B → Group A"
         echo
         echo "Output files:"
-        echo "  A→B: $resfile_ab, $csvfile_ab"
-        echo "  B→A: $resfile_ba, $csvfile_ba"
+        echo "  A→B: $resfile_ab, $jsonfile_ab"
+        echo "  B→A: $resfile_ba, $jsonfile_ba"
         echo
 
         # Verify services are TCP-reachable from this node before launching coordinators
@@ -503,15 +508,16 @@ run_netbench_half_half() {
             --servers "$group_b_csv"
             --port "$NETBENCH_PORT"
             --block "$NETBENCH_BLOCKSIZE"
-            --respsize "$NETBENCH_RESPSIZE"
+            --recvsize "$NETBENCH_RESPSIZE"
             --size "$per_thread_size"
             --threads "$thread_count"
             --lat
             --lathisto
             --latpercent
             --nolive
+            --svcstats "$NETBENCH_SVCSTATS"
             --resfile "$resfile_ab"
-            --csvfile "$csvfile_ab"
+            --jsonfile "$jsonfile_ab"
         )
         run_a_netbench "${netbench_args_ab[@]}"
 
@@ -523,15 +529,16 @@ run_netbench_half_half() {
             --servers "$group_a_csv"
             --port "$NETBENCH_PORT"
             --block "$NETBENCH_BLOCKSIZE"
-            --respsize "$NETBENCH_RESPSIZE"
+            --recvsize "$NETBENCH_RESPSIZE"
             --size "$per_thread_size"
             --threads "$thread_count"
             --lat
             --lathisto
             --latpercent
             --nolive
+            --svcstats "$NETBENCH_SVCSTATS"
             --resfile "$resfile_ba"
-            --csvfile "$csvfile_ba"
+            --jsonfile "$jsonfile_ba"
         )
         run_a_netbench "${netbench_args_ba[@]}"
 

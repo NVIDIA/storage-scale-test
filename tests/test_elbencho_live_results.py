@@ -31,8 +31,15 @@ import jsonschema
 import pytest
 import zstandard
 
+from tests.test_filesystem_results_schema import validate_sidecar_lines
+
 from lib import elbencho_live_steady as steady_mod
-from lib.elbencho_live_report import LIVE_CSV_COLUMNS, MIB, LiveClientId
+from lib.elbencho_live_report import (
+    LIVE_CSV_COLUMNS,
+    LIVE_CSV_COLUMNS_V34,
+    MIB,
+    LiveClientId,
+)
 from lib.elbencho_live_steady import (
     ClientSteady,
     LatencySummary,
@@ -49,7 +56,7 @@ SCHEMA_PATH = os.path.join(
     "..",
     "docs",
     "schemas",
-    "filesystem-batch-results-1.schema.json",
+    "filesystem-batch-results-2.schema.json",
 )
 
 
@@ -69,7 +76,7 @@ def _stub_filesystem_results():
     """Minimal stand-in used only while lib.filesystem_results is absent."""
     stub = types.ModuleType("lib.filesystem_results")
     stub.LIVE_SCHEMA = "storage-scale-test/live-client-series"
-    stub.LIVE_SCHEMA_VERSION = "1.1"
+    stub.LIVE_SCHEMA_VERSION = "1.2"
     stub.mib_s_to_bytes_per_s = lambda v: None if v is None else round(v * 1048576)
 
     def file_record(path, rel):
@@ -90,10 +97,11 @@ def _stub_filesystem_results():
         def __enter__(self):
             return self
 
-        def write_interval(self, elapsed_ms, rates, deltas=None):
+        def write_interval(self, elapsed_ms, rates, deltas=None, extra=None):
             line = {"elapsed_ms": elapsed_ms, "bytes_per_s": rates}
             if deltas is not None:
                 line["done_bytes_delta"] = deltas
+            line.update(extra or {})
             self.lines.append(line)
 
         def __exit__(self, *exc):
@@ -179,9 +187,9 @@ def _row(runtime_ms, rank, done_bytes, *, phase="WRITE", service="", mib_s="", i
     return values
 
 
-def _write_csv(path, rows):
+def _write_csv(path, rows, columns=None):
     with open(path, "w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=LIVE_CSV_COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=columns or LIVE_CSV_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
     return str(path)
@@ -679,6 +687,8 @@ def test_steady_fairness_latency_objects(live, tmp_path, monkeypatch):
         "final_avg_us": 99.5,
         "rho_jain_latency": -0.3123,
         "rho_latency_throughput": None,
+        "client_avg_p50_us": None,
+        "client_ratio_max": None,
     }
     assert obj["distribution"]["persistent_clients"] == 1
     assert obj["distribution"]["transient_clients"] == 2
@@ -800,3 +810,116 @@ def test_document_replay_matches_the_live_csv(live, tmp_path, monkeypatch):
         context = live.document_phase_context(obj)
         replayed = steady_mod.analyze_steady(analysis, domain, context, 1000)
         assert replayed == steady_mod.analyze_steady(original, expected, context, 1000)
+
+
+# Schema 1.2 client columns, in order (null without elbencho 3.4 data).
+V12_CLIENT_COLUMNS = [
+    "mean_ops_per_s",
+    "steady_ops_per_s",
+    "steady_io_latency_avg_us",
+    "steady_io_latency_p90_us",
+    "steady_io_latency_max_us",
+    "steady_io_latency_ratio",
+]
+
+
+def _v34_csv(path, steps=20, rates=(100, 100, 100, 50), latency=(100, 100, 100, 300)):
+    """elbencho 3.4 rows of 1 MiB IOs at 1 s; client 1 is idle at step 8."""
+    rows = []
+    done = [0] * len(rates)
+    for step in range(1, steps + 1):
+        moved = [
+            0 if (step, rank) == (8, 1) else rate for rank, rate in enumerate(rates)
+        ]
+        done = [count + delta for count, delta in zip(done, moved)]
+        means = [lat if delta else 0 for lat, delta in zip(latency, moved)]
+        total = _row(step * 1000, "Total", sum(done) * MIB, mib_s=sum(moved), iops=1)
+        total.update(
+            {
+                "DoneIOs": str(sum(done)),
+                "Lat IO us": str(
+                    round(sum(m * d for m, d in zip(means, moved)) / sum(moved))
+                ),
+                "Lat IO max us": str(4 * max(means)),
+            }
+        )
+        rows.append(total)
+        for rank, count in enumerate(done):
+            row = _row(step * 1000, rank, count * MIB, service=f"host{rank}:1611")
+            row.update(
+                {
+                    "DoneIOs": str(count),
+                    "Lat IO us": str(means[rank]),
+                    "Lat IO max us": str(2 * means[rank]),
+                }
+            )
+            rows.append(row)
+    return _write_csv(path, rows, LIVE_CSV_COLUMNS_V34)
+
+
+def test_v34_fields_in_the_document(live, tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "analyze_steady", steady_mod.analyze_steady)
+    path = _v34_csv(tmp_path / "v.live.csv")
+    context = PhaseContext(20000, 20000, None, None)
+    sidecars = tmp_path / "side"
+    obj = _build(
+        live, path, level="full", contexts={"write": context}, sidecar_dir=str(sidecars)
+    )["write"]
+    _validate_live(obj)
+    assert live.CLIENT_COLUMNS[-len(V12_CLIENT_COLUMNS) :] == V12_CLIENT_COLUMNS
+    rows = {row["client"]: row for row in _columns(obj)}
+    slow, idle = rows["host3:1611 [rank 3]"], rows["host1:1611 [rank 1]"]
+    assert slow["mean_ops_per_s"] == 50.0
+    assert slow["steady_ops_per_s"] == 50.0
+    assert slow["steady_io_latency_avg_us"] == 300.0
+    assert slow["steady_io_latency_p90_us"] == 300.0
+    assert slow["steady_io_latency_max_us"] == 600.0
+    assert slow["steady_io_latency_ratio"] == 3.0
+    assert idle["steady_io_latency_avg_us"] == 100.0
+    assert idle["mean_ops_per_s"] == pytest.approx(100 * 18 / 19, abs=0.01)
+    series = obj["aggregate_series"]
+    assert series["done_ios"][:2] == [350, 700]
+    assert series["done_bytes"][0] == 350 * MIB
+    assert series["io_latency_max_us"][0] == 1200.0
+    assert series["entries_latency_max_us"] == [None] * 20
+    assert obj["latency"]["max_us"] == 1200.0  # Lat IO max us, not a mean
+    assert obj["latency"]["client_avg_p50_us"] == 100.0
+    assert obj["latency"]["client_ratio_max"] == 3.0
+    assert obj["fairness"]["5s"]["floor_p50"] is not None
+    _, *intervals = validate_sidecar_lines(sidecars / obj["client_series"]["path"])
+    assert intervals[0]["done_ios_delta"] == [100, 100, 100, 50]
+    assert intervals[7]["done_ios_delta"] == [100, 0, 100, 50]
+    assert intervals[7]["io_latency_avg_us"] == [100.0, 0.0, 100.0, 300.0]
+    assert intervals[7]["io_latency_max_us"] == [200.0, 0.0, 200.0, 600.0]
+
+
+def test_older_columns_leave_v12_fields_null(live, tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "analyze_steady", steady_mod.analyze_steady)
+    path = _build_csv(tmp_path / "o.live.csv", [100, 200, 300])
+    sidecars = tmp_path / "side"
+    obj = _build(live, path, level="full", sidecar_dir=str(sidecars))["write"]
+    for row in _columns(obj):
+        assert [row[name] for name in V12_CLIENT_COLUMNS] == [None] * 6
+    series = obj["aggregate_series"]
+    assert series["done_ios"] == series["io_latency_max_us"] == [None] * 4
+    _, *intervals = _read_sidecar(sidecars / obj["client_series"]["path"])
+    assert "done_ios_delta" not in intervals[0]
+
+
+def test_v34_document_replay_matches_the_live_csv(live, tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "analyze_steady", steady_mod.analyze_steady)
+    path = _v34_csv(tmp_path / "r_20261026Z120000.live.csv")
+    sidecars = tmp_path / "side"
+    obj = _build(live, path, level="full", sidecar_dir=str(sidecars))["write"]
+    metadata = live.LiveFileMetadata(path, "", 0, 0, 0, "")
+    original = live.analyze_live_csv(metadata)
+    analysis, domain = live.analyze_document_live(
+        obj, str(sidecars / obj["client_series"]["path"]), metadata
+    )
+    expected = original.domains[live.live_domain_key(obj)]
+    assert domain.has_done_ios
+    assert _analysis_state(domain) == _analysis_state(expected)
+    context = PhaseContext(20000, 20000, None, None)
+    replayed = steady_mod.analyze_steady(analysis, domain, context, 1000)
+    assert replayed == steady_mod.analyze_steady(original, expected, context, 1000)
+    assert replayed.clients[LiveClientId("3", "host3:1611")].io_latency_avg_us == 300

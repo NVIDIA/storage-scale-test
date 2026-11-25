@@ -482,9 +482,9 @@ def test_from_json_accepts_a_subdirectory_and_refuses_another_major(
     _run(IO, FROM_JSON, document / RESULTS, OUTPUT_DIR, document / "again")
     assert (document / "again" / REPORT).is_file()
     data = json.loads((document / RESULTS).read_text(encoding="utf-8"))
-    data["schema_version"] = "2.0"
+    data["schema_version"] = "3.0"
     newer = tmp_path / "newer.json"
     newer.write_text(json.dumps(data), encoding="utf-8")
     done = _run(IO, FROM_JSON, newer, OUTPUT_DIR, tmp_path / "out", check=False)
     assert done.returncode == 2
-    assert "schema_version '2.0' is not supported" in done.stderr
+    assert "schema_version '3.0' is not supported" in done.stderr

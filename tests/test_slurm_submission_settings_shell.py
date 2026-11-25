@@ -23,6 +23,8 @@ import textwrap
 
 import pytest
 
+from tests.filesystem_checkout_test_support import FAKE_ELBENCHO_SCRIPT
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ENV_FUNCTIONS = _REPO_ROOT / "lib" / "env_functions.sh"
 _INVALID_INTERVALS = ("0", "-1", "1.5", "abc")
@@ -77,6 +79,55 @@ def test_run_sbatch_job_validates_the_poll_interval_first(tmp_path, interval):
         assert _sbatch_calls(calls) == 0
 
 
+def _submit_with_sbatch_output(tmp_path, body: str) -> subprocess.CompletedProcess:
+    """Run run_sbatch_job with an sbatch stub whose body is ``body``."""
+    bin_dir, _ = _scheduler_stubs(tmp_path)
+    (bin_dir / "sbatch").write_text(f"#!/usr/bin/env bash\n{body}\n", "utf-8")
+    script = textwrap.dedent(f"""
+        source "{_ENV_FUNCTIONS}"
+        sbatch_cmd=(sbatch)
+        g_sbatch_opts=()
+        log_files=()
+        JOBID=
+        run_sbatch_job 1 job "{tmp_path}/%j.out" Test batch.sh || exit
+        printf 'JOBID=<%s>\\nLOG=<%s>\\n' "$JOBID" "${{log_files[0]}}"
+    """)
+    return subprocess.run(
+        ["bash", "-c", script],
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "echo 'sbatch: lua: Checking requeue policy with options:' >&2; echo 35036",
+        "echo '35036;cluster-a'",
+        "echo 'site banner'; echo 35036; echo",
+    ],
+)
+def test_run_sbatch_job_reads_only_the_parsable_job_id(tmp_path, body):
+    """Site plugin notes on stderr or stdout never become part of the job ID."""
+    result = _submit_with_sbatch_output(tmp_path, body)
+    assert result.returncode == 0, result.stderr
+    assert "JOBID=<35036>" in result.stdout
+    assert f"LOG=<{tmp_path}/35036.out>" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "body", ["echo 'sbatch: lua: note' >&2", "echo 'Submitted batch job'"]
+)
+def test_run_sbatch_job_fails_without_a_job_id(tmp_path, body):
+    """A submission whose output holds no job ID is an error, not a bogus ID."""
+    result = _submit_with_sbatch_output(tmp_path, body)
+    assert result.returncode == 1
+    assert "sbatch printed no job ID" in result.stderr
+    assert "JOBID=" not in result.stdout
+
+
 @pytest.mark.parametrize(
     "launcher, arguments",
     [
@@ -106,6 +157,9 @@ def test_launchers_submit_nothing_with_an_invalid_poll_interval(
         encoding="utf-8",
     )
     (deployment / ".obj_auth").touch()
+    (deployment / "utils").mkdir(exist_ok=True)
+    (deployment / "utils/elbencho").write_text(FAKE_ELBENCHO_SCRIPT)
+    (deployment / "utils/elbencho").chmod(0o755)
     bin_dir, calls = _scheduler_stubs(tmp_path)
 
     result = subprocess.run(

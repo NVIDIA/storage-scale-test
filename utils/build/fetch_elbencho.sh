@@ -24,10 +24,10 @@ fi
 set -uo pipefail
 
 # Pinned elbencho release and its upstream archive SHA-256 values.
-readonly ELBENCHO_VERSION_TAG='v3.2-1'
+readonly ELBENCHO_VERSION_TAG='v3.4-1'
 readonly ELBENCHO_RELEASE_URL_BASE="https://github.com/breuner/elbencho/releases/download/${ELBENCHO_VERSION_TAG}"
-readonly ELBENCHO_SHA256_X86_64="c32f9f905e879b7efed8c2f83ea9be7a362dceae43155bb46ddab3d5d6c23210"
-readonly ELBENCHO_SHA256_AARCH64="3af09f8110586863b35da019e748c8062fcf57cc0f32e446b1c054df4500eba3"
+readonly ELBENCHO_SHA256_X86_64="0ff66bd031fe5cb0004bf74e40e13a6e99ee8961dc9393afd6d48d196db1e328"
+readonly ELBENCHO_SHA256_AARCH64="a5a18384c432a30e871cc94e0b87b0e7434dc0d1a251cbe12abd1afe2c1dd30e"
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd) || {
     echo "Error: Failed to determine script directory" >&2
@@ -37,6 +37,9 @@ readonly SCRIPT_DIR
 # shellcheck source=lib/project_version.sh
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/../../lib/project_version.sh" || exit 2
+# shellcheck source=lib/_platform_functions.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../../lib/_platform_functions.sh" || exit 2
 project_version_option "$SCRIPT_DIR/../.." "$@"
 UTILS_DIR=$(cd "${SCRIPT_DIR}/.." &>/dev/null && pwd) || {
     echo "Error: Failed to determine utils directory" >&2
@@ -50,7 +53,10 @@ Usage: $0 [--force-download]
        $0 --version
 
 Downloads and verifies the pinned elbencho ${ELBENCHO_VERSION_TAG} static binaries
-into ${UTILS_DIR}, keeping existing ones unless --force-download is given.
+into ${UTILS_DIR}. An existing binary is kept when it is elbencho
+${ELBENCHO_MIN_VERSION} or newer (from --version, or from the .version stamp
+written beside each download); otherwise it is replaced.
+--force-download replaces every binary.
 Exits 1 if a download fails, 2 on a usage or configuration error.
 EOF
     return 0
@@ -136,6 +142,11 @@ verify_sha256() {
 validate_elbencho_checksum_configuration() {
     local arch expected
 
+    elbencho_version_at_least "${ELBENCHO_VERSION_TAG}" "${ELBENCHO_MIN_VERSION}" || {
+        _error "Pinned elbencho ${ELBENCHO_VERSION_TAG} is below the minimum ${ELBENCHO_MIN_VERSION}"
+        return 1
+    }
+
     for arch in x86_64 aarch64; do
         expected=$(elbencho_sha256_for_arch "${arch}") || return 1
         if ! validate_expected_sha256 "${expected}" "elbencho ${ELBENCHO_VERSION_TAG} ${arch}"; then
@@ -143,6 +154,34 @@ validate_elbencho_checksum_configuration() {
         fi
     done
     return 0
+}
+
+# Record the release and SHA-256 of a binary this script installed in
+# BINARY.version, so a host that cannot run the binary can still tell its version.
+write_version_stamp() {
+    local binary="$1" sha stamp="$1.version"
+
+    sha=$(calculate_sha256 "${binary}") || return 1
+    if ! printf '%s %s\n' "${ELBENCHO_VERSION_TAG}" "${sha}" > "${stamp}.$$" \
+            || ! mv -f "${stamp}.$$" "${stamp}"; then
+        rm -f "${stamp}.$$"
+        return 1
+    fi
+    return 0
+}
+
+# Succeed (printing the version) when an existing binary is at the floor or newer;
+# print what was found and fail otherwise.
+existing_binary_is_current() {
+    local binary="$1" found
+
+    found=$(elbencho_version_of_binary "${binary}") || found=""
+    if elbencho_version_at_least "${found}" "${ELBENCHO_MIN_VERSION}"; then
+        echo "${found}"
+        return 0
+    fi
+    echo "${found:-unknown}"
+    return 1
 }
 
 # Download, verify, and atomically install one elbencho binary. Silent; the
@@ -197,12 +236,14 @@ download_and_extract_elbencho() {
         return 1
     fi
     rm -rf "$tmpdir"
+    # A missing stamp only costs a re-download later, so it never fails this one.
+    write_version_stamp "$output_path" || true
     return 0
 }
 
 main() {
     local force_download=false
-    local spec arch output_path display_name name i
+    local spec arch output_path display_name name i existing_version
     local download_start_time download_elapsed
     # Per entry: arch|output_path|display_name
     local -a binaries_to_download=(
@@ -237,8 +278,11 @@ main() {
         IFS='|' read -r arch output_path display_name <<< "${spec}"
 
         if [[ -f "$output_path" ]] && [[ "$force_download" == false ]]; then
-            skipped+=("$display_name")
-            continue
+            if existing_version=$(existing_binary_is_current "$output_path"); then
+                skipped+=("${display_name}|${existing_version}")
+                continue
+            fi
+            echo "  replacing ${display_name}: version ${existing_version}, below ${ELBENCHO_MIN_VERSION}"
         fi
 
         display_names+=("$display_name")
@@ -247,7 +291,7 @@ main() {
     done
 
     for name in ${skipped[@]+"${skipped[@]}"}; do
-        echo "  using existing ${name} (add --force-download to override)"
+        echo "  using existing ${name%%|*} (version ${name##*|}; add --force-download to override)"
     done
 
     for i in "${!pids[@]}"; do

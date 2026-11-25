@@ -25,7 +25,7 @@ fault boundaries, and explicit non-goals against which implementation and
 review are evaluated. The historical design record explains why the feature
 was built this way; this document defines the behavior that must remain true.
 Both workloads use the same attempt and execution ledgers. Metadata cells
-publish their per-iteration `.out` and `.csv` files; filesystem IO cells retain
+publish their per-iteration `.out` and `.json` files; filesystem IO cells retain
 their workload-specific completion artifacts.
 
 Prepared filesystem batches add a local assembly phase before attempt creation.

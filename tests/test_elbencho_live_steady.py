@@ -24,6 +24,7 @@ from pathlib import Path
 
 from lib.elbencho_live_report import (
     LIVE_CSV_COLUMNS,
+    LIVE_CSV_COLUMNS_V34,
     MIB,
     DomainAnalysis,
     LiveClientId,
@@ -39,6 +40,7 @@ from lib.elbencho_live_steady import (
     REASON_NO_STEADY_STATE,
     REASON_TOO_SHORT,
     WINDOW_30S,
+    LogHistogram,
     WINDOW_5S,
     WINDOW_INTERVAL,
     ClientSteady,
@@ -97,8 +99,16 @@ def _csv_rows(  # pylint: disable=too-many-arguments
     return rows
 
 
-def _live_row(
-    runtime_ms, rank, done_bytes, *, service="", mib_s="", iops="", lat_io=""
+def _live_row(  # pylint: disable=too-many-arguments
+    runtime_ms,
+    rank,
+    done_bytes,
+    *,
+    service="",
+    mib_s="",
+    iops="",
+    lat_io="",
+    extra=None,
 ):
     row = dict.fromkeys(LIVE_CSV_COLUMNS, "")
     row.update(
@@ -114,7 +124,54 @@ def _live_row(
             "Service": service,
         }
     )
+    row.update(extra or {})
     return row
+
+
+def _v34_rows(rates, latencies=None, total_iops=None):
+    """elbencho 3.4 rows at 1 s intervals of 1 MiB IOs: ``rates[i][c]`` is
+    client c's MiB (and IOs) in interval i. ``latencies[(i, c)]`` is its
+    interval mean (default 100 us; 0 when idle), whose max is twice that.
+    ``total_iops`` overrides the Total rows' IOPS cells."""
+    counters = [0] * len(rates[0])
+    rows = []
+    for index, interval_rates in enumerate(rates):
+        runtime_ms = (index + 1) * 1000
+        means = [
+            (latencies or {}).get((index, client), 100 if rate else 0)
+            for client, rate in enumerate(interval_rates)
+        ]
+        ios = sum(interval_rates)
+        for client, rate in enumerate(interval_rates):
+            counters[client] += rate
+        weighted = sum(mean * rate for mean, rate in zip(means, interval_rates))
+        rows.append(
+            _live_row(
+                runtime_ms,
+                "Total",
+                sum(counters) * MIB,
+                mib_s=ios,
+                iops=total_iops[index] if total_iops else ios,
+                lat_io=round(weighted / ios) if ios else 0,
+                extra={"DoneIOs": sum(counters), "Lat IO max us": 2 * max(means)},
+            )
+        )
+        rows.extend(
+            _live_row(
+                runtime_ms,
+                client,
+                counters[client] * MIB,
+                mib_s=rate,
+                iops=rate,
+                lat_io=means[client],
+                extra={
+                    "DoneIOs": counters[client],
+                    "Lat IO max us": 2 * means[client],
+                },
+            )
+            for client, rate in enumerate(interval_rates)
+        )
+    return rows
 
 
 def _uniform(intervals, clients, rate=100, overrides=None):
@@ -129,6 +186,8 @@ def _uniform(intervals, clients, rate=100, overrides=None):
 class SteadyTestCase(unittest.TestCase):
     """Write a synthetic live CSV and analyze it."""
 
+    COLUMNS = LIVE_CSV_COLUMNS
+
     def setUp(self):
         # pylint: disable=consider-using-with
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -139,7 +198,7 @@ class SteadyTestCase(unittest.TestCase):
 
     def _analysis(self, rows):
         with self.path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, LIVE_CSV_COLUMNS)
+            writer = csv.DictWriter(handle, self.COLUMNS)
             writer.writeheader()
             writer.writerows(rows)
         metadata = LiveFileMetadata(str(self.path), "1M", 1, 4, 1, "x")
@@ -569,3 +628,106 @@ class TestReviewRegressions(SteadyTestCase):
         self.assertTrue(steady.window.available)
         self.assertEqual(steady.latency.p50_us, 200)
         self.assertIsNone(steady.latency.rho_jain_latency)
+
+
+class TestElbencho34(SteadyTestCase):
+    """DoneIOs and client latency (elbencho 3.4 columns)."""
+
+    COLUMNS = LIVE_CSV_COLUMNS_V34
+
+    def test_client_latency_statistics(self):
+        rates = _uniform(25, 3, overrides={(8, 1): 0})
+        latencies = {(index, 2): 200 for index in range(25)}
+        latencies.update({(index, 0): 100 + 10 * (index % 10) for index in range(25)})
+        latencies[(22, 1)] = 5000  # after the steady window
+        _, _, steady = self._steady(_v34_rows(rates, latencies), 20000)
+        self.assertEqual(
+            (steady.window.start_interval, steady.window.end_interval), (1, 19)
+        )
+        varied, idle, slow = (steady.clients[_client(rank)] for rank in range(3))
+        steady_means = [100 + 10 * (index % 10) for index in range(1, 20)]
+        self.assertAlmostEqual(varied.io_latency_avg_us, sum(steady_means) / 19)
+        expected_p90 = sorted(steady_means)[17]  # nearest rank 18 of 19
+        self.assertAlmostEqual(varied.io_latency_p90_us, expected_p90, delta=0.03 * 190)
+        self.assertEqual(varied.io_latency_max_us, 2 * 190)
+        # The idle interval (0 with no new IOs) is not a 0 us sample.
+        self.assertEqual(idle.io_latency_avg_us, 100)
+        self.assertEqual(idle.io_latency_p90_us, 100)
+        self.assertEqual(idle.io_latency_max_us, 200)
+        self.assertEqual(slow.io_latency_avg_us, 200)
+        median = sorted(c.io_latency_avg_us for c in (varied, idle, slow))[1]
+        self.assertAlmostEqual(slow.io_latency_ratio, 200 / median)
+        self.assertAlmostEqual(steady.latency.client_avg_p50_us, median)
+        self.assertAlmostEqual(steady.latency.client_ratio_max, 200 / median)
+        self.assertAlmostEqual(slow.steady_ops_per_s, 100.0)
+        self.assertAlmostEqual(idle.steady_ops_per_s, 100.0 * 17 / 18)
+
+    def test_io_max_and_weights_use_done_ios(self):
+        rates = _uniform(25, 2, overrides={(index, 1): 300 for index in range(5, 25)})
+        latencies = {(index, 0): 100 + index for index in range(25)}
+        latencies[(15, 1)] = 400
+        # IOPS cells that disagree with DoneIOs must not weigh the mean.
+        _, _, steady = self._steady(
+            _v34_rows(rates, latencies, total_iops=[1] * 25), 25000
+        )
+        window = steady.window
+        self.assertEqual((window.start_interval, window.end_interval), (5, 24))
+        latency = steady.latency
+        # Lat IO max us, not the largest interval mean.
+        self.assertEqual(latency.max_us, 800)
+        self.assertAlmostEqual(latency.max_over_p50, 800 / latency.p50_us)
+        expected = 0.0
+        ios = 0
+        for index in range(5, 25):
+            for client, rate in enumerate((100, 300)):
+                mean = latencies.get((index, client), 100)
+                expected += mean * rate
+                ios += rate
+        # Total-row means are rounded to whole microseconds, as elbencho's are.
+        self.assertAlmostEqual(latency.steady_mean_us, expected / ios, delta=0.5)
+
+    def test_floor_counts_ios_without_a_block_size(self):
+        rates = _uniform(20, 4, overrides={(i, 3): 90 for i in range(20)})
+        _, _, steady = self._steady(
+            _v34_rows(rates), None, context=PhaseContext(20000, 20000, None, None)
+        )
+        self.assertAlmostEqual(steady.series[WINDOW_5S].floor[0], 487.5 / 488.5)
+
+    def test_older_columns_have_no_client_latency_or_floor(self):
+        self.COLUMNS = LIVE_CSV_COLUMNS  # pylint: disable=invalid-name
+        rates = _uniform(20, 4)
+        _, domain, steady = self._steady(
+            _csv_rows(rates), None, context=PhaseContext(20000, 20000, None, None)
+        )
+        self.assertFalse(domain.has_done_ios)
+        self.assertIsNone(steady.series[WINDOW_5S].floor[0])
+        client = steady.clients[_client(0)]
+        self.assertEqual(
+            (
+                client.steady_ops_per_s,
+                client.io_latency_avg_us,
+                client.io_latency_p90_us,
+                client.io_latency_max_us,
+                client.io_latency_ratio,
+            ),
+            (None,) * 5,
+        )
+        self.assertIsNone(domain.clients[_client(0)].mean_ops_s)
+
+
+class TestLogHistogram(unittest.TestCase):
+    """Bounded-memory percentiles of client interval latency."""
+
+    def test_percentiles(self):
+        histogram = LogHistogram()
+        self.assertIsNone(histogram.percentile(90))
+        for value in range(1, 1001):
+            histogram.add(float(value))
+        self.assertAlmostEqual(histogram.percentile(90), 900, delta=900 * 0.03)
+        self.assertEqual(histogram.percentile(100), 1000)
+        self.assertAlmostEqual(histogram.percentile(0), 1, delta=0.03)
+        zeros = LogHistogram()
+        for value in (0.0, 0.0, 5.0):
+            zeros.add(value)
+        self.assertEqual(zeros.percentile(50), 0.0)
+        self.assertEqual(zeros.percentile(90), 5.0)

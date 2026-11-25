@@ -88,7 +88,7 @@ def fake_cluster(tmp_path: Path) -> str:
         fake={str(tmp_path / 'fake')!r}
         mkdir -p "$manifests" "$fake"
         export KUBECTL_NODE_SELECTOR=storage-test=true
-        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.2-1
+        export KUBECTL_ELBENCHO_IMAGE=breuner/elbencho:v3.4-1
         export KUBECTL_IMAGE_PULL_POLICY=Never KUBECTL_RUN_AS_USER=2000
         export KUBECTL_RUN_AS_GROUP=2000 KUBECTL_SEQUENCER_IMAGE={SEQUENCER_IMAGE}
         event() {{ printf '%s\\n' "$*" >> "$events"; }}

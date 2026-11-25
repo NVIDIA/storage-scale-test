@@ -187,9 +187,9 @@ Operation is in [FILESYSTEM_TESTING.md](FILESYSTEM_TESTING.md). Invariants:
 - Generated shared-directory phases are exact-completion operations judged by
   JSON file, byte, and entry counters, not exit status: a zero exit does not
   prove a time-limited phase finished its dataset.
-- The JSON parser tolerates Elbencho v3.2-1 streamed phase objects (adjacent,
-  newline-separated, or followed by blank lines) but requires exactly one
-  record of the expected phase.
+- The JSON parser tolerates streamed phase objects (adjacent,
+  newline-separated, or followed by blank lines; checked on v3.2-1 and v3.4-1
+  output) but requires exactly one record of the expected phase.
 - Generated targets are removed with `rmdir` after verified distributed
   deletion; recursive removal is only for identity-checked failure and signal
   cleanup.
@@ -198,15 +198,17 @@ Operation is in [FILESYSTEM_TESTING.md](FILESYSTEM_TESTING.md). Invariants:
 - `--read-from` publishes `.storage-scale-test-elbencho-treefile.txt`
   atomically after a successful read and reuses it; the operator must remove
   it after changing the dataset.
-- All phases of a cell append to one CSV (later phases use `--nocsvlabels`);
-  `extract-elbencho.py` also parses headerless Elbencho CSV.
+- All phases of a cell append to one `--jsonfile`; shared-directory write and
+  read use per-phase JSON for the completion check, then append it. Result
+  directories without `.json` (elbencho < 3.4) are read from `.csv`/`.out`,
+  including headerless CSV.
 
 ## Other benchmark contracts
 
 ### Filesystem metadata
 
 - Because elbencho appends to result files, a retry removes every
-  per-iteration `.out`/`.csv` pair before target preparation.
+  per-iteration `.out`/`.json` (and stale `.csv`) before target preparation.
 - A cell succeeds only with nonempty, nonsymlink result pairs and an atomic
   completion marker written after all phases and cleanup.
 - When a metadata ledger exists, the analyzer counts only `SUCCESS` cells;
@@ -232,6 +234,9 @@ collect before resume.
 - Network testing is beta; Elbencho netbench has no native timeout, so
   external execution limits are the operator's concern.
 - Raw and live histograms sum repeated buckets so no observation is lost.
+- Netbench writes `--jsonfile` (no `.csv`); 3.4 renamed `--respsize` to
+  `--recvsize` (env var still `NETBENCH_RESPSIZE`). Older directories read
+  from `.csv`/`.out`.
 
 ## Results and analysis
 
@@ -251,9 +256,12 @@ collect before resume.
   `coordinates` and `coordinate_key`; `dataset`/`results` only when parsed.
 - Live outputs replay from sidecar `done_bytes_delta` (exact `DoneBytes`);
   rates alone drift (rounding, gaps, resets). Below `full`, text uses the
-  stored fairness summary. Renderers read 1.1 fields with `.get`.
+  stored fairness summary. Renderers read post-1.0 fields with `.get`.
 - Pass the same `ReportSelection` to every `report.html` write so HTML shows
   what text shows. Template names and anchors are user-facing references.
+- Chart hover names (hosts, clients) are interned into the blob's shared
+  `$hosts` table; series `names` hold indexes. Per-service charts need only
+  `results.json`, so runs without live data still get a run detail.
 - `report_html/pairing.py`'s docstring defines which settings block, imply
   or are only noted in comparisons. `lib/setting_relevance.py` is the single
   source of truth for which settings apply to a run.
@@ -283,9 +291,14 @@ python3 utils/compress_json_for_context.py < result.json
 
 ## Deployment and supply chain
 
-`utils/build/fetch_elbencho.sh` downloads pinned upstream elbencho `v3.2-1` and
-verifies per-architecture SHA-256 values; existing custom binaries stay unless
-`--force-download`. Warp is never downloaded: existing binaries are included,
+`utils/build/fetch_elbencho.sh` downloads pinned upstream elbencho `v3.4-1` and
+verifies per-architecture SHA-256 values. An existing binary is kept only if
+it is at least `ELBENCHO_MIN_VERSION` (3.4-1, `lib/_platform_functions.sh`)
+and `--force-download` is not given; a failed download only warns. Each
+download gets a `.version` stamp, which the version check uses for binaries
+that cannot run on the launcher. Checks run in `validate_env.sh`, the sweep,
+mdtest and netbench launchers, the kubectl coordinator, and the validation
+Job. Warp is never downloaded: existing binaries are included,
 or users build them with `utils/build/build_warp_from_source.sh`. Archives
 exclude credential files. Users own source and toolchain selection,
 provenance, licenses, and validation of the tarball they build.

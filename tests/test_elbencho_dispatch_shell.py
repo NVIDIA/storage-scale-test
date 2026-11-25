@@ -492,19 +492,23 @@ class TestElbenchoDispatchShell(unittest.TestCase):
         )
         self.assertNotIn("999999", result.stdout)
 
-    def test_result_artifact_cleanup_removes_csv_out_live_and_treefile(self) -> None:
+    def test_result_artifact_cleanup_removes_json_csv_out_live_and_treefile(
+        self,
+    ) -> None:
         script = f"""
         set -e
         source "{_ELBENCHO_FUNCTIONS}"
         tmp=$(mktemp -d)
         trap 'rm -rf "$tmp"' EXIT
-        _elbencho_io_set_resfile_csvfile "$tmp" r64K 4 8 2 20260731Z010203
+        _elbencho_io_set_result_files "$tmp" r64K 4 8 2 20260731Z010203
         _elbencho_io_set_livecsvfile "$tmp" r64K 4 8 2 20260731Z010203
         _elbencho_io_set_treefile "$tmp" r64K 4 8 2 20260731Z010203
-        touch "$resfile" "$csvfile" "$livecsvfile" "$treefile"
+        [[ "$jsonfile" == "$tmp/elbencho-r64K-c_004-s_008-d_002_20260731Z010203.json" ]]
+        [[ "$csvfile" == "${{jsonfile%.json}}.csv" && "$resfile" == "${{jsonfile%.json}}.out" ]]
+        touch "$resfile" "$jsonfile" "$csvfile" "$livecsvfile" "$treefile"
         _elbencho_io_cleanup_result_artifacts \
-            "$resfile" "$csvfile" "$livecsvfile" "$treefile"
-        for f in "$resfile" "$csvfile" "$livecsvfile" "$treefile"; do
+            "$resfile" "$jsonfile" "$csvfile" "$livecsvfile" "$treefile"
+        for f in "$resfile" "$jsonfile" "$csvfile" "$livecsvfile" "$treefile"; do
             [[ ! -e "$f" ]] || exit 1
         done
         """
@@ -2143,6 +2147,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 [[ "$1" == bio && "$4" == 0 ]]
             }
             resolve_elbencho_completion_mode() { return 99; }
+            elbencho_check_binary_version() { return 0; }
             dispatch_slurm_executions() { printf 'RESTORED_DISPATCH:%s\n' "$1"; }
             """.replace("__FAKE_ROOT__", str(fake_root))
             (fake_root / "env.sh").write_text(
@@ -2217,6 +2222,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
                 [[ "$ELBENCHO_FILES_PER_NODE" == 8 ]]
                 [[ "$ELBENCHO_FILE_SIZE" == 64G ]]
             }
+            elbencho_check_binary_version() { return 0; }
             dispatch_slurm_executions() { printf 'SHARED_DISPATCH:%s\n' "$1"; }
             """.replace("__FAKE_ROOT__", str(fake_root))
             (fake_root / "env.sh").write_text(
@@ -2298,6 +2304,7 @@ class TestElbenchoDispatchShell(unittest.TestCase):
             print_slurm_node_warnings() { printf 'WARNING_NODES=%s\\n' "$1"; }
             reify_all_elbencho_executions() { printf 'REIFIED=%s\\n' "$5"; }
             dispatch_slurm_executions() { return 0; }
+            elbencho_check_binary_version() { return 0; }
             """.replace("__FAKE_ROOT__", str(fake_root))
                 .replace("__RESULTS_DIR__", str(Path(tmp) / "results"))
                 .replace("__FUNCTIONS__", str(_ELBENCHO_FUNCTIONS))

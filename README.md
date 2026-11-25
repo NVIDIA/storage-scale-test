@@ -89,6 +89,9 @@ Object and network reports differ; see their guides.
   (`brew install bash coreutils`; kubectl also needs `gnu-tar flock`).
 - Reporting requires Python 3.12+. The extraction wrappers set up their Python
   dependencies.
+- elbencho 3.4-1 or newer is required (checked by `validate_env.sh` and
+  before each run). Older binaries cannot run the tests; results from older
+  runs still report.
 - SSH/Slurm workers need benchmark binaries under `utils/` for each client
   architecture; see the archive builder below. Kubernetes uses the configured
   workload image instead.
@@ -105,8 +108,9 @@ present ([Warp preparation](docs/OBJECT_STORAGE_TESTING.md#prepare-the-tools)),
 builds `s3test`, and writes `storage-scale-test.tar.gz` (without `docs/`;
 read guides in the checkout or repository browser). Unpack it on your launcher
 and configure its `env.sh`. A failed download only warns, so confirm the tools
-for every client architecture. Neither the repository nor NVIDIA distributes
-these binaries; see [NOTICE](NOTICE) for provenance and licenses (elbencho
+for every client architecture. `utils/elbencho*.version` records each
+download's tag; an existing binary older than 3.4-1 is replaced. Neither the
+repository nor NVIDIA distributes these binaries; see [NOTICE](NOTICE) for provenance and licenses (elbencho
 GPL-3.0, Warp AGPL-3.0).
 
 ## Configure the execution substrate

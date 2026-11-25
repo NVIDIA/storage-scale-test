@@ -16,7 +16,8 @@
 """Read filesystem results documents and their live sidecars.
 
 A document (``results.json``) follows ``docs/MACHINE_READABLE_RESULTS.md``.
-Any schema 1.x is accepted; another major version fails clearly. Sidecar
+Documents at schema 1.x and 2.x and sidecars at 1.x are accepted; another
+major version fails clearly. Sidecar
 paths resolve relative to the document's directory and are streamed, so a
 renderer never holds every client's series at once.
 """
@@ -28,13 +29,14 @@ import hashlib
 import io
 import json
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Sequence
 
 from lib.filesystem_report_options import LIVE_DETAIL_LEVELS
 
 DOCUMENT_SCHEMA = "storage-scale-test/filesystem-batch-results"
 SIDECAR_SCHEMA = "storage-scale-test/live-client-series"
-SUPPORTED_MAJOR = 1
+# 2.0 made live latency.max_us the per-IO max; 1.x documents still load.
+SUPPORTED_MAJORS = {DOCUMENT_SCHEMA: (1, 2), SIDECAR_SCHEMA: (1,)}
 
 
 class ResultsDocumentError(ValueError):
@@ -71,10 +73,12 @@ def check_schema(data: Any, schema: str, source: str) -> None:
     if not isinstance(data, dict) or data.get("schema") != schema:
         raise ResultsDocumentError(f"{source}: not a {schema} document")
     version = data.get("schema_version")
-    if _major(version) != SUPPORTED_MAJOR:
+    majors = SUPPORTED_MAJORS[schema]
+    if _major(version) not in majors:
+        readable = " and ".join(f"{major}.x" for major in majors)
         raise ResultsDocumentError(
             f"{source}: schema_version {version!r} is not supported "
-            f"(this tool reads {SUPPORTED_MAJOR}.x)"
+            f"(this tool reads {readable})"
         )
 
 
@@ -165,6 +169,39 @@ def open_client_series(path: Path, values: str = "bytes_per_s") -> ClientSeries:
 
     ``values`` is ``bytes_per_s`` or ``done_bytes_delta`` (schema 1.1).
     """
+    lines, clients = _open_sidecar(path, values)
+    return ClientSeries(clients=clients, rows=_rows(lines, path, values))
+
+
+def open_client_arrays(path: Path, names: Sequence[str]) -> ClientSeries:
+    """Stream (elapsed_ms, [list per name]) rows in source order.
+
+    The first name is required; later ones are optional (schema 1.2 arrays)
+    and None on rows without them.
+    """
+    lines, clients = _open_sidecar(path, names[0])
+    return ClientSeries(clients=clients, rows=_array_rows(lines, path, names))
+
+
+def _array_rows(
+    lines: Iterator[dict], path: Path, names: Sequence[str]
+) -> Iterator[tuple[int, list]]:
+    required, optional = names[0], names[1:]
+    for line in lines:
+        try:
+            arrays = [list(line[required])]
+            arrays.extend(
+                None if line.get(name) is None else list(line[name])
+                for name in optional
+            )
+            yield int(line["elapsed_ms"]), arrays
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise ResultsDocumentError(f"{path}: malformed sidecar row") from error
+
+
+def _open_sidecar(path: Path, values: str) -> tuple[Iterator[dict], list[str]]:
+    """The sidecar's remaining lines and its client labels, after checking
+    the header can supply ``values``."""
     lines = _sidecar_lines(path)
     header = next(lines, None)
     try:
@@ -182,6 +219,4 @@ def open_client_series(path: Path, values: str = "bytes_per_s") -> ClientSeries:
             f"{path}: schema 1.0 sidecars hold no DoneBytes; report the raw "
             "results again for client CSVs and PNGs"
         )
-    return ClientSeries(
-        clients=[str(c) for c in clients], rows=_rows(lines, path, values)
-    )
+    return lines, [str(c) for c in clients]

@@ -38,9 +38,19 @@ section below.
   `extract-mdtest-elbencho.py` are now its internal engines.
 - `results.json` schema 1.1 adds what the text reports read: every live
   domain, producer versions, mdtest commands, and settings text.
+- Reports show elbencho 3.4 detail: each client's IOPS and IO latency, the
+  slowest single IO, and each service's final latency and completion time.
+  `report.html` charts them. Older results report as before.
 
 ### Changed (breaking)
 
+- elbencho 3.4-1 or newer is required (default image and downloads:
+  v3.4-1). `validate_env.sh` and every launcher check it; an older
+  downloaded binary is replaced.
+- elbencho results are saved as `.json` instead of `.csv`.
+- `results.json` schema 2.0 adds the per-client and per-service data above.
+  For elbencho 3.4 runs, live `latency.max_us` is the slowest single IO, not
+  the slowest interval average. `--from-json` reads schema 1.x and 2.x.
 - Filesystem reports always write `results.json`, `report.html`,
   `report.txt`, and PNGs, and `--live-detail` defaults to `full`. `--to-json`
   and `--markdown` are removed from filesystem reports; netbench and Warp
@@ -50,6 +60,9 @@ section below.
 
 ### Fixed
 
+- Netbench (beta) works with elbencho 3.4.
+- A Slurm site message on `sbatch`'s stderr no longer corrupts the job ID,
+  which made launchers abandon a running coordinator.
 - Results saved before prepared batches report correctly (an empty
   `executions/` directory, an older `env_used.yaml`).
 - Metadata reports reject a malformed `--only-nodes` or `--only-threads`

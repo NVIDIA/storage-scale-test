@@ -44,11 +44,15 @@ produce it. Open it in a browser.
    also names a node count all runs share ("single node"; the tables then
    omit the nodes column) and phases of 10 minutes or more ("30 min per
    phase").
-4. Per-run live detail inside each section, collapsed on load. elbencho's
-   `SYNC` and `DROPCACHE` phases move no data and are left out
-   (`results.json` keeps them).
-5. Provenance, per document: command, versions, source paths and hashes, and
-   diagnostics (collapsed).
+4. Per-run detail inside each section, collapsed on load: live charts, and
+   the per-service charts, which need only `results.json` and so appear
+   without live data too. elbencho's `SYNC` and `DROPCACHE` phases move no
+   data and are left out (`results.json` keeps them).
+5. Provenance, per document: command, versions (including elbencho's), source
+   paths and hashes, and diagnostics (collapsed).
+
+Columns that need elbencho 3.4 results are left out when no row has a value,
+so older results render as before.
 
 ## Referring to a part
 
@@ -83,16 +87,19 @@ produce it. Open it in a browser.
 | `sweep-share` | GB/s per node vs nodes (node sweeps). |
 | `sweep-latency` | p50 and p99 latency, log scale; one chart per phase (`-write`, `-read`). |
 | `sweep-histogram` | Latency histogram at peak throughput. |
-| `results-table` | One row per execution: a table per phase, write then read (IO; `-write`, `-read`), or per operation (metadata; `-create`, `-stat`, `-delete`). The `run` ID column is behind "Show all columns" and links to the run's detail. |
-| `fairness-table` | Live fairness in the steady window: a table per phase (`-write`, `-read`), one row per execution; `none (reason)` when the window was rejected (e.g. phase too short). |
+| `results-table` | One row per execution: a table per phase, write then read (IO; `-write`, `-read`), or per operation (metadata; `-create`, `-stat`, `-delete`). The `run` ID column is behind "Show all columns" and links to the run's detail. With `--svcstats` minmax results (elbencho 3.4), the slowest and fastest host's MB/s and ops/s and their ratio are added, with or without live data. |
+| `fairness-table` | Live fairness in the steady window: a table per phase (`-write`, `-read`), one row per execution; `none (reason)` when the window was rejected (e.g. phase too short). `lat max ms` (the largest single IO) is shown only for elbencho 3.4 runs; `lat max ÷ p50` uses the per-IO max for 3.4 and the largest interval mean before. elbencho 3.4 adds the worst client's mean latency over the median and the client with the highest final p99 with its ratio to the phase p99. |
 | `md-rates` | Metadata ops/s vs the swept dimension; one chart per operation when several configurations are swept. |
 | `md-latency` | Metadata p50 and p99 latency; split per operation like `md-rates`. |
-| `run-aggregate` | One run's aggregate throughput and latency over time. |
+| `run-aggregate` | One run's aggregate throughput and latency over time; with elbencho 3.4, a dashed line for the slowest single IO per interval. |
 | `run-spread` | Per-client p10-p90 band and median over time. |
 | `run-fairness` | Jain index over time. |
 | `run-clients` | The slowest clients, median and fastest client over time. |
 | `run-heatmap` | Clients by interval, each as a share of the fleet median. |
-| `run-client-table` | Per-client summary, slowest first. |
+| `run-client-table` | Per-client summary, slowest first; with elbencho 3.4, steady ops/s and IO latency, and the client's final latency percentiles and completion time from `--svcstats`. |
+| `run-client-scatter` | Per client, steady MB/s against steady mean IO latency, coloured by class (`ok` is normal); hover names the client. Low throughput at normal latency points at the client host, high latency at its IO path. Needs elbencho 3.4 and two or more clients; at most 500 points. |
+| `service-latency` | Per IO phase with two or more services (elbencho 3.4 `--svcstats`): each service's final p99 and p50, ordered by p99, with the phase p99 dashed. Hover names the host; at most 300 services are drawn. |
+| `service-completion` | The same services' completion times, shortest first. |
 | `provenance` | Command, versions, sources, diagnostics. |
 
 The swept dimension goes on x (nodes, then threads, then IO depth), with one

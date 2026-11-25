@@ -102,12 +102,14 @@ LOG = logging.getLogger("storage-scale-integration")
 # One batch group's expectation: (group ID, workload kind, storage target name).
 GroupRow = tuple[str, str, str]
 
-ELBENCHO_VERSION = "v3.2-1"
+ELBENCHO_VERSION = "v3.4-1"
 ELBENCHO_RELEASE_API = (
     "https://api.github.com/repos/breuner/elbencho/releases/tags/" + ELBENCHO_VERSION
 )
 ELBENCHO_CONTAINER = ELBENCHO_UPSTREAM_IMAGE
 SBX_ELBENCHO_BUNDLE_RECIPE = 1
+# results.json major version; must match lib/filesystem_results.py.
+RESULTS_SCHEMA_MAJOR = "2"
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
 MAX_DEPLOYMENT_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_DEPLOYMENT_FILES = 10_000
@@ -115,12 +117,12 @@ SLURM_CLEANUP_MARGIN_SECONDS = 120
 ELBENCHO_ARCHIVES = {
     "x86_64": (
         "elbencho-static-x86_64.tar.gz",
-        "c32f9f905e879b7efed8c2f83ea9be7a362dceae43155bb46ddab3d5d6c23210",
+        "0ff66bd031fe5cb0004bf74e40e13a6e99ee8961dc9393afd6d48d196db1e328",
         "elbencho",
     ),
     "aarch64": (
         "elbencho-static-aarch64.tar.gz",
-        "3af09f8110586863b35da019e748c8062fcf57cc0f32e446b1c054df4500eba3",
+        "a5a18384c432a30e871cc94e0b87b0e7434dc0d1a251cbe12abd1afe2c1dd30e",
         "elbencho.aarch64",
     ),
 }
@@ -2574,7 +2576,7 @@ def _assert_mdtest_result_artifacts(
     result: Path, execution_root: Path, execution_id: str, nodes: int, tasks: int
 ) -> None:
     """Require a completed MD cell to publish raw data and its commit marker."""
-    for suffix in ("csv", "out"):
+    for suffix in ("json", "out"):
         matches = sorted(
             result.glob(f"mdtest-elbencho-c_{nodes:03d}-t_{tasks:03d}_*_iter1.{suffix}")
         )
@@ -3010,8 +3012,38 @@ def _live_object_problems(document: dict[str, Any]) -> list[str]:
             latency = live.get("aggregate_series", {}).get("io_latency_avg_us", ())
             if not any(isinstance(value, (int, float)) for value in latency):
                 problems.append(f"{label}: no Lat IO us samples")
+            problems.extend(_v34_live_problems(label, live))
+            if live.get("client_mode") == "service":
+                phase_services = _phase_services(execution, name)
+                if not (phase_services or {}).get("instances"):
+                    problems.append(f"{label}: no services.instances")
     if not document.get("executions"):
         problems.append("no executions")
+    return problems
+
+
+def _phase_services(execution: dict[str, Any], name: str) -> dict[str, Any] | None:
+    """The ``services`` object of one IO phase of an execution, if any."""
+    for phase in (execution.get("results") or {}).get("phases", ()):
+        if phase.get("phase") == name:
+            return phase.get("services")
+    return None
+
+
+def _v34_live_problems(label: str, live: dict[str, Any]) -> list[str]:
+    """Problems with the elbencho 3.4 live fields (counts and client latency)."""
+    problems = []
+    series = live.get("aggregate_series", {})
+    for key in ("done_ios", "io_latency_max_us"):
+        if not any(isinstance(value, (int, float)) for value in series.get(key, ())):
+            problems.append(f"{label}: no {key} samples")
+    summary = live.get("clients_summary") or {}
+    columns = summary.get("columns", ())
+    if "mean_ops_per_s" not in columns:
+        return problems + [f"{label}: clients_summary lacks 3.4 columns"]
+    position = columns.index("mean_ops_per_s")
+    if not any(isinstance(row[position], (int, float)) for row in summary["rows"]):
+        problems.append(f"{label}: no client ops/s")
     return problems
 
 
@@ -3182,6 +3214,8 @@ def _assert_read_cache(step: ScenarioStep, result: Path) -> None:
 
 LIVE_FAIRNESS_HEADING = "Live fairness"
 LIVE_PHASES = ("write", "read")
+# DoneBytes plus the columns elbencho 3.4 added (the floor for these runs).
+LIVE_CSV_COLUMNS_V34 = ("DoneBytes", "DoneIOs", "Lat IO max us")
 
 
 def _assert_live_capture(result: Path) -> None:
@@ -3195,8 +3229,9 @@ def _assert_live_capture(result: Path) -> None:
         if len(lines) < 3:
             continue
         header = lines[0]
-        if "DoneBytes" not in header:
-            raise IntegrationTestError(f"live CSV lacks DoneBytes column: {path}")
+        for column in LIVE_CSV_COLUMNS_V34:
+            if column not in header:
+                raise IntegrationTestError(f"live CSV lacks {column} column: {path}")
         stable_series = True
     if not stable_series:
         raise IntegrationTestError(
@@ -5947,9 +5982,9 @@ def _assert_batch_cell(
     elif assignments.get("ELBENCHO_FILE_LAYOUT") != "worker-directories":
         # Only the generated shared-directory layout writes per-phase JSON;
         # worker-directory cells (e.g. a weighted multi-root target) prove
-        # completion through their CSV/OUT results below.
+        # completion through their JSON/OUT results below.
         _assert_phase_artifacts(output / "executions", identity, step, status)
-    for suffix in ("csv", "out"):
+    for suffix in ("json", "out"):
         if not any(path.stat().st_size for path in output.glob(f"*.{suffix}")):
             raise IntegrationTestError(
                 f"mixed batch group {group[1]} lacks {suffix} evidence"
@@ -6217,7 +6252,7 @@ def _assert_batch_results_json(path: Path, rows: tuple[GroupRow, ...]) -> None:
     problems = []
     if document.get("schema") != "storage-scale-test/filesystem-batch-results":
         problems.append(f"schema {document.get('schema')!r}")
-    if not str(document.get("schema_version")).startswith("1."):
+    if not str(document.get("schema_version")).startswith(f"{RESULTS_SCHEMA_MAJOR}."):
         problems.append(f"schema_version {document.get('schema_version')!r}")
     if document.get("batch_outcome", {}).get("complete") is not True:
         problems.append("batch_outcome.complete is not true")

@@ -93,7 +93,7 @@ OUTPUT:
   Results are written to \$RESULTS_DIR/netbench-<mode>-<datestamp>/
   Each configuration produces:
     - netbench-<mode>-c_<nodes>-t_<threads>_<datestamp>_iter<N>.out
-    - netbench-<mode>-c_<nodes>-t_<threads>_<datestamp>_iter<N>.csv
+    - netbench-<mode>-c_<nodes>-t_<threads>_<datestamp>_iter<N>.json
 
 EOF
     exit "${1:-1}"
@@ -218,6 +218,8 @@ if [[ -z "${NETBENCH_ITERATIONS:-}" ]] || [[ "$NETBENCH_ITERATIONS" -lt 1 ]]; th
     echo "Error: NETBENCH_ITERATIONS must be at least 1" >&2
     exit 1
 fi
+
+elbencho_check_binary_version "$ELBENCHO" || exit 1
 
 # Mode abbreviation for directory naming
 if [[ "$bidirectional" == "true" ]]; then

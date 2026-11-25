@@ -749,7 +749,7 @@ _coordinator_require_success_artifacts() {
                 "$scratch" "$nodes" "$tasks_per_node" \
                 "${COORDINATOR_OUTPUT_BASENAME##*-}" "$iteration")
             if [[ ! -s "$stem.out" || -L "$stem.out" \
-                    || ! -s "$stem.csv" || -L "$stem.csv" ]]; then
+                    || ! -s "$stem.json" || -L "$stem.json" ]]; then
                 _coordinator_error "successful MD execution $id lacks iteration $iteration results"
                 return 1
             fi
@@ -764,7 +764,7 @@ _coordinator_require_success_artifacts() {
     fi
     # The pre-existing workload contract identifies completion files only for
     # shared-directory and staged-read modes. Legacy worker-directory output is
-    # parsed from Elbencho's regular .out/.csv artifacts and has no synthetic
+    # parsed from Elbencho's regular .out/.json artifacts and has no synthetic
     # completion sidecar to require here.
     local required=()
     if [[ -n "${ELBENCHO_SWEEP_READ_FROM:-}" \
@@ -1529,6 +1529,15 @@ _coordinator_main() {
     # shellcheck disable=SC1091,SC1090  # Digest-verified, colocated control library.
     source "$CONTROL_DIR/_elbencho_functions.sh" || return 1
     _coordinator_initialize_state || return 1
+    # The floor applies to the image the workers run too, so check before any
+    # benchmark. An integration fake stands in for the binary and has no version.
+    if [[ -z "${KUBECTL_INTEGRATION_FAKE_ELBENCHO:-}" ]]; then
+        local version_error
+        version_error=$(elbencho_check_binary_version "$ELBENCHO" 2>&1) || {
+            _coordinator_finish_startup_failure "$version_error"
+            return 1
+        }
+    fi
     _coordinator_validate_endpoint_rows || {
         _coordinator_finish_startup_failure "invalid worker endpoint evidence"
         return 1

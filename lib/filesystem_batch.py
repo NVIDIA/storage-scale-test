@@ -399,10 +399,11 @@ def _stage_execution(
     source = manifest.group_path(group)
     ledger = destination / "executions"
     for stem in stems:
-        for extension in ("csv", "out"):
-            _copy_published(
-                source / f"{stem}.{extension}", destination / f"{stem}.{extension}"
-            )
+        _copy_published(source / f"{stem}.out", destination / f"{stem}.out")
+        results = source / f"{stem}.json"
+        if not results.exists() and not results.is_symlink():
+            results = source / f"{stem}.csv"  # elbencho before 3.4
+        _copy_published(results, destination / results.name)
         live = source / f"{stem}.live.csv"
         if live.exists():
             _copy_published(live, destination / live.name)

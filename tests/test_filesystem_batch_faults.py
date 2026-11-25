@@ -24,6 +24,7 @@ import time
 import pytest
 
 from lib.filesystem_batch import read_batch_manifest
+from tests.filesystem_checkout_test_support import FAKE_ELBENCHO_SCRIPT
 
 # Pytest registers the imported fixture under its declared "checkout" name.
 # pylint: disable=unused-import
@@ -47,7 +48,7 @@ def fault_checkout_fixture(checkout):
     """Provide a local executable so real preflight can validate deployment identity."""
     for name in ("elbencho", "elbencho.aarch64"):
         executable = checkout / "utils" / name
-        executable.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        executable.write_text(FAKE_ELBENCHO_SCRIPT, encoding="utf-8")
         executable.chmod(0o755)
     return checkout
 
