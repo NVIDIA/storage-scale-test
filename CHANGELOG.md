@@ -61,6 +61,8 @@ section below.
 ### Fixed
 
 - Netbench (beta) works with elbencho 3.4.
+- A Slurm site message on `sbatch`'s stderr no longer corrupts the job ID,
+  which made launchers abandon a running coordinator.
 - Results saved before prepared batches report correctly (an empty
   `executions/` directory, an older `env_used.yaml`).
 - Metadata reports reject a malformed `--only-nodes` or `--only-threads`

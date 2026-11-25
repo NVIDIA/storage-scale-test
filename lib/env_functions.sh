@@ -5214,6 +5214,19 @@ print_slurm_node_warnings() {
     return 0
 }
 
+# Print the numeric job ID from `sbatch --parsable` output: the last nonempty
+# line, `jobid` or `jobid;cluster`. Returns 1 when there is none.
+_sbatch_parsable_job_id() {
+    local line last=""
+    while IFS= read -r line; do
+        [[ -z "${line//[[:space:]]/}" ]] || last="$line"
+    done <<< "$1"
+    last="${last%%;*}"
+    last="${last//[[:space:]]/}"
+    [[ "$last" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$last"
+}
+
 # Submit one sbatch job with dependency chaining, error checking, and log tracking.
 #
 # Relies on the following caller-scoped variables:
@@ -5258,14 +5271,20 @@ run_sbatch_job() {
         loop_sbatch_opts+=("--nodelist=${ordered_nodelist}")
     fi
 
-    JOBID="$( "${sbatch_cmd[@]}" --parsable --nodes="$nodes" \
+    # Only stdout carries the job ID; site plugins may write notes to stderr,
+    # which pass through to the terminal.
+    local sbatch_output rc=0
+    sbatch_output="$( "${sbatch_cmd[@]}" --parsable --nodes="$nodes" \
         "${g_sbatch_opts[@]}" \
         "${loop_sbatch_opts[@]}" \
-        "$@" 2>&1 )"
-    local rc=$?
+        "$@" )" || rc=$?
     if [[ $rc -ne 0 ]]; then
-        echo "$JOBID" >&2
+        [[ -z "$sbatch_output" ]] || echo "$sbatch_output" >&2
         return $rc
+    fi
+    if ! JOBID=$(_sbatch_parsable_job_id "$sbatch_output"); then
+        echo "Error: sbatch printed no job ID (output: '$sbatch_output'); check squeue for job '$job_name'" >&2
+        return 1
     fi
 
     local this_log_file="${output_fmt/\%j/$JOBID}"
