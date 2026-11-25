@@ -256,6 +256,9 @@ collect before resume.
   stored fairness summary. Renderers read post-1.0 fields with `.get`.
 - Pass the same `ReportSelection` to every `report.html` write so HTML shows
   what text shows. Template names and anchors are user-facing references.
+- Chart hover names (hosts, clients) are interned into the blob's shared
+  `$hosts` table; series `names` hold indexes. Per-service charts need only
+  `results.json`, so runs without live data still get a run detail.
 - `report_html/pairing.py`'s docstring defines which settings block, imply
   or are only noted in comparisons. `lib/setting_relevance.py` is the single
   source of truth for which settings apply to a run.

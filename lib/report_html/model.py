@@ -47,6 +47,9 @@ RUN_FAIRNESS = "run-fairness"
 RUN_CLIENTS = "run-clients"
 RUN_HEATMAP = "run-heatmap"
 RUN_CLIENT_TABLE = "run-client-table"
+RUN_CLIENT_SCATTER = "run-client-scatter"
+SERVICE_LATENCY = "service-latency"
+SERVICE_COMPLETION = "service-completion"
 PROVENANCE = "provenance"
 TEMPLATES = (
     HEADER_CARDS,
@@ -68,6 +71,9 @@ TEMPLATES = (
     RUN_CLIENTS,
     RUN_HEATMAP,
     RUN_CLIENT_TABLE,
+    RUN_CLIENT_SCATTER,
+    SERVICE_LATENCY,
+    SERVICE_COMPLETION,
     PROVENANCE,
 )
 

@@ -27,6 +27,7 @@ import statistics
 from typing import Sequence
 
 from lib import elbencho_services as services_lib
+from lib.elbencho_live_steady import CLASS_OK, CLASS_PERSISTENT, CLASS_TRANSIENT
 from lib.report_html import model
 from lib.report_html.common import (
     ELAPSED_S,
@@ -52,6 +53,7 @@ from lib.report_html.common import (
     line_spec,
     phase_of,
     results_of,
+    scatter_spec,
     series,
     steady_span,
 )
@@ -77,10 +79,19 @@ from lib.report_html.reduce import (
     scaled,
     sig,
 )
+from lib.report_html.services import service_figures
 from lib.reporting_common import natural_key
 from lib.results_document import ResultsDocumentError, read_client_series
 
 MIN_SPREAD_CLIENTS = 3
+MIN_SCATTER_CLIENTS = 2
+SCATTER_MAX_POINTS = 500
+# Client classes in legend order; "ok" is the normal class.
+_CLASS_COLORS = (
+    (CLASS_PERSISTENT, model.P99),
+    (CLASS_TRANSIENT, category_color(8)),
+    (CLASS_OK, model.NEUTRAL),
+)
 SLOWEST_LINES = 4
 JAIN_WINDOWS = ("5s", "30s")
 MB_PER_CLIENT = "MB/s per client"
@@ -203,6 +214,13 @@ class _DomainBuilder:
                 )
             )
         caption = "Total GB/s (left) and fleet mean IO latency (right) per interval."
+        worst = self._worst_latency(agg, times)
+        if worst:
+            lines.append(worst)
+            caption = (
+                "Total GB/s (left) and fleet IO latency per interval (right): "
+                "mean, and dashed the slowest single IO."
+            )
         if agg.get("start_time"):
             caption += f" Started {agg['start_time']}."
         spec = line_spec(
@@ -215,6 +233,50 @@ class _DomainBuilder:
         title = f"{self.label} aggregate throughput and latency"
         return self.figure(
             model.RUN_AGGREGATE, title, caption + _shade_note(self.shade), spec
+        )
+
+    def _worst_latency(self, agg: dict, times: list) -> dict | None:
+        """The per-interval slowest single IO (elbencho 3.4), on the latency axis."""
+        worst = [scaled(v, US_PER_MS) for v in agg.get("io_latency_max_us") or []]
+        if all(v is None for v in worst):
+            return None
+        points = decimate(times, worst)
+        return series("max latency (any IO)", category_color(4), points, True, "y2")
+
+    def client_scatter(self) -> Figure | None:
+        """Steady MB/s against steady mean IO latency, one point per client."""
+        records = _summary_records(self.live)
+        points = [
+            r
+            for r in records
+            if r.get("steady_bytes_per_s") is not None
+            and r.get("steady_io_latency_avg_us") is not None
+        ]
+        if len(points) < MIN_SCATTER_CLIENTS:
+            return None
+        shown = _scatter_sample(points)
+        groups = []
+        for name, color in _CLASS_COLORS:
+            members = [r for r in shown if (r.get("class") or CLASS_OK) == name]
+            if members:
+                groups.append(_class_series(name, color, members))
+        spec = scatter_spec(
+            axis("steady MB/s", min=0),
+            axis(LATENCY_MS, fmt=FMT_MS, min=0),
+            groups,
+        )
+        caption = (
+            "One point per client over the steady window (hover for the name). "
+            "Low throughput at normal latency points at the client host; high "
+            "latency points at that client's IO path. ok: normal clients."
+        )
+        if len(shown) < len(points):
+            caption += f" Showing {len(shown)} of {len(points)} clients: the slowest and the highest-latency."
+        return self.figure(
+            model.RUN_CLIENT_SCATTER,
+            f"{self.label} client throughput vs latency",
+            caption,
+            spec,
         )
 
     def spread(self) -> Figure | None:
@@ -276,7 +338,8 @@ class _DomainBuilder:
     def build(self, heading_anchor: str, heading: str) -> RunDomain:
         """All figures, the client table and notes of this domain."""
         result = RunDomain(heading_anchor, self.phase, heading)
-        for figure in (self.aggregate(), self.spread(), self.fairness()):
+        figures = (self.aggregate(), self.spread(), self.fairness())
+        for figure in figures + (self.client_scatter(),):
             if figure:
                 result.figures.append(figure)
         ref = self.live.get("client_series")
@@ -290,6 +353,33 @@ class _DomainBuilder:
             result.notes.append(f"Per-client data unavailable: {error}")
         result.table = client_table(self)
         return result
+
+
+def _scatter_sample(records: list[dict]) -> list[dict]:
+    """All records, or the slowest and highest-latency half each over the cap."""
+    if len(records) <= SCATTER_MAX_POINTS:
+        return records
+    half = SCATTER_MAX_POINTS // 2
+    slow = sorted(records, key=lambda r: r["steady_bytes_per_s"])[:half]
+    late = sorted(records, key=lambda r: -r["steady_io_latency_avg_us"])
+    keep = {id(r) for r in slow}
+    extra = [r for r in late if id(r) not in keep][: SCATTER_MAX_POINTS - len(slow)]
+    chosen = {id(r) for r in slow + extra}
+    return [r for r in records if id(r) in chosen]
+
+
+def _class_series(name: str, color: str, members: list[dict]) -> dict:
+    points = [
+        [
+            sig(scaled(r["steady_bytes_per_s"], MB)),
+            sig(scaled(r["steady_io_latency_avg_us"], US_PER_MS)),
+        ]
+        for r in members
+    ]
+    return {
+        **series(name, color, points),
+        "names": [str(r.get(K_CLIENT)) for r in members],
+    }
 
 
 def _shade_note(shade) -> str:
@@ -587,16 +677,47 @@ def _domain_services(execution: dict, domain: dict) -> dict | None:
     return (phase_of(execution, str(domain.get(K_PHASE))) or {}).get("services")
 
 
+def _service_domains(
+    section_anchor: str,
+    execution_id: str,
+    execution: dict,
+    plain: dict[str, RunDomain],
+) -> list[RunDomain]:
+    """Add each IO phase's per-service figures to its live domain in ``plain``
+    (by phase), or return a domain of their own for a phase without one."""
+    extra = []
+    for phase in results_of(execution).get("phases") or []:
+        name = str(phase.get(K_PHASE))
+        if name not in IO_PHASES:
+            continue
+        suffix = f"-r{slug(execution_id)}-{slug(name)}"
+
+        def make(template, title, caption, spec, suffix=suffix):
+            anchor = f"{section_anchor}-{template}{suffix}"
+            return Figure(template, anchor, title, caption, spec, True)
+
+        found = service_figures(phase, name, make)
+        if not found:
+            continue
+        if name in plain:
+            plain[name].figures.extend(found)
+            continue
+        count = len(services_lib.instances(phase.get("services")))
+        heading = f"{name}: per-service results, {count} services"
+        extra.append(RunDomain(f"{section_anchor}{suffix}", name, heading, found))
+    return extra
+
+
 def build_run(
     ctx: GroupContext, section_anchor: str, run: tuple[str, str], execution: dict
 ) -> RunDetail | None:
-    """Collapsed live detail of one execution, or None without live data."""
+    """Collapsed detail of one execution: its live domains and the per-service
+    results of its IO phases; None without either."""
     execution_id, label = run
     domains = live_domains(execution, ctx.live_detail)
-    if not domains:
-        return None
     run_anchor = f"{section_anchor}-r{slug(execution_id)}"
     built = []
+    plain = {}
     for domain in domains:
         suffix = f"-r{slug(execution_id)}-{domain_slug(domain)}"
         live = domain[K_LIVE]
@@ -604,6 +725,12 @@ def build_run(
         heading = f"{domain_label(domain)}: {live.get('clients') or 0} {mode}s"
         services = _domain_services(execution, domain)
         builder = _DomainBuilder(ctx, (section_anchor, suffix), domain, services)
-        built.append(builder.build(f"{section_anchor}{suffix}", heading))
+        result = builder.build(f"{section_anchor}{suffix}", heading)
+        built.append(result)
+        if not (domain.get(K_MIX) or domain.get(K_OCCURRENCE)):
+            plain.setdefault(str(domain.get(K_PHASE)), result)
+    extra = _service_domains(section_anchor, execution_id, execution, plain)
+    if not built and not extra:
+        return None
     chips = [_chip(execution, d) for d in domains]
-    return RunDetail(run_anchor, execution_id, label, chips, built)
+    return RunDetail(run_anchor, execution_id, label, chips, built + extra)

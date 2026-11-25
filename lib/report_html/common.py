@@ -460,6 +460,12 @@ def line_spec(x: dict, y: dict, line_series: list, **extra) -> dict:
     return spec
 
 
+def scatter_spec(x: dict, y: dict, groups: list) -> dict:
+    """A scatter chart spec; each group is a series with ``points`` and
+    ``names`` (the label shown on hover)."""
+    return {"kind": "scatter", "x": x, "y": y, "series": groups}
+
+
 def bar_spec(categories: list[str], x_label: str, y: dict, bars: list) -> dict:
     """A bar chart spec; each bar series has one value per category."""
     return {
